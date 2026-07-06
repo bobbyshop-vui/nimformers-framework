@@ -1,0 +1,77 @@
+name: Build & Test (macOS Intel + Apple Silicon)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            name: macOS (Apple Silicon / arm64)
+          - os: macos-15-intel
+            name: macOS (Intel / x86_64)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show architecture and OS
+        run: |
+          echo "uname -m: $(uname -m)"
+          echo "uname -a: $(uname -a)"
+          sw_vers || true
+          xcodebuild -version || echo "Xcode not found"
+      - name: Install Xcode 26
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.0'
+
+      - name: Show Xcode version after install
+        run: |
+          xcodebuild -version
+          xcode-select -p
+      - name: Accept Xcode license
+        run: sudo xcodebuild -license accept || true
+
+      - name: Install Metal Toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+
+      - name: Verify Metal compiler
+        run: |
+          metal -version || echo "metal not found"
+          xcrun metal -version || echo "xcrun metal not found"
+      - name: Install Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: 'stable'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Show Nim version
+        run: |
+          nim --version
+          nimble --version
+      - name: Build
+        run: make build
+
+      - name: Test with metal
+        run: make run-metal
+      - name: Test with cpu
+        run: make run-cpu
+      - name: Upload build artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nimcache-${{ matrix.os }}
+          path: |
+            nimcache/
+            *.log
+          if-no-files-found: ignore
