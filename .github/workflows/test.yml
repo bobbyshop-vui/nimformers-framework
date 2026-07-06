@@ -1,4 +1,4 @@
-name: Build & Test (macOS Intel + Apple Silicon)
+name: Build & Test (CPU + GPGPU-Sim)
 
 on:
   push:
@@ -8,7 +8,10 @@ on:
   workflow_dispatch: {}
 
 jobs:
-  build-and-test:
+  # ─────────────────────────────────────────────────────────────
+  # macOS (Intel + Apple Silicon) — Metal + CPU
+  # ─────────────────────────────────────────────────────────────
+  macos:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -24,21 +27,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show architecture and OS
+      - name: Show architecture
         run: |
           echo "uname -m: $(uname -m)"
-          echo "uname -a: $(uname -a)"
           sw_vers || true
-          xcodebuild -version || echo "Xcode not found"
+
       - name: Install Xcode 26
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: '26.0'
 
-      - name: Show Xcode version after install
-        run: |
-          xcodebuild -version
-          xcode-select -p
       - name: Accept Xcode license
         run: sudo xcodebuild -license accept || true
 
@@ -46,31 +44,147 @@ jobs:
         run: xcodebuild -downloadComponent MetalToolchain
 
       - name: Verify Metal compiler
-        run: |
-          metal -version || echo "metal not found"
-          xcrun metal -version || echo "xcrun metal not found"
+        run: metal -version || echo "metal not found"
+
       - name: Install Nim
         uses: jiro4989/setup-nim-action@v2
         with:
           nim-version: 'stable'
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Show Nim version
-        run: |
-          nim --version
-          nimble --version
+        run: nim --version
+
       - name: Build
         run: make build
 
-      - name: Test with metal
+      - name: Test with Metal
         run: make run-metal
-      - name: Test with cpu
+
+      - name: Test with CPU
         run: make run-cpu
-      - name: Upload build artifacts on failure
+
+      - name: Upload artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: nimcache-${{ matrix.os }}
+          path: |
+            nimcache/
+            *.log
+          if-no-files-found: ignore
+
+  # ─────────────────────────────────────────────────────────────
+  # Linux (Ubuntu) — CPU only (không có GPU)
+  # ─────────────────────────────────────────────────────────────
+  linux:
+    name: Linux (Ubuntu) CPU
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential gcc g++ make
+
+      - name: Install Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: 'stable'
+
+      - name: Build CPU backend
+        run: make build-cpu
+
+      - name: Test with CPU
+        run: make run-cpu
+
+      - name: Upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nimcache-linux
+          path: |
+            nimcache/
+            *.log
+          if-no-files-found: ignore
+
+  # ─────────────────────────────────────────────────────────────
+  # Windows — CPU only (không có GPU)
+  # ─────────────────────────────────────────────────────────────
+  windows:
+    name: Windows CPU
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: 'stable'
+
+      - name: Build CPU backend
+        run: |
+          make build
+          make run-cpu
+
+      - name: Test with CPU
+        run: ./test_nimformer.exe
+
+      - name: Upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nimcache-windows
+          path: |
+            nimcache/
+            *.log
+          if-no-files-found: ignore
+
+  # ─────────────────────────────────────────────────────────────
+  # GPGPU-Sim — mô phỏng CUDA trên CPU (chậm, dùng để test)
+  # ─────────────────────────────────────────────────────────────
+  gpgpu-sim:
+    name: GPGPU-Sim (CUDA simulation)
+    runs-on: ubuntu-latest
+    continue-on-error: true  # Không fail workflow nếu GPGPU-Sim lỗi
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential gcc g++ make cmake git
+
+      - name: Install CUDA Toolkit (cần cho compile)
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: '11.8.0'
+
+      - name: Clone GPGPU-Sim
+        run: |
+          git clone --depth 1 https://github.com/gpgpu-sim/gpgpu-sim_distribution.git
+          cd gpgpu-sim_distribution
+          make setup
+          source setup_environment
+
+      - name: Build CUDA test with GPGPU-Sim
+        run: |
+          export CUDA_INSTALL_PATH=/usr/local/cuda
+          source gpgpu-sim_distribution/setup_environment
+          make cuda-lib
+          make run-cuda || echo "GPGPU-Sim test failed (expected on CI)"
+
+      - name: Upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nimcache-gpgpu-sim
           path: |
             nimcache/
             *.log
