@@ -92,11 +92,33 @@ Using the provided `Makefile`:
 ```bash
 make            # build test_nimformer + metal_ai, then run test_nimformer
 make build      # build only, don't run
-make run        # build + run test_nimformer
+make cuda-lib "your cuda compiler path" #compile cuda shader
+make run        # build + run test_nimformer + the backend is auto
+make run-cuda   # run on nvdia gpu
+make run-cpu    # run on cpu
+make run-metal  # run on metal gpu
 make clean      # remove binaries, nimcache/, and any model_*.nimq checkpoints
 ```
 ---
+## 4.1 Setting the backend
 
+Build flag:
+
+```bash
+nim c -d:release -d:backend=cpu test_nimformer.nim
+nim c -d:release -d:backend=metal test_nimformer.nim
+nim c -d:release -d:withCuda -d:backend=cuda --passL:"-L. -lcudakernels -lcudart -lcublas -lstdc++" test_nimformer.nim
+```
+
+In code:
+
+```nim
+import backend
+let ctx = newBackend("cpu")
+let ctx = newBackend("metal")
+let ctx = newBackend("cuda")
+let ctx = newBackend("auto")
+```
 ## 5. Using each library module
 
 ### 5.1. `customfloat.nim` — CustomFloat & APF
