@@ -148,44 +148,60 @@ jobs:
   # GPGPU-Sim — mô phỏng CUDA trên CPU (chậm, dùng để test)
   # ─────────────────────────────────────────────────────────────
   gpgpu-sim:
-    name: GPGPU-Sim (CUDA simulation)
-    runs-on: ubuntu-latest
-    continue-on-error: true  # Không fail workflow nếu GPGPU-Sim lỗi
-
+    name: GPGPU-Sim (CUDA simulation on CPU)
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+  
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
+      - uses: actions/checkout@v4
+  
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y build-essential gcc g++ make cmake git
-
-      - name: Install CUDA Toolkit (cần cho compile)
-        uses: Jimver/cuda-toolkit@v0.2.35
-        with:
-          cuda: '11.8.0'
-
-      - name: Clone GPGPU-Sim
+          sudo apt-get install -y libc6-dev-i386 libc6-dev
+  
+      - name: Install CUDA Toolkit (cần cho compile kernel)
+        run: |
+          wget https://developer.download.nvidia.com/compute/cuda/11.8.0/local_installers/cuda_11.8.0_520.61.05_linux.run
+          chmod +x cuda_11.8.0_520.61.05_linux.run
+          sudo ./cuda_11.8.0_520.61.05_linux.run --toolkit --silent --override
+          echo "export PATH=/usr/local/cuda-11.8/bin:$PATH" >> $GITHUB_ENV
+          echo "export LD_LIBRARY_PATH=/usr/local/cuda-11.8/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+  
+      - name: Check CUDA
+        run: |
+          /usr/local/cuda-11.8/bin/nvcc --version || echo "CUDA not found"
+  
+      - name: Clone and build GPGPU-Sim
         run: |
           git clone --depth 1 https://github.com/gpgpu-sim/gpgpu-sim_distribution.git
           cd gpgpu-sim_distribution
           make setup
           source setup_environment
-
-      - name: Build CUDA test with GPGPU-Sim
+  
+      - name: Set GPGPU-Sim environment
         run: |
-          export CUDA_INSTALL_PATH=/usr/local/cuda
+          echo "source $(pwd)/gpgpu-sim_distribution/setup_environment" >> $GITHUB_ENV
+  
+      - name: Install Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: 'stable'
+  
+      - name: Build CUDA kernel
+        run: |
           source gpgpu-sim_distribution/setup_environment
           make cuda-lib
-          make run-cuda || echo "GPGPU-Sim test failed (expected on CI)"
-
-      - name: Upload artifacts on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: nimcache-gpgpu-sim
-          path: |
-            nimcache/
-            *.log
-          if-no-files-found: ignore
+  
+      - name: Build Nim with GPGPU-Sim
+        run: |
+          source gpgpu-sim_distribution/setup_environment
+          nim c -d:release -d:withCuda -d:backend=cuda \
+            --passL:"-L. -lcudakernels -lcudart -lcublas" \
+            test_nimformer.nim
+  
+      - name: Test with GPGPU-Sim
+        run: |
+          source gpgpu-sim_distribution/setup_environment
+          ./test_nimformer || echo "GPGPU-Sim test may fail on CI"
