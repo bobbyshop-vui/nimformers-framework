@@ -95,7 +95,7 @@ jobs:
           nim-version: 'stable'
 
       - name: Build CPU backend
-        run: make build-cpu
+        run: make build
 
       - name: Test with CPU
         run: make run-cpu
