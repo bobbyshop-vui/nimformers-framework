@@ -5,7 +5,7 @@
 import std/[math, random, sequtils, strformat, times]
 import customfloat
 import quant
-import metal_ai  # Import MetalContext và các helper
+import backend  # Import Backend và các helper
 
 # ===================================================================
 # Tensor utilities (giữ nguyên)
@@ -75,7 +75,7 @@ proc newLinear*(inF, outF: int): Linear =
   result.weight = randnTensor(@[outF, inF], scale)
   result.bias = newTensor(@[outF])
 
-proc forward*(l: Linear, x: Tensor, ctx: MetalContext): Tensor =
+proc forward*(l: Linear, x: Tensor, ctx: Backend): Tensor =
   ## Forward Linear: y = x @ W^T + b
   let (rows, cols) = flatten2D(x.shape)
   assert cols == l.inF
@@ -88,7 +88,7 @@ proc forward*(l: Linear, x: Tensor, ctx: MetalContext): Tensor =
   # (l.inF, l.outF) trong khi dữ liệu vẫn nằm theo thứ tự [outF, inF] —
   # làm vậy sẽ đọc sai phần tử bất cứ khi nào inF != outF.
   let wT = transpose(l.weight)  # -> [inF, outF]
-  let y = metalMatmul(ctx, x.data, rows, cols, wT.data, l.inF, l.outF)
+  let y = beMatmul(ctx, x.data, rows, cols, wT.data, l.inF, l.outF)
   # y là [rows, outF] phẳng row-major -> phần tử i có row = i div outF,
   # col (= chỉ số output feature) = i mod outF. Bias phải cộng theo CỘT
   # (mỗi output feature 1 giá trị bias, không phải theo hàng/sample).
@@ -99,7 +99,7 @@ proc forward*(l: Linear, x: Tensor, ctx: MetalContext): Tensor =
   for i in 0 ..< y.len:
     result.data[i] = y[i] + l.bias.data[i mod l.outF]
 
-proc backward*(l: Linear, x: Tensor, dOut: Tensor, ctx: MetalContext): tuple[dX, dW, dB: Tensor] =
+proc backward*(l: Linear, x: Tensor, dOut: Tensor, ctx: Backend): tuple[dX, dW, dB: Tensor] =
   ## Backward Linear: 
   ## dW = x^T @ dOut  (cộng dồn qua batch)
   ## dB = sum(dOut, axis=0)
@@ -117,7 +117,7 @@ proc backward*(l: Linear, x: Tensor, dOut: Tensor, ctx: MetalContext): tuple[dX,
   # dW và dX ĐỘC LẬP với nhau (không cái nào cần đọc kết quả của cái kia),
   # nên gộp cả 2 vào 1 command buffer (metalMatmul2) thay vì gọi metalMatmul
   # riêng 2 lần — giảm một nửa số lần dispatch+wait GPU cho mỗi Linear.backward.
-  let (dWRawFlat, dXFlat) = metalMatmul2(ctx,
+  let (dWRawFlat, dXFlat) = beMatmul2(ctx,
     xT.data, l.inF, rows, dOutFlat, rows, l.outF,
     dOutFlat, rows, l.outF, l.weight.data, l.outF, l.inF)
 
@@ -153,7 +153,7 @@ proc newLayerNorm*(dim: int, eps: float32 = 1e-5'f32): LayerNorm =
   result.beta  = newTensor(@[dim], 0'f32)
   result.eps   = eps
 
-proc forward*(ln: LayerNorm, x: Tensor, ctx: MetalContext): Tensor =
+proc forward*(ln: LayerNorm, x: Tensor, ctx: Backend): Tensor =
   let (rows, cols) = flatten2D(x.shape)
   assert cols == ln.dim
   # Chuẩn hóa theo từng hàng: (x - mean) / std
@@ -173,7 +173,7 @@ proc forward*(ln: LayerNorm, x: Tensor, ctx: MetalContext): Tensor =
       result.data[off + c] = (x.data[off + c] - mean) * inv * ln.gamma.data[c] + ln.beta.data[c]
   result
 
-proc backward*(ln: LayerNorm, x: Tensor, dOut: Tensor, ctx: MetalContext): tuple[dX, dGamma, dBeta: Tensor] =
+proc backward*(ln: LayerNorm, x: Tensor, dOut: Tensor, ctx: Backend): tuple[dX, dGamma, dBeta: Tensor] =
   ## Backward LayerNorm (dùng phép toán ma trận)
   let (rows, cols) = flatten2D(x.shape)
   assert cols == ln.dim
@@ -242,7 +242,7 @@ proc softmaxInplace(row: var seq[float32]) =
   for i in 0 ..< row.len:
     row[i] = row[i] / s
 
-proc forward*(attn: CausalSelfAttention, x: Tensor, ctx: MetalContext): Tensor =
+proc forward*(attn: CausalSelfAttention, x: Tensor, ctx: Backend): Tensor =
   let B = x.shape[0]
   let T = x.shape[1]
   let C = x.shape[2]
@@ -274,7 +274,7 @@ proc forward*(attn: CausalSelfAttention, x: Tensor, ctx: MetalContext): Tensor =
           attnOut.data[baseOut + ti * C + h * hd + d] = acc
   result = attn.proj.forward(attnOut, ctx)
 
-proc backward*(attn: CausalSelfAttention, x: Tensor, dOut: Tensor, ctx: MetalContext): tuple[
+proc backward*(attn: CausalSelfAttention, x: Tensor, dOut: Tensor, ctx: Backend): tuple[
     dX, dQkvW, dQkvB, dProjW, dProjB: Tensor] =
   let B = x.shape[0]
   let T = x.shape[1]
@@ -394,12 +394,12 @@ proc newFeedForward*(embedDim, mult: int): FeedForward =
   result.fc1 = newLinear(embedDim, embedDim * mult)
   result.fc2 = newLinear(embedDim * mult, embedDim)
 
-proc forward*(ff: FeedForward, x: Tensor, ctx: MetalContext): Tensor =
+proc forward*(ff: FeedForward, x: Tensor, ctx: Backend): Tensor =
   var h = ff.fc1.forward(x, ctx)
   for i in 0 ..< h.data.len: h.data[i] = apfluAct(h.data[i])
   result = ff.fc2.forward(h, ctx)
 
-proc backward*(ff: FeedForward, x: Tensor, dOut: Tensor, ctx: MetalContext): tuple[
+proc backward*(ff: FeedForward, x: Tensor, dOut: Tensor, ctx: Backend): tuple[
     dX, dFc1W, dFc1B, dFc2W, dFc2B: Tensor] =
   let hidden = ff.fc1.forward(x, ctx)
   let dFc2 = ff.fc2.backward(hidden, dOut, ctx)
@@ -424,7 +424,7 @@ proc newTransformerBlock*(embedDim, nHeads, ffMult: int): TransformerBlock =
   result.ln1 = newLayerNorm(embedDim)
   result.ln2 = newLayerNorm(embedDim)
 
-proc forward*(blk: TransformerBlock, x: Tensor, ctx: MetalContext): Tensor =
+proc forward*(blk: TransformerBlock, x: Tensor, ctx: Backend): Tensor =
   let x1 = blk.ln1.forward(x, ctx)
   let attnOut = blk.attn.forward(x1, ctx)
   let x2 = addT(x, attnOut)
@@ -432,7 +432,7 @@ proc forward*(blk: TransformerBlock, x: Tensor, ctx: MetalContext): Tensor =
   let ffOut = blk.ff.forward(x3, ctx)
   result = addT(x2, ffOut)
 
-proc backward*(blk: TransformerBlock, x: Tensor, dOut: Tensor, ctx: MetalContext): tuple[
+proc backward*(blk: TransformerBlock, x: Tensor, dOut: Tensor, ctx: Backend): tuple[
     dX, dAttnQkvW, dAttnQkvB, dAttnProjW, dAttnProjB,
     dFf1W, dFf1B, dFf2W, dFf2B,
     dLn1G, dLn1B, dLn2G, dLn2B: Tensor] =
@@ -481,7 +481,7 @@ proc newEmbedding*(vocab, dim: int): Embedding =
   result.dim = dim
   result.weight = randnTensor(@[vocab, dim], sqrt(2'f32 / float32(vocab)))
 
-proc lookupBatch*(e: Embedding, idsBatch: seq[seq[int]], ctx: MetalContext): Tensor =
+proc lookupBatch*(e: Embedding, idsBatch: seq[seq[int]], ctx: Backend): Tensor =
   let B = idsBatch.len
   let T = idsBatch[0].len
   result = newTensor(@[B, T, e.dim])
@@ -493,7 +493,7 @@ proc lookupBatch*(e: Embedding, idsBatch: seq[seq[int]], ctx: MetalContext): Ten
       for d in 0 ..< e.dim:
         result.data[dst + d] = e.weight.data[src + d]
 
-proc backward*(e: Embedding, idsBatch: seq[seq[int]], dOut: Tensor, ctx: MetalContext): Tensor =
+proc backward*(e: Embedding, idsBatch: seq[seq[int]], dOut: Tensor, ctx: Backend): Tensor =
   let B = idsBatch.len
   let T = idsBatch[0].len
   var dWeight = newTensor(e.weight.shape)
@@ -524,7 +524,7 @@ proc newNimformerModel*(vocab, embedDim, nHeads, nLayers, ffMult: int): Nimforme
     result.blocks[i] = newTransformerBlock(embedDim, nHeads, ffMult)
   result.outProj = newLinear(embedDim, vocab)
 
-proc forwardBatch*(m: NimformerModel, idsBatch: seq[seq[int]], ctx: MetalContext): Tensor =
+proc forwardBatch*(m: NimformerModel, idsBatch: seq[seq[int]], ctx: Backend): Tensor =
   ## Forward THẬT với batch B (idsBatch.len chuỗi cùng độ dài T) trong 1 lần
   ## gọi — Linear/LayerNorm coi B*T là số "hàng" nên GPU nhận hẳn M=B*T dòng
   ## trong mỗi matmul, thay vì bị gọi B lần tuần tự (mỗi lần B=1) như trước.
@@ -534,14 +534,14 @@ proc forwardBatch*(m: NimformerModel, idsBatch: seq[seq[int]], ctx: MetalContext
     x = blk.forward(x, ctx)
   result = m.outProj.forward(x, ctx)
 
-proc forward*(m: NimformerModel, ids: seq[int], ctx: MetalContext): Tensor =
+proc forward*(m: NimformerModel, ids: seq[int], ctx: Backend): Tensor =
   ## Tiện ích cho 1 chuỗi đơn (giữ nguyên API cũ cho test_nimformer.nim) —
   ## gọi forwardBatch với B=1 rồi bỏ chiều batch.
   let logits = m.forwardBatch(@[ids], ctx)
   result = Tensor(data: logits.data, shape: logits.shape[1 .. ^1])
 
 proc backwardBatch*(m: NimformerModel, idsBatch: seq[seq[int]], dLoss: Tensor,
-                     ctx: MetalContext): seq[Tensor] =
+                     ctx: Backend): seq[Tensor] =
   ## Backward THẬT với batch B. dLoss: shape [B, T, vocab] (gradient loss
   ## theo logits, ĐÃ đúng batch — không còn phải giả B=1 rồi bọc thêm 1
   ## chiều như bản cũ). Linear.backward tự cộng dồn gradient qua B*T hàng
@@ -569,7 +569,7 @@ proc backwardBatch*(m: NimformerModel, idsBatch: seq[seq[int]], dLoss: Tensor,
   grads.add(dEmb)
   return grads
 
-proc backward*(m: NimformerModel, ids: seq[int], dLoss: Tensor, ctx: MetalContext): seq[Tensor] =
+proc backward*(m: NimformerModel, ids: seq[int], dLoss: Tensor, ctx: Backend): seq[Tensor] =
   ## Tiện ích cho 1 chuỗi đơn (giữ nguyên API cũ cho test_nimformer.nim).
   let dLossBatch = Tensor(data: dLoss.data, shape: @[1] & dLoss.shape)
   result = m.backwardBatch(@[ids], dLossBatch, ctx)

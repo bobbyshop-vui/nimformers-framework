@@ -25,7 +25,7 @@
 
 import std/[os, math, random, strformat, strutils, sequtils, tables, json,
             times, parseopt, osproc, streams, re, httpclient]
-import quant, nimformer, metal_ai, customfloat
+import quant, nimformer, backend, customfloat
 
 # ═══════════════════════════════════════════════════════════════
 # Config — thay cho các hằng số cứng SEQ/BATCH_SIZE/STEPS ở đầu main.py
@@ -654,7 +654,7 @@ proc loadCheckpointFull*(path: string): tuple[model: NimformerModel, states: seq
 # chính phép matmul đó (không cần cộng dồn tay trên CPU nữa).
 # ═══════════════════════════════════════════════════════════════
 
-proc train(model: var NimformerModel, samples: seq[Sample], ctx: MetalContext,
+proc train(model: var NimformerModel, samples: seq[Sample], ctx: Backend,
            cfg: Config, states: var seq[ApfAdamState], startStep: int = 0) =
   ## startStep > 0 khi resume từ checkpoint (xem loadCheckpointFull trong main) —
   ## vòng lặp tiếp tục đúng từ đó tới cfg.steps thay vì train lại từ 0.
@@ -755,8 +755,8 @@ proc main() =
     stderr.writeLine "Không đủ dữ liệu để tạo sample (texts ngắn hơn seq_len). Giảm --seq hoặc thêm dữ liệu."
     quit(1)
 
-  echo "== Init Metal GPU context =="
-  let ctx = newMetalContext()
+  echo "== Init backend (cpu/metal/cuda — xem log 'Backend đã chọn' bên dưới) =="
+  let ctx = newBackend()
 
   if not resuming:
     echo "== Build model =="

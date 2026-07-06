@@ -8,7 +8,7 @@
 ## metalSoftmax, metalLayernorm, metalEmbeddingLookup, customfloatEncodeGpu/
 ## customfloatDecodeGpu, apfCastForTrainingGpu.
 
-import std/[os, strformat, tables]
+import std/[strformat, tables]
 import customfloat
 
 {.passC: "-fobjc-arc".}
@@ -167,6 +167,17 @@ type
     # mtl_new_buffer() mới — số buffer sống thật trong tiến trình sẽ hội tụ
     # về mức đỉnh (peak) rồi PHẲNG, không tăng vô hạn theo số step nữa.
     bufferPool: ref Table[uint64, seq[MTLBufferRef]]
+
+proc metalDeviceAvailable*(): bool =
+  ## Dò xem có Metal device dùng được không, KHÔNG raise — dùng cho
+  ## backend.nim ở chế độ "auto" để quyết định có chọn bkMetal hay không.
+  ## Tạo thử device rồi mtl_release ngay (không giữ context sống thật),
+  ## khác newMetalContext() vốn raise nếu fail (dùng khi đã CHỌN metal rồi).
+  let d = mtlCreateDevice()
+  if d == nil:
+    return false
+  mtlRelease(d)
+  return true
 
 proc newMetalContext*(): MetalContext =
   result.device = mtlCreateDevice()
