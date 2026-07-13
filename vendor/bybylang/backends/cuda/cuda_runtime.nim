@@ -14,10 +14,7 @@ import std/dynlib
 import std/tables
 import cuda_driver
 
-# CudaTensor SỐNG Ở cuda_driver.nim (không phải ở đây). Trước đây bị định
-# nghĩa nhầm ở module này trong khi gpubackend.nim luôn gọi `cudaDrv.CudaTensor`
-# (tức mong đợi nó nằm trong cuda_driver.nim) -> lỗi "undeclared identifier".
-# Re-export để code cũ import cuda_runtime rồi dùng CudaTensor vẫn chạy được.
+# Export CudaTensor từ cuda_driver để các module khác dùng được
 export cuda_driver.CudaTensor
 
 type
@@ -32,7 +29,7 @@ const
   cudaMemcpyDeviceToHost: int32 = 2
   CUBLAS_OP_N: cublasOperation_t = 0
   CUBLAS_DEFAULT_MATH: cublasMath_t = 0
-  CUBLAS_TENSOR_OP_MATH: cublasMath_t = 1   # bật Tensor Core cho cuBLAS gemm
+  CUBLAS_TENSOR_OP_MATH: cublasMath_t = 1
 
 type
   CudartLib = object
@@ -60,20 +57,6 @@ var cublas: CublasLib
 var cudartLoaded = false
 var cublasLoaded = false
 
-# ─────────────────────────────────────────────────────────────
-# ĐÃ SỬA (tối ưu hiệu năng): TRƯỚC ĐÂY cudaMatmulF32 tạo mới cublasHandle_t
-# (cublasCreate_v2/cublasDestroy_v2) VÀ cudaMalloc/cudaFree cho A/B/C ở MỖI
-# LẦN GỌI. cublasCreate không rẻ (khởi tạo context cuBLAS nội bộ), và
-# cudaMalloc/cudaFree đều là thao tác đồng bộ với driver, tốn tương đương một
-# lần round-trip lên GPU. Vì matmul là phép toán được gọi nhiều nhất và tốn
-# nhất trong 1 bước train transformer (attention + FFN), đây là nguyên nhân
-# chính khiến CUDA "chậm chạm".
-#
-# Bây giờ: 1 cublasHandle_t DUY NHẤT được tạo 1 lần cho toàn bộ process (giữ
-# nguyên Tensor Core math mode đã bật), và device buffer được lấy từ pool
-# theo kích thước (byte) thay vì cudaMalloc/cudaFree mỗi lần, y hệt cách
-# cuda_driver.nim đã làm cho các phép elementwise.
-# ─────────────────────────────────────────────────────────────
 var gHandle: cublasHandle_t
 var gHandleInitialized = false
 var gDevicePool = initTable[csize_t, seq[pointer]]()
@@ -92,7 +75,6 @@ proc ensureHandle(): cublasHandle_t =
   result = gHandle
 
 proc getDeviceBuf(bytes: csize_t): pointer =
-  ## Lấy device buffer từ pool nếu có sẵn cùng kích thước, không thì cudaMalloc.
   if gDevicePool.hasKey(bytes) and gDevicePool[bytes].len > 0:
     return gDevicePool[bytes].pop()
   var p: pointer
@@ -100,7 +82,6 @@ proc getDeviceBuf(bytes: csize_t): pointer =
   result = p
 
 proc putDeviceBuf(bytes: csize_t, p: pointer) =
-  ## Trả buffer về pool để tái sử dụng thay vì cudaFree ngay.
   gDevicePool.mgetOrPut(bytes, @[]).add(p)
 
 proc tryLoadCudart(): bool =
@@ -133,19 +114,12 @@ proc tryLoadCublas(): bool =
   result = cublas.cublasCreate_v2 != nil and cublas.cublasSgemm_v2 != nil
 
 proc cudaRuntimeAvailable*(): bool =
-  ## Dò libcudart + ít nhất 1 GPU. Dùng riêng cho đường matmul (cudaAvailable()
-  ## trong cuda_driver.nim vẫn là cổng chính cho vecop qua Driver API).
   if not tryLoadCudart(): return false
   var count: int32 = 0
   if cudart.cudaGetDeviceCount(addr count) != 0: return false
   result = count > 0
 
 proc cudaMatmulF32*(a, b: seq[float32], m, k, n: int): seq[float32] =
-  ## C(m x n) = A(m x k) * B(k x n), toàn bộ row-major (giống layout Nim seq bình thường).
-  ## Chạy qua cudart (cudaMalloc/cudaMemcpy) + cublasSgemm với Tensor Core math
-  ## mode bật sẵn. cuBLAS là column-major nên dùng thủ thuật chuẩn: tính
-  ## C^T = B^T * A^T bằng cách hoán đổi thứ tự & kích thước tham số -> kết quả
-  ## ra đúng C row-major mà không cần transpose thủ công trên host.
   gpuCheck(tryLoadCudart(), "libcudart not found")
   gpuCheck(tryLoadCublas(), "libcublas not found")
   result = newSeq[float32](m * n)
@@ -182,25 +156,6 @@ proc debugLog(msg: string) =
     stderr.writeLine("[cuda_runtime][DEBUG] " & msg)
 
 proc cudaMatmulF32R*(a, b: CudaTensor, m, k, n: int): CudaTensor =
-  ## Bản resident của cudaMatmulF32: A, B đã sống sẵn trên GPU (upload bởi
-  ## cuda_driver.uploadAsync), kết quả C cũng ở lại GPU (không D2H) để chuỗi
-  ## resident op tiếp theo (add/relu/softmax/...) dùng thẳng.
-  ##
-  ## LƯU Ý AN TOÀN: a.dptr/b.dptr được cấp phát bởi cuda_driver.nim qua Driver
-  ## API (cuMemAlloc, context tạo bằng cuCtxCreate), còn cublasSgemm_v2 ở đây
-  ## gọi qua Runtime API (cudart/cublas). Đây là pattern trộn Driver+Runtime
-  ## API đã có sẵn trong chính file này (ensureHandle() gọi
-  ## cublasSetStream_v2(handle, getStream()) dùng stream tạo bởi cuda_driver)
-  ## - cublas dùng device pointer thuần (không phân biệt driver-alloc hay
-  ## runtime-alloc) miễn là cùng context hiện hành, nên cast CUdeviceptr sang
-  ## `pointer` ở đây an toàn. C cũng cấp phát qua pool của cuda_driver
-  ## (getDeviceBuf/putDeviceBuf export sẵn) để mọi CudaTensor resident dùng
-  ## chung 1 pool duy nhất, tránh có 2 hệ thống pool tách rời cho cùng 1 loại
-  ## buffer (dễ rò rỉ VRAM nếu lẫn lộn).
-  ##
-  ## CHƯA test trên GPU thật (không có GPU NVIDIA trong môi trường sinh code
-  ## này). Trước khi tin dùng cho train: so khớp số học với cudaMatmulF32
-  ## không-resident (hoặc cpuMatmul) trên input ngẫu nhiên nhỏ.
   gpuCheck(tryLoadCudart(), "cudaMatmulF32R: libcudart not found")
   gpuCheck(tryLoadCublas(), "cudaMatmulF32R: libcublas not found")
   gpuCheck(a.dptr != 0 and b.dptr != 0, "cudaMatmulF32R: input tensor rỗng/đã free")
@@ -221,19 +176,5 @@ proc cudaMatmulF32R*(a, b: CudaTensor, m, k, n: int): CudaTensor =
                                   int32(n), int32(m), int32(k),
                                   addr alpha, pB, int32(n), pA, int32(k),
                                   addr beta, pC, int32(n)) == 0, "cudaMatmulF32R: cublasSgemm failed")
-  # ĐÃ SỬA (tối ưu hiệu năng): trước đây có cudaDeviceSynchronize() ở đây,
-  # tức là CHẶN TOÀN BỘ DEVICE (mọi stream, mọi kernel khác đang chạy) sau
-  # MỖI lần gọi matmul resident. Với transformer thì matmul là op resident
-  # gọi nhiều nhất (mỗi lớp attention + FFN), nên trước đây mỗi matmul đều
-  # ép GPU rỗng hàng đợi rồi mới cho làm tiếp -> cùng một lỗi round-trip
-  # đồng bộ mà phần buffer pool/async copy ở cuda_driver.nim đã cố tránh,
-  # chỉ khác là lỗi này nằm ở module cublas riêng nên trước không thấy.
-  # cublasSetStream_v2(handle, getStream()) đã được set 1 lần trong
-  # ensureHandle(), nên cublasSgemm ở đây ĐÃ chạy trên đúng gStream và các
-  # resident-op tiếp theo (add/relu/softmax/layernorm resident) tự động
-  # được stream-order đúng thứ tự sau nó mà không cần đồng bộ gì thêm.
-  # Điểm sync DUY NHẤT cho toàn chuỗi resident vẫn là downloadSync() ở
-  # cuda_driver.nim (cuStreamSynchronize trên gStream) khi thật sự cần lấy
-  # kết quả về host.
   debugLog("cudaMatmulF32R m=" & $m & " k=" & $k & " n=" & $n)
   result = CudaTensor(dptr: cast[cuda_driver.CUdeviceptr](dC), bytes: bytesC, numel: m * n)

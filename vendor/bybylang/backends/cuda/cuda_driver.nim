@@ -15,15 +15,20 @@
 import std/dynlib
 import std/os
 import std/tables
-
 type
-  CUresult = int32
-  CUdevice = int32
-  CUcontext = pointer
-  CUmodule = pointer
-  CUfunction = pointer
-  CUstream = pointer
   CUdeviceptr* = uint64
+  CUstream* = pointer
+  CUcontext* = pointer
+  CUmodule* = pointer
+  CUfunction* = pointer
+  CUdevice* = int32
+  CUresult* = int32
+
+  CudaTensor* = object
+    dptr*: CUdeviceptr
+    bytes*: csize_t
+    numel*: int
+type
   CUdevice_attribute = int32
 
   CudaLib = object
@@ -212,7 +217,35 @@ proc getHostBuf(bytes: csize_t): pointer =
 
 proc putHostBuf(bytes: csize_t, p: pointer) =
   gHostPool.mgetOrPut(bytes, @[]).add(p)
+proc uploadAsync*(data: seq[float32]): CudaTensor =
+  ensureInit()
+  let bytes = csize_t(data.len * sizeof(float32))
+  let dptr = getDeviceBuf(bytes)
+  gpuCheck(lib.cuMemcpyHtoDAsync(dptr, unsafeAddr data[0], bytes, gStream) == 0, "uploadAsync H2D failed")
+  return CudaTensor(dptr: dptr, bytes: bytes, numel: data.len)
 
+proc uploadIndicesAsync*(data: seq[int32]): CudaTensor =
+  ensureInit()
+  let bytes = csize_t(data.len * sizeof(int32))
+  let dptr = getDeviceBuf(bytes)
+  gpuCheck(lib.cuMemcpyHtoDAsync(dptr, unsafeAddr data[0], bytes, gStream) == 0, "uploadIndicesAsync H2D failed")
+  return CudaTensor(dptr: dptr, bytes: bytes, numel: data.len)
+
+proc downloadSync*(t: CudaTensor): seq[float32] =
+  ensureInit()
+  result = newSeq[float32](t.numel)
+  gpuCheck(lib.cuMemcpyDtoHAsync(addr result[0], t.dptr, t.bytes, gStream) == 0, "downloadSync D2H failed")
+  gpuCheck(lib.cuStreamSynchronize(gStream) == 0, "downloadSync sync failed")
+
+proc freeResident*(t: var CudaTensor) =
+  if t.dptr != 0:
+    putDeviceBuf(t.bytes, t.dptr)
+    t.dptr = 0
+    t.bytes = 0
+    t.numel = 0
+# ============================================================
+# VECTOR OPERATIONS
+# ============================================================
 proc cudaVecOp*(op: string, a, b: seq[float32]): seq[float32] =
   ## Chạy phép toán elementwise (add/sub/mul/div) trên GPU NVIDIA qua CUDA Driver API.
   ## Raise nếu có lỗi bất kỳ, để tầng gọi (gpubackend) fallback về CPU.
@@ -240,6 +273,9 @@ proc cudaVecOp*(op: string, a, b: seq[float32]): seq[float32] =
   gpuCheck(lib.cuMemcpyDtoHAsync(addr result[0], dC, bytes, gStream) == 0, "D2H failed")
   gpuCheck(lib.cuStreamSynchronize(gStream) == 0, "cuStreamSynchronize failed")
 
+# ============================================================
+# ACTIVATIONS
+# ============================================================
 proc cudaActivation*(op: string, x: seq[float32]): seq[float32] =
   ensureInit()
   let n = x.len
@@ -262,6 +298,72 @@ proc cudaActivation*(op: string, x: seq[float32]): seq[float32] =
   gpuCheck(lib.cuMemcpyDtoHAsync(addr result[0], dY, bytes, gStream) == 0, "D2H failed")
   gpuCheck(lib.cuStreamSynchronize(gStream) == 0, "cuStreamSynchronize failed")
 
+# ============================================================
+# APFLU FORWARD
+# ============================================================
+proc cudaApflu*(x: seq[float32], alpha: float32, beta: float32): seq[float32] =
+  ensureInit()
+  let n = x.len
+  result = newSeq[float32](n)
+  let fn = getFn("vecop_apflu")
+  let bytes = csize_t(n * sizeof(float32))
+
+  let dX = getDeviceBuf(bytes)
+  let dY = getDeviceBuf(bytes)
+  defer:
+    putDeviceBuf(bytes, dX); putDeviceBuf(bytes, dY)
+
+  gpuCheck(lib.cuMemcpyHtoDAsync(dX, unsafeAddr x[0], bytes, gStream) == 0, "H2D failed")
+
+  var dXv = dX; var dYv = dY
+  var nParam = int32(n)
+  var aParam = alpha
+  var bParam = beta
+  var params: array[5, pointer] = [
+    cast[pointer](addr dXv), cast[pointer](addr dYv),
+    cast[pointer](addr nParam), cast[pointer](addr aParam),
+    cast[pointer](addr bParam)
+  ]
+  gpuCheck(lib.cuLaunchKernel(fn, gridFor(n), 1, 1, getOptimalBlockSize(), 1, 1, 0, gStream,
+                                addr params[0], nil) == 0, "cuLaunchKernel failed")
+  gpuCheck(lib.cuMemcpyDtoHAsync(addr result[0], dY, bytes, gStream) == 0, "D2H failed")
+  gpuCheck(lib.cuStreamSynchronize(gStream) == 0, "cuStreamSynchronize failed")
+
+# ============================================================
+# APFLU BACKWARD
+# ============================================================
+proc cudaApfluBackward*(x, dy: seq[float32], alpha: float32, beta: float32): seq[float32] =
+  ensureInit()
+  let n = x.len
+  result = newSeq[float32](n)
+  let fn = getFn("vecop_apflu_backward")
+  let bytes = csize_t(n * sizeof(float32))
+
+  let dXin = getDeviceBuf(bytes)      # SỬA: dXin
+  let dDy = getDeviceBuf(bytes)
+  let dDxOut = getDeviceBuf(bytes)    # SỬA: dDxOut
+  defer:
+    putDeviceBuf(bytes, dXin); putDeviceBuf(bytes, dDy); putDeviceBuf(bytes, dDxOut)
+
+  gpuCheck(lib.cuMemcpyHtoDAsync(dXin, unsafeAddr x[0], bytes, gStream) == 0, "H2D failed")
+  gpuCheck(lib.cuMemcpyHtoDAsync(dDy, unsafeAddr dy[0], bytes, gStream) == 0, "H2D failed")
+
+  var dXinV = dXin; var dDyV = dDy; var dDxOutV = dDxOut
+  var nParam = int32(n)
+  var aParam = alpha
+  var bParam = beta
+  var params: array[6, pointer] = [
+    cast[pointer](addr dXinV), cast[pointer](addr dDyV), cast[pointer](addr dDxOutV),
+    cast[pointer](addr nParam), cast[pointer](addr aParam),
+    cast[pointer](addr bParam)
+  ]
+  gpuCheck(lib.cuLaunchKernel(fn, gridFor(n), 1, 1, getOptimalBlockSize(), 1, 1, 0, gStream,
+                                addr params[0], nil) == 0, "cuLaunchKernel failed")
+  gpuCheck(lib.cuMemcpyDtoHAsync(addr result[0], dDxOut, bytes, gStream) == 0, "D2H failed")
+  gpuCheck(lib.cuStreamSynchronize(gStream) == 0, "cuStreamSynchronize failed")
+# ============================================================
+# SOFTMAX
+# ============================================================
 proc cudaSoftmax*(x: seq[float32], rows, cols: int): seq[float32] =
   ensureInit()
   let n = rows * cols
@@ -286,6 +388,9 @@ proc cudaSoftmax*(x: seq[float32], rows, cols: int): seq[float32] =
   gpuCheck(lib.cuMemcpyDtoHAsync(addr result[0], dY, bytes, gStream) == 0, "D2H failed")
   gpuCheck(lib.cuStreamSynchronize(gStream) == 0, "cuStreamSynchronize failed")
 
+# ============================================================
+# LAYERNORM FORWARD
+# ============================================================
 proc cudaLayernorm*(x, gamma, beta: seq[float32], rows, cols: int, eps: float32): seq[float32] =
   ensureInit()
   let n = rows * cols
@@ -317,6 +422,60 @@ proc cudaLayernorm*(x, gamma, beta: seq[float32], rows, cols: int, eps: float32)
   gpuCheck(lib.cuMemcpyDtoHAsync(addr result[0], dY, bytesX, gStream) == 0, "D2H failed")
   gpuCheck(lib.cuStreamSynchronize(gStream) == 0, "cuStreamSynchronize failed")
 
+proc cudaLayernormBackward*(dy, x, gamma, beta: seq[float32], rows, cols: int, eps: float32): tuple[dx, dgamma, dbeta: seq[float32]] =
+  ensureInit()
+  let n = rows * cols
+  var dx = newSeq[float32](n)
+  var dgamma = newSeq[float32](cols)
+  var dbeta = newSeq[float32](cols)
+
+  let fn = getFn("layernorm_backward_kernel")
+
+  let bytesX = csize_t(n * sizeof(float32))
+  let bytesC = csize_t(cols * sizeof(float32))
+
+  let dDyBuf = getDeviceBuf(bytesX)      # SỬA: dDyBuf
+  let dXBuf = getDeviceBuf(bytesX)       # SỬA: dXBuf
+  let dGammaBuf = getDeviceBuf(bytesC)   # SỬA: dGammaBuf
+  let dBetaBuf = getDeviceBuf(bytesC)    # SỬA: dBetaBuf
+  let dDxBuf = getDeviceBuf(bytesX)      # SỬA: dDxBuf
+  let dDgammaBuf = getDeviceBuf(bytesC)  # SỬA: dDgammaBuf
+  let dDbetaBuf = getDeviceBuf(bytesC)   # SỬA: dDbetaBuf
+  defer:
+    putDeviceBuf(bytesX, dDyBuf); putDeviceBuf(bytesX, dXBuf)
+    putDeviceBuf(bytesC, dGammaBuf); putDeviceBuf(bytesC, dBetaBuf)
+    putDeviceBuf(bytesX, dDxBuf); putDeviceBuf(bytesC, dDgammaBuf)
+    putDeviceBuf(bytesC, dDbetaBuf)
+
+  gpuCheck(lib.cuMemcpyHtoDAsync(dDyBuf, unsafeAddr dy[0], bytesX, gStream) == 0, "H2D failed")
+  gpuCheck(lib.cuMemcpyHtoDAsync(dXBuf, unsafeAddr x[0], bytesX, gStream) == 0, "H2D failed")
+  gpuCheck(lib.cuMemcpyHtoDAsync(dGammaBuf, unsafeAddr gamma[0], bytesC, gStream) == 0, "H2D failed")
+  gpuCheck(lib.cuMemcpyHtoDAsync(dBetaBuf, unsafeAddr beta[0], bytesC, gStream) == 0, "H2D failed")
+
+  var dDyV = dDyBuf; var dXV = dXBuf; var dGammaV = dGammaBuf; var dBetaV = dBetaBuf
+  var dDxV = dDxBuf; var dDgammaV = dDgammaBuf; var dDbetaV = dDbetaBuf
+  var rParam = int32(rows)
+  var cParam = int32(cols)
+  var eParam = float32(eps)
+  var params: array[10, pointer] = [
+    cast[pointer](addr dDyV), cast[pointer](addr dXV),
+    cast[pointer](addr dGammaV), cast[pointer](addr dBetaV),
+    cast[pointer](addr dDxV), cast[pointer](addr dDgammaV),
+    cast[pointer](addr dDbetaV),
+    cast[pointer](addr rParam), cast[pointer](addr cParam),
+    cast[pointer](addr eParam)
+  ]
+  let blockSize = getOptimalBlockSize()
+  gpuCheck(lib.cuLaunchKernel(fn, uint32(max(rows, cols)), 1, 1, blockSize, 1, 1, 0, gStream,
+                                addr params[0], nil) == 0, "cuLaunchKernel failed")
+  gpuCheck(lib.cuMemcpyDtoHAsync(addr dx[0], dDxBuf, bytesX, gStream) == 0, "D2H failed")
+  gpuCheck(lib.cuMemcpyDtoHAsync(addr dgamma[0], dDgammaBuf, bytesC, gStream) == 0, "D2H failed")
+  gpuCheck(lib.cuMemcpyDtoHAsync(addr dbeta[0], dDbetaBuf, bytesC, gStream) == 0, "D2H failed")
+  gpuCheck(lib.cuStreamSynchronize(gStream) == 0, "cuStreamSynchronize failed")
+  result = (dx, dgamma, dbeta)
+# ============================================================
+# EMBEDDING LOOKUP
+# ============================================================
 proc cudaEmbeddingLookup*(table: seq[float32], indices: seq[int32], vocab, dim: int): seq[float32] =
   ensureInit()
   let num = indices.len
@@ -346,158 +505,8 @@ proc cudaEmbeddingLookup*(table: seq[float32], indices: seq[int32], vocab, dim: 
   gpuCheck(lib.cuMemcpyDtoHAsync(addr result[0], dY, bytesY, gStream) == 0, "D2H failed")
   gpuCheck(lib.cuStreamSynchronize(gStream) == 0, "cuStreamSynchronize failed")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# API RESIDENT
-# ═══════════════════════════════════════════════════════════════════════════
-
-type
-  CudaTensor* = object
-    dptr*: CUdeviceptr
-    bytes*: csize_t
-    numel*: int
-
-proc debugLog(msg: string) =
-  when defined(nimformerCudaDebug):
-    stderr.writeLine("[cuda_driver][DEBUG] " & msg)
-
-proc uploadAsync*(data: seq[float32]): CudaTensor =
-  ensureInit()
-  let n = data.len
-  gpuCheck(n > 0, "uploadAsync: empty input")
-  let bytes = csize_t(n * sizeof(float32))
-  let dptr = getDeviceBuf(bytes)
-  gpuCheck(lib.cuMemcpyHtoDAsync(dptr, unsafeAddr data[0], bytes, gStream) == 0,
-           "uploadAsync: H2D failed (n=" & $n & ")")
-  gpuCheck(lib.cuStreamSynchronize(gStream) == 0, "uploadAsync: stream sync failed")
-  debugLog("uploadAsync n=" & $n & " bytes=" & $bytes)
-  result = CudaTensor(dptr: dptr, bytes: bytes, numel: n)
-
-proc uploadIndicesAsync*(data: seq[int32]): CudaTensor =
-  ensureInit()
-  let n = data.len
-  gpuCheck(n > 0, "uploadIndicesAsync: empty input")
-  let bytes = csize_t(n * sizeof(int32))
-  let dptr = getDeviceBuf(bytes)
-  gpuCheck(lib.cuMemcpyHtoDAsync(dptr, unsafeAddr data[0], bytes, gStream) == 0,
-           "uploadIndicesAsync: H2D failed (n=" & $n & ")")
-  gpuCheck(lib.cuStreamSynchronize(gStream) == 0, "uploadIndicesAsync: stream sync failed")
-  debugLog("uploadIndicesAsync n=" & $n & " bytes=" & $bytes)
-  result = CudaTensor(dptr: dptr, bytes: bytes, numel: n)
-
-proc downloadSync*(t: CudaTensor): seq[float32] =
-  ensureInit()
-  gpuCheck(t.dptr != 0, "downloadSync: tensor rỗng/đã free")
-  result = newSeq[float32](t.numel)
-  gpuCheck(lib.cuMemcpyDtoHAsync(addr result[0], t.dptr, t.bytes, gStream) == 0,
-           "downloadSync: D2H failed (numel=" & $t.numel & ")")
-  gpuCheck(lib.cuStreamSynchronize(gStream) == 0, "downloadSync: stream sync failed")
-  debugLog("downloadSync numel=" & $t.numel)
-
-proc freeResident*(t: var CudaTensor) =
-  if t.dptr != 0:
-    putDeviceBuf(t.bytes, t.dptr)
-    debugLog("freeResident bytes=" & $t.bytes)
-  t.dptr = 0
-  t.bytes = 0
-  t.numel = 0
-
-proc cudaVecOpR*(op: string, a, b: CudaTensor): CudaTensor =
-  ensureInit()
-  gpuCheck(a.dptr != 0 and b.dptr != 0, "cudaVecOpR: input tensor rỗng/đã free (op=" & op & ")")
-  gpuCheck(a.numel == b.numel, "cudaVecOpR: shape mismatch a.numel=" & $a.numel &
-           " b.numel=" & $b.numel & " (op=" & op & ")")
-  let n = a.numel
-  let fn = getFn(fnNameFor(op))
-  let dC = getDeviceBuf(a.bytes)
-  var dAv = a.dptr; var dBv = b.dptr; var dCv = dC
-  var nParam = int32(n)
-  var params: array[4, pointer] = [cast[pointer](addr dAv), cast[pointer](addr dBv),
-                                    cast[pointer](addr dCv), cast[pointer](addr nParam)]
-  gpuCheck(lib.cuLaunchKernel(fn, gridFor(n), 1, 1, getOptimalBlockSize(), 1, 1, 0, gStream,
-                                addr params[0], nil) == 0, "cudaVecOpR: cuLaunchKernel failed (op=" & op & ")")
-  gpuCheck(lib.cuStreamSynchronize(gStream) == 0, "cudaVecOpR: stream sync failed (op=" & op & ")")
-  debugLog("cudaVecOpR op=" & op & " n=" & $n)
-  result = CudaTensor(dptr: dC, bytes: a.bytes, numel: n)
-
-proc cudaActivationR*(op: string, x: CudaTensor): CudaTensor =
-  ensureInit()
-  gpuCheck(x.dptr != 0, "cudaActivationR: input tensor rỗng/đã free (op=" & op & ")")
-  let n = x.numel
-  let fn = getFn("vecop_" & op)
-  let dY = getDeviceBuf(x.bytes)
-  var dXv = x.dptr; var dYv = dY
-  var nParam = int32(n)
-  var params: array[3, pointer] = [cast[pointer](addr dXv), cast[pointer](addr dYv), cast[pointer](addr nParam)]
-  gpuCheck(lib.cuLaunchKernel(fn, gridFor(n), 1, 1, getOptimalBlockSize(), 1, 1, 0, gStream,
-                                addr params[0], nil) == 0, "cudaActivationR: cuLaunchKernel failed (op=" & op & ")")
-  gpuCheck(lib.cuStreamSynchronize(gStream) == 0, "cudaActivationR: stream sync failed (op=" & op & ")")
-  debugLog("cudaActivationR op=" & op & " n=" & $n)
-  result = CudaTensor(dptr: dY, bytes: x.bytes, numel: n)
-
-proc cudaSoftmaxR*(x: CudaTensor, rows, cols: int): CudaTensor =
-  ensureInit()
-  gpuCheck(x.dptr != 0, "cudaSoftmaxR: input tensor rỗng/đã free")
-  gpuCheck(x.numel == rows * cols, "cudaSoftmaxR: shape mismatch numel=" & $x.numel &
-           " rows*cols=" & $(rows*cols))
-  let fn = getFn("softmax_kernel")
-  let dY = getDeviceBuf(x.bytes)
-  var dXv = x.dptr; var dYv = dY
-  var rParam = int32(rows); var cParam = int32(cols)
-  var params: array[4, pointer] = [cast[pointer](addr dXv), cast[pointer](addr dYv),
-                                    cast[pointer](addr rParam), cast[pointer](addr cParam)]
-  gpuCheck(lib.cuLaunchKernel(fn, uint32(rows), 1, 1, getOptimalBlockSize(), 1, 1, 0, gStream,
-                                addr params[0], nil) == 0, "cudaSoftmaxR: cuLaunchKernel failed")
-  gpuCheck(lib.cuStreamSynchronize(gStream) == 0, "cudaSoftmaxR: stream sync failed")
-  debugLog("cudaSoftmaxR rows=" & $rows & " cols=" & $cols)
-  result = CudaTensor(dptr: dY, bytes: x.bytes, numel: x.numel)
-
-proc cudaLayernormR*(x, gamma, beta: CudaTensor, rows, cols: int, eps: float32): CudaTensor =
-  ensureInit()
-  gpuCheck(x.dptr != 0 and gamma.dptr != 0 and beta.dptr != 0,
-           "cudaLayernormR: input tensor rỗng/đã free")
-  gpuCheck(x.numel == rows * cols, "cudaLayernormR: shape mismatch x.numel=" & $x.numel &
-           " rows*cols=" & $(rows*cols))
-  gpuCheck(gamma.numel == cols and beta.numel == cols,
-           "cudaLayernormR: gamma/beta phải có numel=cols=" & $cols &
-           " (gamma=" & $gamma.numel & " beta=" & $beta.numel & ")")
-  let fn = getFn("layernorm_kernel")
-  let dY = getDeviceBuf(x.bytes)
-  var dXv = x.dptr; var dGv = gamma.dptr; var dBv = beta.dptr; var dYv = dY
-  var rParam = int32(rows); var cParam = int32(cols); var eParam = float32(eps)
-  var params: array[7, pointer] = [cast[pointer](addr dXv), cast[pointer](addr dGv), cast[pointer](addr dBv),
-                                    cast[pointer](addr dYv), cast[pointer](addr rParam), cast[pointer](addr cParam),
-                                    cast[pointer](addr eParam)]
-  gpuCheck(lib.cuLaunchKernel(fn, uint32(rows), 1, 1, getOptimalBlockSize(), 1, 1, 0, gStream,
-                                addr params[0], nil) == 0, "cudaLayernormR: cuLaunchKernel failed")
-  gpuCheck(lib.cuStreamSynchronize(gStream) == 0, "cudaLayernormR: stream sync failed")
-  debugLog("cudaLayernormR rows=" & $rows & " cols=" & $cols & " eps=" & $eps)
-  result = CudaTensor(dptr: dY, bytes: x.bytes, numel: x.numel)
-
-proc cudaEmbeddingLookupR*(table, indices: CudaTensor, numIdx, vocab, dim: int): CudaTensor =
-  ensureInit()
-  gpuCheck(table.dptr != 0 and indices.dptr != 0, "cudaEmbeddingLookupR: input tensor rỗng/đã free")
-  gpuCheck(table.numel == vocab * dim, "cudaEmbeddingLookupR: table.numel=" & $table.numel &
-           " != vocab*dim=" & $(vocab*dim))
-  gpuCheck(indices.numel == numIdx, "cudaEmbeddingLookupR: indices.numel=" & $indices.numel &
-           " != numIdx=" & $numIdx)
-  let fn = getFn("embedding_lookup_kernel")
-  let bytesY = csize_t(numIdx * dim * sizeof(float32))
-  let dY = getDeviceBuf(bytesY)
-  var dTv = table.dptr; var dIdxv = indices.dptr; var dYv = dY
-  var vParam = int32(vocab); var dParam = int32(dim); var numParam = int32(numIdx)
-  var params: array[6, pointer] = [cast[pointer](addr dTv), cast[pointer](addr dIdxv), cast[pointer](addr dYv),
-                                    cast[pointer](addr vParam), cast[pointer](addr dParam), cast[pointer](addr numParam)]
-  gpuCheck(lib.cuLaunchKernel(fn, gridFor(numIdx), 1, 1, getOptimalBlockSize(), 1, 1, 0, gStream,
-                                addr params[0], nil) == 0, "cudaEmbeddingLookupR: cuLaunchKernel failed")
-  gpuCheck(lib.cuStreamSynchronize(gStream) == 0, "cudaEmbeddingLookupR: stream sync failed")
-  debugLog("cudaEmbeddingLookupR numIdx=" & $numIdx & " vocab=" & $vocab & " dim=" & $dim)
-  result = CudaTensor(dptr: dY, bytes: bytesY, numel: numIdx * dim)
-
 # ============================================================
-# CUDA ATTENTION FUSED FORWARD
-# ============================================================
-# ============================================================
-# CUDA ATTENTION FUSED FORWARD
+# ATTENTION FUSED FORWARD
 # ============================================================
 proc cudaAttentionFused*(q, k, v, mask: seq[float32], B, H, S, D: int, scale: float32): tuple[o, s_matrix: seq[float32]] =
   ensureInit()
@@ -513,13 +522,13 @@ proc cudaAttentionFused*(q, k, v, mask: seq[float32], B, H, S, D: int, scale: fl
   let dQ = getDeviceBuf(bytesQKV)
   let dK = getDeviceBuf(bytesQKV)
   let dV = getDeviceBuf(bytesQKV)
-  let dOut = getDeviceBuf(bytesQKV)          # SỬA: dO -> dOut
+  let dOut = getDeviceBuf(bytesQKV)
   let dS = getDeviceBuf(bytesS)
   defer:
     putDeviceBuf(bytesQKV, dQ)
     putDeviceBuf(bytesQKV, dK)
     putDeviceBuf(bytesQKV, dV)
-    putDeviceBuf(bytesQKV, dOut)             # SỬA: dO -> dOut
+    putDeviceBuf(bytesQKV, dOut)
     putDeviceBuf(bytesS, dS)
   
   gpuCheck(lib.cuMemcpyHtoDAsync(dQ, unsafeAddr q[0], bytesQKV, gStream) == 0, "H2D Q failed")
@@ -528,12 +537,12 @@ proc cudaAttentionFused*(q, k, v, mask: seq[float32], B, H, S, D: int, scale: fl
   
   let fn = getFn("attention_fused_kernel")
   
-  var bQ = dQ; var bK = dK; var bV = dV; var bOut = dOut; var bS = dS   # SỬA: bO -> bOut
+  var bQ = dQ; var bK = dK; var bV = dV; var bOut = dOut; var bS = dS
   var bArg = int32(B); var hArg = int32(H); var sArg = int32(S); var dArg = int32(D); var scArg = float32(scale)
   
   var params: array[10, pointer] = [
     cast[pointer](addr bQ), cast[pointer](addr bK), cast[pointer](addr bV),
-    cast[pointer](addr bOut), cast[pointer](addr bS),                   # SỬA: bO -> bOut
+    cast[pointer](addr bOut), cast[pointer](addr bS),
     cast[pointer](addr bArg), cast[pointer](addr hArg),
     cast[pointer](addr sArg), cast[pointer](addr dArg),
     cast[pointer](addr scArg)
@@ -543,11 +552,12 @@ proc cudaAttentionFused*(q, k, v, mask: seq[float32], B, H, S, D: int, scale: fl
   gpuCheck(lib.cuLaunchKernel(fn, uint32(B*H), uint32(S), 1, blockSize, 1, 1, 0, gStream,
                                 addr params[0], nil) == 0, "attention_fused_kernel launch failed")
   
-  gpuCheck(lib.cuMemcpyDtoHAsync(addr result.o[0], dOut, bytesQKV, gStream) == 0, "D2H O failed")  # SỬA: dO -> dOut
+  gpuCheck(lib.cuMemcpyDtoHAsync(addr result.o[0], dOut, bytesQKV, gStream) == 0, "D2H O failed")
   gpuCheck(lib.cuMemcpyDtoHAsync(addr result.s_matrix[0], dS, bytesS, gStream) == 0, "D2H S failed")
   gpuCheck(lib.cuStreamSynchronize(gStream) == 0, "stream sync failed")
+
 # ============================================================
-# CUDA ATTENTION FUSED BACKWARD
+# ATTENTION FUSED BACKWARD
 # ============================================================
 proc cudaAttentionFusedBackward*(q, k, v, s_matrix, dy: seq[float32], B, H, S, D: int, scale: float32): tuple[dq, dk, dv: seq[float32]] =
   ensureInit()
@@ -608,3 +618,82 @@ proc cudaAttentionFusedBackward*(q, k, v, s_matrix, dy: seq[float32], B, H, S, D
   gpuCheck(lib.cuMemcpyDtoHAsync(addr result.dk[0], dDk, bytesQKV, gStream) == 0, "D2H dk failed")
   gpuCheck(lib.cuMemcpyDtoHAsync(addr result.dv[0], dDv, bytesQKV, gStream) == 0, "D2H dv failed")
   gpuCheck(lib.cuStreamSynchronize(gStream) == 0, "stream sync failed")
+# ─────────────────────────────────────────────────────────────
+# CUDA Resident Vector Ops
+# ─────────────────────────────────────────────────────────────
+
+proc cudaVecOpR*(op: string, a, b: CudaTensor): CudaTensor =
+  ensureInit()
+  gpuCheck(a.numel == b.numel, "cudaVecOpR: size mismatch")
+  let n = a.numel
+  let bytes = a.bytes
+  let dC = getDeviceBuf(bytes)
+  
+  let fn = getFn(fnNameFor(op))
+  var dAv = a.dptr; var dBv = b.dptr; var dCv = dC
+  var nParam = int32(n)
+  var params: array[4, pointer] = [cast[pointer](addr dAv), cast[pointer](addr dBv),
+                                    cast[pointer](addr dCv), cast[pointer](addr nParam)]
+  gpuCheck(lib.cuLaunchKernel(fn, gridFor(n), 1, 1, getOptimalBlockSize(), 1, 1, 0, gStream,
+                                addr params[0], nil) == 0, "cudaVecOpR launch failed")
+  return CudaTensor(dptr: dC, bytes: bytes, numel: n)
+
+proc cudaActivationR*(op: string, x: CudaTensor): CudaTensor =
+  ensureInit()
+  let n = x.numel
+  let bytes = x.bytes
+  let dY = getDeviceBuf(bytes)
+  
+  let fn = getFn("vecop_" & op)
+  var dXv = x.dptr; var dYv = dY
+  var nParam = int32(n)
+  var params: array[3, pointer] = [cast[pointer](addr dXv), cast[pointer](addr dYv), cast[pointer](addr nParam)]
+  gpuCheck(lib.cuLaunchKernel(fn, gridFor(n), 1, 1, getOptimalBlockSize(), 1, 1, 0, gStream,
+                                addr params[0], nil) == 0, "cudaActivationR launch failed")
+  return CudaTensor(dptr: dY, bytes: bytes, numel: n)
+
+proc cudaSoftmaxR*(x: CudaTensor, rows, cols: int): CudaTensor =
+  ensureInit()
+  let n = rows * cols
+  let bytes = csize_t(n * sizeof(float32))
+  let dY = getDeviceBuf(bytes)
+  
+  let fn = getFn("softmax_kernel")
+  var dXv = x.dptr; var dYv = dY
+  var rParam = int32(rows); var cParam = int32(cols)
+  var params: array[4, pointer] = [cast[pointer](addr dXv), cast[pointer](addr dYv),
+                                    cast[pointer](addr rParam), cast[pointer](addr cParam)]
+  gpuCheck(lib.cuLaunchKernel(fn, uint32(rows), 1, 1, getOptimalBlockSize(), 1, 1, 0, gStream,
+                                addr params[0], nil) == 0, "cudaSoftmaxR launch failed")
+  return CudaTensor(dptr: dY, bytes: bytes, numel: n)
+
+proc cudaLayernormR*(x, gamma, beta: CudaTensor, rows, cols: int, eps: float32): CudaTensor =
+  ensureInit()
+  let n = rows * cols
+  let bytesX = csize_t(n * sizeof(float32))
+  let bytesC = csize_t(cols * sizeof(float32))
+  let dY = getDeviceBuf(bytesX)
+  
+  let fn = getFn("layernorm_kernel")
+  var dXv = x.dptr; var dGv = gamma.dptr; var dBv = beta.dptr; var dYv = dY
+  var rParam = int32(rows); var cParam = int32(cols); var eParam = float32(eps)
+  var params: array[7, pointer] = [cast[pointer](addr dXv), cast[pointer](addr dGv), cast[pointer](addr dBv),
+                                    cast[pointer](addr dYv), cast[pointer](addr rParam), cast[pointer](addr cParam),
+                                    cast[pointer](addr eParam)]
+  gpuCheck(lib.cuLaunchKernel(fn, uint32(rows), 1, 1, getOptimalBlockSize(), 1, 1, 0, gStream,
+                                addr params[0], nil) == 0, "cudaLayernormR launch failed")
+  return CudaTensor(dptr: dY, bytes: bytesX, numel: n)
+
+proc cudaEmbeddingLookupR*(table, indices: CudaTensor, numIdx, vocab, dim: int): CudaTensor =
+  ensureInit()
+  let bytesY = csize_t(numIdx * dim * sizeof(float32))
+  let dY = getDeviceBuf(bytesY)
+  
+  let fn = getFn("embedding_lookup_kernel")
+  var dTv = table.dptr; var dIdxv = indices.dptr; var dYv = dY
+  var vParam = int32(vocab); var dParam = int32(dim); var numParam = int32(numIdx)
+  var params: array[6, pointer] = [cast[pointer](addr dTv), cast[pointer](addr dIdxv), cast[pointer](addr dYv),
+                                    cast[pointer](addr vParam), cast[pointer](addr dParam), cast[pointer](addr numParam)]
+  gpuCheck(lib.cuLaunchKernel(fn, gridFor(numIdx), 1, 1, getOptimalBlockSize(), 1, 1, 0, gStream,
+                                addr params[0], nil) == 0, "cudaEmbeddingLookupR launch failed")
+  return CudaTensor(dptr: dY, bytes: bytesY, numel: numIdx * dim)

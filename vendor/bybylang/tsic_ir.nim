@@ -294,75 +294,123 @@ proc tsicMatmulOp*(a, b: seq[float32], m, k, n: int): seq[float32] =
 proc tsicRelu*(x: seq[float32]): seq[float32] =
   let backend = tsicInit()
   case backend
-  of tbCuda: return cudaActivation("relu", x)
-  of tbMetal: return metalActivation("relu", x)
-  of tbOpenCL: return openclActivation("relu", x)
-  else: raise newException(CatchableError, "TSIC: No GPU backend available")
+  of tbCuda:
+    return cudaActivation("relu", x)
+  of tbMetal:
+    return metalActivation("relu", x)
+  of tbOpenCL:
+    return openclActivation("relu", x)
+  else:
+    raise newException(CatchableError, "TSIC: No GPU backend available")
 
 proc tsicSigmoid*(x: seq[float32]): seq[float32] =
   let backend = tsicInit()
   case backend
-  of tbCuda: return cudaActivation("sigmoid", x)
-  of tbMetal: return metalActivation("sigmoid", x)
-  of tbOpenCL: return openclActivation("sigmoid", x)
-  else: raise newException(CatchableError, "TSIC: No GPU backend available")
+  of tbCuda:
+    return cudaActivation("sigmoid", x)
+  of tbMetal:
+    return metalActivation("sigmoid", x)
+  of tbOpenCL:
+    return openclActivation("sigmoid", x)
+  else:
+    raise newException(CatchableError, "TSIC: No GPU backend available")
 
 proc tsicTanh*(x: seq[float32]): seq[float32] =
   let backend = tsicInit()
   case backend
-  of tbCuda: return cudaActivation("tanh", x)
-  of tbMetal: return metalActivation("tanh", x)
-  of tbOpenCL: return openclActivation("tanh", x)
-  else: raise newException(CatchableError, "TSIC: No GPU backend available")
+  of tbCuda:
+    return cudaActivation("tanh", x)
+  of tbMetal:
+    return metalActivation("tanh", x)
+  of tbOpenCL:
+    return openclActivation("tanh", x)
+  else:
+    raise newException(CatchableError, "TSIC: No GPU backend available")
 
 proc tsicSoftmax*(x: seq[float32], rows, cols: int): seq[float32] =
   let backend = tsicInit()
   case backend
-  of tbCuda: return cudaSoftmax(x, rows, cols)
-  of tbMetal: return metalSoftmax(x, rows, cols)
-  of tbOpenCL: return openclSoftmax(x, rows, cols)
-  else: raise newException(CatchableError, "TSIC: No GPU backend available")
+  of tbCuda:
+    return cudaSoftmax(x, rows, cols)
+  of tbMetal:
+    return metalSoftmax(x, rows, cols)
+  of tbOpenCL:
+    return openclSoftmax(x, rows, cols)
+  else:
+    raise newException(CatchableError, "TSIC: No GPU backend available")
 
 proc tsicLayernorm*(x, gamma, beta: seq[float32], rows, cols: int, eps: float32): seq[float32] =
   let backend = tsicInit()
   case backend
-  of tbCuda: return cudaLayernorm(x, gamma, beta, rows, cols, eps)
-  of tbMetal: return metalLayernorm(x, gamma, beta, rows, cols, eps)
-  of tbOpenCL: return openclLayernorm(x, gamma, beta, rows, cols, eps)
-  else: raise newException(CatchableError, "TSIC: No GPU backend available")
+  of tbCuda:
+    return cudaLayernorm(x, gamma, beta, rows, cols, eps)
+  of tbMetal:
+    return metalLayernorm(x, gamma, beta, rows, cols, eps)
+  of tbOpenCL:
+    return openclLayernorm(x, gamma, beta, rows, cols, eps)
+  else:
+    raise newException(CatchableError, "TSIC: No GPU backend available")
 
 proc tsicEmbeddingLookup*(table: seq[float32], indices: seq[int32], vocab, dim: int): seq[float32] =
   let backend = tsicInit()
   case backend
-  of tbCuda: return cudaEmbeddingLookup(table, indices, vocab, dim)
-  of tbMetal: return metalEmbeddingLookup(table, indices, vocab, dim)
-  of tbOpenCL: return openclEmbeddingLookup(table, indices, vocab, dim)
-  else: raise newException(CatchableError, "TSIC: No GPU backend available")
+  of tbCuda:
+    return cudaEmbeddingLookup(table, indices, vocab, dim)
+  of tbMetal:
+    return metalEmbeddingLookup(table, indices, vocab, dim)
+  of tbOpenCL:
+    return openclEmbeddingLookup(table, indices, vocab, dim)
+  else:
+    raise newException(CatchableError, "TSIC: No GPU backend available")
 
+# ============================================================
+# SỬA: CUDA APFLU - GỌI KERNEL THẬT
+# ============================================================
 proc tsicApflu*(x: seq[float32], alpha, beta: float32): seq[float32] =
   let backend = tsicInit()
   case backend
-  of tbCuda: raise newException(CatchableError, "TSIC: apflu chua co kernel CUDA")
-  of tbMetal: return metalApflu(x, alpha, beta)
-  of tbOpenCL: return openclApflu(x, alpha, beta)
-  else: raise newException(CatchableError, "TSIC: No GPU backend available")
+  of tbCuda:
+    return cudaApflu(x, alpha, beta)
+  of tbMetal:
+    return metalApflu(x, alpha, beta)
+  of tbOpenCL:
+    return openclApflu(x, alpha, beta)
+  else:
+    raise newException(CatchableError, "TSIC: No GPU backend available")
 
+# ============================================================
+# SỬA: CUDA APFLU BACKWARD - GỌI KERNEL THẬT
+# ============================================================
 proc tsicApfluBackward*(x, dy: seq[float32], alpha, beta: float32): seq[float32] =
   let backend = tsicInit()
   case backend
-  of tbCuda: raise newException(CatchableError, "TSIC: apflu_backward chua co kernel CUDA")
-  of tbMetal: return metalApfluBackward(x, dy, alpha, beta)
-  of tbOpenCL: return openclApfluBackward(x, dy, alpha, beta)
-  else: raise newException(CatchableError, "TSIC: No GPU backend available")
+  of tbCuda:
+    return cudaApfluBackward(x, dy, alpha, beta)
+  of tbMetal:
+    return metalApfluBackward(x, dy, alpha, beta)
+  of tbOpenCL:
+    return openclApfluBackward(x, dy, alpha, beta)
+  else:
+    raise newException(CatchableError, "TSIC: No GPU backend available")
 
+# ============================================================
+# SỬA: CUDA LAYERNORM BACKWARD - GỌI KERNEL THẬT
+# ============================================================
 proc tsicLayernormBackward*(dy, x, gamma, beta: seq[float32], rows, cols: int, eps: float32): tuple[dx, dgamma, dbeta: seq[float32]] =
   let backend = tsicInit()
   case backend
-  of tbCuda: raise newException(CatchableError, "TSIC: layernorm_backward chua co kernel CUDA")
-  of tbMetal: return metalLayernormBackward(dy, x, gamma, beta, rows, cols, eps)
-  of tbOpenCL: return openclLayernormBackward(dy, x, gamma, beta, rows, cols, eps)
-  else: raise newException(CatchableError, "TSIC: No GPU backend available")
+  of tbCuda:
+    return cudaLayernormBackward(dy, x, gamma, beta, rows, cols, eps)
+  of tbMetal:
+    return metalLayernormBackward(dy, x, gamma, beta, rows, cols, eps)
+  of tbOpenCL:
+    return openclLayernormBackward(dy, x, gamma, beta, rows, cols, eps)
+  else:
+    raise newException(CatchableError, "TSIC: No GPU backend available")
 
+# ============================================================
+# ATTENTION - ĐÃ GỌI CUDA ĐÚNG
+# ============================================================
 proc tsicAttentionFused*(q, k, v, mask: seq[float32], B, H, S, D: int, scale: float32): tuple[o, s_matrix: seq[float32]] =
   let backend = tsicInit()
   case backend
@@ -393,7 +441,8 @@ proc actImmOf(act: string): int =
   of "relu": 1
   of "sigmoid": 2
   of "tanh": 3
-  else: raise newException(ValueError, "actImmOf: unknown activation: " & act)
+  else:
+    raise newException(ValueError, "actImmOf: unknown activation: " & act)
 
 proc genTsicFusedAddAct*(act: string): TsicProgram =
   result.name = "fused_add_" & act
@@ -408,7 +457,8 @@ proc genTsicFusedAddAct*(act: string): TsicProgram =
 proc fusedActOf(prog: TsicProgram): int =
   result = 0
   for i in prog.instrs:
-    if i.op == tFusedAddAct: return i.imm
+    if i.op == tFusedAddAct:
+      return i.imm
 
 proc tsicEmitFusedAddActPTX*(prog: TsicProgram): string =
   let act = fusedActOf(prog)
@@ -416,7 +466,8 @@ proc tsicEmitFusedAddActPTX*(prog: TsicProgram): string =
     case act
     of 0: "fma.rn.f32 \t%f3, %f2, 1.0, %f1;"
     of 1: "add.f32 \t%f3, %f2, %f1;\n    max.f32 \t%f3, %f3, %f0;"
-    else: raise newException(ValueError, "tsicEmitFusedAddActPTX: activation " & $act & " chua co PTX")
+    else:
+      raise newException(ValueError, "tsicEmitFusedAddActPTX: activation " & $act & " chua co PTX")
   result = """
 .version 7.5
 .target sm_75
@@ -471,7 +522,8 @@ proc tsicEmitFusedAddActMSL*(prog: TsicProgram): string =
     of 1: "max(s, 0.0f)"
     of 2: "1.0f / (1.0f + exp(-s))"
     of 3: "tanh(s)"
-    else: raise newException(ValueError, "tsicEmitFusedAddActMSL: unknown imm " & $act)
+    else:
+      raise newException(ValueError, "tsicEmitFusedAddActMSL: unknown imm " & $act)
   result = """
 #include <metal_stdlib>
 using namespace metal;
@@ -492,7 +544,8 @@ proc tsicEmitFusedAddActOpenCLC*(prog: TsicProgram): string =
     of 1: "fmax(s, 0.0f)"
     of 2: "1.0f / (1.0f + exp(-s))"
     of 3: "tanh(s)"
-    else: raise newException(ValueError, "tsicEmitFusedAddActOpenCLC: unknown imm " & $act)
+    else:
+      raise newException(ValueError, "tsicEmitFusedAddActOpenCLC: unknown imm " & $act)
   result = """
 __kernel void """ & prog.name & """(__global const float* a, __global const float* b, __global float* c) {
     int i = get_global_id(0);

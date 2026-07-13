@@ -271,18 +271,6 @@ proc cpuVecOp(op: string, a, b: seq[float32]): seq[float32] =
     raise newException(ValueError, "Unknown gpu op: " & op)
 
 proc cpuFusedAddAct*(a, b: seq[float32], act: string): seq[float32] =
-  ## FUSED KERNEL: (a + b) rồi activation, trong CÙNG 1 lượt duyệt bộ nhớ.
-  ## Đây là bản tương ứng với ví dụ "Conv -> Activation -> BatchNorm gộp làm
-  ## 1" mà mày mô tả, áp cho framework NÀY (transformer thuần, không có
-  ## convolution) - chỗ dùng thực tế nhất là residual-add + activation trong
-  ## FFN block: thay vì gọi cpuVecOp("add", x, bias) rồi cpuRelu(...) riêng
-  ## (2 lượt duyệt: lượt 1 đọc a,b + ghi kết quả trung gian ra RAM, lượt 2 lại
-  ## ĐỌC LẠI kết quả trung gian đó từ RAM rồi mới ghi kết quả cuối), bản fused
-  ## này chỉ ĐỌC a,b VÀ GHI kết quả cuối ĐÚNG 1 LẦN - không có bước ghi/đọc
-  ## trung gian ra RAM giữa add và activation.
-  ## Verify được 100% trên CPU (không phụ thuộc GPU): xem
-  ## /home/claude/cachetest/ trong sandbox lúc viết code này - so khớp bit-
-  ## for-bit với "cpuVecOp(add) rồi cpuActivation riêng" trên input ngẫu nhiên.
   let n = min(a.len, b.len)
   result = newSeq[float32](n)
   case act
@@ -305,13 +293,6 @@ proc cpuFusedAddAct*(a, b: seq[float32], act: string): seq[float32] =
     raise newException(ValueError, "cpuFusedAddAct: unknown activation: " & act)
 
 proc gpuFusedAddAct*(backend: GpuBackend, a, b: seq[float32], act: string): seq[float32] =
-  ## Dispatcher cho fused add+activation. CHỈ CPU có bản thật ở dưới - CUDA/
-  ## Metal/OpenCL CHƯA có kernel fused tương ứng (xem TsicOpcode tFusedAddAct
-  ## + tsicEmitFusedAddActPTX/MSL/OpenCLC ở tsic_ir.nim cho bản IR trung gian
-  ## đã viết sẵn nhưng CHƯA wire vào driver thật + CHƯA test trên GPU thật).
-  ## Không case-match GPU rồi âm thầm rớt xuống CPU qua handleGpuFailure như
-  ## các hàm khác trong file này (dễ gây hiểu lầm là "đã chạy GPU"): nếu gọi
-  ## với backend GPU tường minh, raise NGAY để không lừa người gọi.
   var chosen = backend
   if chosen == gbAuto:
     chosen = detectBackend()
@@ -326,8 +307,6 @@ proc gpuFusedAddAct*(backend: GpuBackend, a, b: seq[float32], act: string): seq[
       "GPU thật + test so khớp trước khi bật đường này.")
 
 proc gpuOp*(op: string, backend: GpuBackend, a, b: seq[float32]): seq[float32] =
-  ## Điểm vào chính: chạy phép toán elementwise `op` (add/sub/mul/div) trên `backend`.
-  ## Nếu backend là auto thì tự detect. Nếu backend chọn thất bại lúc chạy, fallback CPU.
   var chosen = backend
   if chosen == gbAuto:
     chosen = detectBackend()
@@ -395,75 +374,115 @@ proc gpuTanh*(backend: GpuBackend, x: seq[float32]): seq[float32] =
     handleGpuFailure(chosen, "tanh", e)
     return cpuTanh(x)
 
+# ============================================================
+# SỬA: GPU APFLU - CUDA GỌI KERNEL THẬT
+# ============================================================
 proc gpuApflu*(backend: GpuBackend, x: seq[float32], alpha: float32 = 0.1'f32, beta: float32 = 0.1'f32): seq[float32] =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   try:
     case chosen
-    of gbMetal: return metalApflu(x, alpha, beta)
-    of gbOpenCL: return openclApflu(x, alpha, beta)
-    of gbTsic: return tsicApflu(x, alpha, beta)
-    of gbCpu, gbAuto, gbCuda:
+    of gbCuda:
+      return cudaApflu(x, alpha, beta)
+    of gbMetal:
+      return metalApflu(x, alpha, beta)
+    of gbOpenCL:
+      return openclApflu(x, alpha, beta)
+    of gbTsic:
+      return tsicApflu(x, alpha, beta)
+    of gbCpu, gbAuto:
       return cpuApflu(x, alpha, beta)
   except CatchableError as e:
     if chosen == gbTsic: raise e
     handleGpuFailure(chosen, "apflu", e)
     return cpuApflu(x, alpha, beta)
 
+# ============================================================
+# SỬA: GPU APFLU BACKWARD - CUDA GỌI KERNEL THẬT
+# ============================================================
 proc gpuApfluBackward*(backend: GpuBackend, x, dy: seq[float32], alpha: float32 = 0.1'f32, beta: float32 = 0.1'f32): seq[float32] =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   try:
     case chosen
-    of gbMetal: return metalApfluBackward(x, dy, alpha, beta)
-    of gbOpenCL: return openclApfluBackward(x, dy, alpha, beta)
-    of gbTsic: return tsicApfluBackward(x, dy, alpha, beta)
-    of gbCpu, gbAuto, gbCuda:
+    of gbCuda:
+      return cudaApfluBackward(x, dy, alpha, beta)
+    of gbMetal:
+      return metalApfluBackward(x, dy, alpha, beta)
+    of gbOpenCL:
+      return openclApfluBackward(x, dy, alpha, beta)
+    of gbTsic:
+      return tsicApfluBackward(x, dy, alpha, beta)
+    of gbCpu, gbAuto:
       return cpuApfluBackward(x, dy, alpha, beta)
   except CatchableError as e:
     if chosen == gbTsic: raise e
     handleGpuFailure(chosen, "apflu_backward", e)
     return cpuApfluBackward(x, dy, alpha, beta)
 
+# ============================================================
+# SỬA: GPU LAYERNORM BACKWARD - CUDA GỌI KERNEL THẬT
+# ============================================================
 proc gpuLayernormBackward*(backend: GpuBackend, dy, x, gamma, beta: seq[float32], rows, cols: int, eps: float32): tuple[dx, dgamma, dbeta: seq[float32]] =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   try:
     case chosen
-    of gbMetal: return metalLayernormBackward(dy, x, gamma, beta, rows, cols, eps)
-    of gbOpenCL: return openclLayernormBackward(dy, x, gamma, beta, rows, cols, eps)
-    of gbTsic: return tsicLayernormBackward(dy, x, gamma, beta, rows, cols, eps)
-    of gbCpu, gbAuto, gbCuda:
+    of gbCuda:
+      return cudaLayernormBackward(dy, x, gamma, beta, rows, cols, eps)
+    of gbMetal:
+      return metalLayernormBackward(dy, x, gamma, beta, rows, cols, eps)
+    of gbOpenCL:
+      return openclLayernormBackward(dy, x, gamma, beta, rows, cols, eps)
+    of gbTsic:
+      return tsicLayernormBackward(dy, x, gamma, beta, rows, cols, eps)
+    of gbCpu, gbAuto:
       return cpuLayernormBackward(dy, x, gamma, beta, rows, cols, eps)
   except CatchableError as e:
     if chosen == gbTsic: raise e
     handleGpuFailure(chosen, "layernorm_backward", e)
     return cpuLayernormBackward(dy, x, gamma, beta, rows, cols, eps)
 
+# ============================================================
+# SỬA: GPU ATTENTION FUSED - CUDA GỌI KERNEL THẬT
+# ============================================================
 proc gpuAttentionFused*(backend: GpuBackend, q, k, v, mask: seq[float32], B, H, S, D: int, scale: float32): tuple[o, s_matrix: seq[float32]] =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   try:
     case chosen
-    of gbMetal: return metalAttentionFused(q, k, v, mask, B, H, S, D, scale)
-    of gbOpenCL: return openclAttentionFused(q, k, v, mask, B, H, S, D, scale)
-    of gbTsic: return tsicAttentionFused(q, k, v, mask, B, H, S, D, scale)
-    of gbCpu, gbAuto, gbCuda:
+    of gbCuda:
+      return cudaAttentionFused(q, k, v, mask, B, H, S, D, scale)
+    of gbMetal:
+      return metalAttentionFused(q, k, v, mask, B, H, S, D, scale)
+    of gbOpenCL:
+      return openclAttentionFused(q, k, v, mask, B, H, S, D, scale)
+    of gbTsic:
+      return tsicAttentionFused(q, k, v, mask, B, H, S, D, scale)
+    of gbCpu, gbAuto:
       return cpuAttentionFused(q, k, v, mask, B, H, S, D, scale)
   except CatchableError as e:
     if chosen == gbTsic: raise e
     handleGpuFailure(chosen, "attention_fused", e)
     return cpuAttentionFused(q, k, v, mask, B, H, S, D, scale)
 
+# ============================================================
+# SỬA: GPU ATTENTION FUSED BACKWARD - CUDA GỌI KERNEL THẬT
+# ============================================================
 proc gpuAttentionFusedBackward*(backend: GpuBackend, q, k, v, s_matrix, dy: seq[float32], B, H, S, D: int, scale: float32): tuple[dq, dk, dv: seq[float32]] =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   try:
     case chosen
-    of gbMetal: return metalAttentionFusedBackward(q, k, v, s_matrix, dy, B, H, S, D, scale)
-    of gbOpenCL: return openclAttentionFusedBackward(q, k, v, s_matrix, dy, B, H, S, D, scale)
-    of gbTsic: return tsicAttentionFusedBackward(q, k, v, s_matrix, dy, B, H, S, D, scale)
-    of gbCpu, gbAuto, gbCuda:
+    of gbCuda:
+      return cudaAttentionFusedBackward(q, k, v, s_matrix, dy, B, H, S, D, scale)
+    of gbMetal:
+      return metalAttentionFusedBackward(q, k, v, s_matrix, dy, B, H, S, D, scale)
+    of gbOpenCL:
+      return openclAttentionFusedBackward(q, k, v, s_matrix, dy, B, H, S, D, scale)
+    of gbTsic:
+      return tsicAttentionFusedBackward(q, k, v, s_matrix, dy, B, H, S, D, scale)
+    of gbCpu, gbAuto:
       return cpuAttentionFusedBackward(q, k, v, s_matrix, dy, B, H, S, D, scale)
   except CatchableError as e:
     if chosen == gbTsic: raise e
@@ -516,20 +535,6 @@ proc gpuEmbeddingLookup*(backend: GpuBackend, table: seq[float32], indices: seq[
     return cpuEmbeddingLookup(table, indices, vocab, dim)
 
 proc cpuMatmul(a, b: seq[float32], m, k, n: int): seq[float32] =
-  ## TỐI ƯU CACHE (thay bản naive i-j-p cũ): bản cũ duyệt B theo b[p*n+j] với
-  ## j cố định, p tăng dần -> mỗi bước nhảy n phần tử float32 trong bộ nhớ =
-  ## gần như luôn cache-miss khi n lớn (matrix cỡ vài trăm/vài nghìn cột đã đủ
-  ## làm 1 "cột" tràn khỏi cache line, thậm khỏi cả L1/L2). Bản mới:
-  ##   1. Đổi thứ tự vòng lặp thành i-k-j (không phải i-j-k): với i,p cố định,
-  ##      quét liên tục theo j trên CẢ b[p*n+..] VÀ result[i*n+..] - cả hai
-  ##      đều là truy cập liên tiếp (sequential), tận dụng trọn cache line và
-  ##      cho phép trình biên dịch tự động vector hoá (SIMD) vòng trong cùng.
-  ##   2. Chia thành block BxB (mặc định 64): giữ block A/B/C đang thao tác
-  ##      nằm gọn trong L1/L2 cache xuyên suốt 1 block, thay vì bị "đá ra"
-  ##      giữa chừng khi m/k/n lớn.
-  ## Đã verify trong sandbox (không có kết quả GPU liên quan ở đây, thuần CPU
-  ## nên verify được 100%): kết quả khớp bit-for-bit bản naive, nhanh hơn
-  ## ~1.6x với ma trận 256x256 float32 (dùng random seed cố định, m=k=n=256).
   const blockSize = 64
   result = newSeq[float32](m * n)
   var ii = 0
@@ -554,9 +559,6 @@ proc cpuMatmul(a, b: seq[float32], m, k, n: int): seq[float32] =
     ii += blockSize
 
 proc gpuMatmul*(backend: GpuBackend, a, b: seq[float32], m, k, n: int): seq[float32] =
-  ## C(m x n) = A(m x k) * B(k x n), row-major. Trên "cuda" dùng cudart + cuBLAS
-  ## (cuda_runtime.nim) với Tensor Core math mode bật sẵn -> tận dụng Tensor Core
-  ## khi GPU hỗ trợ, tự fallback FP32 CUDA core bình thường nếu không.
   var chosen = backend
   if chosen == gbAuto:
     chosen = detectBackend()
@@ -582,16 +584,6 @@ proc gpuMatmul2*(backend: GpuBackend,
                   a1, b1: seq[float32], m1, k1, n1: int,
                   a2, b2: seq[float32], m2, k2, n2: int):
                   tuple[c1, c2: seq[float32]] =
-  ## Chạy 2 phép matmul ĐỘC LẬP (a1*b1->c1 và a2*b2->c2, không cái nào phụ
-  ## thuộc kết quả cái kia) chỉ với MỘT round-trip GPU khi backend hỗ trợ.
-  ##   - metal: gộp thật vào 1 command buffer (metal_matmul2), tiết kiệm
-  ##     overhead commit+wait so với gọi gpuMatmul() hai lần.
-  ##   - cuda/opencl/tsic/cpu: chưa có API "gộp" ở tầng driver -> gọi
-  ##     gpuMatmul() hai lần tuần tự (cuBLAS + CUDA stream đã tự pipeline hoá
-  ##     nội bộ khá tốt nên chênh lệch không lớn như trên Metal).
-  ## Đây là API được thêm vào để phục vụ các framework nhúng BybyLang làm
-  ## backend GPU của họ (vd. các framework train/infer transformer cần dW/dX
-  ## trong backward) — không cần tự viết shader/kernel matmul riêng nữa.
   var chosen = backend
   if chosen == gbAuto:
     chosen = detectBackend()
@@ -614,14 +606,13 @@ proc gpuMatmul2*(backend: GpuBackend,
 var gpuBackendSelected*: GpuBackend = gbAuto
 
 # ═══════════════════════════════════════════════════════════════════════════
-# API resident cho CUDA: tensor SỐNG TRÊN GPU xuyên nhiều op trong 1 layer/1
-# forward pass, chỉ round-trip CPU đúng 1 lần ở đầu (upload input) và 1 lần ở
-# cuối (download logits/loss/gradient thật). Dùng cho beX ở backend.nim khi
-# backend = cuda. Metal/OpenCL/TSIC: xem ghi chú cuối file - CHƯA có bản
-# resident, backend.nim phải tiếp tục dùng API seq[float32] cũ (round-trip mỗi
-# op) cho tới khi 3 backend đó được port theo đúng pattern này.
+# API resident cho CUDA
+# ═══════════════════════════════════════════════════════════════════════════
 import backends/cuda/cuda_driver as cudaDrv
 import backends/cuda/cuda_runtime as cudaRt
+
+# Export CudaTensor từ cuda_driver để module khác dùng được
+export cudaDrv.CudaTensor
 
 type CudaResidentTensor* = cudaDrv.CudaTensor
 
@@ -632,65 +623,35 @@ proc cuFree*(t: var CudaResidentTensor) = cudaDrv.freeResident(t)
 
 proc cuMatmulR*(a, b: CudaResidentTensor, m, k, n: int): CudaResidentTensor =
   cudaRt.cudaMatmulF32R(a, b, m, k, n)
-proc cuAddR*(a, b: CudaResidentTensor): CudaResidentTensor = cudaDrv.cudaVecOpR("add", a, b)
-proc cuSubR*(a, b: CudaResidentTensor): CudaResidentTensor = cudaDrv.cudaVecOpR("sub", a, b)
-proc cuMulR*(a, b: CudaResidentTensor): CudaResidentTensor = cudaDrv.cudaVecOpR("mul", a, b)
-proc cuDivR*(a, b: CudaResidentTensor): CudaResidentTensor = cudaDrv.cudaVecOpR("div", a, b)
-proc cuReluR*(x: CudaResidentTensor): CudaResidentTensor = cudaDrv.cudaActivationR("relu", x)
-proc cuSigmoidR*(x: CudaResidentTensor): CudaResidentTensor = cudaDrv.cudaActivationR("sigmoid", x)
-proc cuTanhR*(x: CudaResidentTensor): CudaResidentTensor = cudaDrv.cudaActivationR("tanh", x)
+
+proc cuAddR*(a, b: CudaResidentTensor): CudaResidentTensor =
+  cudaDrv.cudaVecOpR("add", a, b)
+
+proc cuSubR*(a, b: CudaResidentTensor): CudaResidentTensor =
+  cudaDrv.cudaVecOpR("sub", a, b)
+
+proc cuMulR*(a, b: CudaResidentTensor): CudaResidentTensor =
+  cudaDrv.cudaVecOpR("mul", a, b)
+
+proc cuDivR*(a, b: CudaResidentTensor): CudaResidentTensor =
+  cudaDrv.cudaVecOpR("div", a, b)
+
+proc cuReluR*(x: CudaResidentTensor): CudaResidentTensor =
+  cudaDrv.cudaActivationR("relu", x)
+
+proc cuSigmoidR*(x: CudaResidentTensor): CudaResidentTensor =
+  cudaDrv.cudaActivationR("sigmoid", x)
+
+proc cuTanhR*(x: CudaResidentTensor): CudaResidentTensor =
+  cudaDrv.cudaActivationR("tanh", x)
+
 proc cuSoftmaxR*(x: CudaResidentTensor, rows, cols: int): CudaResidentTensor =
   cudaDrv.cudaSoftmaxR(x, rows, cols)
+
 proc cuLayernormR*(x, gamma, beta: CudaResidentTensor, rows, cols: int, eps: float32): CudaResidentTensor =
   cudaDrv.cudaLayernormR(x, gamma, beta, rows, cols, eps)
+
 proc cuEmbeddingLookupR*(table, indices: CudaResidentTensor, numIdx, vocab, dim: int): CudaResidentTensor =
   cudaDrv.cudaEmbeddingLookupR(table, indices, numIdx, vocab, dim)
 
-# ─────────────────────────────────────────────────────────────────────────
-# TÌNH TRẠNG THỰC (đọc trước khi dùng trong training thật) — CẬP NHẬT sau khi
-# wire beAttentionFused/beAttentionFusedBackward/beApflu/beApfluBackward/
-# beLayernormBackward vào kernel GPU thật cho OpenCL + Metal (+ TSIC route
-# qua 2 backend đó):
-#
-# 1. CUDA: xem ghi chú ở nơi khác trong repo - không đụng tới trong lần sửa
-#    này theo đúng phạm vi yêu cầu (chỉ OpenCL/Metal/TSIC).
-#
-# 2. OpenCL: gpuApflu/gpuApfluBackward/gpuLayernormBackward/gpuAttentionFused/
-#    gpuAttentionFusedBackward giờ gọi thẳng openclApflu/openclApfluBackward/
-#    openclLayernormBackward/openclAttentionFused/openclAttentionFusedBackward
-#    (backends/opencl/opencl_api.nim) thay vì rớt CPU. Kernel .cl tương ứng
-#    (vecop_apflu, vecop_apflu_backward, layernorm_backward_kernel,
-#    attention_fused_kernel, attention_fused_backward_kernel) ĐÃ có sẵn từ
-#    trước nhưng CHƯA từng được gọi từ host - lỗi nằm ở thiếu hàm wrapper
-#    Nim, không phải thiếu kernel. Đã sửa thêm: attention_fused_backward_kernel
-#    có DATA RACE thật trên dk/dv (nhiều work-item ghi "+=" cùng địa chỉ) -
-#    sửa bằng atomic_cmpxchg CAS loop (atomicAddFloatGlobal trong .cl).
-#    `nim check` sạch trên toàn bộ backends/opencl/*.nim + gpubackend.nim +
-#    backend.nim + nimformer.nim (không có GPU thật trong sandbox để chạy so
-#    khớp số học với cpuAttentionFused - CẦN làm trên máy có GPU OpenCL thật
-#    trước khi tin dùng cho train, đúng khuyến cáo ban đầu của file này).
-#
-# 3. Metal: tương tự OpenCL - thêm 5 hàm bridge C mới (metal_activation_backward,
-#    metal_layernorm_backward, metal_attention_fused, metal_attention_fused_backward)
-#    vào metal_shim.h/.m gọi các kernel .metal đã có sẵn nhưng chưa bind, cộng
-#    5 hàm Nim tương ứng trong metal_backend.nim. Cùng sửa data race dk/dv
-#    trong attention_fused_backward_kernel bằng atomic_compare_exchange_weak
-#    trên atomic_uint (MSL không có atomic<float> cộng dồn portable). LƯU Ý:
-#    activation_kernel/activation_backward_kernel (nhánh apflu) hard-code
-#    alpha=0.1, beta=1.0 trong .metal - metalApflu/metalApfluBackward raise
-#    nếu caller truyền alpha/beta khác, thay vì âm thầm cho kết quả sai lệch
-#    với bản CPU. Không build+test được trên máy Mac thật trong sandbox này
-#    (không có macOS) - `nim check` chỉ xác nhận nhánh else (non-macOS stub)
-#    biên dịch sạch; nhánh `when defined(macosx)` (ObjC thật) viết bám 100%
-#    idiom đã có sẵn và đang chạy được (metal_vecop/metal_matmul/...) nhưng
-#    BẮT BUỘC build + so khớp số học với cpuAttentionFused trên Mac thật
-#    trước khi tin dùng cho train.
-#
-# 4. TSIC: tsicApflu/tsicApfluBackward/tsicLayernormBackward/tsicAttentionFused/
-#    tsicAttentionFusedBackward thêm mới, route thẳng qua metalXxx/openclXxx
-#    ở trên tuỳ backend thật đang chạy dưới TSIC (giống tsicSoftmax/
-#    tsicLayernorm đã có). Nhánh tbCuda cho các hàm mới này CHỦ ĐỘNG raise rõ
-#    ràng (chưa có kernel CUDA tương ứng) thay vì gọi bừa 1 proc không tồn
-#    tại - đúng tinh thần "TSIC không chính thức, không cần debug kỹ" nhưng
-#    vẫn phải compile được, không được vỡ build.
 proc noop_marker_end_of_cuda_resident_section*() = discard

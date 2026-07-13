@@ -1,41 +1,116 @@
 mode is 3
 
-gpu backend is "opencl"
+gpu backend is "tsic"
+
+# 1. Khai bao array
 gpu array A = [1, 2, 3, 4, 5, 6, 7, 8]
 gpu array B = [10, 20, 30, 40, 50, 60, 70, 80]
 gpu array E = [10, 20, 30, 40, 50, 60, 70, 80, 100, 110, 120, 130, 134, 12122121123123123, 123123123]
 gpu array O = [10, 20, 30, 40, 50, 60, 70, 80, 100, 110, 120, 130, 134, 12122121123123123, 123123123]
+
+# 2. Vector operations
 gpu add A, B -> C size 8
 gpu mul A, B -> D size 8
 gpu mul E, O -> G size 15
 gpu sub A, B -> H size 8
 gpu div A, B -> I size 8
+
+# 3. Activations
 gpu relu A -> J
-gpu sigmoid A -> K
+gpu sigmoid A -> SigR
 gpu tanh A -> L
+
+# 4. APFLU Activation
+gpu apflu A -> APFLURES alpha 0.1 beta 1.0
+gpu apflu B -> APFLURESB beta 0.2 alpha 0.05
+
+# 5. Softmax
 gpu softmax A -> M rows 1 cols 8
+
+# 6. Matmul
 gpu matmul A, B -> N m 8 k 8 n 1
 
+# 7. Layernorm forward
+gpu layernorm A, B, C -> LAYERNORMRES rows 8 cols 1 eps 1e-5
+
+# 8. Layernorm Backward
+gpu array DY = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+gpu layernorm_backward DY, A, B, C -> DX, DGAMMA, DBETA rows 8 cols 1 eps 1e-5
+
+# 9. Embedding Lookup
+indices = [0, 1, 2, 3, 4, 5, 6, 7]
+gpu embedding E, indices -> EMBEDRES vocab 8 dim 8
+
+# 10. Fused Attention Forward
+gpu array Q = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+gpu array MatKey = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6]
+gpu array V = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32]
+gpu attention Q, MatKey, V -> ATTENTIONO, ATTENTIONS B 1 H 1 S 4 D 4 scale 0.7071
+
+# 11. Fused Attention Backward
+gpu array DYATTN = [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.11, 0.12, 0.13, 0.14, 0.15, 0.16]
+gpu attention_backward Q, MatKey, V, ATTENTIONS, DYATTN -> DQ, DK, DV B 1 H 1 S 4 D 4 scale 0.7071
+
+# 12. In ket qua
+print "=== GPU VECTOR OPERATIONS ==="
 print "GPU add result:"
 print C
-print "GPU mul result:"
+print "GPU mul result (A*B):"
 print D
+print "GPU mul result (E*O):"
+print G
 print "GPU sub result:"
 print H
 print "GPU div result:"
 print I
+
+print "=== GPU ACTIVATIONS ==="
 print "GPU relu result:"
 print J
 print "GPU sigmoid result:"
-print K
+print SigR
 print "GPU tanh result:"
 print L
+print "GPU apflu result (A):"
+print APFLURES
+print "GPU apflu result (B):"
+print APFLURESB
+
+print "=== GPU SOFTMAX ==="
 print "GPU softmax result:"
 print M
+
+print "=== GPU MATMUL ==="
 print "GPU matmul result:"
 print N
-print G
 
+print "=== GPU LAYERNORM ==="
+print "GPU layernorm result:"
+print LAYERNORMRES
+print "GPU layernorm backward DX:"
+print DX
+print "GPU layernorm backward DGAMMA:"
+print DGAMMA
+print "GPU layernorm backward DBETA:"
+print DBETA
+
+print "=== GPU EMBEDDING ==="
+print "GPU embedding result:"
+print EMBEDRES
+
+print "=== GPU ATTENTION ==="
+print "GPU attention output:"
+print ATTENTIONO
+print "GPU attention score matrix:"
+print ATTENTIONS
+print "GPU attention backward DQ:"
+print DQ
+print "GPU attention backward DK:"
+print DK
+print "GPU attention backward DV:"
+print DV
+
+# 13. Control flow test
 x = 5
 if x > 0:
     print "x duong"
@@ -57,15 +132,3 @@ for i in range(1, 4):
         print "gap so 2 trong vong lap"
     else:
         print "khong phai so 2"
-
-# Các phép toán GPU nâng cao
-gpu layernorm A, B, C -> LAYERNORM_RES rows 8 cols 1 eps 1e-5
-
-# Tạo indices riêng cho embedding (dùng biến thường, không phải gpu array)
-indices = [0, 1, 2, 3, 4, 5, 6, 7]
-gpu embedding E, indices -> EMBED_RES vocab 8 dim 8
-
-print "GPU layernorm result:"
-print LAYERNORM_RES
-print "GPU embedding result:"
-print EMBED_RES

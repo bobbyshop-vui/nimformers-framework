@@ -311,6 +311,134 @@ BB_TANH_2:
 }
 
 // ============================================================
+// VECOP APFLU (Forward)
+// ============================================================
+.visible .entry vecop_apflu(
+    .param .u64 apflu_param_0,
+    .param .u64 apflu_param_1,
+    .param .u32 apflu_param_2,
+    .param .f32 apflu_param_3,
+    .param .f32 apflu_param_4
+)
+{
+    .reg .pred %p<3>;
+    .reg .f32 %f<8>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [apflu_param_0];
+    ld.param.u64 %rd2, [apflu_param_1];
+    ld.param.u32 %r2, [apflu_param_2];
+    ld.param.f32 %f1, [apflu_param_3];   // alpha
+    ld.param.f32 %f2, [apflu_param_4];   // beta
+
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %tid.x;
+    mad.lo.s32 %r1, %r4, %r3, %r5;
+    setp.ge.s32 %p1, %r1, %r2;
+    @%p1 bra BB_APFLU_RET;
+
+    cvta.to.global.u64 %rd3, %rd1;
+    mul.wide.s32 %rd4, %r1, 4;
+    add.s64 %rd5, %rd3, %rd4;
+    ld.global.nc.f32 %f3, [%rd5];
+
+    // APFLU: x*(1+alpha*x) if x>0 else beta*x*exp(x)
+    setp.gt.f32 %p2, %f3, 0f00000000;
+    @%p2 bra BB_APFLU_POS;
+
+    // x <= 0: beta * x * exp(x)
+    mul.f32 %f4, %f3, 0f3fb8aa3b;
+    ex2.approx.f32 %f5, %f4;
+    mul.f32 %f6, %f2, %f3;
+    mul.f32 %f7, %f6, %f5;
+    cvta.to.global.u64 %rd6, %rd2;
+    add.s64 %rd7, %rd6, %rd4;
+    st.global.f32 [%rd7], %f7;
+    bra BB_APFLU_RET;
+
+BB_APFLU_POS:
+    // x > 0: x * (1 + alpha * x)
+    fma.rn.f32 %f4, %f1, %f3, 0f3f800000;
+    mul.f32 %f5, %f3, %f4;
+    cvta.to.global.u64 %rd6, %rd2;
+    add.s64 %rd7, %rd6, %rd4;
+    st.global.f32 [%rd7], %f5;
+
+BB_APFLU_RET:
+    ret;
+}
+
+// ============================================================
+// VECOP APFLU BACKWARD
+// ============================================================
+.visible .entry vecop_apflu_backward(
+    .param .u64 apflu_bwd_param_0,
+    .param .u64 apflu_bwd_param_1,
+    .param .u64 apflu_bwd_param_2,
+    .param .u32 apflu_bwd_param_3,
+    .param .f32 apflu_bwd_param_4,
+    .param .f32 apflu_bwd_param_5
+)
+{
+    .reg .pred %p<3>;
+    .reg .f32 %f<10>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<10>;
+
+    ld.param.u64 %rd1, [apflu_bwd_param_0];
+    ld.param.u64 %rd2, [apflu_bwd_param_1];
+    ld.param.u64 %rd3, [apflu_bwd_param_2];
+    ld.param.u32 %r2, [apflu_bwd_param_3];
+    ld.param.f32 %f1, [apflu_bwd_param_4];
+    ld.param.f32 %f2, [apflu_bwd_param_5];
+
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %tid.x;
+    mad.lo.s32 %r1, %r4, %r3, %r5;
+    setp.ge.s32 %p1, %r1, %r2;
+    @%p1 bra BB_APFLU_BWD_RET;
+
+    cvta.to.global.u64 %rd4, %rd1;
+    mul.wide.s32 %rd5, %r1, 4;
+    add.s64 %rd6, %rd4, %rd5;
+    ld.global.nc.f32 %f3, [%rd6];  // x
+
+    cvta.to.global.u64 %rd7, %rd2;
+    add.s64 %rd8, %rd7, %rd5;
+    ld.global.nc.f32 %f4, [%rd8];  // dy
+
+    setp.gt.f32 %p2, %f3, 0f00000000;
+    @%p2 bra BB_APFLU_BWD_POS;
+
+    // x <= 0: d * beta * exp(x) * (1 + x)
+    mul.f32 %f5, %f3, 0f3fb8aa3b;
+    ex2.approx.f32 %f6, %f5;
+    mul.f32 %f7, %f2, %f4;
+    mul.f32 %f8, %f7, %f6;
+    add.f32 %f9, %f3, 0f3f800000;
+    mul.f32 %f10, %f8, %f9;
+    cvta.to.global.u64 %rd9, %rd3;
+    add.s64 %rd10, %rd9, %rd5;
+    st.global.f32 [%rd10], %f10;
+    bra BB_APFLU_BWD_RET;
+
+BB_APFLU_BWD_POS:
+    // x > 0: d * (1 + 2*alpha*x)
+    mul.f32 %f5, %f1, 0f40000000;
+    fma.rn.f32 %f6, %f5, %f3, 0f3f800000;
+    mul.f32 %f7, %f4, %f6;
+    cvta.to.global.u64 %rd9, %rd3;
+    add.s64 %rd10, %rd9, %rd5;
+    st.global.f32 [%rd10], %f7;
+
+BB_APFLU_BWD_RET:
+    ret;
+}
+
+// ============================================================
 // EMBEDDING LOOKUP
 // ============================================================
 .visible .entry embedding_lookup_kernel(
@@ -535,7 +663,7 @@ BB_SM_RET:
 }
 
 // ============================================================
-// LAYERNORM - Block size 512
+// LAYERNORM FORWARD - Block size 512
 // ============================================================
 .visible .entry layernorm_kernel(
     .param .u64 ln_param_0,
@@ -673,6 +801,214 @@ BB_LN_RET:
 }
 
 // ============================================================
+// LAYERNORM BACKWARD
+// ============================================================
+.visible .entry layernorm_backward_kernel(
+    .param .u64 ln_bwd_param_0,
+    .param .u64 ln_bwd_param_1,
+    .param .u64 ln_bwd_param_2,
+    .param .u64 ln_bwd_param_3,
+    .param .u64 ln_bwd_param_4,
+    .param .u64 ln_bwd_param_5,
+    .param .u64 ln_bwd_param_6,
+    .param .u32 ln_bwd_param_7,
+    .param .u32 ln_bwd_param_8,
+    .param .f32 ln_bwd_param_9
+)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<30>;
+    .reg .f32 %f<30>;
+    .reg .b64 %rd<20>;
+
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %tid.x;
+
+    ld.param.u32 %r3, [ln_bwd_param_7];
+    ld.param.u32 %r4, [ln_bwd_param_8];
+    ld.param.f32 %f1, [ln_bwd_param_9];
+
+    ld.param.u64 %rd1, [ln_bwd_param_0];
+    ld.param.u64 %rd2, [ln_bwd_param_1];
+    ld.param.u64 %rd3, [ln_bwd_param_2];
+    ld.param.u64 %rd4, [ln_bwd_param_3];
+    ld.param.u64 %rd5, [ln_bwd_param_4];
+    ld.param.u64 %rd6, [ln_bwd_param_5];
+    ld.param.u64 %rd7, [ln_bwd_param_6];
+
+    // Tính dgamma, dbeta cho mỗi col (tid < cols)
+    setp.ge.u32 %p1, %r2, %r4;
+    @%p1 bra BB_LN_BWD_SKIP_DG;
+
+    mov.f32 %f2, 0f00000000;
+    mov.f32 %f3, 0f00000000;
+    mov.u32 %r5, 0;
+
+BB_LN_BWD_DG_LOOP:
+    setp.ge.u32 %p2, %r5, %r3;
+    @%p2 bra BB_LN_BWD_DG_DONE;
+
+    mul.lo.s32 %r6, %r5, %r4;
+    add.s32 %r7, %r6, %r2;
+    mul.wide.s32 %rd8, %r7, 4;
+
+    // Tính mean, var
+    mov.f32 %f4, 0f00000000;
+    mov.f32 %f5, 0f00000000;
+    mov.u32 %r8, 0;
+
+BB_LN_BWD_MEAN_LOOP:
+    setp.ge.u32 %p3, %r8, %r4;
+    @%p3 bra BB_LN_BWD_MEAN_DONE;
+
+    mul.lo.s32 %r9, %r5, %r4;
+    add.s32 %r10, %r9, %r8;
+    mul.wide.s32 %rd9, %r10, 4;
+    add.s64 %rd10, %rd2, %rd9;
+    ld.global.nc.f32 %f6, [%rd10];
+    add.f32 %f4, %f4, %f6;
+    fma.rn.f32 %f5, %f6, %f6, %f5;
+
+    add.s32 %r8, %r8, 1;
+    bra BB_LN_BWD_MEAN_LOOP;
+
+BB_LN_BWD_MEAN_DONE:
+    cvt.rn.f32.s32 %f7, %r4;
+    rcp.approx.f32 %f8, %f7;
+    mul.f32 %f9, %f4, %f8;
+    mul.f32 %f10, %f5, %f8;
+    mul.f32 %f11, %f9, %f9;
+    sub.f32 %f12, %f10, %f11;
+    add.f32 %f13, %f12, %f1;
+    rsqrt.approx.f32 %f14, %f13;
+
+    // dgamma += dy * (x - mean) * invStd
+    add.s64 %rd11, %rd1, %rd8;
+    ld.global.nc.f32 %f15, [%rd11];
+    add.s64 %rd12, %rd2, %rd8;
+    ld.global.nc.f32 %f16, [%rd12];
+    sub.f32 %f17, %f16, %f9;
+    mul.f32 %f18, %f17, %f14;
+    fma.rn.f32 %f2, %f15, %f18, %f2;
+
+    // dbeta += dy
+    fma.rn.f32 %f3, %f15, 1.0, %f3;
+
+    add.s32 %r5, %r5, 1;
+    bra BB_LN_BWD_DG_LOOP;
+
+BB_LN_BWD_DG_DONE:
+    add.s64 %rd13, %rd6, %rd8;
+    st.global.f32 [%rd13], %f2;
+    add.s64 %rd14, %rd7, %rd8;
+    st.global.f32 [%rd14], %f3;
+
+BB_LN_BWD_SKIP_DG:
+
+    // dx cho mỗi row (tid < rows)
+    setp.ge.u32 %p2, %r2, %r3;
+    @%p2 bra BB_LN_BWD_RET;
+
+    mul.lo.s32 %r11, %r2, %r4;
+    mul.wide.s32 %rd15, %r11, 4;
+
+    // Tính mean và var cho row này
+    mov.f32 %f4, 0f00000000;
+    mov.f32 %f5, 0f00000000;
+    mov.u32 %r8, 0;
+
+BB_LN_BWD_ROW_MEAN_LOOP:
+    setp.ge.u32 %p3, %r8, %r4;
+    @%p3 bra BB_LN_BWD_ROW_MEAN_DONE;
+
+    add.s64 %rd16, %rd2, %rd15;
+    ld.global.nc.f32 %f6, [%rd16];
+    add.f32 %f4, %f4, %f6;
+    fma.rn.f32 %f5, %f6, %f6, %f5;
+
+    add.s32 %r8, %r8, 1;
+    bra BB_LN_BWD_ROW_MEAN_LOOP;
+
+BB_LN_BWD_ROW_MEAN_DONE:
+    cvt.rn.f32.s32 %f7, %r4;
+    rcp.approx.f32 %f8, %f7;
+    mul.f32 %f9, %f4, %f8;
+    mul.f32 %f10, %f5, %f8;
+    mul.f32 %f11, %f9, %f9;
+    sub.f32 %f12, %f10, %f11;
+    add.f32 %f13, %f12, %f1;
+    rsqrt.approx.f32 %f14, %f13;
+
+    // sum1 và sum2
+    mov.f32 %f15, 0f00000000;
+    mov.f32 %f16, 0f00000000;
+    mov.u32 %r8, 0;
+
+BB_LN_BWD_DX_SUM_LOOP:
+    setp.ge.u32 %p3, %r8, %r4;
+    @%p3 bra BB_LN_BWD_DX_SUM_DONE;
+
+    add.s64 %rd17, %rd1, %rd15;
+    ld.global.nc.f32 %f17, [%rd17];
+    add.s64 %rd18, %rd3, %rd8;
+    ld.global.nc.f32 %f18, [%rd18];
+    add.s64 %rd19, %rd2, %rd15;
+    ld.global.nc.f32 %f19, [%rd19];
+
+    mul.f32 %f20, %f17, %f18;
+    mul.f32 %f20, %f20, %f14;
+    fma.rn.f32 %f15, %f20, 1.0, %f15;
+    sub.f32 %f21, %f19, %f9;
+    fma.rn.f32 %f16, %f20, %f21, %f16;
+
+    add.s32 %r8, %r8, 1;
+    bra BB_LN_BWD_DX_SUM_LOOP;
+
+BB_LN_BWD_DX_SUM_DONE:
+    mul.f32 %f22, %f14, %f14;
+    mul.f32 %f22, %f22, %f8;
+    neg.f32 %f16, %f16;
+    mul.f32 %f16, %f16, %f22;
+
+    mov.u32 %r8, 0;
+
+BB_LN_BWD_DX_LOOP:
+    setp.ge.u32 %p3, %r8, %r4;
+    @%p3 bra BB_LN_BWD_DX_DONE;
+
+    add.s64 %rd20, %rd5, %rd15;
+    add.s64 %rd21, %rd1, %rd15;
+    add.s64 %rd22, %rd3, %rd8;
+    add.s64 %rd23, %rd2, %rd15;
+
+    ld.global.nc.f32 %f17, [%rd21];
+    ld.global.nc.f32 %f18, [%rd22];
+    ld.global.nc.f32 %f19, [%rd23];
+
+    mul.f32 %f23, %f17, %f18;
+    mul.f32 %f23, %f23, %f14;
+    mul.f32 %f24, %f15, %f8;
+    sub.f32 %f25, %f19, %f9;
+    mul.f32 %f26, %f16, 0f40000000;
+    mul.f32 %f26, %f26, %f8;
+    mul.f32 %f26, %f25, %f26;
+
+    sub.f32 %f27, %f23, %f24;
+    add.f32 %f28, %f27, %f26;
+
+    add.s64 %rd24, %rd4, %rd15;
+    st.global.f32 [%rd24], %f28;
+
+    add.s32 %r8, %r8, 1;
+    bra BB_LN_BWD_DX_LOOP;
+
+BB_LN_BWD_DX_DONE:
+
+BB_LN_BWD_RET:
+    ret;
+}
+
+// ============================================================
 // ATTENTION FUSED FORWARD
 // ============================================================
 .visible .entry attention_fused_kernel(
@@ -726,131 +1062,103 @@ BB_LN_RET:
     mov.u32 %r13, %r2;
     mov.u32 %r14, %r3;
     
-    // Tính base offset
     mul.lo.s32 %r15, %r2, %r7;
     add.s32 %r15, %r15, %r3;
     mul.wide.s32 %rd6, %r15, 4;
     
-    // === PASS 1: Tính scores và max ===
-    mov.f32 %f2, 0fFF800000;  // -inf
+    mov.f32 %f2, 0fFF800000;
     mov.u32 %r16, 0;
     
 BB_ATTN_SCORE_LOOP:
     setp.ge.u32 %p4, %r16, %r2;
     @%p4 bra BB_ATTN_SCORE_DONE;
     
-    // dot = q[ti] * k[tj]
-    mov.f32 %f3, 0f00000000;
-    mov.u32 %r17, 0;
-    
-BB_ATTN_DOT_LOOP:
-    setp.ge.u32 %p5, %r17, %r7;
-    @%p5 bra BB_ATTN_DOT_DONE;
-    
-    // q[base_idx + ti*D + d]
-    mul.lo.s32 %r18, %r2, %r7;
-    add.s32 %r18, %r18, %r17;
+    mul.lo.s32 %r17, %r16, %r7;
+    add.s32 %r18, %r17, %r3;
     mul.wide.s32 %rd7, %r18, 4;
-    add.s64 %rd8, %rd1, %rd7;
-    ld.global.f32 %f4, [%rd8];
     
-    // k[base_idx + tj*D + d]
-    mul.lo.s32 %r19, %r16, %r7;
-    add.s32 %r19, %r19, %r17;
-    mul.wide.s32 %rd9, %r19, 4;
-    add.s64 %rd10, %rd2, %rd9;
-    ld.global.f32 %f5, [%rd10];
+    add.s64 %rd8, %rd1, %rd6;
+    ld.global.nc.f32 %f3, [%rd8];
     
-    fma.rn.f32 %f3, %f4, %f5, %f3;
-    add.s32 %r17, %r17, 1;
-    bra BB_ATTN_DOT_LOOP;
+    add.s64 %rd9, %rd2, %rd7;
+    ld.global.nc.f32 %f4, [%rd9];
     
-BB_ATTN_DOT_DONE:
-    mul.f32 %f3, %f3, %f1;  // dot * scale
-    st.sreg.f32 scores[%r16], %f3;
-    setp.gt.f32 %p4, %f3, %f2;
-    selp.f32 %f2, %f3, %f2, %p4;
+    mul.f32 %f5, %f3, %f4;
+    add.f32 %f6, %f6, %f5;
+    
     add.s32 %r16, %r16, 1;
     bra BB_ATTN_SCORE_LOOP;
     
 BB_ATTN_SCORE_DONE:
-    // === PASS 2: exp và sum ===
-    mov.f32 %f6, 0f00000000;  // sum
+    mul.f32 %f6, %f6, %f1;
+    st.sreg.f32 scores[%r16], %f6;
+    setp.gt.f32 %p5, %f6, %f2;
+    selp.f32 %f2, %f6, %f2, %p5;
+    
+    mov.f32 %f7, 0f00000000;
     mov.u32 %r16, 0;
     
 BB_ATTN_EXP_LOOP:
     setp.ge.u32 %p4, %r16, %r2;
     @%p4 bra BB_ATTN_EXP_DONE;
     
-    ld.sreg.f32 %f3, scores[%r16];
-    sub.f32 %f7, %f3, %f2;
-    mul.f32 %f7, %f7, 0f3fb8aa3b;
-    ex2.approx.f32 %f8, %f7;
-    st.sreg.f32 scores[%r16], %f8;
-    add.f32 %f6, %f6, %f8;
+    ld.sreg.f32 %f6, scores[%r16];
+    sub.f32 %f8, %f6, %f2;
+    mul.f32 %f8, %f8, 0f3fb8aa3b;
+    ex2.approx.f32 %f9, %f8;
+    st.sreg.f32 scores[%r16], %f9;
+    add.f32 %f7, %f7, %f9;
+    
     add.s32 %r16, %r16, 1;
     bra BB_ATTN_EXP_LOOP;
     
 BB_ATTN_EXP_DONE:
-    rcp.approx.f32 %f9, %f6;  // 1/sum
+    rcp.approx.f32 %f10, %f7;
+    
     mov.u32 %r16, 0;
     
-BB_ATTN_STORE_S_LOOP:
+BB_ATTN_NORM_LOOP:
     setp.ge.u32 %p4, %r16, %r2;
-    @%p4 bra BB_ATTN_STORE_S_DONE;
+    @%p4 bra BB_ATTN_NORM_DONE;
     
-    ld.sreg.f32 %f3, scores[%r16];
-    mul.f32 %f10, %f3, %f9;  // normalized score
-    st.sreg.f32 scores[%r16], %f10;
+    ld.sreg.f32 %f9, scores[%r16];
+    mul.f32 %f11, %f9, %f10;
     
-    // store s_matrix[base_s + ti*S + tj]
-    mul.lo.s32 %r20, %r2, %r6;
-    add.s32 %r20, %r20, %r16;
-    mul.wide.s32 %rd11, %r20, 4;
-    add.s64 %rd12, %rd5, %rd11;
-    st.global.f32 [%rd12], %f10;
+    mul.lo.s32 %r19, %r2, %r6;
+    add.s32 %r20, %r19, %r16;
+    mul.wide.s32 %rd10, %r20, 4;
+    add.s64 %rd11, %rd5, %rd10;
+    st.global.f32 [%rd11], %f11;
+    
     add.s32 %r16, %r16, 1;
-    bra BB_ATTN_STORE_S_LOOP;
+    bra BB_ATTN_NORM_LOOP;
     
-BB_ATTN_STORE_S_DONE:
-    // === PASS 3: Output = S @ V ===
-    mov.u32 %r17, 0;  // d
+BB_ATTN_NORM_DONE:
+    
+    mov.u32 %r16, 0;
+    mov.f32 %f12, 0f00000000;
     
 BB_ATTN_OUT_LOOP:
-    setp.ge.u32 %p5, %r17, %r7;
-    @%p5 bra BB_ATTN_OUT_DONE;
-    
-    mov.f32 %f11, 0f00000000;
-    mov.u32 %r16, 0;
-    
-BB_ATTN_OUT_DOT_LOOP:
     setp.ge.u32 %p4, %r16, %r2;
-    @%p4 bra BB_ATTN_OUT_DOT_DONE;
+    @%p4 bra BB_ATTN_OUT_DONE;
     
-    ld.sreg.f32 %f3, scores[%r16];
+    ld.sreg.f32 %f11, scores[%r16];
     
-    // v[base_idx + tj*D + d]
     mul.lo.s32 %r21, %r16, %r7;
-    add.s32 %r21, %r21, %r17;
-    mul.wide.s32 %rd13, %r21, 4;
-    add.s64 %rd14, %rd3, %rd13;
-    ld.global.f32 %f12, [%rd14];
+    add.s32 %r22, %r21, %r3;
+    mul.wide.s32 %rd12, %r22, 4;
+    add.s64 %rd13, %rd3, %rd12;
+    ld.global.nc.f32 %f13, [%rd13];
     
-    fma.rn.f32 %f11, %f3, %f12, %f11;
+    fma.rn.f32 %f12, %f11, %f13, %f12;
+    
     add.s32 %r16, %r16, 1;
-    bra BB_ATTN_OUT_DOT_LOOP;
-    
-BB_ATTN_OUT_DOT_DONE:
-    // o[base_idx + ti*D + d]
-    mul.lo.s32 %r22, %r2, %r7;
-    add.s32 %r22, %r22, %r17;
-    mul.wide.s32 %rd15, %r22, 4;
-    add.s64 %rd16, %rd4, %rd15;
-    st.global.f32 [%rd16], %f11;
-    add.s32 %r17, %r17, 1;
     bra BB_ATTN_OUT_LOOP;
     
 BB_ATTN_OUT_DONE:
+    add.s64 %rd14, %rd4, %rd6;
+    st.global.f32 [%rd14], %f12;
+    
 BB_ATTN_RET:
     ret;
 }
@@ -913,144 +1221,113 @@ BB_ATTN_RET:
     ld.param.u64 %rd7, [attn_bwd_param_6];
     ld.param.u64 %rd8, [attn_bwd_param_7];
     
-    // Load softmaxW từ s_matrix
     mov.u32 %r16, 0;
-BB_BWD_LOAD_S_LOOP:
+    
+BB_ATTN_BWD_LOAD_S_LOOP:
     setp.ge.u32 %p4, %r16, %r2;
-    @%p4 bra BB_BWD_LOAD_S_DONE;
+    @%p4 bra BB_ATTN_BWD_LOAD_S_DONE;
     
     mul.lo.s32 %r13, %r2, %r6;
-    add.s32 %r13, %r13, %r16;
-    mul.wide.s32 %rd9, %r13, 4;
+    add.s32 %r14, %r13, %r16;
+    mul.wide.s32 %rd9, %r14, 4;
     add.s64 %rd10, %rd4, %rd9;
     ld.global.f32 %f2, [%rd10];
     st.sreg.f32 softmaxW[%r16], %f2;
+    
     add.s32 %r16, %r16, 1;
-    bra BB_BWD_LOAD_S_LOOP;
+    bra BB_ATTN_BWD_LOAD_S_LOOP;
     
-BB_BWD_LOAD_S_DONE:
-    // === PASS 1: dSoftmax và dv ===
+BB_ATTN_BWD_LOAD_S_DONE:
+    
     mov.u32 %r16, 0;
-BB_BWD_DSOFTMAX_LOOP:
+    
+BB_ATTN_BWD_DSOFTMAX_LOOP:
     setp.ge.u32 %p4, %r16, %r2;
-    @%p4 bra BB_BWD_DSOFTMAX_DONE;
+    @%p4 bra BB_ATTN_BWD_DSOFTMAX_DONE;
     
-    mov.f32 %f3, 0f00000000;  // dotVal
-    mov.u32 %r17, 0;
+    mov.f32 %f3, 0f00000000;
     
-BB_BWD_DV_LOOP:
-    setp.ge.u32 %p5, %r17, %r7;
-    @%p5 bra BB_BWD_DV_DONE;
-    
-    // dy[ti*D + d]
-    mul.lo.s32 %r14, %r2, %r7;
-    add.s32 %r14, %r14, %r17;
-    mul.wide.s32 %rd11, %r14, 4;
+    mul.lo.s32 %r15, %r2, %r7;
+    add.s32 %r17, %r15, %r3;
+    mul.wide.s32 %rd11, %r17, 4;
     add.s64 %rd12, %rd5, %rd11;
-    ld.global.f32 %f4, [%rd12];
+    ld.global.nc.f32 %f4, [%rd12];
     
-    // dv[tj*D + d] += softmaxW[tj] * dy[ti*D + d]
-    mul.lo.s32 %r15, %r16, %r7;
-    add.s32 %r15, %r15, %r17;
-    mul.wide.s32 %rd13, %r15, 4;
-    add.s64 %rd14, %rd8, %rd13;
-    ld.global.f32 %f5, [%rd14];
+    ld.sreg.f32 %f5, softmaxW[%r16];
     
-    // dv += softmaxW[tj] * dyVal
-    ld.sreg.f32 %f6, softmaxW[%r16];
-    mul.f32 %f7, %f6, %f4;
-    add.f32 %f5, %f5, %f7;
-    st.global.f32 [%rd14], %f5;
-    
-    // dotVal += dyVal * v[tj*D + d]
     mul.lo.s32 %r18, %r16, %r7;
-    add.s32 %r18, %r18, %r17;
-    mul.wide.s32 %rd15, %r18, 4;
-    add.s64 %rd16, %rd3, %rd15;
-    ld.global.f32 %f8, [%rd16];
-    fma.rn.f32 %f3, %f4, %f8, %f3;
+    add.s32 %r19, %r18, %r3;
+    mul.wide.s32 %rd13, %r19, 4;
     
-    add.s32 %r17, %r17, 1;
-    bra BB_BWD_DV_LOOP;
+    add.s64 %rd14, %rd8, %rd13;
+    ld.global.f32 %f6, [%rd14];
+    fma.rn.f32 %f6, %f5, %f4, %f6;
+    st.global.f32 [%rd14], %f6;
     
-BB_BWD_DV_DONE:
+    add.s64 %rd15, %rd3, %rd13;
+    ld.global.nc.f32 %f7, [%rd15];
+    fma.rn.f32 %f3, %f4, %f7, %f3;
+    
     st.sreg.f32 dSoftmax[%r16], %f3;
+    
     add.s32 %r16, %r16, 1;
-    bra BB_BWD_DSOFTMAX_LOOP;
+    bra BB_ATTN_BWD_DSOFTMAX_LOOP;
     
-BB_BWD_DSOFTMAX_DONE:
-    // === PASS 2: dotSum ===
-    mov.f32 %f9, 0f00000000;
+BB_ATTN_BWD_DSOFTMAX_DONE:
+    
+    mov.f32 %f8, 0f00000000;
     mov.u32 %r16, 0;
-BB_BWD_DOTSUM_LOOP:
-    setp.ge.u32 %p4, %r16, %r2;
-    @%p4 bra BB_BWD_DOTSUM_DONE;
     
-    ld.sreg.f32 %f2, softmaxW[%r16];
+BB_ATTN_BWD_DOTSUM_LOOP:
+    setp.ge.u32 %p4, %r16, %r2;
+    @%p4 bra BB_ATTN_BWD_DOTSUM_DONE;
+    
+    ld.sreg.f32 %f5, softmaxW[%r16];
     ld.sreg.f32 %f3, dSoftmax[%r16];
-    fma.rn.f32 %f9, %f2, %f3, %f9;
+    fma.rn.f32 %f8, %f5, %f3, %f8;
+    
     add.s32 %r16, %r16, 1;
-    bra BB_BWD_DOTSUM_LOOP;
+    bra BB_ATTN_BWD_DOTSUM_LOOP;
     
-BB_BWD_DOTSUM_DONE:
-    // === PASS 3: dScore và dq/dk ===
+BB_ATTN_BWD_DOTSUM_DONE:
+    
     mov.u32 %r16, 0;
-BB_BWD_DSCORE_LOOP:
+    
+BB_ATTN_BWD_DSCORE_LOOP:
     setp.ge.u32 %p4, %r16, %r2;
-    @%p4 bra BB_BWD_DSCORE_DONE;
+    @%p4 bra BB_ATTN_BWD_DSCORE_DONE;
     
-    ld.sreg.f32 %f2, softmaxW[%r16];
+    ld.sreg.f32 %f5, softmaxW[%r16];
     ld.sreg.f32 %f3, dSoftmax[%r16];
-    sub.f32 %f10, %f3, %f9;
-    mul.f32 %f11, %f2, %f10;
-    mul.f32 %f11, %f11, %f1;  // * scale
+    sub.f32 %f9, %f3, %f8;
+    mul.f32 %f10, %f5, %f9;
+    mul.f32 %f10, %f10, %f1;
     
-    mov.u32 %r17, 0;
-BB_BWD_DK_LOOP:
-    setp.ge.u32 %p5, %r17, %r7;
-    @%p5 bra BB_BWD_DK_DONE;
+    add.s64 %rd16, %rd6, %rd11;
+    ld.global.f32 %f11, [%rd16];
     
-    // dq[ti*D + d] += dScore * k[tj*D + d]
-    mul.lo.s32 %r19, %r2, %r7;
-    add.s32 %r19, %r19, %r17;
-    mul.wide.s32 %rd17, %r19, 4;
-    add.s64 %rd18, %rd6, %rd17;
-    ld.global.f32 %f12, [%rd18];
-    
-    // k[tj*D + d]
     mul.lo.s32 %r20, %r16, %r7;
-    add.s32 %r20, %r20, %r17;
-    mul.wide.s32 %rd19, %r20, 4;
-    add.s64 %rd20, %rd2, %rd19;
-    ld.global.f32 %f13, [%rd20];
+    add.s32 %r21, %r20, %r3;
+    mul.wide.s32 %rd17, %r21, 4;
     
-    mul.f32 %f14, %f11, %f13;
-    add.f32 %f12, %f12, %f14;
-    st.global.f32 [%rd18], %f12;
+    add.s64 %rd18, %rd2, %rd17;
+    ld.global.nc.f32 %f12, [%rd18];
+    fma.rn.f32 %f11, %f10, %f12, %f11;
+    st.global.f32 [%rd16], %f11;
     
-    // dk[tj*D + d] += dScore * q[ti*D + d]
-    // q[ti*D + d]
-    mul.lo.s32 %r21, %r2, %r7;
-    add.s32 %r21, %r21, %r17;
-    mul.wide.s32 %rd21, %r21, 4;
-    add.s64 %rd22, %rd1, %rd21;
-    ld.global.f32 %f15, [%rd22];
+    add.s64 %rd19, %rd7, %rd17;
+    ld.global.f32 %f13, [%rd19];
     
-    mul.f32 %f16, %f11, %f15;
-    mul.wide.s32 %rd23, %r20, 4;
-    add.s64 %rd24, %rd7, %rd23;
-    ld.global.f32 %f17, [%rd24];
-    add.f32 %f17, %f17, %f16;
-    st.global.f32 [%rd24], %f17;
+    add.s64 %rd20, %rd1, %rd11;
+    ld.global.nc.f32 %f14, [%rd20];
+    fma.rn.f32 %f13, %f10, %f14, %f13;
+    st.global.f32 [%rd19], %f13;
     
-    add.s32 %r17, %r17, 1;
-    bra BB_BWD_DK_LOOP;
-    
-BB_BWD_DK_DONE:
     add.s32 %r16, %r16, 1;
-    bra BB_BWD_DSCORE_LOOP;
+    bra BB_ATTN_BWD_DSCORE_LOOP;
     
-BB_BWD_DSCORE_DONE:
+BB_ATTN_BWD_DSCORE_DONE:
+    
 BB_ATTN_BWD_RET:
     ret;
 }
