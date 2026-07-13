@@ -1024,141 +1024,243 @@ BB_LN_BWD_RET:
     .param .f32 attn_param_9
 )
 {
-    .reg .pred %p<6>;
-    .reg .b32 %r<25>;
-    .reg .f32 %f<20>;
-    .reg .b64 %rd<20>;
-    .reg .f32 scores[256];
-    
-    mov.u32 %r1, %ctaid.x;
-    mov.u32 %r2, %ctaid.y;
-    mov.u32 %r3, %tid.x;
-    
-    ld.param.u32 %r4, [attn_param_5];
-    ld.param.u32 %r5, [attn_param_6];
-    ld.param.u32 %r6, [attn_param_7];
-    ld.param.u32 %r7, [attn_param_8];
-    ld.param.f32 %f1, [attn_param_9];
-    
-    mul.lo.s32 %r8, %r4, %r5;
-    setp.ge.u32 %p1, %r1, %r8;
+    .reg .pred %p<10>;
+    .reg .b32 %r<100>;
+    .reg .f32 %f<60>;
+    .reg .b64 %rd<60>;
+    .shared .align 4 .f32 scores[256];
+    .shared .align 4 .f32 redBuf[512];
+
+    // grid = (B*H, S, 1) ; block = (blockSize, 1, 1)
+    // moi block xu ly 1 hang query (bh, i), song song hoa qua cac thread theo j (key) va d (dim)
+    mov.u32 %r1, %ctaid.x;      // bh
+    mov.u32 %r2, %ctaid.y;      // i (query row)
+    mov.u32 %r3, %tid.x;        // t
+    mov.u32 %r4, %ntid.x;       // blockDim
+
+    ld.param.u32 %r5, [attn_param_5];   // B
+    ld.param.u32 %r6, [attn_param_6];   // H
+    ld.param.u32 %r7, [attn_param_7];   // S (seqlen)
+    ld.param.u32 %r8, [attn_param_8];   // D (head dim)
+    ld.param.f32 %f1, [attn_param_9];   // scale
+
+    mul.lo.s32 %r9, %r5, %r6;           // B*H
+    setp.ge.u32 %p1, %r1, %r9;
     @%p1 bra BB_ATTN_RET;
-    setp.ge.u32 %p2, %r2, %r6;
+    setp.ge.u32 %p2, %r2, %r7;
     @%p2 bra BB_ATTN_RET;
-    setp.ge.u32 %p3, %r3, %r7;
-    @%p3 bra BB_ATTN_RET;
-    
-    mul.lo.s32 %r9, %r8, %r6;
-    mul.lo.s32 %r10, %r9, %r7;
-    mul.lo.s32 %r11, %r8, %r6;
-    mul.lo.s32 %r12, %r11, %r6;
-    
-    ld.param.u64 %rd1, [attn_param_0];
-    ld.param.u64 %rd2, [attn_param_1];
-    ld.param.u64 %rd3, [attn_param_2];
-    ld.param.u64 %rd4, [attn_param_3];
-    ld.param.u64 %rd5, [attn_param_4];
-    
-    mov.u32 %r13, %r2;
-    mov.u32 %r14, %r3;
-    
-    mul.lo.s32 %r15, %r2, %r7;
-    add.s32 %r15, %r15, %r3;
-    mul.wide.s32 %rd6, %r15, 4;
-    
-    mov.f32 %f2, 0fFF800000;
-    mov.u32 %r16, 0;
-    
+
+    ld.param.u64 %rd1, [attn_param_0];  // Q
+    ld.param.u64 %rd2, [attn_param_1];  // K
+    ld.param.u64 %rd3, [attn_param_2];  // V
+    ld.param.u64 %rd4, [attn_param_3];  // Out
+    ld.param.u64 %rd5, [attn_param_4];  // S_matrix
+
+    mov.u64 %rd6, scores;
+    mov.u64 %rd7, redBuf;
+
+    mul.lo.s32 %r10, %r1, %r7;          // bh*S
+    add.s32 %r11, %r10, %r2;            // rowIdx = bh*S+i
+    mul.lo.s32 %r12, %r11, %r8;         // rowIdx*D
+    mul.lo.s32 %r13, %r11, %r7;         // rowIdx*S
+
+    mul.wide.s32 %rd8, %r12, 4;
+    add.s64 %rd9, %rd1, %rd8;           // &Q[i,0]
+    add.s64 %rd10, %rd4, %rd8;          // &Out[i,0]
+    mul.wide.s32 %rd11, %r13, 4;
+    add.s64 %rd12, %rd5, %rd11;         // &S_matrix[i,0]
+
+    // ================= PHASE A: scores[j] = scale * Q_i . K_j =================
+    mov.f32 %f2, 0fFF800000;            // threadMax = -inf
+    mov.u32 %r14, %r3;                  // j = t
+
 BB_ATTN_SCORE_LOOP:
-    setp.ge.u32 %p4, %r16, %r2;
-    @%p4 bra BB_ATTN_SCORE_DONE;
-    
-    mul.lo.s32 %r17, %r16, %r7;
-    add.s32 %r18, %r17, %r3;
-    mul.wide.s32 %rd7, %r18, 4;
-    
-    add.s64 %rd8, %rd1, %rd6;
-    ld.global.nc.f32 %f3, [%rd8];
-    
-    add.s64 %rd9, %rd2, %rd7;
-    ld.global.nc.f32 %f4, [%rd9];
-    
-    mul.f32 %f5, %f3, %f4;
-    add.f32 %f6, %f6, %f5;
-    
-    add.s32 %r16, %r16, 1;
+    setp.ge.u32 %p3, %r14, %r7;
+    @%p3 bra BB_ATTN_SCORE_DONE;
+
+    add.s32 %r15, %r10, %r14;           // bh*S + j
+    mul.lo.s32 %r16, %r15, %r8;         // (bh*S+j)*D
+    mul.wide.s32 %rd13, %r16, 4;
+    add.s64 %rd14, %rd2, %rd13;         // &K[j,0]
+
+    mov.f32 %f3, 0f00000000;            // dot accum
+    mov.u32 %r17, 0;                    // d
+
+BB_ATTN_DOT_LOOP:
+    setp.ge.u32 %p3, %r17, %r8;
+    @%p3 bra BB_ATTN_DOT_DONE;
+
+    mul.wide.s32 %rd15, %r17, 4;
+    add.s64 %rd16, %rd9, %rd15;
+    ld.global.nc.f32 %f4, [%rd16];      // Q[i,d]
+    add.s64 %rd17, %rd14, %rd15;
+    ld.global.nc.f32 %f5, [%rd17];      // K[j,d]
+    fma.rn.f32 %f3, %f4, %f5, %f3;
+
+    add.s32 %r17, %r17, 1;
+    bra BB_ATTN_DOT_LOOP;
+
+BB_ATTN_DOT_DONE:
+    mul.f32 %f3, %f3, %f1;              // *scale
+
+    mul.wide.s32 %rd18, %r14, 4;
+    add.s64 %rd19, %rd6, %rd18;
+    st.shared.f32 [%rd19], %f3;         // scores[j] = score
+
+    setp.gt.f32 %p3, %f3, %f2;
+    selp.f32 %f2, %f3, %f2, %p3;        // threadMax = max(threadMax, score)
+
+    add.s32 %r14, %r14, %r4;            // j += ntid
     bra BB_ATTN_SCORE_LOOP;
-    
+
 BB_ATTN_SCORE_DONE:
-    mul.f32 %f6, %f6, %f1;
-    st.sreg.f32 scores[%r16], %f6;
-    setp.gt.f32 %p5, %f6, %f2;
-    selp.f32 %f2, %f6, %f2, %p5;
-    
-    mov.f32 %f7, 0f00000000;
-    mov.u32 %r16, 0;
-    
+
+    // ---- block-wide max reduction ----
+    mul.wide.s32 %rd20, %r3, 4;
+    add.s64 %rd21, %rd7, %rd20;
+    st.shared.f32 [%rd21], %f2;         // redBuf[t] = threadMax
+    bar.sync 0;
+
+    shr.u32 %r18, %r4, 1;               // stride = blockDim/2
+
+BB_ATTN_MAXRED_LOOP:
+    setp.eq.u32 %p3, %r18, 0;
+    @%p3 bra BB_ATTN_MAXRED_DONE;
+
+    setp.ge.u32 %p4, %r3, %r18;
+    @%p4 bra BB_ATTN_MAXRED_SKIP;
+
+    add.s32 %r19, %r3, %r18;            // t+stride
+    mul.wide.s32 %rd22, %r19, 4;
+    add.s64 %rd23, %rd7, %rd22;
+    ld.shared.f32 %f6, [%rd23];         // redBuf[t+stride]
+    ld.shared.f32 %f7, [%rd21];         // redBuf[t]
+    setp.gt.f32 %p5, %f6, %f7;
+    selp.f32 %f8, %f6, %f7, %p5;
+    st.shared.f32 [%rd21], %f8;
+
+BB_ATTN_MAXRED_SKIP:
+    bar.sync 0;
+    shr.u32 %r18, %r18, 1;
+    bra BB_ATTN_MAXRED_LOOP;
+
+BB_ATTN_MAXRED_DONE:
+    ld.shared.f32 %f9, [%rd7];          // blockMax = redBuf[0]
+
+    // ================= PHASE B: exponentiate =================
+    mov.f32 %f10, 0f00000000;           // threadSum
+    mov.u32 %r14, %r3;                  // j = t
+
 BB_ATTN_EXP_LOOP:
-    setp.ge.u32 %p4, %r16, %r2;
-    @%p4 bra BB_ATTN_EXP_DONE;
-    
-    ld.sreg.f32 %f6, scores[%r16];
-    sub.f32 %f8, %f6, %f2;
-    mul.f32 %f8, %f8, 0f3fb8aa3b;
-    ex2.approx.f32 %f9, %f8;
-    st.sreg.f32 scores[%r16], %f9;
-    add.f32 %f7, %f7, %f9;
-    
-    add.s32 %r16, %r16, 1;
+    setp.ge.u32 %p3, %r14, %r7;
+    @%p3 bra BB_ATTN_EXP_DONE;
+
+    mul.wide.s32 %rd18, %r14, 4;
+    add.s64 %rd19, %rd6, %rd18;
+    ld.shared.f32 %f11, [%rd19];
+    sub.f32 %f11, %f11, %f9;
+    mul.f32 %f11, %f11, 0f3fb8aa3b;     // * log2(e)
+    ex2.approx.f32 %f12, %f11;
+    st.shared.f32 [%rd19], %f12;
+    add.f32 %f10, %f10, %f12;
+
+    add.s32 %r14, %r14, %r4;
     bra BB_ATTN_EXP_LOOP;
-    
+
 BB_ATTN_EXP_DONE:
-    rcp.approx.f32 %f10, %f7;
-    
-    mov.u32 %r16, 0;
-    
+
+    // ---- block-wide sum reduction ----
+    st.shared.f32 [%rd21], %f10;        // redBuf[t] = threadSum
+    bar.sync 0;
+
+    shr.u32 %r18, %r4, 1;
+
+BB_ATTN_SUMRED_LOOP:
+    setp.eq.u32 %p3, %r18, 0;
+    @%p3 bra BB_ATTN_SUMRED_DONE;
+
+    setp.ge.u32 %p4, %r3, %r18;
+    @%p4 bra BB_ATTN_SUMRED_SKIP;
+
+    add.s32 %r19, %r3, %r18;
+    mul.wide.s32 %rd22, %r19, 4;
+    add.s64 %rd23, %rd7, %rd22;
+    ld.shared.f32 %f6, [%rd23];
+    ld.shared.f32 %f7, [%rd21];
+    add.f32 %f8, %f6, %f7;
+    st.shared.f32 [%rd21], %f8;
+
+BB_ATTN_SUMRED_SKIP:
+    bar.sync 0;
+    shr.u32 %r18, %r18, 1;
+    bra BB_ATTN_SUMRED_LOOP;
+
+BB_ATTN_SUMRED_DONE:
+    ld.shared.f32 %f13, [%rd7];         // blockSum = redBuf[0]
+    rcp.approx.f32 %f14, %f13;          // invSum
+
+    // ================= PHASE C: normalize + write S_matrix =================
+    mov.u32 %r14, %r3;                  // j = t
+
 BB_ATTN_NORM_LOOP:
-    setp.ge.u32 %p4, %r16, %r2;
-    @%p4 bra BB_ATTN_NORM_DONE;
-    
-    ld.sreg.f32 %f9, scores[%r16];
-    mul.f32 %f11, %f9, %f10;
-    
-    mul.lo.s32 %r19, %r2, %r6;
-    add.s32 %r20, %r19, %r16;
-    mul.wide.s32 %rd10, %r20, 4;
-    add.s64 %rd11, %rd5, %rd10;
-    st.global.f32 [%rd11], %f11;
-    
-    add.s32 %r16, %r16, 1;
+    setp.ge.u32 %p3, %r14, %r7;
+    @%p3 bra BB_ATTN_NORM_DONE;
+
+    mul.wide.s32 %rd18, %r14, 4;
+    add.s64 %rd19, %rd6, %rd18;
+    ld.shared.f32 %f15, [%rd19];
+    mul.f32 %f15, %f15, %f14;
+    st.shared.f32 [%rd19], %f15;        // scores[j] = softmax weight
+
+    add.s64 %rd24, %rd12, %rd18;
+    st.global.f32 [%rd24], %f15;        // S_matrix[i,j] = weight
+
+    add.s32 %r14, %r14, %r4;
     bra BB_ATTN_NORM_LOOP;
-    
+
 BB_ATTN_NORM_DONE:
-    
-    mov.u32 %r16, 0;
-    mov.f32 %f12, 0f00000000;
-    
-BB_ATTN_OUT_LOOP:
-    setp.ge.u32 %p4, %r16, %r2;
-    @%p4 bra BB_ATTN_OUT_DONE;
-    
-    ld.sreg.f32 %f11, scores[%r16];
-    
-    mul.lo.s32 %r21, %r16, %r7;
-    add.s32 %r22, %r21, %r3;
-    mul.wide.s32 %rd12, %r22, 4;
-    add.s64 %rd13, %rd3, %rd12;
-    ld.global.nc.f32 %f13, [%rd13];
-    
-    fma.rn.f32 %f12, %f11, %f13, %f12;
-    
-    add.s32 %r16, %r16, 1;
-    bra BB_ATTN_OUT_LOOP;
-    
-BB_ATTN_OUT_DONE:
-    add.s64 %rd14, %rd4, %rd6;
-    st.global.f32 [%rd14], %f12;
-    
+    bar.sync 0;                         // dam bao scores[] ghi xong truoc khi Phase D doc
+
+    // ================= PHASE D: Out[i,d] = sum_j weight_j * V[j,d] =================
+    mov.u32 %r20, %r3;                  // d = t
+
+BB_ATTN_OUT_D_LOOP:
+    setp.ge.u32 %p3, %r20, %r8;
+    @%p3 bra BB_ATTN_OUT_D_DONE;
+
+    mov.f32 %f16, 0f00000000;           // acc
+    mov.u32 %r14, 0;                    // j
+
+BB_ATTN_OUT_J_LOOP:
+    setp.ge.u32 %p3, %r14, %r7;
+    @%p3 bra BB_ATTN_OUT_J_DONE;
+
+    mul.wide.s32 %rd18, %r14, 4;
+    add.s64 %rd19, %rd6, %rd18;
+    ld.shared.f32 %f17, [%rd19];        // weight_j
+
+    add.s32 %r15, %r10, %r14;           // bh*S+j
+    mul.lo.s32 %r16, %r15, %r8;
+    add.s32 %r21, %r16, %r20;           // (bh*S+j)*D + d
+    mul.wide.s32 %rd25, %r21, 4;
+    add.s64 %rd26, %rd3, %rd25;
+    ld.global.nc.f32 %f18, [%rd26];     // V[j,d]
+
+    fma.rn.f32 %f16, %f17, %f18, %f16;
+
+    add.s32 %r14, %r14, 1;
+    bra BB_ATTN_OUT_J_LOOP;
+
+BB_ATTN_OUT_J_DONE:
+    mul.wide.s32 %rd27, %r20, 4;
+    add.s64 %rd28, %rd10, %rd27;
+    st.global.f32 [%rd28], %f16;        // Out[i,d] = acc
+
+    add.s32 %r20, %r20, %r4;            // d += ntid
+    bra BB_ATTN_OUT_D_LOOP;
+
+BB_ATTN_OUT_D_DONE:
+
 BB_ATTN_RET:
     ret;
 }
@@ -1182,152 +1284,267 @@ BB_ATTN_RET:
     .param .f32 attn_bwd_param_12
 )
 {
-    .reg .pred %p<6>;
-    .reg .b32 %r<25>;
-    .reg .f32 %f<20>;
-    .reg .b64 %rd<21>;
-    .reg .f32 softmaxW[256];
-    .reg .f32 dSoftmax[256];
-    
-    mov.u32 %r1, %ctaid.x;
-    mov.u32 %r2, %ctaid.y;
-    mov.u32 %r3, %tid.x;
-    
-    ld.param.u32 %r4, [attn_bwd_param_8];
-    ld.param.u32 %r5, [attn_bwd_param_9];
-    ld.param.u32 %r6, [attn_bwd_param_10];
-    ld.param.u32 %r7, [attn_bwd_param_11];
-    ld.param.f32 %f1, [attn_bwd_param_12];
-    
-    mul.lo.s32 %r8, %r4, %r5;
-    setp.ge.u32 %p1, %r1, %r8;
+    .reg .pred %p<10>;
+    .reg .b32 %r<100>;
+    .reg .f32 %f<60>;
+    .reg .b64 %rd<60>;
+    .shared .align 4 .f32 softmaxW[256];
+    .shared .align 4 .f32 dScoreArr[256];
+    .shared .align 4 .f32 redBuf[512];
+
+    // grid = (B*H, S, 1) ; block = (blockSize, 1, 1)
+    // moi block xu ly grad cho 1 hang query (bh, i). dK/dV cong don qua nhieu block -> dung atomic add.
+    mov.u32 %r1, %ctaid.x;      // bh
+    mov.u32 %r2, %ctaid.y;      // i
+    mov.u32 %r3, %tid.x;        // t
+    mov.u32 %r4, %ntid.x;       // blockDim
+
+    ld.param.u32 %r5, [attn_bwd_param_8];   // B
+    ld.param.u32 %r6, [attn_bwd_param_9];   // H
+    ld.param.u32 %r7, [attn_bwd_param_10];  // S
+    ld.param.u32 %r8, [attn_bwd_param_11];  // D
+    ld.param.f32 %f1, [attn_bwd_param_12];  // scale
+
+    mul.lo.s32 %r9, %r5, %r6;           // B*H
+    setp.ge.u32 %p1, %r1, %r9;
     @%p1 bra BB_ATTN_BWD_RET;
-    setp.ge.u32 %p2, %r2, %r6;
+    setp.ge.u32 %p2, %r2, %r7;
     @%p2 bra BB_ATTN_BWD_RET;
-    setp.ge.u32 %p3, %r3, %r7;
-    @%p3 bra BB_ATTN_BWD_RET;
-    
-    mul.lo.s32 %r9, %r8, %r6;
-    mul.lo.s32 %r10, %r9, %r7;
-    mul.lo.s32 %r11, %r8, %r6;
-    mul.lo.s32 %r12, %r11, %r6;
-    
-    ld.param.u64 %rd1, [attn_bwd_param_0];
-    ld.param.u64 %rd2, [attn_bwd_param_1];
-    ld.param.u64 %rd3, [attn_bwd_param_2];
-    ld.param.u64 %rd4, [attn_bwd_param_3];
-    ld.param.u64 %rd5, [attn_bwd_param_4];
-    ld.param.u64 %rd6, [attn_bwd_param_5];
-    ld.param.u64 %rd7, [attn_bwd_param_6];
-    ld.param.u64 %rd8, [attn_bwd_param_7];
-    
-    mov.u32 %r16, 0;
-    
-BB_ATTN_BWD_LOAD_S_LOOP:
-    setp.ge.u32 %p4, %r16, %r2;
-    @%p4 bra BB_ATTN_BWD_LOAD_S_DONE;
-    
-    mul.lo.s32 %r13, %r2, %r6;
-    add.s32 %r14, %r13, %r16;
-    mul.wide.s32 %rd9, %r14, 4;
-    add.s64 %rd10, %rd4, %rd9;
-    ld.global.f32 %f2, [%rd10];
-    st.sreg.f32 softmaxW[%r16], %f2;
-    
-    add.s32 %r16, %r16, 1;
-    bra BB_ATTN_BWD_LOAD_S_LOOP;
-    
-BB_ATTN_BWD_LOAD_S_DONE:
-    
-    mov.u32 %r16, 0;
-    
-BB_ATTN_BWD_DSOFTMAX_LOOP:
-    setp.ge.u32 %p4, %r16, %r2;
-    @%p4 bra BB_ATTN_BWD_DSOFTMAX_DONE;
-    
-    mov.f32 %f3, 0f00000000;
-    
-    mul.lo.s32 %r15, %r2, %r7;
-    add.s32 %r17, %r15, %r3;
-    mul.wide.s32 %rd11, %r17, 4;
-    add.s64 %rd12, %rd5, %rd11;
-    ld.global.nc.f32 %f4, [%rd12];
-    
-    ld.sreg.f32 %f5, softmaxW[%r16];
-    
-    mul.lo.s32 %r18, %r16, %r7;
-    add.s32 %r19, %r18, %r3;
-    mul.wide.s32 %rd13, %r19, 4;
-    
-    add.s64 %rd14, %rd8, %rd13;
-    ld.global.f32 %f6, [%rd14];
-    fma.rn.f32 %f6, %f5, %f4, %f6;
-    st.global.f32 [%rd14], %f6;
-    
-    add.s64 %rd15, %rd3, %rd13;
-    ld.global.nc.f32 %f7, [%rd15];
-    fma.rn.f32 %f3, %f4, %f7, %f3;
-    
-    st.sreg.f32 dSoftmax[%r16], %f3;
-    
-    add.s32 %r16, %r16, 1;
-    bra BB_ATTN_BWD_DSOFTMAX_LOOP;
-    
-BB_ATTN_BWD_DSOFTMAX_DONE:
-    
-    mov.f32 %f8, 0f00000000;
-    mov.u32 %r16, 0;
-    
-BB_ATTN_BWD_DOTSUM_LOOP:
-    setp.ge.u32 %p4, %r16, %r2;
-    @%p4 bra BB_ATTN_BWD_DOTSUM_DONE;
-    
-    ld.sreg.f32 %f5, softmaxW[%r16];
-    ld.sreg.f32 %f3, dSoftmax[%r16];
-    fma.rn.f32 %f8, %f5, %f3, %f8;
-    
-    add.s32 %r16, %r16, 1;
-    bra BB_ATTN_BWD_DOTSUM_LOOP;
-    
-BB_ATTN_BWD_DOTSUM_DONE:
-    
-    mov.u32 %r16, 0;
-    
+
+    ld.param.u64 %rd1, [attn_bwd_param_0];  // Q
+    ld.param.u64 %rd2, [attn_bwd_param_1];  // K
+    ld.param.u64 %rd3, [attn_bwd_param_2];  // V
+    ld.param.u64 %rd4, [attn_bwd_param_3];  // S_matrix
+    ld.param.u64 %rd5, [attn_bwd_param_4];  // dY
+    ld.param.u64 %rd6, [attn_bwd_param_5];  // dQ
+    ld.param.u64 %rd7, [attn_bwd_param_6];  // dK
+    ld.param.u64 %rd8, [attn_bwd_param_7];  // dV
+
+    mov.u64 %rd9, softmaxW;
+    mov.u64 %rd10, dScoreArr;
+    mov.u64 %rd11, redBuf;
+
+    mul.lo.s32 %r10, %r1, %r7;          // bh*S
+    add.s32 %r11, %r10, %r2;            // rowIdx = bh*S+i
+    mul.lo.s32 %r12, %r11, %r8;         // rowIdx*D
+    mul.lo.s32 %r13, %r11, %r7;         // rowIdx*S
+
+    mul.wide.s32 %rd12, %r12, 4;
+    add.s64 %rd13, %rd1, %rd12;         // &Q[i,0]
+    add.s64 %rd14, %rd5, %rd12;         // &dY[i,0]
+    add.s64 %rd15, %rd6, %rd12;         // &dQ[i,0]
+    mul.wide.s32 %rd16, %r13, 4;
+    add.s64 %rd17, %rd4, %rd16;         // &S_matrix[i,0]
+
+    // ================= PHASE A: softmaxW[j]=S_ij ; dScoreArr[j]=dS_ij=dY_i.V_j =================
+    mov.u32 %r14, %r3;                  // j = t
+
+BB_ATTN_BWD_LOAD_LOOP:
+    setp.ge.u32 %p3, %r14, %r7;
+    @%p3 bra BB_ATTN_BWD_LOAD_DONE;
+
+    mul.wide.s32 %rd18, %r14, 4;
+    add.s64 %rd19, %rd17, %rd18;
+    ld.global.f32 %f2, [%rd19];         // S_ij
+    add.s64 %rd20, %rd9, %rd18;
+    st.shared.f32 [%rd20], %f2;         // softmaxW[j] = S_ij
+
+    add.s32 %r15, %r10, %r14;           // bh*S+j
+    mul.lo.s32 %r16, %r15, %r8;         // (bh*S+j)*D
+    mul.wide.s32 %rd21, %r16, 4;
+    add.s64 %rd22, %rd3, %rd21;         // &V[j,0]
+
+    mov.f32 %f3, 0f00000000;            // dS accum
+    mov.u32 %r17, 0;                    // d
+
+BB_ATTN_BWD_DS_LOOP:
+    setp.ge.u32 %p3, %r17, %r8;
+    @%p3 bra BB_ATTN_BWD_DS_DONE;
+
+    mul.wide.s32 %rd23, %r17, 4;
+    add.s64 %rd24, %rd14, %rd23;
+    ld.global.nc.f32 %f4, [%rd24];      // dY[i,d]
+    add.s64 %rd25, %rd22, %rd23;
+    ld.global.nc.f32 %f5, [%rd25];      // V[j,d]
+    fma.rn.f32 %f3, %f4, %f5, %f3;
+
+    add.s32 %r17, %r17, 1;
+    bra BB_ATTN_BWD_DS_LOOP;
+
+BB_ATTN_BWD_DS_DONE:
+    add.s64 %rd26, %rd10, %rd18;
+    st.shared.f32 [%rd26], %f3;         // dScoreArr[j] = dS_ij (tam)
+
+    add.s32 %r14, %r14, %r4;            // j += ntid
+    bra BB_ATTN_BWD_LOAD_LOOP;
+
+BB_ATTN_BWD_LOAD_DONE:
+    bar.sync 0;                         // dam bao softmaxW/dScoreArr day du truoc khi reduce
+
+    // ================= PHASE B: rowdot = sum_j softmaxW[j]*dScoreArr[j] =================
+    mov.f32 %f6, 0f00000000;            // threadDot
+    mov.u32 %r14, %r3;                  // j = t
+
+BB_ATTN_BWD_DOT_LOOP:
+    setp.ge.u32 %p3, %r14, %r7;
+    @%p3 bra BB_ATTN_BWD_DOT_DONE;
+
+    mul.wide.s32 %rd18, %r14, 4;
+    add.s64 %rd20, %rd9, %rd18;
+    ld.shared.f32 %f7, [%rd20];         // softmaxW[j]
+    add.s64 %rd26, %rd10, %rd18;
+    ld.shared.f32 %f8, [%rd26];         // dScoreArr[j] (dS_ij)
+    fma.rn.f32 %f6, %f7, %f8, %f6;
+
+    add.s32 %r14, %r14, %r4;
+    bra BB_ATTN_BWD_DOT_LOOP;
+
+BB_ATTN_BWD_DOT_DONE:
+
+    // ---- block-wide sum reduction -> rowdot ----
+    mul.wide.s32 %rd27, %r3, 4;
+    add.s64 %rd28, %rd11, %rd27;
+    st.shared.f32 [%rd28], %f6;         // redBuf[t] = threadDot
+    bar.sync 0;
+
+    shr.u32 %r18, %r4, 1;
+
+BB_ATTN_BWD_SUMRED_LOOP:
+    setp.eq.u32 %p3, %r18, 0;
+    @%p3 bra BB_ATTN_BWD_SUMRED_DONE;
+
+    setp.ge.u32 %p4, %r3, %r18;
+    @%p4 bra BB_ATTN_BWD_SUMRED_SKIP;
+
+    add.s32 %r19, %r3, %r18;
+    mul.wide.s32 %rd29, %r19, 4;
+    add.s64 %rd30, %rd11, %rd29;
+    ld.shared.f32 %f9, [%rd30];
+    ld.shared.f32 %f10, [%rd28];
+    add.f32 %f11, %f9, %f10;
+    st.shared.f32 [%rd28], %f11;
+
+BB_ATTN_BWD_SUMRED_SKIP:
+    bar.sync 0;
+    shr.u32 %r18, %r18, 1;
+    bra BB_ATTN_BWD_SUMRED_LOOP;
+
+BB_ATTN_BWD_SUMRED_DONE:
+    ld.shared.f32 %f12, [%rd11];        // rowdot = redBuf[0]
+
+    // ================= PHASE C: dScoreArr[j] = softmaxW[j]*(dScoreArr[j]-rowdot) =================
+    mov.u32 %r14, %r3;                  // j = t
+
 BB_ATTN_BWD_DSCORE_LOOP:
-    setp.ge.u32 %p4, %r16, %r2;
-    @%p4 bra BB_ATTN_BWD_DSCORE_DONE;
-    
-    ld.sreg.f32 %f5, softmaxW[%r16];
-    ld.sreg.f32 %f3, dSoftmax[%r16];
-    sub.f32 %f9, %f3, %f8;
-    mul.f32 %f10, %f5, %f9;
-    mul.f32 %f10, %f10, %f1;
-    
-    add.s64 %rd16, %rd6, %rd11;
-    ld.global.f32 %f11, [%rd16];
-    
-    mul.lo.s32 %r20, %r16, %r7;
-    add.s32 %r21, %r20, %r3;
-    mul.wide.s32 %rd17, %r21, 4;
-    
-    add.s64 %rd18, %rd2, %rd17;
-    ld.global.nc.f32 %f12, [%rd18];
-    fma.rn.f32 %f11, %f10, %f12, %f11;
-    st.global.f32 [%rd16], %f11;
-    
-    add.s64 %rd19, %rd7, %rd17;
-    ld.global.f32 %f13, [%rd19];
-    
-    add.s64 %rd20, %rd1, %rd11;
-    ld.global.nc.f32 %f14, [%rd20];
-    fma.rn.f32 %f13, %f10, %f14, %f13;
-    st.global.f32 [%rd19], %f13;
-    
-    add.s32 %r16, %r16, 1;
+    setp.ge.u32 %p3, %r14, %r7;
+    @%p3 bra BB_ATTN_BWD_DSCORE_DONE;
+
+    mul.wide.s32 %rd18, %r14, 4;
+    add.s64 %rd20, %rd9, %rd18;
+    ld.shared.f32 %f13, [%rd20];        // softmaxW[j]
+    add.s64 %rd26, %rd10, %rd18;
+    ld.shared.f32 %f14, [%rd26];        // dS_ij
+    sub.f32 %f15, %f14, %f12;
+    mul.f32 %f15, %f13, %f15;
+    st.shared.f32 [%rd26], %f15;        // dScoreArr[j] = dScore cuoi cung
+
+    add.s32 %r14, %r14, %r4;
     bra BB_ATTN_BWD_DSCORE_LOOP;
-    
+
 BB_ATTN_BWD_DSCORE_DONE:
-    
+    bar.sync 0;                         // dam bao dScoreArr[] day du truoc Phase D/E
+
+    // ================= PHASE D: dQ[i,d] = scale * sum_j dScoreArr[j]*K[j,d] =================
+    mov.u32 %r20, %r3;                  // d = t
+
+BB_ATTN_BWD_DQ_D_LOOP:
+    setp.ge.u32 %p3, %r20, %r8;
+    @%p3 bra BB_ATTN_BWD_DQ_D_DONE;
+
+    mov.f32 %f16, 0f00000000;           // acc
+    mov.u32 %r14, 0;                    // j
+
+BB_ATTN_BWD_DQ_J_LOOP:
+    setp.ge.u32 %p3, %r14, %r7;
+    @%p3 bra BB_ATTN_BWD_DQ_J_DONE;
+
+    mul.wide.s32 %rd18, %r14, 4;
+    add.s64 %rd26, %rd10, %rd18;
+    ld.shared.f32 %f17, [%rd26];        // dScoreArr[j]
+
+    add.s32 %r15, %r10, %r14;           // bh*S+j
+    mul.lo.s32 %r16, %r15, %r8;
+    add.s32 %r21, %r16, %r20;           // (bh*S+j)*D + d
+    mul.wide.s32 %rd31, %r21, 4;
+    add.s64 %rd32, %rd2, %rd31;
+    ld.global.nc.f32 %f18, [%rd32];     // K[j,d]
+
+    fma.rn.f32 %f16, %f17, %f18, %f16;
+
+    add.s32 %r14, %r14, 1;
+    bra BB_ATTN_BWD_DQ_J_LOOP;
+
+BB_ATTN_BWD_DQ_J_DONE:
+    mul.f32 %f16, %f16, %f1;            // * scale
+    mul.wide.s32 %rd33, %r20, 4;
+    add.s64 %rd34, %rd15, %rd33;
+    st.global.f32 [%rd34], %f16;        // dQ[i,d] = acc (khong dung, moi block ghi rieng)
+
+    add.s32 %r20, %r20, %r4;            // d += ntid
+    bra BB_ATTN_BWD_DQ_D_LOOP;
+
+BB_ATTN_BWD_DQ_D_DONE:
+
+    // ================= PHASE E: dK[j,d] += dScoreArr[j]*scale*Q[i,d] ; dV[j,d] += softmaxW[j]*dY[i,d] =================
+    // (nhieu block khac nhau (bh cung, i khac) co the ghi cung [j,d] -> BAT BUOC atomic)
+    mov.u32 %r14, %r3;                  // j = t
+
+BB_ATTN_BWD_DKV_J_LOOP:
+    setp.ge.u32 %p3, %r14, %r7;
+    @%p3 bra BB_ATTN_BWD_DKV_J_DONE;
+
+    mul.wide.s32 %rd18, %r14, 4;
+    add.s64 %rd26, %rd10, %rd18;
+    ld.shared.f32 %f19, [%rd26];        // dScoreArr[j]
+    mul.f32 %f20, %f19, %f1;            // dScoreArr[j]*scale
+
+    add.s64 %rd20, %rd9, %rd18;
+    ld.shared.f32 %f21, [%rd20];        // softmaxW[j]
+
+    add.s32 %r15, %r10, %r14;           // bh*S+j
+    mul.lo.s32 %r16, %r15, %r8;         // (bh*S+j)*D
+
+    mov.u32 %r22, 0;                    // d
+
+BB_ATTN_BWD_DKV_D_LOOP:
+    setp.ge.u32 %p3, %r22, %r8;
+    @%p3 bra BB_ATTN_BWD_DKV_D_DONE;
+
+    add.s32 %r23, %r16, %r22;           // (bh*S+j)*D + d
+    mul.wide.s32 %rd35, %r23, 4;
+
+    mul.wide.s32 %rd36, %r22, 4;
+    add.s64 %rd37, %rd13, %rd36;
+    ld.global.nc.f32 %f22, [%rd37];     // Q[i,d]
+    mul.f32 %f23, %f20, %f22;           // dScoreArr[j]*scale*Q[i,d]
+    add.s64 %rd38, %rd7, %rd35;
+    atom.global.add.f32 %f24, [%rd38], %f23;   // dK[j,d] += ...
+
+    add.s64 %rd39, %rd14, %rd36;
+    ld.global.nc.f32 %f25, [%rd39];     // dY[i,d]
+    mul.f32 %f26, %f21, %f25;           // softmaxW[j]*dY[i,d]
+    add.s64 %rd40, %rd8, %rd35;
+    atom.global.add.f32 %f27, [%rd40], %f26;   // dV[j,d] += ...
+
+    add.s32 %r22, %r22, 1;
+    bra BB_ATTN_BWD_DKV_D_LOOP;
+
+BB_ATTN_BWD_DKV_D_DONE:
+    add.s32 %r14, %r14, %r4;            // j += ntid
+    bra BB_ATTN_BWD_DKV_J_LOOP;
+
+BB_ATTN_BWD_DKV_J_DONE:
+
 BB_ATTN_BWD_RET:
     ret;
 }
