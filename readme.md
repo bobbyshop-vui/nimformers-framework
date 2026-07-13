@@ -1,8 +1,8 @@
 # Nimformer Framework
 
-Nimformer là framework transformer thuần **Nim**, hỗ trợ đa backend (CPU, Metal, CUDA), lượng tử hóa thích ứng (int8/int4/fp8/APF) và checkpoint nén `.nimq`.
+Nimformer is a pure **Nim** transformer framework that supports multiple backends (CPU, Metal, CUDA), adaptive quantization (int8/int4/fp8/APF), and compressed `.nimq` checkpoints.
 
-## 1. Cấu trúc dự án
+## 1. Project Structure
 
 ```
 nimformers-framework/
@@ -52,20 +52,20 @@ nimformers-framework/
 
 ---
 
-## 2. Backend API – các phép toán có sẵn
+## 2. Backend API – Available Operations
 
-`backend.nim` cung cấp interface thống nhất cho CPU, Metal và CUDA. Tất cả các hàm dưới đây đều có sẵn qua `Backend` object.
+`backend.nim` provides a unified interface for CPU, Metal, and CUDA. All functions below are available through the `Backend` object.
 
-### 2.1. `beMatmul` – phép nhân ma trận
+### 2.1. `beMatmul` – Matrix Multiplication
 
 ```
 proc beMatmul(ctx: Backend, a: seq[float32], M, K: int,
               b: seq[float32], K2, N: int): seq[float32]
 ```
 
-Nhân ma trận `A (M x K)` với `B (K x N)`, trả về `C (M x N)` dạng phẳng.
+Multiplies matrix `A (M x K)` by `B (K x N)` and returns a flattened `C (M x N)`.
 
-### 2.2. `beMatmul2` – hai phép matmul độc lập trong cùng một lần gọi
+### 2.2. `beMatmul2` – Two Independent Matrix Multiplications in a Single Call
 
 ```
 proc beMatmul2(ctx: Backend,
@@ -74,77 +74,77 @@ proc beMatmul2(ctx: Backend,
                tuple[y1, y2: seq[float32]]
 ```
 
-Thực hiện hai phép matmul riêng biệt trong cùng một command buffer (Metal/CUDA) để giảm overhead.
+Performs two separate matrix multiplications within the same command buffer (Metal/CUDA) to reduce overhead.
 
-### 2.3. `beAdd` – cộng hai vector
+### 2.3. `beAdd` – Vector Addition
 
 ```
 proc beAdd(ctx: Backend, a, b: seq[float32]): seq[float32]
 ```
 
-### 2.4. `beSub` – trừ hai vector
+### 2.4. `beSub` – Vector Subtraction
 
 ```
 proc beSub(ctx: Backend, a, b: seq[float32]): seq[float32]
 ```
 
-Trừ từng phần tử `a - b`.
+Subtracts each element: `a - b`.
 
-### 2.5. `beMul` – nhân từng phần tử (element-wise)
+### 2.5. `beMul` – Element-wise Multiplication
 
 ```
 proc beMul(ctx: Backend, a, b: seq[float32]): seq[float32]
 ```
 
-### 2.6. `beDiv` – chia từng phần tử (element-wise)
+### 2.6. `beDiv` – Element-wise Division
 
 ```
 proc beDiv(ctx: Backend, a, b: seq[float32]): seq[float32]
 ```
 
-### 2.7. `beRelu` – ReLU activation
+### 2.7. `beRelu` – ReLU Activation
 
 ```
 proc beRelu(ctx: Backend, x: seq[float32]): seq[float32]
 ```
 
-### 2.8. `beSigmoid` – Sigmoid activation
+### 2.8. `beSigmoid` – Sigmoid Activation
 
 ```
 proc beSigmoid(ctx: Backend, x: seq[float32]): seq[float32]
 ```
 
-### 2.9. `beTanh` – Tanh activation
+### 2.9. `beTanh` – Tanh Activation
 
 ```
 proc beTanh(ctx: Backend, x: seq[float32]): seq[float32]
 ```
 
-### 2.10. `beApflu` – APF Linear Unit activation
+### 2.10. `beApflu` – APF Linear Unit Activation
 
 ```
 proc beApflu(ctx: Backend, x: seq[float32],
              alpha: float32 = 0.1, beta: float32 = 0.1): seq[float32]
 ```
 
-Activation tuỳ biến theo tham số `alpha`/`beta` (mặc định 0.1).
+A customizable activation with `alpha`/`beta` parameters (default 0.1).
 
-### 2.11. `beApfluBackward` – backward pass cho APFLU
+### 2.11. `beApfluBackward` – Backward Pass for APFLU
 
 ```
 proc beApfluBackward(ctx: Backend, x, dy: seq[float32],
                       alpha: float32 = 0.1, beta: float32 = 0.1): seq[float32]
 ```
 
-Tính gradient ngược cho `beApflu`.
+Computes the backward gradient for `beApflu`.
 
-### 2.12. `beSoftmax` – Softmax theo hàng
+### 2.12. `beSoftmax` – Row-wise Softmax
 
 ```
 proc beSoftmax(ctx: Backend, x: seq[float32], rows, cols: int): seq[float32]
 ```
 
-Softmax theo từng hàng của ma trận `rows x cols`.
+Applies Softmax to each row of a `rows x cols` matrix.
 
 ### 2.13. `beLayernorm` – Layer Normalization
 
@@ -153,7 +153,7 @@ proc beLayernorm(ctx: Backend, x: seq[float32], gamma, beta: seq[float32],
                  rows, cols: int, eps: float32 = 1e-5): seq[float32]
 ```
 
-### 2.14. `beLayernormBackward` – backward pass cho Layer Normalization
+### 2.14. `beLayernormBackward` – Backward Pass for Layer Normalization
 
 ```
 proc beLayernormBackward(ctx: Backend, dy, x, gamma, beta: seq[float32],
@@ -161,18 +161,18 @@ proc beLayernormBackward(ctx: Backend, dy, x, gamma, beta: seq[float32],
                           tuple[dx, dgamma, dbeta: seq[float32]]
 ```
 
-Tính gradient của input, `gamma` và `beta` từ `dy` (gradient đầu ra).
+Computes the gradients of the input, `gamma`, and `beta` from `dy` (the output gradient).
 
-### 2.15. `beEmbeddingLookup` – tra cứu embedding
+### 2.15. `beEmbeddingLookup` – Embedding Lookup
 
 ```
 proc beEmbeddingLookup(ctx: Backend, table: seq[float32], vocab, dim: int,
                         indices: seq[int32]): seq[float32]
 ```
 
-Tra cứu các hàng trong `table (vocab x dim)` theo `indices`, trả về `(len(indices) x dim)`.
+Looks up rows in `table (vocab x dim)` using `indices`, returning `(len(indices) x dim)`.
 
-### 2.16. `beAttentionFused` – Attention fused (forward)
+### 2.16. `beAttentionFused` – Fused Attention (Forward)
 
 ```
 proc beAttentionFused(ctx: Backend, q, k, v, mask: seq[float32],
@@ -180,9 +180,9 @@ proc beAttentionFused(ctx: Backend, q, k, v, mask: seq[float32],
                        tuple[o, s_matrix: seq[float32]]
 ```
 
-Tính attention (Q, K, V, mask) đã fuse thành một lần gọi kernel duy nhất — giảm overhead so với tách rời matmul + softmax. `B`=batch, `H`=số head, `S`=độ dài chuỗi, `D`=kích thước head. Trả về output `o` và ma trận attention score `s_matrix` (dùng lại cho backward).
+Computes attention (Q, K, V, mask) fused into a single kernel call, reducing overhead compared to separate matmul + softmax operations. `B` = batch size, `H` = number of heads, `S` = sequence length, `D` = head dimension. Returns the output `o` and the attention score matrix `s_matrix` (reused during backward).
 
-### 2.17. `beAttentionFusedBackward` – Attention fused (backward)
+### 2.17. `beAttentionFusedBackward` – Fused Attention (Backward)
 
 ```
 proc beAttentionFusedBackward(ctx: Backend, q, k, v, s_matrix, dy: seq[float32],
@@ -190,27 +190,27 @@ proc beAttentionFusedBackward(ctx: Backend, q, k, v, s_matrix, dy: seq[float32],
                                tuple[dq, dk, dv: seq[float32]]
 ```
 
-Tính gradient `dq, dk, dv` cho attention fused, dùng `s_matrix` đã lưu từ bước forward.
+Computes gradients `dq`, `dk`, and `dv` for fused attention using the `s_matrix` saved during the forward pass.
 
 ---
 
-## 2b. CustomFloat / APF helpers (`backend.nim`)
+## 2b. CustomFloat / APF Helpers (`backend.nim`)
 
-Các hàm hỗ trợ mã hoá/giải mã và tự động chọn định dạng CustomFloat, dùng khi cần nén dữ liệu ở độ chính xác thấp hơn float32 chuẩn.
+These functions support encoding/decoding and automatic CustomFloat format selection for compressing data at lower precision than standard float32.
 
-### 2b.1. `beCustomfloatEncode` – encode mảng float32 sang bytes
+### 2b.1. `beCustomfloatEncode` – Encode float32 Array to Bytes
 
 ```
 proc beCustomfloatEncode(ctx: Backend, arr: seq[float32], cf: CustomFloat): seq[uint8]
 ```
 
-### 2b.2. `beCustomfloatDecode` – decode bytes ngược lại float32
+### 2b.2. `beCustomfloatDecode` – Decode Bytes Back to float32
 
 ```
 proc beCustomfloatDecode(ctx: Backend, buf: seq[uint8], cf: CustomFloat): seq[float32]
 ```
 
-### 2b.3. `beApfCastForTraining` – tự động chọn CustomFloat phù hợp cho training
+### 2b.3. `beApfCastForTraining` – Automatically Select the Appropriate CustomFloat Format for Training
 
 ```
 proc beApfCastForTraining(ctx: Backend, arr: seq[float32], gradArr: seq[float32] = [],
@@ -219,53 +219,53 @@ proc beApfCastForTraining(ctx: Backend, arr: seq[float32], gradArr: seq[float32]
                            tuple[data: seq[uint8], cf: CustomFloat]
 ```
 
-Dựa vào `arr` (và `gradArr` nếu có) để tự động chọn số bit / định dạng CustomFloat (APF) tối ưu, cân bằng giữa sai số cho phép (`relErrorTol`) và biên độ exponent (`expMargin`). Trả về dữ liệu đã encode cùng `CustomFloat` đã chọn.
+Automatically chooses the optimal CustomFloat (APF) bit width/format based on `arr` (and `gradArr`, if provided), balancing the allowed relative error (`relErrorTol`) and exponent margin (`expMargin`). Returns the encoded data and the selected `CustomFloat` format.
 
 ---
 
-## 3. Cách chọn backend
+## 3. Selecting a Backend
 
-Trong `main.nim` hoặc code của bạn:
+In `main.nim` or your own code:
 
 ```
 import backend
 
-# Tự động chọn: Metal nếu có, ngược lại CPU
+# Automatically select: Metal if available, otherwise CPU
 newBackend("auto")
 
-# Chọn cụ thể
+# Explicit selection
 newBackend("cpu")
 newBackend("metal")
 newBackend("cuda")
 newBackend("tsic")
 ```
 
-Hoặc qua build flag (Makefile):
+Or via build flags (Makefile):
 
 ```
-make run-metal   # dùng Metal
-make run-cpu     # dùng CPU
-make run-cuda    # dùng CUDA (cần build cuda_kernels.cu trước)
+make run-metal   # use Metal
+make run-cpu     # use CPU
+make run-cuda    # use CUDA (requires building cuda_kernels.cu first)
 ```
 
 ---
 
-## 4. Lượng tử hóa (`quant.nim`)
+## 4. Quantization (`quant.nim`)
 
-### 4.1. Các kiểu lượng tử
+### 4.1. Quantization Types
 
 ```
 type QuantKind* = enum
-  qkFp32Raw   # không nén
-  qkInt8      # int8 symmetric
-  qkInt4      # int4 symmetric (2 giá trị/byte)
+  qkFp32Raw   # no compression
+  qkInt8      # symmetric int8
+  qkInt4      # symmetric int4 (2 values per byte)
   qkFp8E4M3   # fp8 (4 exponent, 3 mantissa)
   qkFp8E5M2   # fp8 (5 exponent, 2 mantissa)
-  qkCustom    # CustomFloat bất kỳ
-  qkAuto      # APF – tự động chọn số bit
+  qkCustom    # arbitrary CustomFloat
+  qkAuto      # APF – automatically choose bit width
 ```
 
-### 4.2. Lượng tử hóa và giải mã
+### 4.2. Quantization and Dequantization
 
 ```
 import quant
@@ -273,11 +273,11 @@ import quant
 let qt = quantizeTensor(data, shape, qkInt8)
 let raw = dequantizeTensor(qt)
 
-# Với APF (tự động)
+# Using APF (automatic)
 let qtAuto = quantizeTensor(data, shape, qkAuto, gradArr = grad)
 ```
 
-### 4.3. Đọc/ghi checkpoint `.nimq`
+### 4.3. Reading/Writing `.nimq` Checkpoints
 
 ```
 saveQuantStateDict("model.nimq", [vocab, embedDim, heads, layers, ffMult], sd)
@@ -288,7 +288,7 @@ let (arch, sd) = loadQuantStateDict("model.nimq")
 
 ## 5. Model (`nimformer.nim`)
 
-### 5.1. Tạo model
+### 5.1. Creating a Model
 
 ```
 import nimformer, backend
@@ -302,24 +302,24 @@ var model = newNimformerModel(
 )
 ```
 
-### 5.2. Forward – batch
+### 5.2. Forward – Batch
 
 ```
 let idsBatch = @[@[1, 2, 3], @[4, 5, 6]]   # [B=2, T=3]
 let logits = model.forwardBatch(idsBatch, ctx)   # shape [2, 3, vocab]
 ```
 
-### 5.3. Backward – batch
+### 5.3. Backward – Batch
 
 ```
-let dLoss = randnTensor(@[2, 3, vocab], 0.01)   # gradient giả
+let dLoss = randnTensor(@[2, 3, vocab], 0.01)   # dummy gradient
 let grads = model.backwardBatch(idsBatch, dLoss, ctx)
-# grads là seq[Tensor] theo thứ tự: outProj.W, outProj.B,
-# các block từ cuối lên đầu (mỗi block gồm 12 gradient),
-# và cuối cùng là embed.weight.
+# grads is seq[Tensor] in the following order: outProj.W, outProj.B,
+# blocks from last to first (each block contains 12 gradients),
+# and finally embed.weight.
 ```
 
-### 5.4. ApfAdam optimizer
+### 5.4. ApfAdam Optimizer
 
 ```
 var state = newApfAdamState(param.data.len)
@@ -328,9 +328,9 @@ let cf = apfAdamStep(param, grad, state, lr = 3e-3, requantizeEvery = 50)
 
 ---
 
-## 6. Checkpoint (lưu và resume)
+## 6. Checkpoints (Save and Resume)
 
-### 6.1. Lưu checkpoint đầy đủ (weight + optimizer state + step)
+### 6.1. Save a Complete Checkpoint (Weights + Optimizer State + Step)
 
 ```
 saveCheckpoint(model, states, stepNo, "ckpt.nimq.ckpt",
@@ -338,26 +338,26 @@ saveCheckpoint(model, states, stepNo, "ckpt.nimq.ckpt",
                embedDim, nHeads, nLayers, ffMult)
 ```
 
-### 6.2. Load checkpoint full
+### 6.2. Load a Complete Checkpoint
 
 ```
 let (model, states, stepNo) = loadCheckpointFull("ckpt.nimq.ckpt")
-# Tiếp tục training từ stepNo
+# Continue training from stepNo
 ```
 
 ---
 
-## 7. Export từ Hugging Face → `.nimq`
+## 7. Export from Hugging Face → `.nimq`
 
 ```
 python export_to_nimq.py --model TheBloke/deepseek-coder-6.7B-instruct-GPTQ --output model.nimq --int8
 ```
 
-Hỗ trợ model thường và GPTQ.
+Supports both standard models and GPTQ models.
 
 ---
 
-## 8. Inference với `nim_inference.nim` (cho LLaMA)
+## 8. Inference with `nim_inference.nim` (for LLaMA)
 
 ```
 import nim_inference, metal_ai
@@ -373,19 +373,19 @@ echo output
 
 ---
 
-## 9. Định dạng `.nimq`
+## 9. `.nimq` Format
 
 - Header: `NIMQ1`
-- Arch: 5 số nguyên (vocab, embedDim, nHeads, nLayers, ffMult)
-- Danh sách các `(tên, QuantTensor)`
-- Quy ước: weight dùng kiểu lượng tử đã chọn; bias và LayerNorm (gamma/beta) luôn `qkFp32Raw`
+- Architecture: 5 integers (`vocab`, `embedDim`, `nHeads`, `nLayers`, `ffMult`)
+- List of `(name, QuantTensor)` entries
+- Convention: weights use the selected quantization type; biases and LayerNorm (`gamma`/`beta`) always use `qkFp32Raw`
 
 ---
 
-## 10. Lưu ý quan trọng
+## 10. Important Notes
 
-- **Bias và LayerNorm** luôn giữ fp32 để tránh sai số.
-- **Buffer pool** trong Metal: dùng `poolGet`/`poolPut` để tránh rò rỉ RAM.
-- **Pipeline cache** – compile kernel một lần duy nhất.
-- **`@autoreleasepool`** trong `metal_bridge.m` – bắt buộc để dọn autorelease objects.
-- **Backend "auto"**: nếu không dò được GPU nào (CUDA/Metal/OpenCL/TSIC), mặc định sẽ `raise` lỗi thay vì âm thầm rơi về CPU (`gForbidCpuFallback = true`). Muốn chạy CPU khi không có GPU: gọi `setForbidCpuFallback(false)` trước `newBackend()`, hoặc dùng `newBackend("cpu")` tường minh.
+- **Biases and LayerNorm** are always kept in fp32 to avoid numerical errors.
+- **Buffer pool** in Metal: use `poolGet`/`poolPut` to avoid RAM leaks.
+- **Pipeline cache**: compile kernels only once.
+- **`@autoreleasepool`** in `metal_bridge.m`: required to clean up autorelease objects.
+- **Backend `"auto"`**: if no GPU backend (CUDA/Metal/OpenCL/TSIC) is detected, it raises an error instead of silently falling back to CPU (`gForbidCpuFallback = true`). To allow CPU execution when no GPU is available, call `setForbidCpuFallback(false)` before `newBackend()`, or explicitly use `newBackend("cpu")`.
