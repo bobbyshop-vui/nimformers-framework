@@ -383,9 +383,9 @@ BB_APFLU_RET:
 )
 {
     .reg .pred %p<3>;
-    .reg .f32 %f<10>;
+    .reg .f32 %f<11>;
     .reg .b32 %r<6>;
-    .reg .b64 %rd<10>;
+    .reg .b64 %rd<11>;
 
     ld.param.u64 %rd1, [apflu_bwd_param_0];
     ld.param.u64 %rd2, [apflu_bwd_param_1];
@@ -816,10 +816,10 @@ BB_LN_RET:
     .param .f32 ln_bwd_param_9
 )
 {
-    .reg .pred %p<3>;
+    .reg .pred %p<4>;
     .reg .b32 %r<30>;
     .reg .f32 %f<30>;
-    .reg .b64 %rd<20>;
+    .reg .b64 %rd<25>;
 
     mov.u32 %r1, %ctaid.x;
     mov.u32 %r2, %tid.x;
@@ -836,7 +836,7 @@ BB_LN_RET:
     ld.param.u64 %rd6, [ln_bwd_param_5];
     ld.param.u64 %rd7, [ln_bwd_param_6];
 
-    // Tính dgamma, dbeta cho mỗi col (tid < cols)
+    // Tinh dgamma, dbeta cho moi col (tid < cols)
     setp.ge.u32 %p1, %r2, %r4;
     @%p1 bra BB_LN_BWD_SKIP_DG;
 
@@ -852,7 +852,7 @@ BB_LN_BWD_DG_LOOP:
     add.s32 %r7, %r6, %r2;
     mul.wide.s32 %rd8, %r7, 4;
 
-    // Tính mean, var
+    // Tinh mean, var
     mov.f32 %f4, 0f00000000;
     mov.f32 %f5, 0f00000000;
     mov.u32 %r8, 0;
@@ -905,14 +905,14 @@ BB_LN_BWD_DG_DONE:
 
 BB_LN_BWD_SKIP_DG:
 
-    // dx cho mỗi row (tid < rows)
+    // dx cho moi row (tid < rows)
     setp.ge.u32 %p2, %r2, %r3;
     @%p2 bra BB_LN_BWD_RET;
 
     mul.lo.s32 %r11, %r2, %r4;
     mul.wide.s32 %rd15, %r11, 4;
 
-    // Tính mean và var cho row này
+    // Tinh mean va var cho row nay
     mov.f32 %f4, 0f00000000;
     mov.f32 %f5, 0f00000000;
     mov.u32 %r8, 0;
@@ -939,7 +939,7 @@ BB_LN_BWD_ROW_MEAN_DONE:
     add.f32 %f13, %f12, %f1;
     rsqrt.approx.f32 %f14, %f13;
 
-    // sum1 và sum2
+    // sum1 va sum2
     mov.f32 %f15, 0f00000000;
     mov.f32 %f16, 0f00000000;
     mov.u32 %r8, 0;
@@ -1185,7 +1185,7 @@ BB_ATTN_RET:
     .reg .pred %p<6>;
     .reg .b32 %r<25>;
     .reg .f32 %f<20>;
-    .reg .b64 %rd<20>;
+    .reg .b64 %rd<21>;
     .reg .f32 softmaxW[256];
     .reg .f32 dSoftmax[256];
     
