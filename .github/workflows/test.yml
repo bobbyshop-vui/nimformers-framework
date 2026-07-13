@@ -56,8 +56,8 @@ jobs:
 
       - name: Test OpenCL (PoCL)
         run: |
-          export MESA_LOADER_DRIVER_OVERRIDE=zink
-          make run-opencl || echo "OpenCL test may fail if no GPU available"
+          export NIMFLAGS="-d:backend=opencl -d:gForbidCpuFallback=false"
+          make run-opencl
 
   test-macos-intel:
     name: macOS Intel (CPU + Metal + OpenCL)
@@ -107,8 +107,8 @@ jobs:
 
       - name: Test OpenCL (PoCL)
         run: |
-          export MESA_LOADER_DRIVER_OVERRIDE=zink
-          make run-opencl || echo "OpenCL test may fail if no GPU available"
+          export NIMFLAGS="-d:backend=opencl -d:gForbidCpuFallback=false"
+          make run-opencl
 
   test-linux:
     name: Linux (CPU + OpenCL/PoCL)
@@ -143,7 +143,9 @@ jobs:
         run: make run-cpu
 
       - name: Test OpenCL (PoCL)
-        run: make run-opencl
+        run: |
+          export NIMFLAGS="-d:backend=opencl -d:gForbidCpuFallback=false"
+          make run-opencl
 
       - name: CUDA Test Link (Colab)
         run: |
@@ -167,24 +169,17 @@ jobs:
         with:
           nim-version: '2.0.0'
 
-      - name: Install LLVM and Mesa (LLVMpipe)
-        shell: pwsh
-        run: |
-          echo "=== INSTALLING LLVM ==="
-          choco install llvm -y --limit-output
-          echo "=== INSTALLING MSYS2 ==="
-          choco install msys2 -y --limit-output
-          echo "=== INSTALLING MESA via MSYS2 ==="
-          C:\tools\msys64\usr\bin\bash.exe -lc "pacman -Syu --noconfirm"
-          C:\tools\msys64\usr\bin\bash.exe -lc "pacman -S --noconfirm mingw-w64-x86_64-mesa mingw-w64-x86_64-llvm"
+      - name: Install Mesa Windows (LLVMpipe)
+        uses: f3d-app/install-mesa-windows-action@v1
+        with:
+          path: ${{ github.workspace }}
+          version: 24.0.5
 
-      - name: Check LLVMpipe
+      - name: Check Mesa/LLVMpipe
         shell: pwsh
         run: |
-          echo "=== LLVM INFO ==="
-          & "C:\Program Files\LLVM\bin\llvm-config.exe" --version || echo "LLVM not found"
-          echo "=== LLVMPipe CHECK ==="
-          C:\tools\msys64\usr\bin\bash.exe -lc "find /mingw64 -name '*llvmpipe*' 2>/dev/null || echo 'LLVMpipe not found'"
+          echo "=== CHECKING MESA ==="
+          Get-ChildItem -Path ${{ github.workspace }} -Filter "opengl32.dll" -Recurse | ForEach-Object { Write-Host "Found: $($_.FullName)" }
 
       - name: Test CPU
         shell: pwsh
@@ -193,10 +188,8 @@ jobs:
       - name: Test LLVMpipe (OpenCL)
         shell: pwsh
         run: |
-          $env:GALLIUM_DRIVER = "llvmpipe"
-          $env:MESA_LOADER_DRIVER_OVERRIDE = "llvmpipe"
-          $env:PATH = "C:\tools\msys64\mingw64\bin;$env:PATH"
-          make run-opencl || echo "LLVMpipe test may fail if no device"
+          $env:NIMFLAGS = "-d:backend=opencl -d:gForbidCpuFallback=false"
+          make run-opencl
 
       - name: CUDA Test Link (Colab)
         shell: pwsh
