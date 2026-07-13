@@ -9,7 +9,7 @@ on:
 
 jobs:
   test-macos-arm:
-    name: macOS ARM (CPU + Metal + OpenCL/PoCL)
+    name: macOS ARM (CPU + Metal + OpenCL)
     runs-on: macos-15
     
     steps:
@@ -28,24 +28,10 @@ jobs:
           echo "=== INSTALLING METAL TOOLCHAIN ==="
           sudo xcodebuild -downloadComponent MetalToolchain
           sleep 10
-          METAL_PATH=$(find /Library/Developer/CommandLineTools/usr/bin -name metal -type f 2>/dev/null | head -1)
-          if [ -z "$METAL_PATH" ]; then
-            METAL_PATH=$(find /Applications/Xcode.app/Contents/Developer/Toolchains -name metal -type f 2>/dev/null | head -1)
-          fi
-          if [ -n "$METAL_PATH" ]; then
-            echo "Found Metal at: $METAL_PATH"
-            export PATH=$(dirname "$METAL_PATH"):$PATH
-          else
-            sudo xcode-select --reset
-            sudo xcode-select -switch /Applications/Xcode.app/Contents/Developer
-          fi
           echo "=== VERIFYING METAL ==="
-          xcrun -sdk macosx metal --version || echo "Metal version check failed"
-          xcrun -sdk macosx metallib --version || echo "Metallib version check failed"
+          xcrun -sdk macosx metal --version || echo "Metal not found"
           echo "=== XCODE INFO ==="
           xcodebuild -version
-          echo "=== GPU INFO ==="
-          system_profiler SPDisplaysDataType | grep -E "Chipset|VRAM|Metal" || echo "No GPU found"
 
       - name: Install PoCL (OpenCL on CPU)
         run: |
@@ -71,10 +57,10 @@ jobs:
       - name: Test OpenCL (PoCL)
         run: |
           export MESA_LOADER_DRIVER_OVERRIDE=zink
-          make run-opencl || echo "OpenCL test may fail"
+          make run-opencl || echo "OpenCL test may fail if no GPU available"
 
   test-macos-intel:
-    name: macOS Intel (CPU + Metal + OpenCL/PoCL)
+    name: macOS Intel (CPU + Metal + OpenCL)
     runs-on: macos-15-intel
     
     steps:
@@ -93,24 +79,10 @@ jobs:
           echo "=== INSTALLING METAL TOOLCHAIN ==="
           sudo xcodebuild -downloadComponent MetalToolchain
           sleep 10
-          METAL_PATH=$(find /Library/Developer/CommandLineTools/usr/bin -name metal -type f 2>/dev/null | head -1)
-          if [ -z "$METAL_PATH" ]; then
-            METAL_PATH=$(find /Applications/Xcode.app/Contents/Developer/Toolchains -name metal -type f 2>/dev/null | head -1)
-          fi
-          if [ -n "$METAL_PATH" ]; then
-            echo "Found Metal at: $METAL_PATH"
-            export PATH=$(dirname "$METAL_PATH"):$PATH
-          else
-            sudo xcode-select --reset
-            sudo xcode-select -switch /Applications/Xcode.app/Contents/Developer
-          fi
           echo "=== VERIFYING METAL ==="
-          xcrun -sdk macosx metal --version || echo "Metal version check failed"
-          xcrun -sdk macosx metallib --version || echo "Metallib version check failed"
+          xcrun -sdk macosx metal --version || echo "Metal not found"
           echo "=== XCODE INFO ==="
           xcodebuild -version
-          echo "=== GPU INFO ==="
-          system_profiler SPDisplaysDataType | grep -E "Chipset|VRAM|Metal" || echo "No GPU found"
 
       - name: Install PoCL (OpenCL on CPU)
         run: |
@@ -136,7 +108,7 @@ jobs:
       - name: Test OpenCL (PoCL)
         run: |
           export MESA_LOADER_DRIVER_OVERRIDE=zink
-          make run-opencl || echo "OpenCL test may fail"
+          make run-opencl || echo "OpenCL test may fail if no GPU available"
 
   test-linux:
     name: Linux (CPU + OpenCL/PoCL)
@@ -171,8 +143,7 @@ jobs:
         run: make run-cpu
 
       - name: Test OpenCL (PoCL)
-        run: |
-          make run-opencl || echo "OpenCL test may fail"
+        run: make run-opencl
 
       - name: CUDA Test Link (Colab)
         run: |
@@ -182,7 +153,7 @@ jobs:
           echo "==========================================================="
 
   test-windows:
-    name: Windows (CPU + LLVMpipe/OpenCL)
+    name: Windows (CPU + LLVMpipe)
     runs-on: windows-latest
     
     steps:
@@ -196,34 +167,36 @@ jobs:
         with:
           nim-version: '2.0.0'
 
-      - name: Install LLVM and PoCL
+      - name: Install LLVM and Mesa (LLVMpipe)
         shell: pwsh
         run: |
           echo "=== INSTALLING LLVM ==="
           choco install llvm -y --limit-output
           echo "=== INSTALLING MSYS2 ==="
           choco install msys2 -y --limit-output
-          echo "=== INSTALLING POCL via MSYS2 ==="
+          echo "=== INSTALLING MESA via MSYS2 ==="
           C:\tools\msys64\usr\bin\bash.exe -lc "pacman -Syu --noconfirm"
-          C:\tools\msys64\usr\bin\bash.exe -lc "pacman -S --noconfirm mingw-w64-x86_64-pocl mingw-w64-x86_64-llvm"
+          C:\tools\msys64\usr\bin\bash.exe -lc "pacman -S --noconfirm mingw-w64-x86_64-mesa mingw-w64-x86_64-llvm"
 
-      - name: Check OpenCL
+      - name: Check LLVMpipe
         shell: pwsh
         run: |
-          echo "=== CHECKING OPENCL DEVICES ==="
-          C:\tools\msys64\usr\bin\bash.exe -lc "clinfo || echo 'No OpenCL devices found'"
-          echo "=== CHECKING POCL ==="
-          C:\tools\msys64\usr\bin\bash.exe -lc "find /mingw64 -name '*pocl*' 2>/dev/null || echo 'PoCL not found'"
+          echo "=== LLVM INFO ==="
+          & "C:\Program Files\LLVM\bin\llvm-config.exe" --version || echo "LLVM not found"
+          echo "=== LLVMPipe CHECK ==="
+          C:\tools\msys64\usr\bin\bash.exe -lc "find /mingw64 -name '*llvmpipe*' 2>/dev/null || echo 'LLVMpipe not found'"
 
       - name: Test CPU
         shell: pwsh
         run: make run-cpu
 
-      - name: Test OpenCL (PoCL)
+      - name: Test LLVMpipe (OpenCL)
         shell: pwsh
         run: |
+          $env:GALLIUM_DRIVER = "llvmpipe"
+          $env:MESA_LOADER_DRIVER_OVERRIDE = "llvmpipe"
           $env:PATH = "C:\tools\msys64\mingw64\bin;$env:PATH"
-          make run-opencl || echo "OpenCL test may fail"
+          make run-opencl || echo "LLVMpipe test may fail if no device"
 
       - name: CUDA Test Link (Colab)
         shell: pwsh
@@ -255,7 +228,7 @@ jobs:
           echo "| 🐧 Linux | x86_64 | CPU | ${{ needs.test-linux.result }} |"
           echo "| 🐧 Linux | x86_64 | OpenCL (PoCL) | ${{ needs.test-linux.result }} |"
           echo "| 🪟 Windows | x86_64 | CPU | ${{ needs.test-windows.result }} |"
-          echo "| 🪟 Windows | x86_64 | OpenCL (PoCL) | ${{ needs.test-windows.result }} |"
+          echo "| 🪟 Windows | x86_64 | LLVMpipe | ${{ needs.test-windows.result }} |"
           echo ""
           echo "### 🔗 Test CUDA trên Colab:"
           echo "https://colab.research.google.com/drive/1-ZSYCivvF5ISxLpAwzy4KFvV7xiCtkdO#scrollTo=rrR_2QUkUxXZ"
