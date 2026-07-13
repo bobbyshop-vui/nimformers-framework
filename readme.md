@@ -5,20 +5,49 @@ Nimformer là framework transformer thuần **Nim**, hỗ trợ đa backend (CPU
 ## 1. Cấu trúc dự án
 
 ```
-customfloat.nim        – CustomFloat + APF (CPU)
-quant.nim              – Lượng tử hóa tensor & đọc/ghi .nimq
-backend.nim            – Abstract backend (CPU/Metal/CUDA) + CÁC PHÉP TOÁN
-metal_ai.nim           – Metal backend (GPU) – wrapper cho metal_bridge
-metal_bridge.h/.m      – Objective-C bridge cho Metal
-metal_kernels.metal    – Metal kernels
-cuda_bridge.h          – C header cho CUDA
-cuda_kernels.cu        – CUDA kernels + cuBLAS
-nimformer.nim          – Transformer model (Linear, Attention, Block, Embedding, ApfAdam)
-main.nim               – CLI training driver
-test_nimformer.nim     – Test nhanh
-export_to_nimq.nim     – Export PyTorch model → .nimq (Python)
-nim_inference.nim      – Inference LLaMA (DeepSeek-Coder, Llama…)
-Makefile               – Build & chạy
+nimformers-framework/
+├── backend.nim
+├── customfloat.nim
+├── databricks-dolly-15k.jsonl
+├── export_to_nimq.py
+├── finetune.nimq.ckpt
+├── harness_attn.nim
+├── harness_attn2.nim
+├── LICENSE
+├── Makefile
+├── nim_inference.nim
+├── nimformer.nim
+├── quant.nim
+├── readme.md
+├── test_nimformer.nim
+├── tokenizer.json
+└── vendor/
+    └── bybylang/
+        ├── LICENSE
+        ├── backends/
+        │   ├── cuda/
+        │   │   ├── cuda_driver.nim
+        │   │   ├── cuda_runtime.nim
+        │   │   └── kernels/
+        │   │       └── vecop.ptx
+        │   ├── metal/
+        │   │   ├── kernels/
+        │   │   │   └── vecop_matmul.metal
+        │   │   ├── metal_backend.nim
+        │   │   ├── metal_shim.h
+        │   │   └── metal_shim.m
+        │   └── opencl/
+        │       ├── kernels/
+        │       │   └── vecop_matmul.cl
+        │       └── opencl_api.nim
+        ├── bybylang.nim
+        ├── demo/
+        │   ├── demo_gpu.bybylang
+        │   └── demo_gpu_out.nim
+        ├── gpubackend.nim
+        ├── makefile
+        ├── readme.md
+        └── tsic_ir.nim
 ```
 
 ---
