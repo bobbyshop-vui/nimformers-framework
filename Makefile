@@ -75,3 +75,6 @@ else
 	$(RM_RF) nimcache
 	$(RM_F) model_*.nimq
 endif
+run-cuda:
+	nim c -d:release --hints:off -d:backend=cuda test_nimformer.nim
+	$(shell if [ -f test_nimformer.exe ]; then ./test_nimformer.exe; else ./test_nimformer; fi)

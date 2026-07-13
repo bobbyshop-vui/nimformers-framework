@@ -1,4 +1,4 @@
-.version 7.5
+.version 6.5
 .target sm_75
 .address_size 64
 
