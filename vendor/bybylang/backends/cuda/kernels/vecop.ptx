@@ -820,7 +820,7 @@ BB_LN_RET:
     .reg .pred %p<4>;
     .reg .b32 %r<30>;
     .reg .f32 %f<30>;
-    .reg .b64 %rd<25>;
+    .reg .b64 %rd<30>;
 
     mov.u32 %r1, %ctaid.x;
     mov.u32 %r29, %ntid.x;
@@ -901,9 +901,12 @@ BB_LN_BWD_MEAN_DONE:
     bra BB_LN_BWD_DG_LOOP;
 
 BB_LN_BWD_DG_DONE:
-    add.s64 %rd13, %rd6, %rd8;
+    mul.wide.s32 %rd25, %r2, 4;         // FIX: offset dung cho dgamma/dbeta la id*4 (cols-sized buffer),
+                                         // KHONG dung %rd8 (gia tri "stale" con sot lai tu vong lap hang
+                                         // = (rows*cols+id)*4 -> ghi ra ngoai bo nho -> illegal memory access)
+    add.s64 %rd13, %rd6, %rd25;
     st.global.f32 [%rd13], %f2;
-    add.s64 %rd14, %rd7, %rd8;
+    add.s64 %rd14, %rd7, %rd25;
     st.global.f32 [%rd14], %f3;
 
 BB_LN_BWD_SKIP_DG:
@@ -951,11 +954,16 @@ BB_LN_BWD_DX_SUM_LOOP:
     setp.ge.u32 %p3, %r8, %r4;
     @%p3 bra BB_LN_BWD_DX_SUM_DONE;
 
-    add.s64 %rd17, %rd1, %rd15;
+    mul.wide.s32 %rd26, %r8, 4;         // FIX: offset cot c*4 (thieu truoc day -> luon doc phan tu dau
+                                         // tien cua row thay vi phan tu thu c -> sai ket qua toan bo)
+    add.s64 %rd27, %rd15, %rd26;        // off + c*4
+
+    add.s64 %rd17, %rd1, %rd27;
     ld.global.nc.f32 %f17, [%rd17];
-    add.s64 %rd18, %rd3, %rd8;
+    add.s64 %rd18, %rd3, %rd26;         // FIX: gamma[c] = gammaBase + c*4 (truoc day dung %rd8 "stale"
+                                         // = (rows*cols+id)*4 -> doc ngoai bo nho gamma)
     ld.global.nc.f32 %f18, [%rd18];
-    add.s64 %rd19, %rd2, %rd15;
+    add.s64 %rd19, %rd2, %rd27;
     ld.global.nc.f32 %f19, [%rd19];
 
     mul.f32 %f20, %f17, %f18;
@@ -979,10 +987,12 @@ BB_LN_BWD_DX_LOOP:
     setp.ge.u32 %p3, %r8, %r4;
     @%p3 bra BB_LN_BWD_DX_DONE;
 
-    add.s64 %rd20, %rd5, %rd15;
-    add.s64 %rd21, %rd1, %rd15;
-    add.s64 %rd22, %rd3, %rd8;
-    add.s64 %rd23, %rd2, %rd15;
+    mul.wide.s32 %rd26, %r8, 4;         // c*4
+    add.s64 %rd27, %rd15, %rd26;        // off + c*4
+
+    add.s64 %rd21, %rd1, %rd27;         // dy[off+c]
+    add.s64 %rd22, %rd3, %rd26;         // FIX: gamma[c] = gammaBase + c*4 (truoc day dung %rd8 stale)
+    add.s64 %rd23, %rd2, %rd27;         // x[off+c]
 
     ld.global.nc.f32 %f17, [%rd21];
     ld.global.nc.f32 %f18, [%rd22];
@@ -999,7 +1009,9 @@ BB_LN_BWD_DX_LOOP:
     sub.f32 %f27, %f23, %f24;
     add.f32 %f28, %f27, %f26;
 
-    add.s64 %rd24, %rd4, %rd15;
+    add.s64 %rd24, %rd5, %rd27;         // FIX: dx[off+c] = dxBase(%rd5) + off + c*4 -- truoc day dung
+                                         // %rd4 (con tro BETA, chi rd15 khong co c*4) -> ghi de/ghi vuot
+                                         // qua buffer beta rat nho -> illegal memory access (D2H failed)
     st.global.f32 [%rd24], %f28;
 
     add.s32 %r8, %r8, 1;
