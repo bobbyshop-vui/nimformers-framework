@@ -33,11 +33,11 @@ jobs:
           echo "=== XCODE INFO ==="
           xcodebuild -version
 
-      - name: Install PoCL (OpenCL on CPU)
+      - name: Install Mesa OpenCL for macOS
         run: |
-          echo "=== INSTALLING POCL ==="
+          echo "=== INSTALLING MESA OPENCL ==="
           brew update
-          brew install pocl
+          brew install mesa mesa-opencl ocl-icd clinfo
           echo "=== CHECK OPENCL ==="
           clinfo || echo "No OpenCL devices found"
 
@@ -54,9 +54,9 @@ jobs:
           export PATH=$PATH:/Library/Developer/CommandLineTools/usr/bin
           make run-metal
 
-      - name: Test OpenCL (PoCL)
+      - name: Test OpenCL (Mesa)
         run: |
-          export NIMFLAGS="-d:backend=opencl -d:gForbidCpuFallback=false"
+          export MESA_LOADER_DRIVER_OVERRIDE=zink
           make run-opencl
 
   test-macos-intel:
@@ -84,11 +84,11 @@ jobs:
           echo "=== XCODE INFO ==="
           xcodebuild -version
 
-      - name: Install PoCL (OpenCL on CPU)
+      - name: Install Mesa OpenCL for macOS
         run: |
-          echo "=== INSTALLING POCL ==="
+          echo "=== INSTALLING MESA OPENCL ==="
           brew update
-          brew install pocl
+          brew install mesa mesa-opencl ocl-icd clinfo
           echo "=== CHECK OPENCL ==="
           clinfo || echo "No OpenCL devices found"
 
@@ -105,9 +105,9 @@ jobs:
           export PATH=$PATH:/Library/Developer/CommandLineTools/usr/bin
           make run-metal
 
-      - name: Test OpenCL (PoCL)
+      - name: Test OpenCL (Mesa)
         run: |
-          export NIMFLAGS="-d:backend=opencl -d:gForbidCpuFallback=false"
+          export MESA_LOADER_DRIVER_OVERRIDE=zink
           make run-opencl
 
   test-linux:
@@ -143,9 +143,7 @@ jobs:
         run: make run-cpu
 
       - name: Test OpenCL (PoCL)
-        run: |
-          export NIMFLAGS="-d:backend=opencl -d:gForbidCpuFallback=false"
-          make run-opencl
+        run: make run-opencl
 
       - name: CUDA Test Link (Colab)
         run: |
@@ -188,7 +186,9 @@ jobs:
       - name: Test LLVMpipe (OpenCL)
         shell: pwsh
         run: |
-          $env:NIMFLAGS = "-d:backend=opencl -d:gForbidCpuFallback=false"
+          $env:GALLIUM_DRIVER = "llvmpipe"
+          $env:MESA_LOADER_DRIVER_OVERRIDE = "llvmpipe"
+          $env:PATH = "C:\tools\msys64\mingw64\bin;$env:PATH"
           make run-opencl
 
       - name: CUDA Test Link (Colab)
@@ -214,10 +214,10 @@ jobs:
           echo "|----------|--------------|---------|--------|"
           echo "| 🍎 macOS | ARM | CPU | ${{ needs.test-macos-arm.result }} |"
           echo "| 🍎 macOS | ARM | Metal | ${{ needs.test-macos-arm.result }} |"
-          echo "| 🍎 macOS | ARM | OpenCL (PoCL) | ${{ needs.test-macos-arm.result }} |"
+          echo "| 🍎 macOS | ARM | OpenCL (Mesa) | ${{ needs.test-macos-arm.result }} |"
           echo "| 🍎 macOS | Intel | CPU | ${{ needs.test-macos-intel.result }} |"
           echo "| 🍎 macOS | Intel | Metal | ${{ needs.test-macos-intel.result }} |"
-          echo "| 🍎 macOS | Intel | OpenCL (PoCL) | ${{ needs.test-macos-intel.result }} |"
+          echo "| 🍎 macOS | Intel | OpenCL (Mesa) | ${{ needs.test-macos-intel.result }} |"
           echo "| 🐧 Linux | x86_64 | CPU | ${{ needs.test-linux.result }} |"
           echo "| 🐧 Linux | x86_64 | OpenCL (PoCL) | ${{ needs.test-linux.result }} |"
           echo "| 🪟 Windows | x86_64 | CPU | ${{ needs.test-windows.result }} |"
