@@ -1,0 +1,275 @@
+name: Test Nimformer
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  test-macos-arm:
+    name: macOS ARM (CPU + Metal + OpenCL)
+    runs-on: macos-15  # ARM (Apple Silicon)
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Xcode 26
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26'
+
+      - name: Install Metal toolchain
+        run: |
+          echo "=== INSTALLING METAL TOOLCHAIN ==="
+          sudo xcodebuild -downloadPlatform macOS
+          sudo xcodebuild -downloadComponent MetalToolchain
+          echo "=== VERIFYING METAL ==="
+          xcrun -sdk macosx metal --version
+          xcrun -sdk macosx metallib --version
+          echo "=== XCODE INFO ==="
+          xcodebuild -version
+          echo "=== GPU INFO ==="
+          system_profiler SPDisplaysDataType | grep -E "Chipset|VRAM|Metal" || echo "No GPU found"
+
+      - name: Install Mesa + OpenCL via Homebrew
+        run: |
+          echo "=== INSTALLING MESA + OPENCL ==="
+          brew update
+          brew install mesa mesa-opencl ocl-icd clinfo
+          echo "=== CHECK OPENCL ==="
+          clinfo || echo "No OpenCL devices found"
+          echo "=== CHECK MESA ==="
+          brew list mesa | head -10
+
+      - name: Setup Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: '2.0.0'
+
+      - name: Install dependencies
+        run: nimble install -y
+
+      - name: Test CPU
+        run: make run-cpu
+
+      - name: Test Metal
+        run: make run-metal
+
+      - name: Test OpenCL (Mesa)
+        run: |
+          export MESA_LOADER_DRIVER_OVERRIDE=zink
+          make run-opencl
+
+  test-macos-intel:
+    name: macOS Intel (CPU + Metal + OpenCL)
+    runs-on: macos-15-intel  # Intel (x86_64)
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Xcode 26
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26'
+
+      - name: Install Metal toolchain
+        run: |
+          echo "=== INSTALLING METAL TOOLCHAIN ==="
+          sudo xcodebuild -downloadPlatform macOS
+          sudo xcodebuild -downloadComponent MetalToolchain
+          echo "=== VERIFYING METAL ==="
+          xcrun -sdk macosx metal --version
+          xcrun -sdk macosx metallib --version
+          echo "=== XCODE INFO ==="
+          xcodebuild -version
+          echo "=== GPU INFO ==="
+          system_profiler SPDisplaysDataType | grep -E "Chipset|VRAM|Metal" || echo "No GPU found"
+
+      - name: Install Mesa + OpenCL via Homebrew
+        run: |
+          echo "=== INSTALLING MESA + OPENCL ==="
+          brew update
+          brew install mesa mesa-opencl ocl-icd clinfo
+          echo "=== CHECK OPENCL ==="
+          clinfo || echo "No OpenCL devices found"
+          echo "=== CHECK MESA ==="
+          brew list mesa | head -10
+
+      - name: Setup Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: '2.0.0'
+
+      - name: Install dependencies
+        run: nimble install -y
+
+      - name: Test CPU
+        run: make run-cpu
+
+      - name: Test Metal
+        run: make run-metal
+
+      - name: Test OpenCL (Mesa)
+        run: |
+          export MESA_LOADER_DRIVER_OVERRIDE=zink
+          make run-opencl
+
+  test-linux:
+    name: Linux (CPU + OpenCL/Mesa)
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: '2.0.0'
+
+      - name: Install Mesa OpenCL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            mesa-opencl-icd \
+            ocl-icd-libopencl1 \
+            clinfo \
+            mesa-utils \
+            llvm-dev \
+            libclang-dev
+
+      - name: Check OpenCL
+        run: |
+          echo "=== OPENCL INFO ==="
+          clinfo || echo "No OpenCL devices found"
+          echo "=== MESA INFO ==="
+          glxinfo | grep "OpenGL" || echo "No Mesa info"
+          echo "==================="
+
+      - name: Install dependencies
+        run: nimble install -y
+
+      - name: Test CPU
+        run: make run-cpu
+
+      - name: Test OpenCL (Mesa)
+        run: |
+          export MESA_LOADER_DRIVER_OVERRIDE=zink
+          make run-opencl
+
+      - name: CUDA Test Link (Colab)
+        run: |
+          echo "==========================================================="
+          echo "🔗 Để test CUDA, hãy chạy trên Google Colab với GPU:"
+          echo "https://colab.research.google.com/drive/1-ZSYCivvF5ISxLpAwzy4KFvV7xiCtkdO#scrollTo=rrR_2QUkUxXZ"
+          echo "==========================================================="
+
+  test-windows:
+    name: Windows (CPU + LLVMpipe)
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: '2.0.0'
+
+      - name: Install LLVM and Mesa
+        shell: pwsh
+        run: |
+          echo "=== INSTALLING LLVM ==="
+          choco install llvm -y
+          echo "=== INSTALLING MSYS2 ==="
+          choco install msys2 -y
+          echo "=== INSTALLING MESA via MSYS2 ==="
+          C:\tools\msys64\usr\bin\bash.exe -lc "pacman -Syu --noconfirm"
+          C:\tools\msys64\usr\bin\bash.exe -lc "pacman -S --noconfirm mingw-w64-x86_64-mesa mingw-w64-x86_64-llvm"
+
+      - name: Check LLVMpipe
+        shell: pwsh
+        run: |
+          echo "=== LLVM INFO ==="
+          llvm-config --version
+          echo "=== LLVMPipe CHECK ==="
+          C:\tools\msys64\usr\bin\bash.exe -lc "find /mingw64 -name '*llvmpipe*' 2>/dev/null || echo 'LLVMpipe not found'"
+          echo "=== MESA DRIVERS ==="
+          C:\tools\msys64\usr\bin\bash.exe -lc "ls -la /mingw64/lib/dri/ 2>/dev/null || echo 'No DRI drivers'"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: nimble install -y
+
+      - name: Test CPU
+        shell: pwsh
+        run: make run-cpu
+
+      - name: Test LLVMpipe (OpenCL)
+        shell: pwsh
+        run: |
+          $env:GALLIUM_DRIVER = "llvmpipe"
+          $env:MESA_LOADER_DRIVER_OVERRIDE = "llvmpipe"
+          $env:PATH = "C:\tools\msys64\mingw64\bin;$env:PATH"
+          make run-opencl
+
+      - name: CUDA Test Link (Colab)
+        shell: pwsh
+        run: |
+          Write-Host "==========================================================="
+          Write-Host "🔗 Để test CUDA, hãy chạy trên Google Colab với GPU:"
+          Write-Host "https://colab.research.google.com/drive/1-ZSYCivvF5ISxLpAwzy4KFvV7xiCtkdO#scrollTo=rrR_2QUkUxXZ"
+          Write-Host "==========================================================="
+
+  summary:
+    name: Test Summary
+    runs-on: ubuntu-latest
+    needs: [test-macos-arm, test-macos-intel, test-linux, test-windows]
+    if: always()
+    
+    steps:
+      - name: Print summary
+        run: |
+          echo "## 🧪 Test Summary"
+          echo ""
+          echo "| Platform | Architecture | Backend | Status |"
+          echo "|----------|--------------|---------|--------|"
+          echo "| 🍎 macOS | ARM (Apple Silicon) | CPU | ${{ needs.test-macos-arm.result }} |"
+          echo "| 🍎 macOS | ARM (Apple Silicon) | Metal | ${{ needs.test-macos-arm.result }} |"
+          echo "| 🍎 macOS | ARM (Apple Silicon) | OpenCL (Mesa) | ${{ needs.test-macos-arm.result }} |"
+          echo "| 🍎 macOS | Intel (x86_64) | CPU | ${{ needs.test-macos-intel.result }} |"
+          echo "| 🍎 macOS | Intel (x86_64) | Metal | ${{ needs.test-macos-intel.result }} |"
+          echo "| 🍎 macOS | Intel (x86_64) | OpenCL (Mesa) | ${{ needs.test-macos-intel.result }} |"
+          echo "| 🐧 Linux | x86_64 | CPU | ${{ needs.test-linux.result }} |"
+          echo "| 🐧 Linux | x86_64 | Mesa OpenCL | ${{ needs.test-linux.result }} |"
+          echo "| 🪟 Windows | x86_64 | CPU | ${{ needs.test-windows.result }} |"
+          echo "| 🪟 Windows | x86_64 | LLVMpipe/OpenCL | ${{ needs.test-windows.result }} |"
+          echo ""
+          echo "### 🔗 Link test CUDA trên Colab:"
+          echo "https://colab.research.google.com/drive/1-ZSYCivvF5ISxLpAwzy4KFvV7xiCtkdO#scrollTo=rrR_2QUkUxXZ"
+          echo ""
+          echo "### 📝 Notes:"
+          echo "- macOS 15 ARM dùng Xcode 26 + Mesa/OpenCL"
+          echo "- macOS 15 Intel dùng Xcode 26 + Mesa/OpenCL"
+          echo "- Metal toolchain installed via xcodebuild -downloadComponent"
+          echo "- Linux dùng Mesa OpenCL (CPU-based)"
+          echo "- Windows dùng LLVMpipe qua OpenCL backend"
+          
+      - name: Check overall status
+        if: needs.test-macos-arm.result != 'success' || needs.test-macos-intel.result != 'success' || needs.test-linux.result != 'success' || needs.test-windows.result != 'success'
+        run: |
+          echo "::error::❌ Some tests failed!"
+          exit 1
