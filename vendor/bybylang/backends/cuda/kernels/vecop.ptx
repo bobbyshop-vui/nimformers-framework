@@ -824,7 +824,7 @@ BB_LN_RET:
     mov.u32 %r1, %ctaid.x;
     mov.u32 %r29, %ntid.x;
     mov.u32 %r2, %tid.x;
-    mad.lo.s32 %r2, %r1, %r29, %r2;   // SỬA: id toàn cục = ctaid*ntid+tid (trước đây chỉ dùng tid.x -> nhiều block ghi đè cùng địa chỉ -> race/illegal memory access -> D2H failed)
+    mad.lo.s32 %r2, %r1, %r29, %r2;   // FIX: global id = ctaid*ntid+tid (was tid.x only -> multiple blocks wrote same addresses -> race/illegal memory access -> D2H failed)
 
     ld.param.u32 %r3, [ln_bwd_param_7];
     ld.param.u32 %r4, [ln_bwd_param_8];
