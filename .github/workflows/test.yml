@@ -84,14 +84,6 @@ jobs:
           echo "=== XCODE INFO ==="
           xcodebuild -version
 
-      - name: Install Mesa OpenCL for macOS
-        run: |
-          echo "=== INSTALLING MESA OPENCL ==="
-          brew update
-          brew install mesa mesa-opencl ocl-icd clinfo
-          echo "=== CHECK OPENCL ==="
-          clinfo || echo "No OpenCL devices found"
-
       - name: Setup Nim
         uses: jiro4989/setup-nim-action@v2
         with:
