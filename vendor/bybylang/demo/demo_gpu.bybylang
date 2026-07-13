@@ -1,0 +1,71 @@
+mode is 3
+
+gpu backend is "opencl"
+gpu array A = [1, 2, 3, 4, 5, 6, 7, 8]
+gpu array B = [10, 20, 30, 40, 50, 60, 70, 80]
+gpu array E = [10, 20, 30, 40, 50, 60, 70, 80, 100, 110, 120, 130, 134, 12122121123123123, 123123123]
+gpu array O = [10, 20, 30, 40, 50, 60, 70, 80, 100, 110, 120, 130, 134, 12122121123123123, 123123123]
+gpu add A, B -> C size 8
+gpu mul A, B -> D size 8
+gpu mul E, O -> G size 15
+gpu sub A, B -> H size 8
+gpu div A, B -> I size 8
+gpu relu A -> J
+gpu sigmoid A -> K
+gpu tanh A -> L
+gpu softmax A -> M rows 1 cols 8
+gpu matmul A, B -> N m 8 k 8 n 1
+
+print "GPU add result:"
+print C
+print "GPU mul result:"
+print D
+print "GPU sub result:"
+print H
+print "GPU div result:"
+print I
+print "GPU relu result:"
+print J
+print "GPU sigmoid result:"
+print K
+print "GPU tanh result:"
+print L
+print "GPU softmax result:"
+print M
+print "GPU matmul result:"
+print N
+print G
+
+x = 5
+if x > 0:
+    print "x duong"
+    if x > 3:
+        print "x lon hon 3"
+        if x == 5:
+            print "x dung bang 5 - if long 3 cap hoat dong!"
+        else:
+            print "x khac 5"
+    else:
+        print "x tu 1 den 3"
+elif x == 0:
+    print "x bang 0"
+else:
+    print "x am"
+
+for i in range(1, 4):
+    if i == 2:
+        print "gap so 2 trong vong lap"
+    else:
+        print "khong phai so 2"
+
+# Các phép toán GPU nâng cao
+gpu layernorm A, B, C -> LAYERNORM_RES rows 8 cols 1 eps 1e-5
+
+# Tạo indices riêng cho embedding (dùng biến thường, không phải gpu array)
+indices = [0, 1, 2, 3, 4, 5, 6, 7]
+gpu embedding E, indices -> EMBED_RES vocab 8 dim 8
+
+print "GPU layernorm result:"
+print LAYERNORM_RES
+print "GPU embedding result:"
+print EMBED_RES
