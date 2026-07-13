@@ -1,426 +1,183 @@
-# BybyLang - Cross-Platform GPU Programming Language
+# BybyLang
 
-**BybyLang** is a high-level programming language with Python-like syntax, designed to run **directly on the GPU** **without writing shaders**. Just write simple code, and BybyLang automatically compiles and runs it on the GPU backend best suited to your machine.
+A Nim-based DSL, AOT-compiled to Nim source then built into a native binary. Its core is a set of `gpu ...` commands for running tensor ops on CUDA / Metal / OpenCL / TSIC-IR / CPU, plus generic control flow and a set of low-level hardware-simulation commands.
 
----
-
-## ✨ Key Features
-
-- **Automatic GPU Offload** - Code runs on the GPU without writing shaders
-- **Multi-backend** - Supports CUDA, Metal, OpenCL, TSIC (intermediate representation)
-- **Automatic fallback** - Falls back to CPU automatically if no GPU is available
-- **No build dependencies** - Kernels are compiled at runtime, no build tools required
-- **Nested control flow support** - Unlimited nesting of if/while/for
-- **High performance** - Optimized per backend (Tensor Core on CUDA, MPS on Metal)
-
----
-
-## 📋 System Requirements
-
-| Backend | Requirements | Platform |
-|---|---|---|
-| **CUDA** | NVIDIA driver, libcuda.so | Linux, Windows |
-| **Metal** | macOS 10.13+, Xcode CLT | macOS |
-| **OpenCL** | OpenCL 1.2+ driver | Linux, macOS, Windows |
-| **TSIC** | None (intermediate representation) | Any platform |
-
----
-
-## 🛠️ Installation & Build
-
-### 1. Install the Nim compiler
+## Build & run
 
 ```bash
-# Install Nim (if not already installed)
-curl https://nim-lang.org/choosenim/init.sh -sSf | sh
-
-# Or use a package manager:
-# sudo apt install nim  # Ubuntu/Debian
-# brew install nim      # macOS
-```
-
-### 2. Build BybyLang
-
-```bash
-# Clone the repository
-git clone https://github.com/bobbyshop-vui/bybylang
-cd bybylang
-
-# Build using the Makefile
-make build
-
-# Or build manually
-nim c -d:release -o:bybylang bybylang.nim
-```
-
-### 3. Run tests and build your bybylang code
-
-```bash
-# Run the full test suite
+make build #build library don't run that test code
 make test
+# equivalent to:
+nim c -d:release -o:bybylang bybylang.nim
+./bybylang demo/demo_gpu.bybylang --aot=demo/demo_gpu_out
+./demo/demo_gpu_out
 ```
-```bash
-./bybylang (your bybylang code) --aot=(name the execute export and if you are using windows you need to add .exe)
-```
-### 4. Project directory structure
 
-```
-bybylang/
-├── Makefile                  # Build script
-├── bybylang.nim              # Main compiler
-├── gpubackend.nim            # GPU dispatch layer
-├── tsic_ir.nim               # TSIC Intermediate Representation
-├── backends/
-│   ├── cuda/
-│   │   ├── cuda_driver.nim   # CUDA Driver API
-│   │   ├── cuda_runtime.nim  # CUDA Runtime + cuBLAS
-│   │   └── kernels/
-│   │       └── vecop.ptx     # PTX kernels
-│   ├── metal/
-│   │   ├── metal_backend.nim # Nim wrapper
-│   │   ├── metal_shim.m      # Objective-C shim
-│   │   ├── metal_shim.h      # Header
-│   │   └── kernels/
-│   │       └── vecop_matmul.metal # MSL kernels
-│   └── opencl/
-│       ├── opencl_api.nim    # OpenCL bindings
-│       └── kernels/
-│           └── vecop_matmul.cl   # OpenCL C kernels
-```
+`--aot=<path>` generates `<path>.nim`, compiles it with Nim, and produces the binary `<path>`.
 
 ---
 
-## 📝 BybyLang Syntax
+## 1. General syntax
 
-### 1. Backend declaration
+- One command per line in a `.bybylang` file. Indentation (spaces/tabs) determines the block for `if/elif/else/while/for`.
+- `#` at the start of a line is a comment.
+- `import name` or `import "path/name.bybylang"` — recursive import, `.bybylang` extension auto-appended, cycle-protected via absolute path.
+- `print <expr>` → generates `echo <expr>`.
+- `function NAME` ... a line containing only `NAME` closes the definition; call it with `call NAME`.
+- `if cond:` / `elif cond:` / `else:` / `while cond:` / `for x in range(a, b):` — translated directly to the equivalent Nim construct, arbitrarily nestable.
+- `mode is N` (N = 1..4) → prints "Mode 1: Low-level" / "Mode 2: Mid-level" / "Mode 3: High-level" / "Mode 4: Web-level" (any other N → "Unknown mode").
 
-```
-# Automatically select the best backend (default)
-gpu backend is "auto"
+## 2. `gpu ...` commands
 
-# Select a specific backend
-gpu backend is "cuda"      # NVIDIA GPU
-gpu backend is "metal"     # macOS Apple Silicon/AMD
-gpu backend is "opencl"    # AMD/Intel GPU
-gpu backend is "tsic"      # Intermediate IR (for custom GPUs)
-gpu backend is "cpu"       # Run on CPU (fallback)
-```
-
-### 2. Declaring GPU arrays
+### Select backend
 
 ```
-# 1D array
-gpu array A = [1, 2, 3, 4, 5, 6, 7, 8]
-gpu array B = [10, 20, 30, 40, 50, 60, 70, 80]
-
-# Array with floating-point numbers
-gpu array X = [1.5, 2.5, 3.5]
-gpu array Y = [0.5, 1.5, 2.5]
+gpu backend is "auto"      # auto | cpu | cuda | metal | opencl | tsic
 ```
 
-### 3. Vector operations (element-wise)
+`auto` probes in order: CUDA (NVIDIA) → Metal (macOS) → OpenCL → plain CPU.
+By default, **silent CPU fallback is forbidden** (`gForbidCpuFallback = true`): if a specific GPU backend is requested and it's unavailable or fails, the program raises instead of silently falling back to CPU (so you never accidentally train on CPU without noticing).
+
+### Declare an array
 
 ```
-# Basic operations
-gpu add A, B -> C          # C = A + B
-gpu sub A, B -> D          # D = A - B
-gpu mul A, B -> E          # E = A * B
-gpu div A, B -> F          # F = A / B
-
-# Optionally add "size N" (descriptive only)
-gpu add A, B -> C size 8
+gpu array A = [1, 2, 3, 4]
 ```
 
-### 4. Matrix operations
+Generates `var A: seq[float32] = @[1, 2, 3, 4].mapIt(it.float32)`. **Must be declared before use** — codegen has no hoisting; it translates lines strictly in file order.
+
+### Basic binary ops
 
 ```
-# C(m x n) = A(m x k) * B(k x n)
-# Dimensions must be declared
-gpu matmul A, B -> C m 2 k 3 n 4
-
-# Concrete example
-gpu array M1 = [1, 2, 3, 4, 5, 6]    # 2x3
-gpu array M2 = [7, 8, 9, 10, 11, 12] # 3x2
-gpu matmul M1, M2 -> Result m 2 k 3 n 2
+gpu add A, B -> C
+gpu sub A, B -> C
+gpu mul A, B -> C
+gpu div A, B -> C
 ```
 
-### 4b. Activations and NN kernels
+A trailing `size N` is descriptive only and doesn't affect codegen.
 
-These map 1:1 to the same `gpubackend.nim` kernels used by nimformer's
-`backend.nim` (relu/sigmoid/tanh/softmax/layernorm/embedding lookup), across
-every backend (cuda/metal/opencl/tsic/cpu) — adding a kernel there makes it
-available here automatically, no separate shader needed.
+### Matmul
 
 ```
-# Elementwise activations
+gpu matmul A, B -> C m M k K n N
+```
+A: [M×K], B: [K×N] → C: [M×N].
+
+```
+gpu matmul2 A1, B1, A2, B2 -> C1, C2 m1 M k1 K n1 N m2 M k2 K n2 N
+```
+Two independent matmuls fused into a single call.
+
+### Activations
+
+```
 gpu relu X -> Y
 gpu sigmoid X -> Y
 gpu tanh X -> Y
-
-# Row-wise softmax: X is rows*cols flattened, row-major
-gpu softmax X -> Y rows 2 cols 4
-
-# Layernorm over each row of X (gamma/beta length = cols), eps is the
-# numerical-stability epsilon added before the sqrt
-gpu layernorm X, Gamma, Beta -> Y rows 2 cols 4 eps 0.00001
-
-# Embedding lookup: TABLE is vocab*dim flattened, INDICES is int32 ids.
-# Note: "gpu array" only generates seq[float32], so Indices must come from a
-# plain Nim seq[int32] variable (e.g. one you assign to directly), not "gpu array".
-gpu embedding Table, Indices -> Y vocab 100 dim 16
+gpu apflu X -> Y alpha A beta B      # defaults: alpha=0.1, beta=1.0 if omitted
+gpu apflu_backward X, DY -> DX alpha A beta B   # alpha/beta optional, same defaults
 ```
 
-### 5. Control flow
+### Fused add + activation
 
 ```
-# Variables and assignment
-x = 5
-y = 10
-z = x + y
-
-# If-elif-else (supports deep nesting)
-if x > 0:
-    print "x is positive"
-    if x > 3:
-        print "x is greater than 3"
-        if x == 5:
-            print "x equals 5"
-        else:
-            print "x is not 5"
-    else:
-        print "x is between 1 and 3"
-elif x == 0:
-    print "x equals 0"
-else:
-    print "x is negative"
-
-# While loop
-i = 0
-while i < 5:
-    print "i =", i
-    i = i + 1
-
-# For loop (supports range)
-for i in range(0, 10):
-    print "i =", i
-    if i == 5:
-        print "reached 5"
+gpu fused_add_act A, B -> C act "relu"    # "relu" | "sigmoid" | "tanh" | "none"
 ```
 
-### 6. Function definitions
+### Softmax / LayerNorm
 
 ```
-# Define a function
-function my_func:
-    a = 10
-    b = 20
-    c = a + b
-    print "Sum =", c
-my_func
-
-# Functions can call other functions
-function greet:
-    print "Hello from GPU!"
-function main:
-    print "Start"
-    greet()
-    print "End"
-main
+gpu softmax X -> Y rows R cols C
+gpu layernorm X, GAMMA, BETA -> Y rows R cols C eps E
+gpu layernorm_backward DY, X, GAMMA, BETA -> DX, DGAMMA, DBETA rows R cols C eps E
 ```
 
-### 7. System commands (APU)
+### Embedding
 
 ```
-# APU Transfer
-apu tran "data" with "payload"
-
-# APU Memory
-apu mem write "RAM0" with "100"
-apu mem read "RAM0"
-
-# APU Core
-apu core with "run"
-
-# APU Pin
-apu pin 1 to high
-
-# Bit operations
-bit send "01010101"
-bit recv
-
-# Memory mapping
-mem map "GPU_MEM_0"
-
-# Memory push
-mem push "BUFFER_0" with "data"
-
-# Pulse transfer
-tran pulse 4 width "100ns"
+gpu embedding TABLE, INDICES -> Y vocab V dim D
 ```
+`INDICES` is auto-cast to `int32`.
+
+### Attention (fused)
+
+```
+gpu attention Q, K, V -> O, S_MATRIX B H S D scale SCALE
+gpu attention_backward Q, K, V, S_MATRIX, DY -> DQ, DK, DV B H S D scale SCALE
+```
+B=batch, H=heads, S=seq_len, D=head_dim.
+
+### Generic op (fallback)
+
+```
+gpu <other_op> A, B -> C
+```
+Generates `gpuOp("<other_op>", backend, A, B)` — requires a matching branch inside `gpuOp` to actually do something.
 
 ---
 
-## 🚀 Detailed Examples
+## 3. GPU Resident Tensor API (CUDA) — called directly from Nim
 
-### Example 1: GPU Vector Addition
-
-**File: examples/demo_gpu.bybylang**
-
-```
-# Select the backend automatically
-gpu backend is "auto"
-
-# Declare data
-gpu array A = [1, 2, 3, 4, 5, 6, 7, 8]
-gpu array B = [10, 20, 30, 40, 50, 60, 70, 80]
-
-# GPU operations
-gpu add A, B -> C
-gpu mul A, B -> D
-
-# Print results
-print "Addition result:"
-print C
-print "Multiplication result:"
-print D
-```
-
-### Example 2: Matrix Multiplication
-
-**File: examples/demo_matmul.bybylang**
-
-```
-# Select the Metal backend (or CUDA/OpenCL)
-gpu backend is "metal"
-
-# 2x3 matrix
-gpu array M1 = [1, 2, 3, 4, 5, 6]
-
-# 3x2 matrix
-gpu array M2 = [7, 8, 9, 10, 11, 12]
-
-# Matrix multiplication: 2x3 * 3x2 = 2x2
-gpu matmul M1, M2 -> Result m 2 k 3 n 2
-
-print "Matrix result:"
-print Result
-```
-
-### Example 3: Control Flow + GPU
-
-**File: examples/demo_control.bybylang**
-
-```
-# Combine control flow and GPU
-x = 5
-gpu backend is "auto"
-
-if x > 0:
-    gpu array A = [1, 2, 3, 4]
-    gpu array B = [5, 6, 7, 8]
-    gpu add A, B -> C
-    print "GPU result:", C
-    if x == 5:
-        print "x = 5, GPU ran successfully"
-    else:
-        print "x is not 5"
-else:
-    print "x is not positive"
-```
-
----
-
-## 🔧 Backend Details
-
-### 1. CUDA Backend
-
-- **File:** backends/cuda/cuda_driver.nim
-- **Kernel:** PTX (loaded at runtime with cuModuleLoadData)
-- **Matmul:** cuBLAS with Tensor Core (CUBLAS_TENSOR_OP_MATH)
-- **Requirements:** libcuda.so, NVIDIA driver
-
-### 2. Metal Backend
-
-- **File:** backends/metal/metal_shim.m
-- **Kernel:** MSL (compiled at runtime with newLibraryWithSource)
-- **Matmul:** Naive kernel (can use MPSMatrixMultiplication)
-- **Requirements:** macOS, Metal.framework
-
-### 3. OpenCL Backend
-
-- **File:** backends/opencl/opencl_api.nim
-- **Kernel:** OpenCL C (compiled at runtime with clBuildProgram)
-- **Matmul:** Naive kernel (runs on any GPU/CPU)
-- **Requirements:** libOpenCL.so, OpenCL driver
-
-### 3.1 Thư viện API cho framework nhúng (không qua cú pháp .bybylang)
-
-Ngoài cú pháp `.bybylang`, mọi backend đều expose qua `gpubackend.nim` như
-thư viện Nim thuần để framework khác (ví dụ framework transformer/AI) nhúng
-làm lớp GPU của họ mà không cần tự viết shader:
+Defined at the end of `gpubackend.nim`. **Not** exposed through `.bybylang` syntax — call it from plain Nim code to avoid a CPU↔GPU round trip on every op:
 
 ```nim
-import gpubackend
-
-let c  = gpuMatmul(gbAuto, a, b, m, k, n)          # 1 phép matmul
-let r  = gpuMatmul2(gbAuto, a1, b1, m1, k1, n1,     # 2 phép matmul ĐỘC LẬP,
-                     a2, b2, m2, k2, n2)             # gộp 1 round-trip GPU
-# r.c1, r.c2
+let ta = cuUpload(dataA)          # upload seq[float32] to the GPU once
+let tb = cuUpload(dataB)
+let tc = cuAddR(ta, tb)           # result STAYS on the GPU
+let out = cuDownload(tc)          # only download when you actually need the result
+cuFree(ta); cuFree(tb); cuFree(tc)
 ```
 
-`gpuMatmul2` trên backend Metal gộp cả 2 dispatch vào **1 command buffer**
-(1 lần commit+wait) thay vì gọi `gpuMatmul` hai lần — hữu ích cho các phép
-tính có 2 matmul độc lập cần chạy song song (vd. gradient trọng số và
-gradient đầu vào trong lan truyền ngược của một lớp Linear).
+Available: `cuUpload`, `cuUploadIndices`, `cuDownload`, `cuFree`, `cuMatmulR`, `cuAddR`, `cuSubR`, `cuMulR`, `cuDivR`, `cuReluR`, `cuSigmoidR`, `cuTanhR`, `cuSoftmaxR`, `cuLayernormR`, `cuEmbeddingLookupR`.
 
-### 4. TSIC Backend (Intermediate Representation)
-
-- **File:** tsic_ir.nim
-- **Role:** Hardware-independent intermediate representation
-- **Lowering:** Can emit to PTX, MSL, OpenCL C, GLSL
-- **Benefit:** Easy to add new backends, standardized kernels
+> ⚠️ **Note:** these resident-tensor calls exist but the forward pass generated from `.bybylang` (`genGpuLine`) does not call them — every `gpu ...` DSL command still uploads/downloads through `seq[float32]` on each call (per-op round trip), not the resident chain.
 
 ---
 
-## 🧪 Testing
+## 4. Low-level hardware-simulation commands
 
-### Running tests
-
-```bash
-# Build and run all tests
-make build
-make test
-```
-
-### Example test output
+These **do** have real DSL syntax, parsed in `genBlock` (`bybylang.nim` ~line 668–714) and lowered to calls that operate on a simulated RAM (1024 ints) / BUS (seq[string]) / 32 Pins:
 
 ```
-$ make test
-[INFO] Generated Nim code to test_gpu.nim
-[INFO] Built executable: test_gpu
-Addition result:
-@[11.0, 22.0, 33.0, 44.0, 55.0, 66.0, 77.0, 88.0]
-Multiplication result:
-@[10.0, 40.0, 90.0, 160.0, 250.0, 360.0, 490.0, 640.0]
-GPU test PASSED
-
-$ make test-tsic
-[INFO] Built executable: test_tsic
-TSIC IR test PASSED
+apu tran "chip1" with 101010          # -> apuTran("chip1", 101010)
+apu mem write RAM0 with 42            # -> apuMem("write", "RAM0", "42")
+apu mem read RAM0 with 0              # -> apuMem("read", "RAM0", "0")
+apu core run                          # -> apuCore(1, "run")  (mode is always hardcoded to 1)
+apu pin 3 is high                     # -> apuPin(3, "high")
+bit send 1010                         # -> bitSend("1010")
+bit recv                              # -> bitRecv()
+mem map "device0"                     # -> memMap("device0")
+mem push RAM0 with 99                 # -> memPush("RAM0", "99")
+tran pulse pin 3 width 10ns           # -> tranPulse(3, "10ns")
 ```
+
+Parser quirks worth knowing:
+- `apu mem <action> <target> with <value>` — `target` is read positionally as the 4th word (`left[3]`) and quotes are stripped; `action` should be `write` or `read`.
+- `apu core ...` ignores everything after `apu core` — it always emits `apuCore(1, "run")`.
+- `apu pin <n> is <state>` reads `n` from word index 2 and `state` from word index 4 — extra or missing words will misparse silently.
+- `tran pulse pin <n> width <w>` reads `n` from word index 3 and `w` as the **last** word on the line.
+
+`apuTran`, `apuMem`, `apuCore`, `apuPin`, `bitSend`, `bitRecv`, `memMap`, `memPush`, `tranPulse` show up as "declared but not used" warnings only when compiling `bybylang.nim` itself (the compiler for the DSL) — that warning is irrelevant to whether the DSL syntax works. The AOT-generated output (`--aot=...nim`) re-declares its own copies of these same procs (see `bybylang.nim` ~line 775 onward) so the compiled program can actually call them at runtime.
 
 ---
 
-## 📄 License
+## 5. Backends
 
-MIT License - See the LICENSE file for details.
+| Backend | File | Notes |
+|---|---|---|
+| CUDA | `backends/cuda/cuda_driver.nim`, `cuda_runtime.nim` | Direct Driver API + cuBLAS, PTX JIT via `cuModuleLoadDataEx`, persistent context/module cache |
+| Metal | `backends/metal/metal_backend.nim` (+ `.metal` kernels) | macOS GPU, buffer/pipeline cache |
+| OpenCL | `backends/opencl/opencl_api.nim` | any other GPU/CPU |
+| TSIC-IR | `tsic_ir.nim` | intermediate IR, lowerable to PTX / MSL / OpenCL C / GLSL |
+| CPU | inside `gpubackend.nim` (`cpuRelu`, `cpuMatmul`, ...) | pure-Nim fallback, always correct but slow |
 
----
+## 6. Minimal example
 
-## 🤝 Contributing
-
-Contributions are welcome! Please open an issue or pull request on GitHub.
-
----
-
-**Built with ❤️ by the BybyLang team**
+```
+gpu backend is "tsic"
+gpu array A = [1, 2, 3, 4]
+gpu array B = [5, 6, 7, 8]
+gpu add A, B -> C
+print C
+```
