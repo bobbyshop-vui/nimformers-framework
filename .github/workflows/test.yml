@@ -10,7 +10,7 @@ on:
 jobs:
   test-macos-arm:
     name: macOS ARM (CPU + Metal + OpenCL)
-    runs-on: macos-15  # ARM (Apple Silicon)
+    runs-on: macos-15
     
     steps:
       - name: Checkout code
@@ -26,7 +26,6 @@ jobs:
       - name: Install Metal toolchain
         run: |
           echo "=== INSTALLING METAL TOOLCHAIN ==="
-          sudo xcodebuild -downloadPlatform macOS
           sudo xcodebuild -downloadComponent MetalToolchain
           echo "=== VERIFYING METAL ==="
           xcrun -sdk macosx metal --version
@@ -38,21 +37,14 @@ jobs:
 
       - name: Install Mesa + OpenCL via Homebrew
         run: |
-          echo "=== INSTALLING MESA + OPENCL ==="
           brew update
           brew install mesa mesa-opencl ocl-icd clinfo
-          echo "=== CHECK OPENCL ==="
           clinfo || echo "No OpenCL devices found"
-          echo "=== CHECK MESA ==="
-          brew list mesa | head -10
 
       - name: Setup Nim
         uses: jiro4989/setup-nim-action@v2
         with:
           nim-version: '2.0.0'
-
-      - name: Install dependencies
-        run: nimble install -y
 
       - name: Test CPU
         run: make run-cpu
@@ -67,7 +59,7 @@ jobs:
 
   test-macos-intel:
     name: macOS Intel (CPU + Metal + OpenCL)
-    runs-on: macos-15-intel  # Intel (x86_64)
+    runs-on: macos-15-intel
     
     steps:
       - name: Checkout code
@@ -83,7 +75,6 @@ jobs:
       - name: Install Metal toolchain
         run: |
           echo "=== INSTALLING METAL TOOLCHAIN ==="
-          sudo xcodebuild -downloadPlatform macOS
           sudo xcodebuild -downloadComponent MetalToolchain
           echo "=== VERIFYING METAL ==="
           xcrun -sdk macosx metal --version
@@ -95,21 +86,14 @@ jobs:
 
       - name: Install Mesa + OpenCL via Homebrew
         run: |
-          echo "=== INSTALLING MESA + OPENCL ==="
           brew update
           brew install mesa mesa-opencl ocl-icd clinfo
-          echo "=== CHECK OPENCL ==="
           clinfo || echo "No OpenCL devices found"
-          echo "=== CHECK MESA ==="
-          brew list mesa | head -10
 
       - name: Setup Nim
         uses: jiro4989/setup-nim-action@v2
         with:
           nim-version: '2.0.0'
-
-      - name: Install dependencies
-        run: nimble install -y
 
       - name: Test CPU
         run: make run-cpu
@@ -150,14 +134,8 @@ jobs:
 
       - name: Check OpenCL
         run: |
-          echo "=== OPENCL INFO ==="
           clinfo || echo "No OpenCL devices found"
-          echo "=== MESA INFO ==="
           glxinfo | grep "OpenGL" || echo "No Mesa info"
-          echo "==================="
-
-      - name: Install dependencies
-        run: nimble install -y
 
       - name: Test CPU
         run: make run-cpu
@@ -192,27 +170,16 @@ jobs:
       - name: Install LLVM and Mesa
         shell: pwsh
         run: |
-          echo "=== INSTALLING LLVM ==="
-          choco install llvm -y
-          echo "=== INSTALLING MSYS2 ==="
-          choco install msys2 -y
-          echo "=== INSTALLING MESA via MSYS2 ==="
+          choco install llvm -y --limit-output
+          choco install msys2 -y --limit-output
           C:\tools\msys64\usr\bin\bash.exe -lc "pacman -Syu --noconfirm"
           C:\tools\msys64\usr\bin\bash.exe -lc "pacman -S --noconfirm mingw-w64-x86_64-mesa mingw-w64-x86_64-llvm"
 
       - name: Check LLVMpipe
         shell: pwsh
         run: |
-          echo "=== LLVM INFO ==="
-          llvm-config --version
-          echo "=== LLVMPipe CHECK ==="
+          & "C:\Program Files\LLVM\bin\llvm-config.exe" --version || echo "LLVM not found"
           C:\tools\msys64\usr\bin\bash.exe -lc "find /mingw64 -name '*llvmpipe*' 2>/dev/null || echo 'LLVMpipe not found'"
-          echo "=== MESA DRIVERS ==="
-          C:\tools\msys64\usr\bin\bash.exe -lc "ls -la /mingw64/lib/dri/ 2>/dev/null || echo 'No DRI drivers'"
-
-      - name: Install dependencies
-        shell: pwsh
-        run: nimble install -y
 
       - name: Test CPU
         shell: pwsh
@@ -247,26 +214,19 @@ jobs:
           echo ""
           echo "| Platform | Architecture | Backend | Status |"
           echo "|----------|--------------|---------|--------|"
-          echo "| 🍎 macOS | ARM (Apple Silicon) | CPU | ${{ needs.test-macos-arm.result }} |"
-          echo "| 🍎 macOS | ARM (Apple Silicon) | Metal | ${{ needs.test-macos-arm.result }} |"
-          echo "| 🍎 macOS | ARM (Apple Silicon) | OpenCL (Mesa) | ${{ needs.test-macos-arm.result }} |"
-          echo "| 🍎 macOS | Intel (x86_64) | CPU | ${{ needs.test-macos-intel.result }} |"
-          echo "| 🍎 macOS | Intel (x86_64) | Metal | ${{ needs.test-macos-intel.result }} |"
-          echo "| 🍎 macOS | Intel (x86_64) | OpenCL (Mesa) | ${{ needs.test-macos-intel.result }} |"
+          echo "| 🍎 macOS | ARM | CPU | ${{ needs.test-macos-arm.result }} |"
+          echo "| 🍎 macOS | ARM | Metal | ${{ needs.test-macos-arm.result }} |"
+          echo "| 🍎 macOS | ARM | OpenCL | ${{ needs.test-macos-arm.result }} |"
+          echo "| 🍎 macOS | Intel | CPU | ${{ needs.test-macos-intel.result }} |"
+          echo "| 🍎 macOS | Intel | Metal | ${{ needs.test-macos-intel.result }} |"
+          echo "| 🍎 macOS | Intel | OpenCL | ${{ needs.test-macos-intel.result }} |"
           echo "| 🐧 Linux | x86_64 | CPU | ${{ needs.test-linux.result }} |"
-          echo "| 🐧 Linux | x86_64 | Mesa OpenCL | ${{ needs.test-linux.result }} |"
+          echo "| 🐧 Linux | x86_64 | OpenCL | ${{ needs.test-linux.result }} |"
           echo "| 🪟 Windows | x86_64 | CPU | ${{ needs.test-windows.result }} |"
-          echo "| 🪟 Windows | x86_64 | LLVMpipe/OpenCL | ${{ needs.test-windows.result }} |"
+          echo "| 🪟 Windows | x86_64 | LLVMpipe | ${{ needs.test-windows.result }} |"
           echo ""
-          echo "### 🔗 Link test CUDA trên Colab:"
+          echo "### 🔗 Test CUDA trên Colab:"
           echo "https://colab.research.google.com/drive/1-ZSYCivvF5ISxLpAwzy4KFvV7xiCtkdO#scrollTo=rrR_2QUkUxXZ"
-          echo ""
-          echo "### 📝 Notes:"
-          echo "- macOS 15 ARM dùng Xcode 26 + Mesa/OpenCL"
-          echo "- macOS 15 Intel dùng Xcode 26 + Mesa/OpenCL"
-          echo "- Metal toolchain installed via xcodebuild -downloadComponent"
-          echo "- Linux dùng Mesa OpenCL (CPU-based)"
-          echo "- Windows dùng LLVMpipe qua OpenCL backend"
           
       - name: Check overall status
         if: needs.test-macos-arm.result != 'success' || needs.test-macos-intel.result != 'success' || needs.test-linux.result != 'success' || needs.test-windows.result != 'success'
