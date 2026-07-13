@@ -1,3 +1,4 @@
+// MARKER_CHECK_12345 - neu ban thay dong nay bang grep, tuc la file .ptx moi da duoc nap dung
 .version 6.5
 .target sm_61
 .address_size 64
