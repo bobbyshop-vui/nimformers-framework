@@ -465,8 +465,13 @@ proc cudaLayernormBackward*(dy, x, gamma, beta: seq[float32], rows, cols: int, e
     cast[pointer](addr rParam), cast[pointer](addr cParam),
     cast[pointer](addr eParam)
   ]
-  let blockSize = getOptimalBlockSize()
-  gpuCheck(lib.cuLaunchKernel(fn, uint32(max(rows, cols)), 1, 1, blockSize, 1, 1, 0, gStream,
+  # FIX: layernorm_backward_kernel la kernel kieu "1 thread = 1 id doc lap"
+  # (giong OpenCL get_global_id, khong cong tac giua cac thread trong cung block),
+  # khac voi layernorm_kernel (forward) la kieu "1 block = 1 row, nhieu thread cong tac".
+  # Truoc day dung getOptimalBlockSize() (128/256/512 thread/block) khien moi block
+  # chi tinh duoc id trong khoang [0, blockSize) roi GHI DE len nhau -> sai ket qua /
+  # race giua cac block -> CUDA context bi loi ngam -> D2H that bai o lan goi ke tiep.
+  gpuCheck(lib.cuLaunchKernel(fn, uint32(max(rows, cols)), 1, 1, 1, 1, 1, 0, gStream,
                                 addr params[0], nil) == 0, "cuLaunchKernel failed")
   gpuCheck(lib.cuMemcpyDtoHAsync(addr dx[0], dDxBuf, bytesX, gStream) == 0, "D2H failed")
   gpuCheck(lib.cuMemcpyDtoHAsync(addr dgamma[0], dDgammaBuf, bytesC, gStream) == 0, "D2H failed")
