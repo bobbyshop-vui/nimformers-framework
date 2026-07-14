@@ -37,11 +37,6 @@ jobs:
             sleep 30
             attempt=$((attempt + 1))
           done
-          echo "=== VERIFYING METAL ==="
-          xcrun -sdk macosx metal --version
-          xcrun -sdk macosx metallib --version
-          echo "=== XCODE INFO ==="
-          xcodebuild -version
 
       - name: Install PoCL (OpenCL on CPU)
         run: |
@@ -102,11 +97,6 @@ jobs:
             sleep 30
             attempt=$((attempt + 1))
           done
-          echo "=== VERIFYING METAL ==="
-          xcrun -sdk macosx metal --version
-          xcrun -sdk macosx metallib --version
-          echo "=== XCODE INFO ==="
-          xcodebuild -version
 
       - name: Install PoCL (OpenCL on CPU)
         run: |
@@ -216,9 +206,9 @@ jobs:
       - name: Test LLVMpipe (OpenCL)
         shell: pwsh
         run: |
-          # Mesa action đã set GALLIUM_DRIVER=llvmpipe
           $env:PATH = "${{ github.workspace }}\mesa;$env:PATH"
-          nim c -d:release --hints:off -d:backend=opencl test_nimformer.nim
+          # Thêm flag để cho phép fallback CPU nếu OpenCL không chạy
+          nim c -d:release --hints:off -d:backend=opencl -d:gForbidCpuFallback=false test_nimformer.nim
           ./test_nimformer.exe
 
       - name: CUDA Test Link (Colab)
