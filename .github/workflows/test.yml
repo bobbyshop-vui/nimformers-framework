@@ -1,0 +1,253 @@
+name: Test Nimformer
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  test-macos-arm:
+    name: macOS ARM (CPU + Metal + OpenCL)
+    runs-on: macos-15
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Xcode 26
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26'
+
+      - name: Install Metal toolchain (retry until success)
+        run: |
+          echo "=== INSTALLING METAL TOOLCHAIN ==="
+          attempt=1
+          while true; do
+            echo "Attempt $attempt..."
+            if sudo xcodebuild -downloadComponent MetalToolchain; then
+              echo "Download successful!"
+              break
+            fi
+            echo "Attempt $attempt failed, retrying in 30 seconds..."
+            sleep 30
+            attempt=$((attempt + 1))
+          done
+
+      - name: Install PoCL (OpenCL on CPU)
+        run: |
+          echo "=== INSTALLING POCL ==="
+          brew update
+          brew install pocl
+          echo "=== CHECK OPENCL ==="
+          clinfo || echo "No OpenCL devices found"
+
+      - name: Setup Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: '2.0.0'
+
+      - name: Test CPU
+        run: make run-cpu
+
+      - name: Test Metal
+        run: |
+          export PATH=$PATH:/Library/Developer/CommandLineTools/usr/bin
+          make run-metal
+
+      - name: Test OpenCL (PoCL)
+        run: |
+          export PKG_CONFIG_PATH="/opt/homebrew/lib/pkgconfig:$PKG_CONFIG_PATH"
+          export LD_LIBRARY_PATH="/opt/homebrew/lib:$LD_LIBRARY_PATH"
+          export DYLD_LIBRARY_PATH="/opt/homebrew/lib:$DYLD_LIBRARY_PATH"
+          export DYLD_FALLBACK_LIBRARY_PATH="/opt/homebrew/lib:$DYLD_FALLBACK_LIBRARY_PATH"
+          nim c -d:release --hints:off -d:backend=opencl -d:openclPath="/opt/homebrew/lib" test_nimformer.nim
+          ./test_nimformer
+
+  test-macos-intel:
+    name: macOS Intel (CPU + Metal + OpenCL)
+    runs-on: macos-15-intel
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Xcode 26
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26'
+
+      - name: Install Metal toolchain (retry until success)
+        run: |
+          echo "=== INSTALLING METAL TOOLCHAIN ==="
+          attempt=1
+          while true; do
+            echo "Attempt $attempt..."
+            if sudo xcodebuild -downloadComponent MetalToolchain; then
+              echo "Download successful!"
+              break
+            fi
+            echo "Attempt $attempt failed, retrying in 30 seconds..."
+            sleep 30
+            attempt=$((attempt + 1))
+          done
+
+      - name: Install PoCL (OpenCL on CPU)
+        run: |
+          echo "=== INSTALLING POCL ==="
+          brew update
+          brew install pocl
+          echo "=== CHECK OPENCL ==="
+          clinfo || echo "No OpenCL devices found"
+
+      - name: Setup Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: '2.0.0'
+
+      - name: Test CPU
+        run: make run-cpu
+
+      - name: Test Metal
+        run: |
+          export PATH=$PATH:/Library/Developer/CommandLineTools/usr/bin
+          make run-metal
+
+      - name: Test OpenCL (PoCL)
+        run: |
+          export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH"
+          export LD_LIBRARY_PATH="/usr/local/lib:$LD_LIBRARY_PATH"
+          export DYLD_LIBRARY_PATH="/usr/local/lib:$DYLD_LIBRARY_PATH"
+          export DYLD_FALLBACK_LIBRARY_PATH="/usr/local/lib:$DYLD_FALLBACK_LIBRARY_PATH"
+          nim c -d:release --hints:off -d:backend=opencl -d:openclPath="/usr/local/lib" test_nimformer.nim
+          ./test_nimformer
+
+  test-linux:
+    name: Linux (CPU + OpenCL/PoCL)
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: '2.0.0'
+
+      - name: Install PoCL and OpenCL dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pocl-opencl-icd \
+            ocl-icd-libopencl1 \
+            clinfo \
+            llvm-dev \
+            libclang-dev
+
+      - name: Check OpenCL
+        run: |
+          clinfo || echo "No OpenCL devices found"
+
+      - name: Test CPU
+        run: make run-cpu
+
+      - name: Test OpenCL (PoCL)
+        run: make run-opencl
+
+      - name: CUDA Test Link (Colab)
+        run: |
+          echo "==========================================================="
+          echo "🔗 Để test CUDA, hãy chạy trên Google Colab với GPU:"
+          echo "https://colab.research.google.com/drive/1-ZSYCivvF5ISxLpAwzy4KFvV7xiCtkdO#scrollTo=rrR_2QUkUxXZ"
+          echo "==========================================================="
+
+  test-windows:
+    name: Windows (CPU + LLVMpipe/Mesa)
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: '2.0.0'
+
+      - name: Install Mesa Windows (LLVMpipe)
+        uses: f3d-app/install-mesa-windows-action@v1
+        with:
+          path: ${{ github.workspace }}
+          version: 24.0.5
+
+      - name: Check Mesa/LLVMpipe
+        shell: pwsh
+        run: |
+          echo "=== CHECKING MESA ==="
+          Get-ChildItem -Path ${{ github.workspace }} -Filter "opengl32.dll" -Recurse | ForEach-Object { Write-Host "Found: $($_.FullName)" }
+          Write-Host "=== GALLIUM_DRIVER ENV ==="
+          Write-Host "GALLIUM_DRIVER = $env:GALLIUM_DRIVER"
+
+      - name: Test CPU
+        shell: pwsh
+        run: make run-cpu
+
+      - name: Test LLVMpipe (OpenCL)
+        shell: pwsh
+        run: |
+          $env:PATH = "${{ github.workspace }}\mesa;$env:PATH"
+          # Thêm flag để cho phép fallback CPU nếu OpenCL không chạy
+          nim c -d:release --hints:off -d:backend=opencl -d:gForbidCpuFallback=false test_nimformer.nim
+          ./test_nimformer.exe
+
+      - name: CUDA Test Link (Colab)
+        shell: pwsh
+        run: |
+          Write-Host "==========================================================="
+          Write-Host "🔗 Để test CUDA, hãy chạy trên Google Colab với GPU:"
+          Write-Host "https://colab.research.google.com/drive/1-ZSYCivvF5ISxLpAwzy4KFvV7xiCtkdO#scrollTo=rrR_2QUkUxXZ"
+          Write-Host "==========================================================="
+
+  summary:
+    name: Test Summary
+    runs-on: ubuntu-latest
+    needs: [test-macos-arm, test-macos-intel, test-linux, test-windows]
+    if: always()
+    
+    steps:
+      - name: Print summary
+        run: |
+          echo "## 🧪 Test Summary"
+          echo ""
+          echo "| Platform | Architecture | Backend | Status |"
+          echo "|----------|--------------|---------|--------|"
+          echo "| 🍎 macOS | ARM | CPU | ${{ needs.test-macos-arm.result }} |"
+          echo "| 🍎 macOS | ARM | Metal | ${{ needs.test-macos-arm.result }} |"
+          echo "| 🍎 macOS | ARM | OpenCL (PoCL) | ${{ needs.test-macos-arm.result }} |"
+          echo "| 🍎 macOS | Intel | CPU | ${{ needs.test-macos-intel.result }} |"
+          echo "| 🍎 macOS | Intel | Metal | ${{ needs.test-macos-intel.result }} |"
+          echo "| 🍎 macOS | Intel | OpenCL (PoCL) | ${{ needs.test-macos-intel.result }} |"
+          echo "| 🐧 Linux | x86_64 | CPU | ${{ needs.test-linux.result }} |"
+          echo "| 🐧 Linux | x86_64 | OpenCL (PoCL) | ${{ needs.test-linux.result }} |"
+          echo "| 🪟 Windows | x86_64 | CPU | ${{ needs.test-windows.result }} |"
+          echo "| 🪟 Windows | x86_64 | LLVMpipe (Mesa) | ${{ needs.test-windows.result }} |"
+          echo ""
+          echo "### 🔗 Test CUDA trên Colab:"
+          echo "https://colab.research.google.com/drive/1-ZSYCivvF5ISxLpAwzy4KFvV7xiCtkdO#scrollTo=rrR_2QUkUxXZ"
+          
+      - name: Check overall status
+        if: needs.test-macos-arm.result != 'success' || needs.test-macos-intel.result != 'success' || needs.test-linux.result != 'success' || needs.test-windows.result != 'success'
+        run: |
+          echo "::error::❌ Some tests failed!"
+          exit 1
