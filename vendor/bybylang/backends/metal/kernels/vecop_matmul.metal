@@ -20,7 +20,26 @@ kernel void vecop_kernel(
 // ============================================================
 // MATMUL TILED
 // ============================================================
-#define BB_TILE 16
+// SỬA: tăng từ 16 lên 32 - tile 16x16 quá nhỏ để tận dụng iGPU Intel
+// (quá nhiều threadgroup nhỏ, mỗi threadgroup ít việc, overhead dispatch
+// tương đối cao). Tile 32x32 giảm số threadgroup cần dispatch 4 lần, tăng
+// số phép tính trên mỗi lần nạp tileA/tileB vào threadgroup memory (data
+// reuse tốt hơn) - gần với hướng đi của llama.cpp (dùng tile lớn / simdgroup
+// thay vì tile nhỏ cố định). 32*32*4 byte * 2 tile = 8KB threadgroup memory,
+// vẫn nằm trong giới hạn 32KB threadgroup memory của GPU Apple/Intel nên an
+// toàn không tràn.
+// SUA (fix GPU Timeout tren Intel Iris/iGPU yeu): 32x32=1024 threads/threadgroup
+// bi hardcode trong metal_shim.m (metal_matmul) MA KHONG kiem tra
+// pipeline.maxTotalThreadsPerThreadgroup truoc khi dispatch (khac voi
+// metal_vecop cung file co MIN(...) tu te). Tren iGPU yeu, threadgroup memory
+// 8KB (tileA+tileB) + vong lap unroll 32 buoc co the khien compiler gioi han
+// maxTotalThreadsPerThreadgroup cua pipeline nay XUONG DUOI 1024 -> dispatch
+// vuot gioi han that -> driver Intel treo cung thay vi bao loi API ngay ->
+// GPU watchdog kill sau vai giay (dung loi "GPU Timeout" ban gap). Ha xuong
+// 8 (64 threads/threadgroup) de an toan tren moi GPU, doi lai groupSize
+// trong metal_shim.m (metal_matmul VA metal_matmul_enc) tu MTLSizeMake(32,32,1)
+// thanh MTLSizeMake(8,8,1) cho khop.
+#define BB_TILE 8
 
 kernel void matmul_kernel(
     device const float* a [[buffer(0)]],
@@ -332,6 +351,71 @@ kernel void embedding_lookup_kernel(
 }
 
 // ============================================================
+// MATMUL TRUC TIEP TREN INT4 ASYMMETRIC (packed, per-group scale/zero_point)
+// ============================================================
+// SUA (item 3 trong ghi chu hieu nang): TRUOC DAY moi lan Linear.forward()
+// phai dequantizeTensorTransposed() TOAN BO weight int4 ra 1 mang fp32 day
+// du tren CPU (vd 4096x11008 ~180MB fp32) roi UPLOAD ca mang fp32 do len
+// GPU chi de nhan 1 lan roi vut - dung y nhu llama.cpp KHONG lam (ho nhan
+// truc tiep tren du lieu quantized). Kernel nay nhan thang tren buffer
+// int4 da pack (2 gia tri/byte) + scale/zero_point theo group, KHONG can
+// dequant rieng tren CPU va KHONG can upload mang fp32 day du - giam bang
+// thong upload ~4-8 lan (dung tinh than "giam bang thong memory" cua
+// llama.cpp), giai phong luon phan CPU-time danh cho vong for dequant.
+// Layout phai khop CHINH XAC voi quant.nim (quantizeInt4Asymmetric /
+// dequantizeTensorTransposed):
+//   - wq: [N, K] row-major, nibble-packed 2 gia tri/byte, byte thap = phan
+//     tu chan (k%2==0), byte cao = phan tu le (k%2==1).
+//   - scales/zeros: neu groupSize>0, moi hang N chia thanh
+//     ceil(K/groupSize) group, group[g] dung scales[n*nGroupsPerRow+g].
+//   - c[m,n] = sum_k a[m,k] * ((nibble(n,k) - zero(n,g)) * scale(n,g))
+//     -- dung 100% cong thuc trong dequantizeTensorTransposed() + beMatmul
+//     hien tai, chi khac la khong vat chat hoa wT ra fp32 truoc.
+// CHUA CHAY THU TREN GPU METAL THAT (moi truong sinh code la Linux, khong
+// co macOS/Metal that de bien dich+chay) - viet bam sat dung cong thuc
+// tham chieu CPU (quant.nim) nhung BAT BUOC phai tu build+test tren May
+// that truoc khi dung cho sinh token that. Neu ra token rac, day la nghi
+// ngo dau tien (sai offset nibble hoac sai thu tu group).
+kernel void matmul_q4_kernel(
+    device const float* a          [[buffer(0)]],   // [M,K]
+    device const uchar* wq         [[buffer(1)]],   // [N, ceil(K/2)] packed int4
+    device const float* scales     [[buffer(2)]],   // [N * nGroupsPerRow]
+    device const float* zeros      [[buffer(3)]],   // [N * nGroupsPerRow]
+    device float* c                [[buffer(4)]],   // [M,N]
+    device const int& M            [[buffer(5)]],
+    device const int& K            [[buffer(6)]],
+    device const int& N            [[buffer(7)]],
+    device const int& groupSize    [[buffer(8)]],
+    device const int& nGroupsPerRow [[buffer(9)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int n = int(gid.x);
+    int m = int(gid.y);
+    if (m >= M || n >= N) return;
+
+    int bytesPerRow = (K + 1) / 2;
+    int rowByteOff = n * bytesPerRow;
+    int rowGroupOff = n * nGroupsPerRow;
+
+    float sum = 0.0f;
+    int curGroup = -1;
+    float sc = 0.0f, zp = 0.0f;
+    for (int k = 0; k < K; ++k) {
+        int g = groupSize > 0 ? (k / groupSize) : 0;
+        if (g != curGroup) {
+            curGroup = g;
+            sc = scales[rowGroupOff + g];
+            zp = zeros[rowGroupOff + g];
+        }
+        uchar byteVal = wq[rowByteOff + (k >> 1)];
+        uchar nibble = (k & 1) == 0 ? (byteVal & 0x0F) : ((byteVal >> 4) & 0x0F);
+        float wval = (float(nibble) - zp) * sc;
+        sum += a[m * K + k] * wval;
+    }
+    c[m * N + n] = sum;
+}
+
+// ============================================================
 // ATOMIC ADD FLOAT
 // ============================================================
 inline void atomicAddFloatDevice(device atomic_uint* addr, float val) {
@@ -367,36 +451,42 @@ kernel void attention_fused_kernel(
     if (bh < (uint)(B * H) && ti < (uint)S) {
         uint base_idx = bh * S * D;
         uint base_s = bh * S * S;
-        
-        float scores[256];
+        uint row = base_s + ti * S;
+
+        // SUA: bo local array "float scores[256]" (tran bo nho neu S > 256,
+        // vi day la mang co dinh tren stack cua thread, khong lien quan gi
+        // toi kich thuoc thuc te cua S). Dung thang s_matrix (buffer global,
+        // da duoc cap phat dung S*S theo tung lan goi thuc te tu phia Nim)
+        // lam bo nho tam -> khong con gioi han cung nao ve S nua.
         float mx = -1e30f;
         for (uint tj = 0; tj <= ti; ++tj) {
             float dot = 0.0f;
             for (int d = 0; d < D; ++d) {
                 dot += q[base_idx + ti * D + d] * k[base_idx + tj * D + d];
             }
-            scores[tj] = dot * scale;
-            if (scores[tj] > mx) mx = scores[tj];
+            float sc = dot * scale;
+            s_matrix[row + tj] = sc;
+            if (sc > mx) mx = sc;
         }
-        
+
         float sum_exp = 0.0f;
         for (uint tj = 0; tj <= ti; ++tj) {
-            scores[tj] = exp(scores[tj] - mx);
-            sum_exp += scores[tj];
+            float e = exp(s_matrix[row + tj] - mx);
+            s_matrix[row + tj] = e;
+            sum_exp += e;
         }
-        
+
         for (uint tj = 0; tj <= ti; ++tj) {
-            scores[tj] /= sum_exp;
-            s_matrix[base_s + ti * S + tj] = scores[tj];
+            s_matrix[row + tj] /= sum_exp;
         }
         for (uint tj = ti + 1; tj < (uint)S; ++tj) {
-            s_matrix[base_s + ti * S + tj] = 0.0f;
+            s_matrix[row + tj] = 0.0f;
         }
-        
+
         for (int d = 0; d < D; ++d) {
             float acc = 0.0f;
             for (uint tj = 0; tj <= ti; ++tj) {
-                acc += scores[tj] * v[base_idx + tj * D + d];
+                acc += s_matrix[row + tj] * v[base_idx + tj * D + d];
             }
             o[base_idx + ti * D + d] = acc;
         }

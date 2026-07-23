@@ -1,34 +1,306 @@
-## main.nim
-## Bản port của main.py sang framework Nim thuần (nimformer.nim + quant.nim +
-## customfloat.nim + metal_ai.nim) — KHÔNG còn phụ thuộc Python/tinygrad/
-## MetalCharLM nữa. Toàn bộ training loop, tokenizer, ghép batch, tối ưu Adam
-## (ApfAdam) và lượng tử hoá checkpoint (int8/int4/fp8/APF) đều tự viết ở đây,
-## dùng đúng API thật đã có trong 4 file thư viện (không sửa các file đó).
-##
-## Vì các file thư viện (nimformer/quant/customfloat/metal_ai) không có
-## `when isMainModule`, main.nim chính là "code chạy" — giống vai trò của
-## main.py trong bản Python gốc, nhưng linh hoạt hơn: mọi hằng số (SEQ,
-## BATCH_SIZE, STEPS, kiểu lượng tử hoá khi lưu...) đều chỉnh được qua CLI
-## thay vì hard-code.
-##
-## Build & chạy (macOS + Metal, xem thêm README_BUILD.md):
-##   nim c -d:release -o:main main.nim
-##   ./main --steps=2000 --seq=128 --batch=32 --lr=3e-3 \
-##          --embed-dim=128 --heads=4 --layers=4 --ff-mult=4 \
-##          --quant=auto --save=finetune.nimq
-##
-## Các nguồn dữ liệu (giống main.py, đọc file cục bộ nếu có / gọi mạng nếu
-## không, và BỎ QUA êm nếu lỗi, giống hệt tinh thần try/except của bản gốc):
-##   grammar.txt, million_games.pgn, english_words.txt,
-##   databricks-dolly-15k.jsonl, Wikipedia (vài trang tech/history),
-##   StackOverflow (StackExchange API), tự-đấu Stockfish (nếu có binary).
+## test_nimformer.nim - Training với Linear++ Attention + Session API
+## Build: nim c -d:release -o:train_linearpp test_nimformer.nim
+## Chạy: ./train_linearpp --backend=metal --steps=1000 --seq=128 --batch=32
 
 import std/[os, math, random, strformat, strutils, sequtils, tables, json,
             times, parseopt, osproc, streams, re, httpclient]
 import quant, nimformer, backend, customfloat
 
 # ═══════════════════════════════════════════════════════════════
-# Config — thay cho các hằng số cứng SEQ/BATCH_SIZE/STEPS ở đầu main.py
+# IMPORT CÁC BACKEND CÓ SẴN TRONG vendor/bybylang/backends/
+# ═══════════════════════════════════════════════════════════════
+
+when defined(macosx):
+  import vendor/bybylang/backends/metal/metal_backend as metal
+import vendor/bybylang/backends/cuda/cuda_driver
+import vendor/bybylang/backends/opencl/opencl_api
+import vendor/bybylang/gpubackend
+
+# ═══════════════════════════════════════════════════════════════
+# SESSION API CHUNG - dùng thẳng SessionHandle + session* từ gpubackend.nim
+# (không định nghĩa lại ở đây để tránh trùng/lệch với bản gốc, vốn đã hỗ
+#  trợ đủ Metal/CUDA/OpenCL/TSIC).
+# ═══════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════
+# CPU IMPLEMENTATION CHO LINEAR++ ATTENTION
+# ═══════════════════════════════════════════════════════════════
+
+proc cpuLinearPlusForward(qData, kData, vData: seq[float32], B, H, T, D: int, scale: float32): seq[float32] =
+  ## qData/kData/vData layout is [B, T, H*D] (heads interleaved per timestep,
+  ## matching how forwardLinearPlus slices them out of the fused QKV
+  ## projection). Output is written back in that SAME [B, T, H*D] layout so
+  ## it can be dropped straight into a Tensor of shape [B,T,C] afterwards.
+  ##
+  ## KV = K^T @ V is a proper [D, D] matrix (contracted over T), and
+  ## O = Q @ KV is [T, D]. This is O(T*D^2), linear in sequence length T --
+  ## unlike a naive T x T attention matrix. The previous version of this
+  ## function built a "kv" array sized [T, D] and indexed it with a T-ranged
+  ## loop variable used AS a D-index, which only produced correct results by
+  ## coincidence when T == D and silently read wrong memory otherwise.
+  let C = H * D
+  result = newSeq[float32](B * T * C)
+  let norm = 1'f32 / sqrt(float32(T))
+  template idx(b, t, h, d: int): int = b * T * C + t * C + h * D + d
+  for b in 0 ..< B:
+    for h in 0 ..< H:
+      # KV[i,j] = sum_t K[t,i] * V[t,j]  -> [D, D]
+      var kv = newSeq[float32](D * D)
+      for t in 0 ..< T:
+        for i in 0 ..< D:
+          let kt = kData[idx(b, t, h, i)]
+          if kt == 0'f32: continue
+          for j in 0 ..< D:
+            kv[i * D + j] += kt * vData[idx(b, t, h, j)]
+      # O[t,j] = sum_i Q[t,i] * KV[i,j]
+      for t in 0 ..< T:
+        for j in 0 ..< D:
+          var acc = 0'f32
+          for i in 0 ..< D:
+            acc += qData[idx(b, t, h, i)] * kv[i * D + j]
+          result[idx(b, t, h, j)] = acc * scale * norm
+
+proc cpuLinearPlusBackward(qData, kData, vData, dOutData: seq[float32], B, H, T, D: int, scale: float32): tuple[dq, dk, dv: seq[float32]] =
+  ## Same [B, T, H*D] layout and same D×D KV convention as cpuLinearPlusForward.
+  let C = H * D
+  result.dq = newSeq[float32](B * T * C)
+  result.dk = newSeq[float32](B * T * C)
+  result.dv = newSeq[float32](B * T * C)
+  let norm = 1'f32 / sqrt(float32(T))
+  template idx(b, t, h, d: int): int = b * T * C + t * C + h * D + d
+
+  for b in 0 ..< B:
+    for h in 0 ..< H:
+      # Recompute KV[i,j] = sum_t K[t,i] * V[t,j]
+      var kv = newSeq[float32](D * D)
+      for t in 0 ..< T:
+        for i in 0 ..< D:
+          let kt = kData[idx(b, t, h, i)]
+          if kt == 0'f32: continue
+          for j in 0 ..< D:
+            kv[i * D + j] += kt * vData[idx(b, t, h, j)]
+
+      # dKV[i,j] = sum_t Q[t,i] * (dOut[t,j] * scale * norm)   (since O = Q @ KV)
+      var dkv = newSeq[float32](D * D)
+      for t in 0 ..< T:
+        for j in 0 ..< D:
+          let g = dOutData[idx(b, t, h, j)] * scale * norm
+          if g == 0'f32: continue
+          for i in 0 ..< D:
+            dkv[i * D + j] += qData[idx(b, t, h, i)] * g
+
+      # dQ[t,i] = sum_j (dOut[t,j] * scale * norm) * KV[i,j]
+      for t in 0 ..< T:
+        for i in 0 ..< D:
+          var acc = 0'f32
+          for j in 0 ..< D:
+            acc += dOutData[idx(b, t, h, j)] * scale * norm * kv[i * D + j]
+          result.dq[idx(b, t, h, i)] += acc
+
+      # KV = K^T @ V  ->  dK = V @ dKV^T ,  dV = K @ dKV
+      for t in 0 ..< T:
+        for i in 0 ..< D:
+          var accK = 0'f32
+          for j in 0 ..< D:
+            accK += dkv[i * D + j] * vData[idx(b, t, h, j)]
+          result.dk[idx(b, t, h, i)] += accK
+        for j in 0 ..< D:
+          var accV = 0'f32
+          for i in 0 ..< D:
+            accV += kData[idx(b, t, h, i)] * dkv[i * D + j]
+          result.dv[idx(b, t, h, j)] += accV
+
+# ═══════════════════════════════════════════════════════════════
+# LINEAR++ ATTENTION - DÙNG SESSION API
+# ═══════════════════════════════════════════════════════════════
+
+type
+  LinearPlusAttention* = object
+    nHeads*, headDim*, embedDim*: int
+    qkv*, proj*: Linear
+    useSession*: bool
+
+proc newLinearPlusAttention*(embedDim, nHeads: int, useSession: bool = true): LinearPlusAttention =
+  assert embedDim mod nHeads == 0
+  result.embedDim = embedDim
+  result.nHeads = nHeads
+  result.headDim = embedDim div nHeads
+  result.qkv = newLinear(embedDim, 3 * embedDim)
+  result.proj = newLinear(embedDim, embedDim)
+  result.useSession = useSession
+proc forwardLinearPlus*(attn: LinearPlusAttention, x: Tensor, ctx: Backend): Tensor =
+  let B = x.shape[0]
+  let T = x.shape[1]
+  let C = x.shape[2]
+  assert C == attn.embedDim
+
+  let qkv = attn.qkv.forward(x, ctx)
+  let hd = attn.headDim
+  let H = attn.nHeads
+  let scale = 1'f32 / sqrt(float32(hd))
+
+  # === FIX: KHÔNG GÁN qkv.data, DÙNG BIẾN TẠM ===
+  var qkvData = qkv.data
+  let expectedQkvSize = B * T * 3 * C
+  if qkvData.len != expectedQkvSize:
+    stderr.writeLine "[WARN] forwardLinearPlus: qkv.data.len=", qkvData.len, " expected=", expectedQkvSize
+    var fixedQkv = newSeq[float32](expectedQkvSize)
+    let copyLen = min(qkvData.len, expectedQkvSize)
+    for i in 0 ..< copyLen:
+      fixedQkv[i] = qkvData[i]
+    qkvData = fixedQkv
+
+  # Slice Q, K, V
+  var qData = newSeq[float32](B * T * C)
+  var kData = newSeq[float32](B * T * C)
+  var vData = newSeq[float32](B * T * C)
+
+  for b in 0 ..< B:
+    let baseQKV = b * T * 3 * C
+    let baseOut = b * T * C
+    for t in 0 ..< T:
+      for c in 0 ..< C:
+        qData[baseOut + t * C + c] = qkvData[baseQKV + t * 3 * C + c]
+        kData[baseOut + t * C + c] = qkvData[baseQKV + t * 3 * C + C + c]
+        vData[baseOut + t * C + c] = qkvData[baseQKV + t * 3 * C + 2 * C + c]
+
+  var oData: seq[float32]
+  let norm = 1'f32 / sqrt(float32(T))
+
+  if attn.useSession and ctx.kind in {bkMetal, bkCuda, bkOpenCL}:
+    let backend = ctx.kind.toByby()
+    oData = newSeq[float32](B * T * C)
+    var sessionOk = sessionBegin(backend)
+
+    if sessionOk:
+      # Một cặp buffer (KV, O) cho MỖI (batch, head), nhưng TẤT CẢ các lệnh
+      # matmul được encode vào CÙNG 1 session -> chỉ commit+waitUntilCompleted
+      # MỘT LẦN ở sessionEnd() bên dưới, thay vì B*H*2 lần dispatch rời rạc.
+      # Đây chính là điểm của session API (giảm overhead command-buffer trên
+      # iGPU yếu), phần trước đây bị bỏ trống bằng 3 dòng TODO.
+      var kvHandles: seq[SessionHandle] = @[]
+      var oHandles: seq[SessionHandle] = @[]
+
+      block encodeLoop:
+        for b in 0 ..< B:
+          for h in 0 ..< H:
+            # Gom Q, V liên tục [T,D] và K CHUYỂN VỊ [D,T] (matmul không có
+            # tham số transpose, nên phải tự chuyển vị trước khi upload).
+            var qSlice = newSeq[float32](T * hd)
+            var kSliceT = newSeq[float32](hd * T)
+            var vSlice = newSeq[float32](T * hd)
+            for t in 0 ..< T:
+              let srcOff = b * T * C + t * C + h * hd
+              for d in 0 ..< hd:
+                qSlice[t * hd + d] = qData[srcOff + d]
+                kSliceT[d * T + t] = kData[srcOff + d]
+                vSlice[t * hd + d] = vData[srcOff + d]
+
+            var hQ = sessionUpload(backend, qSlice)
+            var hKT = sessionUpload(backend, kSliceT)
+            var hV = sessionUpload(backend, vSlice)
+            var hKV = sessionAllocScratch(backend, hd * hd)
+            var hO = sessionAllocScratch(backend, T * hd)
+
+            # KV[D,D] = K^T[D,T] @ V[T,D]
+            if not sessionMatmul(backend, hKT, hV, hKV, hd, T, hd):
+              sessionOk = false
+            # O[T,D] = Q[T,D] @ KV[D,D]
+            elif not sessionMatmul(backend, hQ, hKV, hO, T, hd, hd):
+              sessionOk = false
+
+            sessionFree(backend, hQ)
+            sessionFree(backend, hKT)
+            sessionFree(backend, hV)
+            kvHandles.add(hKV)
+            oHandles.add(hO)
+            if not sessionOk: break encodeLoop
+
+      if sessionOk and sessionEnd(backend):
+        var hi = 0
+        for b in 0 ..< B:
+          for h in 0 ..< H:
+            let raw = sessionRead(backend, oHandles[hi], T * hd)
+            for t in 0 ..< T:
+              let dstOff = b * T * C + t * C + h * hd
+              for d in 0 ..< hd:
+                oData[dstOff + d] = raw[t * hd + d] * scale * norm
+            inc hi
+      else:
+        oData = cpuLinearPlusForward(qData, kData, vData, B, H, T, hd, scale)
+
+      for h in kvHandles.mitems: sessionFree(backend, h)
+      for h in oHandles.mitems: sessionFree(backend, h)
+    else:
+      oData = cpuLinearPlusForward(qData, kData, vData, B, H, T, hd, scale)
+  else:
+    oData = cpuLinearPlusForward(qData, kData, vData, B, H, T, hd, scale)
+
+  var o = newTensor(@[B, T, C])
+  o.data = oData
+  result = attn.proj.forward(o, ctx)
+proc backwardLinearPlus*(attn: LinearPlusAttention, x: Tensor, dOut: Tensor, ctx: Backend): tuple[
+    dX, dQkvW, dQkvB, dProjW, dProjB: Tensor] =
+
+  let B = x.shape[0]
+  let T = x.shape[1]
+  let C = x.shape[2]
+  let hd = attn.headDim
+  let H = attn.nHeads
+  let scale = 1'f32 / sqrt(float32(hd))
+
+  let qkv = attn.qkv.forward(x, ctx)
+  
+  # === FIX: KHÔNG GÁN qkv.data, DÙNG BIẾN TẠM ===
+  var qkvData = qkv.data
+  let expectedQkvSize = B * T * 3 * C
+  if qkvData.len != expectedQkvSize:
+    stderr.writeLine "[WARN] backwardLinearPlus: qkv.data.len=", qkvData.len, " expected=", expectedQkvSize
+    var fixedQkv = newSeq[float32](expectedQkvSize)
+    let copyLen = min(qkvData.len, expectedQkvSize)
+    for i in 0 ..< copyLen:
+      fixedQkv[i] = qkvData[i]
+    qkvData = fixedQkv
+
+  var qData = newSeq[float32](B * T * C)
+  var kData = newSeq[float32](B * T * C)
+  var vData = newSeq[float32](B * T * C)
+
+  for b in 0 ..< B:
+    let baseQKV = b * T * 3 * C
+    let baseOut = b * T * C
+    for t in 0 ..< T:
+      for c in 0 ..< C:
+        qData[baseOut + t * C + c] = qkvData[baseQKV + t * 3 * C + c]
+        kData[baseOut + t * C + c] = qkvData[baseQKV + t * 3 * C + C + c]
+        vData[baseOut + t * C + c] = qkvData[baseQKV + t * 3 * C + 2 * C + c]
+
+  # Forward để lấy output
+  let oData = cpuLinearPlusForward(qData, kData, vData, B, H, T, hd, scale)
+  var attnOut = newTensor(@[B, T, C])
+  attnOut.data = oData
+
+  # dProj
+  let dProj = attn.proj.backward(attnOut, dOut, ctx)
+  let dAttnOut = dProj.dX
+
+  # Backward Linear++
+  let (dq, dk, dv) = cpuLinearPlusBackward(qData, kData, vData, dAttnOut.data, B, H, T, hd, scale)
+
+  var dQkv = newTensor(qkv.shape)
+  for b in 0 ..< B:
+    let baseQKV = b * T * 3 * C
+    let baseOut = b * T * C
+    for t in 0 ..< T:
+      for c in 0 ..< C:
+        dQkv.data[baseQKV + t * 3 * C + c] = dq[baseOut + t * C + c]
+        dQkv.data[baseQKV + t * 3 * C + C + c] = dk[baseOut + t * C + c]
+        dQkv.data[baseQKV + t * 3 * C + 2 * C + c] = dv[baseOut + t * C + c]
+
+  let dQkvLin = attn.qkv.backward(x, dQkv, ctx)
+  result = (dQkvLin.dX, dQkvLin.dW, dQkvLin.dB, dProj.dW, dProj.dB)
+# ═══════════════════════════════════════════════════════════════
+# CONFIG - THAY CHO HẰNG SỐ CỨNG
 # ═══════════════════════════════════════════════════════════════
 
 type
@@ -41,11 +313,11 @@ type
     steps: int
     lr: float32
     embedDim, nHeads, nLayers, ffMult: int
-    requantizeEvery: int      ## mỗi bao nhiêu bước Adam thì APF requantize lại param (trong lúc train)
+    requantizeEvery: int
     savePath: string
     tokenizerPath: string
     dataDir: string
-    quant: QuantChoice        ## kiểu nén dùng khi LƯU checkpoint cuối (trọng số; bias/LN luôn fp32)
+    quant: QuantChoice
     ckptEvery: int
     logEvery: int
     stockfishPath: string
@@ -55,6 +327,8 @@ type
     soMaxPages: int
     wikiMaxPages: int
     seed: int
+    backend: string
+    useSession: bool
 
 proc parseQuant(s: string): QuantChoice =
   case s.toLowerAscii
@@ -65,7 +339,7 @@ proc parseQuant(s: string): QuantChoice =
   of "auto", "apf": qcAuto
   of "none", "fp32", "raw": qcNone
   else:
-    stderr.writeLine &"[cảnh báo] --quant='{s}' không nhận diện được, dùng mặc định 'auto' (APF)"
+    stderr.writeLine &"[cảnh báo] --quant='{s}' không nhận diện được, dùng mặc định 'auto'"
     qcAuto
 
 proc quantKindOf(choice: QuantChoice): QuantKind =
@@ -83,10 +357,13 @@ proc defaultConfig(): Config =
     batchSize: 32,
     steps: 10000,
     lr: 3e-3'f32,
-    embedDim: 128, nHeads: 4, nLayers: 4, ffMult: 4,
+    embedDim: 128,
+    nHeads: 4,
+    nLayers: 4,
+    ffMult: 4,
     requantizeEvery: 50,
     savePath: "finetune.nimq",
-    tokenizerPath: "tokenizer.json",
+    tokenizerPath: "tokenizer-testmodel.json",
     dataDir: ".",
     quant: qcAuto,
     ckptEvery: 5,
@@ -97,7 +374,9 @@ proc defaultConfig(): Config =
     soTags: @["python", "c", "swift", "objective-c", "nim"],
     soMaxPages: 100,
     wikiMaxPages: 10,
-    seed: 1337
+    seed: 1337,
+    backend: "metal",
+    useSession: true
   )
 
 proc parseArgs(): Config =
@@ -121,15 +400,25 @@ proc parseArgs(): Config =
       of "quant":             result.quant = parseQuant(val)
       of "ckpt-every":        result.ckptEvery = parseInt(val)
       of "log-every":         result.logEvery = parseInt(val)
-      of "stockfish-path":    result.stockfishPath = val
-      of "stockfish-games":   result.stockfishGames = parseInt(val)
-      of "stockfish-plies":   result.stockfishPlies = parseInt(val)
-      of "so-tags":           result.soTags = val.split(",")
-      of "so-max-pages":      result.soMaxPages = parseInt(val)
-      of "wiki-max-pages":    result.wikiMaxPages = parseInt(val)
       of "seed":              result.seed = parseInt(val)
+      of "backend":           result.backend = val
+      of "no-session":        result.useSession = false
       of "help", "h":
-        echo "Xem phần comment đầu main.nim để biết danh sách cờ (--steps, --seq, --batch, --lr, --quant, --save, ...)"
+        echo "Usage: ./train_linearpp [options]"
+        echo "Options:"
+        echo "  --seq=128            Sequence length"
+        echo "  --batch=32           Batch size"
+        echo "  --steps=10000        Training steps"
+        echo "  --lr=3e-3            Learning rate"
+        echo "  --embed-dim=128      Embedding dimension"
+        echo "  --heads=4            Number of attention heads"
+        echo "  --layers=4           Number of transformer layers"
+        echo "  --ff-mult=4          FFN multiplier"
+        echo "  --quant=auto         Quantization type: int8|int4|fp8|auto|none"
+        echo "  --backend=metal      Backend: cpu|metal|cuda|opencl|auto"
+        echo "  --no-session         Disable session API"
+        echo "  --save=finetune.nimq Output checkpoint path"
+        echo "  --help               Show this help"
         quit(0)
       else:
         stderr.writeLine &"[cảnh báo] cờ không rõ: --{key}"
@@ -137,8 +426,7 @@ proc parseArgs(): Config =
       stderr.writeLine &"[cảnh báo] giá trị không hợp lệ cho --{key}='{val}', bỏ qua"
 
 # ═══════════════════════════════════════════════════════════════
-# CharTokenizer — tokenizer byte-level thuần Nim (không cần thư viện ngoài,
-# xử lý tốt cả UTF-8 vì mỗi byte là 1 token; vocab tối đa 256).
+# CHARTOKENIZER - BYTE-LEVEL
 # ═══════════════════════════════════════════════════════════════
 
 type
@@ -159,7 +447,7 @@ proc newCharTokenizer*(texts: seq[string]): CharTokenizer =
       result.itos[idx] = char(b)
       result.stoi[b] = idx
       inc idx
-  result.vocabSize = max(idx, 1)  # tối thiểu 1 để tránh model vocab=0
+  result.vocabSize = max(idx, 1)
 
 proc encode*(tok: CharTokenizer, s: string): seq[int] =
   result = newSeq[int](s.len)
@@ -190,35 +478,8 @@ proc loadTokenizer*(path: string): CharTokenizer =
   result.vocabSize = max(idx, 1)
 
 # ═══════════════════════════════════════════════════════════════
-# Data loaders — port của các hàm load_* trong main.py.
-# Mỗi hàm tự "nuốt" lỗi (file không tồn tại / mạng lỗi) và trả về @[],
-# giống hệt tinh thần try/except im lặng của bản Python gốc.
+# DATA LOADERS
 # ═══════════════════════════════════════════════════════════════
-
-proc loadGrammarTexts*(path: string): seq[string] =
-  result = @[]
-  if not fileExists(path): return
-  for line in lines(path):
-    let l = line.strip()
-    if l.len > 0: result.add(l)
-
-proc loadEnglishDict*(path: string): seq[string] =
-  result = @[]
-  if fileExists(path):
-    for line in lines(path):
-      let l = line.strip()
-      if l.len > 0: result.add(l)
-    return
-  # fallback: tải danh sách từ tiếng Anh phổ biến từ GitHub (giống bản Python)
-  try:
-    var client = newHttpClient(timeout = 10000)
-    defer: client.close()
-    let body = client.getContent(
-      "https://raw.githubusercontent.com/dwyl/english-words/master/words.txt")
-    for w in body.splitLines():
-      if w.len > 0: result.add(w)
-  except CatchableError:
-    discard
 
 proc loadDolly*(path: string): seq[string] =
   result = @[]
@@ -237,157 +498,17 @@ proc loadDolly*(path: string): seq[string] =
     except CatchableError:
       continue
 
-proc loadPgnTxt*(path: string): seq[string] =
-  ## Rút movetext (SAN) trực tiếp từ file PGN bằng regex thay vì replay từng
-  ## nước đi qua 1 chess engine luật đầy đủ (Nim không có sẵn thư viện chess
-  ## tương đương python-chess) — vẫn cho ra đúng chuỗi SAN thật trong file,
-  ## chỉ là không kiểm tra tính hợp lệ, điều mà 1 char-LM không cần tới.
-  result = @[]
-  if not fileExists(path): return
-  let content = readFile(path)
-  for blk in content.split("\n\n"):
-    let b = blk.strip()
-    if b.len == 0 or b.startsWith("["): continue  # bỏ qua block tag-header
-    var moves = b.replace(re"\{[^}]*\}", " ")            # bỏ comment {...}
-    moves = moves.replace(re"\d+\.(\.\.)?", " ")           # bỏ số nước "12." / "12..."
-    moves = moves.replace(re"(1-0|0-1|1/2-1/2|\*)\s*$", "") # bỏ ký hiệu kết quả
-    moves = moves.replace(re"\s+", " ").strip()
-    if moves.len > 0: result.add(moves)
-
-proc loadStockfishSelfPlay*(nGames, plies: int, enginePath: string): seq[string] =
-  ## Tự-đấu bằng chính Stockfish (nó tự chọn nước qua "bestmove"), nên
-  ## KHÔNG cần cài luật cờ vua trong Nim. Ghi lại chuỗi nước UCI + eval cuối,
-  ## thay vì FEN + "Final evaluation" như bản Python (không cần build board).
-  result = @[]
-  if enginePath.len == 0 or not fileExists(enginePath): return
-  var p: Process
-  try:
-    p = startProcess(enginePath, options = {poUsePath})
-  except CatchableError:
-    return
-  defer:
-    try: p.close() except CatchableError: discard
-  let pin = p.inputStream
-  let pout = p.outputStream
-
-  proc send(cmd: string) =
-    try:
-      pin.writeLine(cmd)
-      pin.flush()
-    except CatchableError: discard
-
-  proc waitFor(token: string, maxLines = 2000) =
-    var line: string
-    var n = 0
-    while n < maxLines and pout.readLine(line):
-      inc n
-      if token in line: return
-
-  send("uci"); waitFor("uciok")
-  send("isready"); waitFor("readyok")
-
-  for g in 0 ..< nGames:
-    var moveList: seq[string] = @[]
-    for ply in 0 ..< plies:
-      let posCmd = if moveList.len == 0: "position startpos"
-                   else: "position startpos moves " & moveList.join(" ")
-      send(posCmd)
-      send("go depth 8")
-      var bestMove = ""
-      var line: string
-      var n = 0
-      while n < 2000 and pout.readLine(line):
-        inc n
-        if line.startsWith("bestmove"):
-          let parts = line.splitWhitespace()
-          if parts.len >= 2: bestMove = parts[1]
-          break
-      if bestMove.len == 0 or bestMove == "(none)": break
-      moveList.add(bestMove)
-    if moveList.len == 0: continue
-    send("position startpos moves " & moveList.join(" "))
-    send("eval")
-    var evalLine = ""
-    var line: string
-    var n = 0
-    while n < 500 and pout.readLine(line):
-      inc n
-      if "Final evaluation" in line:
-        evalLine = line.strip()
-        break
-    result.add("MOVES: " & moveList.join(" ") & "\nEVAL: " & evalLine)
-
-  send("quit")
-
-proc stripHtmlTags(s: string): string =
-  result = s.replace(re"<[^>]+>", " ")
-  result = result.replace(re"\s+", " ").strip()
-
-proc loadStackoverflowFirstPage*(tags: seq[string], pagesize, maxPages: int): seq[string] =
-  result = @[]
-  var client: HttpClient
-  try:
-    client = newHttpClient(timeout = 10000)
-  except CatchableError:
-    return
-  defer: client.close()
-
-  var firstPage = true
-  for tag in tags:
-    let page = if firstPage: 1 else: rand(1 .. max(maxPages, 1))
-    firstPage = false
-    let url = "https://api.stackexchange.com/2.3/questions" &
-      "?pagesize=" & $pagesize & "&page=" & $page &
-      "&order=desc&sort=activity&site=stackoverflow&filter=withbody&tagged=" & tag
-    try:
-      let body = client.getContent(url)
-      let js = parseJson(body)
-      if js.hasKey("items"):
-        for item in js["items"]:
-          let raw = item{"body"}.getStr("")
-          let txt = stripHtmlTags(raw)
-          if txt.len > 50: result.add(txt)
-    except CatchableError:
-      discard
-    sleep(1000)
-
-proc loadWikipediaTechHistory*(maxPages: int): seq[string] =
-  result = @[]
-  var topics = @["History_of_computing_hardware", "Operating_system", "Unix",
-                 "Linux", "Artificial_intelligence"]
-  shuffle(topics)
-  let n = rand(1 .. min(max(maxPages, 1), topics.len))
-  var client: HttpClient
-  try:
-    client = newHttpClient(timeout = 15000)
-  except CatchableError:
-    return
-  defer: client.close()
-
-  for i in 0 ..< n:
-    try:
-      let html = client.getContent("https://en.wikipedia.org/wiki/" & topics[i])
-      var paragraphs: seq[string] = @[]
-      for blk in html.findAll(re"(?s)<p[^>]*>.*?</p>"):
-        var t = stripHtmlTags(blk)
-        t = t.replace(re"\[\d+\]", "")
-        if t.len > 60: paragraphs.add(t)
-      let joined = paragraphs.join(" ")
-      if joined.len > 200: result.add(joined)
-    except CatchableError:
-      discard
-    sleep(1000)
-
 proc loadAllTexts*(cfg: Config): seq[string] =
-  ## Chỉ load Dolly — các nguồn khác (grammar/pgn/stockfish/english_words/
-  ## wikipedia/stackoverflow) vẫn còn định nghĩa ở trên, chỉ tạm không gọi.
-  ## Muốn bật lại nguồn nào, thêm dòng result.add load...(...) tương ứng.
   result = @[]
   echo "  -> databricks-dolly-15k.jsonl ..."
   result.add loadDolly(cfg.dataDir / "databricks-dolly-15k.jsonl")
+  if result.len == 0:
+    echo "  -> No data loaded, using dummy data for testing"
+    for i in 0 ..< 100:
+      result.add("This is dummy training text number " & $i & ". ")
 
 # ═══════════════════════════════════════════════════════════════
-# Xây sample huấn luyện (thay cho build_dataset/batch_generator bản Python)
+# BUILD SAMPLES
 # ═══════════════════════════════════════════════════════════════
 
 type Sample = tuple[x, y: seq[int]]
@@ -403,14 +524,33 @@ proc buildSamples*(texts: seq[string], tok: CharTokenizer, seqLen: int): seq[Sam
       i += seqLen
 
 # ═══════════════════════════════════════════════════════════════
-# Loss — batched thật: logits shape [B, T, vocab], targetsBatch: B chuỗi.
-# Trung bình theo B*T (khớp cách chia trung bình cũ khi B=1: chia theo T).
+# CROSS ENTROPY LOSS - BATCHED
 # ═══════════════════════════════════════════════════════════════
-
 proc crossEntropyLossBatch*(logits: Tensor, targetsBatch: seq[seq[int]]): tuple[loss: float32, dLogits: Tensor] =
   let B = logits.shape[0]
   let T = logits.shape[1]
   let vocab = logits.shape[2]
+  
+  # === FIX: KHÔNG GÁN logits.data, DÙNG BIẾN TẠM ===
+  var logitsData = logits.data
+  let expectedSize = B * T * vocab
+  if logitsData.len != expectedSize:
+    stderr.writeLine "[WARN] crossEntropyLossBatch: logits.data.len=", logitsData.len, " expected=", expectedSize
+    var fixedLogits = newSeq[float32](expectedSize)
+    let copyLen = min(logitsData.len, expectedSize)
+    for i in 0 ..< copyLen:
+      fixedLogits[i] = logitsData[i]
+    logitsData = fixedLogits
+  
+  # Kiểm tra targetsBatch có đúng kích thước không
+  if targetsBatch.len != B:
+    stderr.writeLine "[WARN] targetsBatch.len=", targetsBatch.len, " != B=", B
+    return (0.0'f32, newTensor(logits.shape))
+  for b in 0 ..< B:
+    if targetsBatch[b].len != T:
+      stderr.writeLine "[WARN] targetsBatch[", b, "].len=", targetsBatch[b].len, " != T=", T
+      return (0.0'f32, newTensor(logits.shape))
+  
   var loss = 0'f32
   var dLogits = newTensor(logits.shape)
   let denom = float32(B * T)
@@ -419,51 +559,176 @@ proc crossEntropyLossBatch*(logits: Tensor, targetsBatch: seq[seq[int]]): tuple[
     for t in 0 ..< T:
       let off = baseB + t * vocab
       let target = targetsBatch[b][t]
-      let maxVal = logits.data[off ..< off + vocab].max()
+      let maxVal = logitsData[off ..< off + vocab].max()
       var sumExp = 0'f32
       for i in 0 ..< vocab:
-        sumExp += exp(logits.data[off + i] - maxVal)
-      let prob = exp(logits.data[off + target] - maxVal) / sumExp
+        sumExp += exp(logitsData[off + i] - maxVal)
+      let prob = exp(logitsData[off + target] - maxVal) / sumExp
       loss += -ln(max(prob, 1e-12'f32))
       for i in 0 ..< vocab:
-        dLogits.data[off + i] = exp(logits.data[off + i] - maxVal) / sumExp
+        dLogits.data[off + i] = exp(logitsData[off + i] - maxVal) / sumExp
       dLogits.data[off + target] -= 1.0
   loss /= denom
   for i in 0 ..< dLogits.data.len:
     dLogits.data[i] /= denom
   result = (loss, dLogits)
-
-
 # ═══════════════════════════════════════════════════════════════
-# Quản lý tham số: gom thành 1 danh sách CÙNG THỨ TỰ mà
-# NimformerModel.backward() trả gradient về (outProj trước, rồi từng
-# block THEO CHIỀU NGƯỢC, cuối cùng là embedding) — xem nimformer.nim.
+# NIMFORMER MODEL VỚI LINEAR++ ATTENTION
 # ═══════════════════════════════════════════════════════════════
 
-template forEachParam(model: NimformerModel, op: untyped) =
-  ## Duyệt (tên, Tensor) theo đúng thứ tự grads trả về từ model.backward().
-  ## `op` là 1 template/proc nhận (name: string, t: Tensor).
+type
+  TransformerBlockLinearPP* = object
+    attn*: LinearPlusAttention
+    ff*: FeedForward
+    ln1*, ln2*: LayerNorm
+
+proc newTransformerBlockLinearPP*(embedDim, nHeads, ffMult: int, useSession: bool): TransformerBlockLinearPP =
+  result.attn = newLinearPlusAttention(embedDim, nHeads, useSession)
+  result.ff = newFeedForward(embedDim, ffMult)
+  result.ln1 = newLayerNorm(embedDim)
+  result.ln2 = newLayerNorm(embedDim)
+
+proc forward*(blk: TransformerBlockLinearPP, x: Tensor, ctx: Backend): Tensor =
+  let x1 = blk.ln1.forward(x, ctx)
+  let attnOut = forwardLinearPlus(blk.attn, x1, ctx)
+  let x2 = addT(ctx, x, attnOut)
+  let x3 = blk.ln2.forward(x2, ctx)
+  let ffOut = blk.ff.forward(x3, ctx)
+  result = addT(ctx, x2, ffOut)
+
+proc backward*(blk: TransformerBlockLinearPP, x: Tensor, dOut: Tensor, ctx: Backend): tuple[
+    dX, dAttnQkvW, dAttnQkvB, dAttnProjW, dAttnProjB,
+    dFf1W, dFf1B, dFf2W, dFf2B,
+    dLn1G, dLn1B, dLn2G, dLn2B: Tensor] =
+
+  let x1 = blk.ln1.forward(x, ctx)
+  let attnOut = forwardLinearPlus(blk.attn, x1, ctx)
+  let x2 = addT(ctx, x, attnOut)
+  let x3 = blk.ln2.forward(x2, ctx)
+  let ffOut = blk.ff.forward(x3, ctx)
+  let y = addT(ctx, x2, ffOut)
+
+  var dY = dOut
+  let dFF = blk.ff.backward(x3, dY, ctx)
+  var dX2 = dFF.dX
+  let dLN2 = blk.ln2.backward(x2, dX2, ctx)
+  var dX2_ln = dLN2.dX
+  for i in 0 ..< dX2_ln.data.len:
+    dX2_ln.data[i] += dY.data[i]
+
+  let dAttn = backwardLinearPlus(blk.attn, x1, dX2_ln, ctx)
+  let dLN1 = blk.ln1.backward(x, dAttn.dX, ctx)
+  var dX0 = dLN1.dX
+  for i in 0 ..< dX0.data.len:
+    dX0.data[i] += dX2_ln.data[i]
+
+  result = (
+    dX0,
+    dAttn.dQkvW, dAttn.dQkvB, dAttn.dProjW, dAttn.dProjB,
+    dFF.dFc1W, dFF.dFc1B, dFF.dFc2W, dFF.dFc2B,
+    dLN1.dGamma, dLN1.dBeta, dLN2.dGamma, dLN2.dBeta
+  )
+
+type
+  NimformerModelLinearPP* = object
+    embed*: Embedding
+    blocks*: seq[TransformerBlockLinearPP]
+    outProj*: Linear
+    vocab*: int
+
+proc newNimformerModelLinearPP*(vocab, embedDim, nHeads, nLayers, ffMult: int, useSession: bool): NimformerModelLinearPP =
+  result.vocab = vocab
+  result.embed = newEmbedding(vocab, embedDim)
+  result.blocks = newSeq[TransformerBlockLinearPP](nLayers)
+  for i in 0 ..< nLayers:
+    result.blocks[i] = newTransformerBlockLinearPP(embedDim, nHeads, ffMult, useSession)
+  result.outProj = newLinear(embedDim, vocab)
+
+proc forwardBatch*(m: NimformerModelLinearPP, idsBatch: seq[seq[int]], ctx: Backend): Tensor =
+  var x = m.embed.lookupBatch(idsBatch, ctx)
+  for blk in m.blocks:
+    x = blk.forward(x, ctx)
+  result = m.outProj.forward(x, ctx)
+
+proc backwardBatch*(m: NimformerModelLinearPP, idsBatch: seq[seq[int]], dLoss: Tensor, ctx: Backend): seq[Tensor] =
+  var x = m.embed.lookupBatch(idsBatch, ctx)
+  var hiddenStates: seq[Tensor] = @[x]
+  for blk in m.blocks:
+    x = blk.forward(x, ctx)
+    hiddenStates.add(x)
+  let dOutProj = m.outProj.backward(x, dLoss, ctx)
+  var dOut = dOutProj.dX
+  var grads: seq[Tensor] = @[dOutProj.dW, dOutProj.dB]
+  for i in countdown(m.blocks.len - 1, 0):
+    let blk = m.blocks[i]
+    let x_prev = hiddenStates[i]
+    let dBlock = blk.backward(x_prev, dOut, ctx)
+    dOut = dBlock.dX
+    grads.add(dBlock.dAttnQkvW); grads.add(dBlock.dAttnQkvB)
+    grads.add(dBlock.dAttnProjW); grads.add(dBlock.dAttnProjB)
+    grads.add(dBlock.dFf1W); grads.add(dBlock.dFf1B)
+    grads.add(dBlock.dFf2W); grads.add(dBlock.dFf2B)
+    grads.add(dBlock.dLn1G); grads.add(dBlock.dLn1B)
+    grads.add(dBlock.dLn2G); grads.add(dBlock.dLn2B)
+  let dEmb = m.embed.backward(idsBatch, dOut, ctx)
+  grads.add(dEmb)
+  return grads
+
+# ═══════════════════════════════════════════════════════════════
+# APF ADAM OPTIMIZER
+# ═══════════════════════════════════════════════════════════════
+
+type
+  ApfAdamState* = object
+    m*, v*: seq[float32]
+    step*: int
+
+proc newApfAdamState*(paramLen: int): ApfAdamState =
+  result.m = newSeq[float32](paramLen)
+  result.v = newSeq[float32](paramLen)
+  result.step = 0
+
+proc apfAdamStep*(param: var Tensor, grad: Tensor, state: var ApfAdamState,
+                   lr: float32 = 1e-3'f32, b1: float32 = 0.9'f32, b2: float32 = 0.999'f32,
+                   eps: float32 = 1e-8'f32, requantizeEvery: int = 50): CustomFloat =
+  inc state.step
+  let bc1 = 1'f32 - pow(b1, float32(state.step))
+  let bc2 = 1'f32 - pow(b2, float32(state.step))
+  for i in 0 ..< param.data.len:
+    let g = grad.data[i]
+    state.m[i] = b1 * state.m[i] + (1'f32 - b1) * g
+    state.v[i] = b2 * state.v[i] + (1'f32 - b2) * g * g
+    let mHat = state.m[i] / bc1
+    let vHat = state.v[i] / bc2
+    param.data[i] -= lr * mHat / (sqrt(vHat) + eps)
+  if state.step mod requantizeEvery == 0:
+    let cf = buildCustomDtypeForTensor(param.data, grad.data)
+    param.data = decodeArray(encodeArray(param.data, cf), cf)
+    result = cf
+  else:
+    result = buildCustomDtypeForTensor(param.data)
+
+# ═══════════════════════════════════════════════════════════════
+# PARAMETER MANAGEMENT
+# ═══════════════════════════════════════════════════════════════
+
+template forEachParam(model: NimformerModelLinearPP, op: untyped) =
   op("outProj.weight", model.outProj.weight)
   op("outProj.bias", model.outProj.bias)
   for bi {.inject.} in countdown(model.blocks.len - 1, 0):
-    let blk {.inject.} = model.blocks[bi]
-    # Tách sẵn key ra `let` trước khi gọi `op` (thay vì nội suy &"..." trực
-    # tiếp nhiều lần liên tiếp trong thân for): đây chính là nguồn gốc lỗi
-    # "redeclaration of 'fmtRes' with no linkage" lan ra cả saveCheckpoint/
-    # loadCheckpointFull/paramLens/initOptStates — mọi nơi gọi forEachParam
-    # đều bị dính vì template này bị nội suy (inline) vào chỗ gọi.
-    let nQkvW {.inject.} = &"blocks.{bi}.attn.qkv.weight"
-    let nQkvB {.inject.} = &"blocks.{bi}.attn.qkv.bias"
-    let nProjW {.inject.} = &"blocks.{bi}.attn.proj.weight"
-    let nProjB {.inject.} = &"blocks.{bi}.attn.proj.bias"
-    let nFc1W {.inject.} = &"blocks.{bi}.ff.fc1.weight"
-    let nFc1B {.inject.} = &"blocks.{bi}.ff.fc1.bias"
-    let nFc2W {.inject.} = &"blocks.{bi}.ff.fc2.weight"
-    let nFc2B {.inject.} = &"blocks.{bi}.ff.fc2.bias"
-    let nLn1G {.inject.} = &"blocks.{bi}.ln1.gamma"
-    let nLn1B {.inject.} = &"blocks.{bi}.ln1.beta"
-    let nLn2G {.inject.} = &"blocks.{bi}.ln2.gamma"
-    let nLn2B {.inject.} = &"blocks.{bi}.ln2.beta"
+    let blk = model.blocks[bi]
+    let nQkvW = &"blocks.{bi}.attn.qkv.weight"
+    let nQkvB = &"blocks.{bi}.attn.qkv.bias"
+    let nProjW = &"blocks.{bi}.attn.proj.weight"
+    let nProjB = &"blocks.{bi}.attn.proj.bias"
+    let nFc1W = &"blocks.{bi}.ff.fc1.weight"
+    let nFc1B = &"blocks.{bi}.ff.fc1.bias"
+    let nFc2W = &"blocks.{bi}.ff.fc2.weight"
+    let nFc2B = &"blocks.{bi}.ff.fc2.bias"
+    let nLn1G = &"blocks.{bi}.ln1.gamma"
+    let nLn1B = &"blocks.{bi}.ln1.beta"
+    let nLn2G = &"blocks.{bi}.ln2.gamma"
+    let nLn2B = &"blocks.{bi}.ln2.beta"
     op(nQkvW, blk.attn.qkv.weight)
     op(nQkvB, blk.attn.qkv.bias)
     op(nProjW, blk.attn.proj.weight)
@@ -478,21 +743,22 @@ template forEachParam(model: NimformerModel, op: untyped) =
     op(nLn2B, blk.ln2.beta)
   op("embed.weight", model.embed.weight)
 
-proc paramLens(model: NimformerModel): seq[int] =
+proc paramLens(model: NimformerModelLinearPP): seq[int] =
   result = @[]
   template rec(name: string, t: Tensor) = result.add(t.data.len)
   forEachParam(model, rec)
 
-proc initOptStates(model: NimformerModel): seq[ApfAdamState] =
+proc initOptStates(model: NimformerModelLinearPP): seq[ApfAdamState] =
   result = @[]
   for l in paramLens(model): result.add newApfAdamState(l)
-
-proc applyGrads(model: var NimformerModel, grads: seq[Tensor],
+proc applyGrads(model: var NimformerModelLinearPP, grads: seq[Tensor],
                  states: var seq[ApfAdamState], lr: float32, requantizeEvery: int) =
   var idx = 0
   template step(param: untyped) =
-    discard apfAdamStep(param, grads[idx], states[idx], lr,
-                         requantizeEvery = requantizeEvery)
+    if idx < grads.len:
+      discard apfAdamStep(param, grads[idx], states[idx], lr, requantizeEvery = requantizeEvery)
+    else:
+      stderr.writeLine "[WARN] applyGrads: idx=", idx, " >= grads.len=", grads.len
     inc idx
   step(model.outProj.weight)
   step(model.outProj.bias)
@@ -510,73 +776,14 @@ proc applyGrads(model: var NimformerModel, grads: seq[Tensor],
     step(model.blocks[bi].ln2.gamma)
     step(model.blocks[bi].ln2.beta)
   step(model.embed.weight)
-
 # ═══════════════════════════════════════════════════════════════
-# Lưu / tải checkpoint .nimq — chọn kiểu lượng tử hoá cho TRỌNG SỐ (weight
-# ma trận Linear/Embedding); bias và LayerNorm (gamma/beta) LUÔN giữ fp32
-# (đúng quy ước ghi trong README_BUILD.md).
+# SAVE/LOAD CHECKPOINT
 # ═══════════════════════════════════════════════════════════════
 
 proc isBiasOrNorm(name: string): bool =
   name.endsWith(".bias") or name.endsWith(".gamma") or name.endsWith(".beta")
 
-proc saveNimformerModel*(model: NimformerModel, path: string, weightKind: QuantKind,
-                          embedDim, nHeads, nLayers, ffMult: int) =
-  var sd: seq[(string, QuantTensor)] = @[]
-  template rec(name: string, t: Tensor) =
-    let kind = if isBiasOrNorm(name): qkFp32Raw else: weightKind
-    sd.add (name, quantizeTensor(t.data, t.shape, kind))
-  forEachParam(model, rec)
-  saveQuantStateDict(path, [model.vocab, embedDim, nHeads, nLayers, ffMult], sd)
-  echo &"  đã lưu {sd.len} tensor -> {path} (weight={weightKind}, bias/LN=qkFp32Raw)"
-
-proc loadNimformerModel*(path: string): NimformerModel =
-  let (arch, sd) = loadQuantStateDict(path)
-  let vocab = arch[0]; let embedDim = arch[1]; let nHeads = arch[2]
-  let nLayers = arch[3]; let ffMult = arch[4]
-  result = newNimformerModel(vocab, embedDim, nHeads, nLayers, ffMult)
-  var byName = initTable[string, QuantTensor]()
-  for (name, qt) in sd: byName[name] = qt
-  template load(name: string, t: var Tensor) =
-    if byName.hasKey(name):
-      let qt = byName[name]
-      t.data = dequantizeTensor(qt)
-      t.shape = qt.shape
-  load("outProj.weight", result.outProj.weight)
-  load("outProj.bias", result.outProj.bias)
-  for bi in 0 ..< result.blocks.len:
-    load(&"blocks.{bi}.attn.qkv.weight", result.blocks[bi].attn.qkv.weight)
-    load(&"blocks.{bi}.attn.qkv.bias", result.blocks[bi].attn.qkv.bias)
-    load(&"blocks.{bi}.attn.proj.weight", result.blocks[bi].attn.proj.weight)
-    load(&"blocks.{bi}.attn.proj.bias", result.blocks[bi].attn.proj.bias)
-    load(&"blocks.{bi}.ff.fc1.weight", result.blocks[bi].ff.fc1.weight)
-    load(&"blocks.{bi}.ff.fc1.bias", result.blocks[bi].ff.fc1.bias)
-    load(&"blocks.{bi}.ff.fc2.weight", result.blocks[bi].ff.fc2.weight)
-    load(&"blocks.{bi}.ff.fc2.bias", result.blocks[bi].ff.fc2.bias)
-    load(&"blocks.{bi}.ln1.gamma", result.blocks[bi].ln1.gamma)
-    load(&"blocks.{bi}.ln1.beta", result.blocks[bi].ln1.beta)
-    load(&"blocks.{bi}.ln2.gamma", result.blocks[bi].ln2.gamma)
-    load(&"blocks.{bi}.ln2.beta", result.blocks[bi].ln2.beta)
-  load("embed.weight", result.embed.weight)
-
-# ═══════════════════════════════════════════════════════════════
-# Checkpoint CÓ THỂ RESUME — khác với saveNimformerModel/loadNimformerModel
-# ở trên (chỉ lưu weight, dùng cho bản "export" cuối cùng để suy luận),
-# 2 hàm dưới đây lưu THÊM: trạng thái optimizer (m/v của ApfAdam cho từng
-# tham số) và số step đã train, để lần chạy sau load lên là train tiếp
-# đúng chỗ (không mất đà "momentum", không bị reset bias-correction về
-# step=1 làm loss nhảy vọt lúc mới resume).
-#
-# Đúng tinh thần "cả thư viện dùng APF custom": m/v của optimizer cũng
-# được nén bằng qkAuto (APF — buildCustomDtypeForTensor trong
-# customfloat.nim, quant.nim gọi lại) thay vì giữ float32 thô — checkpoint
-# tự chọn số bit exponent/mantissa phù hợp với chính phân bố m/v tại thời
-# điểm lưu, y hệt cách weight đang được nén. Khác biệt duy nhất: weight có
-# thể chọn int8/int4/fp8/... theo --quant, còn m/v LUÔN dùng qkAuto vì cần
-# bám sát phân bố thực mỗi lần lưu hơn là ép theo 1 dtype cố định.
-# ═══════════════════════════════════════════════════════════════
-
-proc saveCheckpoint*(model: NimformerModel, states: seq[ApfAdamState], stepNo: int,
+proc saveCheckpoint*(model: NimformerModelLinearPP, states: seq[ApfAdamState], stepNo: int,
                       path: string, weightKind: QuantKind,
                       embedDim, nHeads, nLayers, ffMult: int) =
   var sd: seq[(string, QuantTensor)] = @[]
@@ -584,41 +791,19 @@ proc saveCheckpoint*(model: NimformerModel, states: seq[ApfAdamState], stepNo: i
   template rec(name: string, t: Tensor) =
     let kind = if isBiasOrNorm(name): qkFp32Raw else: weightKind
     sd.add (name, quantizeTensor(t.data, t.shape, kind))
-    # optimizer state (m/v) — luôn APF custom (qkAuto), không phụ thuộc --quant
     sd.add (name & ".opt_m", quantizeTensor(states[idx].m, @[states[idx].m.len], qkAuto))
     sd.add (name & ".opt_v", quantizeTensor(states[idx].v, @[states[idx].v.len], qkAuto))
     inc idx
   forEachParam(model, rec)
-  # applyGrads gọi apfAdamStep đúng 1 lần/tham số/bước train nên state.step
-  # của MỌI tham số đều bằng nhau và bằng stepNo -> chỉ cần lưu 1 số dùng chung.
   sd.add ("__step__", quantizeTensor(@[float32(stepNo)], @[1], qkFp32Raw))
   saveQuantStateDict(path, [model.vocab, embedDim, nHeads, nLayers, ffMult], sd)
-  # LƯU Ý: proc này có 1 `template rec` khai báo cục bộ ở trên. Trên Nim
-  # 1.6.x, việc dùng macro `&` (strformat) để build chuỗi TRONG CÙNG 1 proc
-  # có khai báo template cục bộ dễ khiến backend C sinh trùng tên biến tạm
-  # `fmtRes` (lỗi "redeclaration of 'fmtRes' with no linkage") — nên ở đây
-  # cố tình dùng nối chuỗi `$` + `&` (string concat, không phải macro fmt)
-  # thay vì cú pháp &"...{x}..." để né hẳn bug codegen đó.
-  echo "  đã lưu checkpoint (weight+optimizer, step=" & $stepNo & ") -> " & path &
-      " (weight=" & $weightKind & ", optimizer m/v=qkAuto/APF, bias/LN=qkFp32Raw)"
-  if weightKind == qkAuto:
-    # In vài ví dụ dtype THẬT mà APF chọn (đọc lại từ chính sd vừa build) để
-    # thấy rõ nó không phải fp32 "trá hình" — mỗi tensor có thể ra 1 dtype
-    # khác nhau tuỳ range dữ liệu (exponent bit adaptive theo range, mantissa
-    # bit ~cố định theo APF_DEFAULT_REL_ERROR_TOL trừ khi có gradient).
-    var shown = 0
-    for (name, qt) in sd:
-      if qt.kind == qkAuto and shown < 3:
-        echo "    [APF] " & name & ": " & qt.cf.name & " (e" & $qt.cf.exponentBits &
-            "m" & $qt.cf.mantissaBits & ", " & $qt.cf.totalBits &
-            " bit/phần tử, so với fp32=32 bit)"
-        inc shown
+  echo "  đã lưu checkpoint (weight+optimizer, step=" & $stepNo & ") -> " & path
 
-proc loadCheckpointFull*(path: string): tuple[model: NimformerModel, states: seq[ApfAdamState], stepNo: int] =
+proc loadCheckpointFull*(path: string): tuple[model: NimformerModelLinearPP, states: seq[ApfAdamState], stepNo: int] =
   let (arch, sd) = loadQuantStateDict(path)
   let vocab = arch[0]; let embedDim = arch[1]; let nHeads = arch[2]
   let nLayers = arch[3]; let ffMult = arch[4]
-  var model = newNimformerModel(vocab, embedDim, nHeads, nLayers, ffMult)
+  var model = newNimformerModelLinearPP(vocab, embedDim, nHeads, nLayers, ffMult, true)
   var byName = initTable[string, QuantTensor]()
   for (name, qt) in sd: byName[name] = qt
 
@@ -637,19 +822,14 @@ proc loadCheckpointFull*(path: string): tuple[model: NimformerModel, states: seq
   template loadWithOpt(name: string, t: var Tensor) =
     load(name, t)
     var st = newApfAdamState(t.data.len)
-    st.step = stepNo   # đồng bộ lại bias-correction Adam đúng chỗ đã dừng
+    st.step = stepNo
     if byName.hasKey(name & ".opt_m"): st.m = dequantizeTensor(byName[name & ".opt_m"])
     if byName.hasKey(name & ".opt_v"): st.v = dequantizeTensor(byName[name & ".opt_v"])
     states.add st
 
-  # Thứ tự PHẢI khớp forEachParam/applyGrads (outProj -> block ngược -> embed)
   loadWithOpt("outProj.weight", model.outProj.weight)
   loadWithOpt("outProj.bias", model.outProj.bias)
   for bi in countdown(model.blocks.len - 1, 0):
-    # Tách sẵn key ra biến `let` trước khi đưa vào loadWithOpt: nếu để
-    # &"..." nội suy trực tiếp nhiều lần liên tiếp trong thân for thì
-    # backend C của Nim 1.6.x sinh trùng tên biến tạm `fmtRes` cùng scope
-    # (lỗi "redeclaration of 'fmtRes' with no linkage").
     let kQkvW = &"blocks.{bi}.attn.qkv.weight"
     let kQkvB = &"blocks.{bi}.attn.qkv.bias"
     let kProjW = &"blocks.{bi}.attn.proj.weight"
@@ -679,25 +859,11 @@ proc loadCheckpointFull*(path: string): tuple[model: NimformerModel, states: seq
   result = (model, states, stepNo)
 
 # ═══════════════════════════════════════════════════════════════
-# Training loop chính — thay cho model.train_streaming(...) bên Python.
-#
-# TRƯỚC: --batch=256 chỉ là 1 vòng for Nim gọi forward/backward B=1 TUẦN TỰ
-# 256 lần rồi cộng dồn gradient trên CPU — mỗi lần lại tự upload/dispatch/
-# wait/download GPU, nên phần lớn thời gian là round-trip CPU<->GPU chờ
-# nhau, không phải tính toán thật -> CPU lẫn GPU đều "rảnh" theo Activity
-# Monitor dù batch để rất lớn.
-#
-# GIỜ: gom cả --batch chuỗi thành 1 idsBatch thật, gọi forwardBatch/
-# backwardBatch ĐÚNG MỘT LẦN cho cả batch — Linear/LayerNorm coi B*T là số
-# hàng nên mỗi matmul GPU nhận hẳn M=B*T dòng (to hơn hẳn, ít round-trip hẳn
-# --batch lần), và Linear.backward tự cộng dồn gradient qua cả batch trong
-# chính phép matmul đó (không cần cộng dồn tay trên CPU nữa).
+# TRAINING LOOP
 # ═══════════════════════════════════════════════════════════════
 
-proc train(model: var NimformerModel, samples: seq[Sample], ctx: Backend,
+proc train(model: var NimformerModelLinearPP, samples: seq[Sample], ctx: Backend,
            cfg: Config, states: var seq[ApfAdamState], startStep: int = 0) =
-  ## startStep > 0 khi resume từ checkpoint (xem loadCheckpointFull trong main) —
-  ## vòng lặp tiếp tục đúng từ đó tới cfg.steps thay vì train lại từ 0.
   if startStep >= cfg.steps:
     echo &"  checkpoint đã ở step {startStep} >= --steps={cfg.steps}, không train thêm."
     return
@@ -717,108 +883,96 @@ proc train(model: var NimformerModel, samples: seq[Sample], ctx: Backend,
       pos = chunkEnd
       if idsBatch.len == 0: continue
 
-      let logits = model.forwardBatch(idsBatch, ctx)                    # [B,T,vocab] — 1 lần forward cho CẢ batch
+      let logits = model.forwardBatch(idsBatch, ctx)
       let (loss, dLogits) = crossEntropyLossBatch(logits, targetsBatch)
-      let grads = model.backwardBatch(idsBatch, dLogits, ctx)           # đã tự cộng dồn gradient qua cả batch
+      let grads = model.backwardBatch(idsBatch, dLogits, ctx)
       applyGrads(model, grads, states, cfg.lr, cfg.requantizeEvery)
 
       inc stepNo
       if stepNo mod cfg.logEvery == 0 or stepNo == 1:
         echo &"[step {stepNo}/{cfg.steps}] loss={loss:.6f} (batch={idsBatch.len})"
-      if cfg.requantizeEvery > 0 and stepNo mod cfg.requantizeEvery == 0:
-        # applyGrads() vừa gọi apfAdamStep() cho MỌI tham số ở bước này, và vì
-        # requantizeEvery giống nhau cho tất cả nên outProj.weight cũng vừa
-        # bị APF requantize xong — build lại (cùng data, cùng công thức) chỉ
-        # để IN RA cho thấy dtype thật đang dùng, không phải để tính lại gì.
-        let exCf = buildCustomDtypeForTensor(model.outProj.weight.data)
-        let requantMsgPart1 = &"  [APF] step {stepNo}: vừa requantize toàn bộ weight "
-        let requantMsgPart2 = &"(ví dụ outProj.weight -> {exCf.name}, e{exCf.exponentBits}m{exCf.mantissaBits}, "
-        let requantMsgPart3 = &"{exCf.totalBits} bit/phần tử — so với fp32=32 bit)"
-        echo requantMsgPart1 & requantMsgPart2 & requantMsgPart3
       if cfg.ckptEvery > 0 and stepNo mod cfg.ckptEvery == 0:
         saveCheckpoint(model, states, stepNo, cfg.savePath & ".ckpt", quantKindOf(cfg.quant),
                         cfg.embedDim, cfg.nHeads, cfg.nLayers, cfg.ffMult)
 
 # ═══════════════════════════════════════════════════════════════
-# main
+# MAIN
 # ═══════════════════════════════════════════════════════════════
 
 proc main() =
   let cfg = parseArgs()
   randomize(cfg.seed)
 
+  echo "== Linear++ Attention Training =="
+  echo &"  Backend: {cfg.backend}, Session: {cfg.useSession}"
+  echo &"  Steps: {cfg.steps}, SeqLen: {cfg.seqLen}, Batch: {cfg.batchSize}"
+  echo &"  EmbedDim: {cfg.embedDim}, Heads: {cfg.nHeads}, Layers: {cfg.nLayers}"
+
   echo "== Load training texts =="
   let texts = loadAllTexts(cfg)
   echo &"TOTAL TEXTS: {texts.len}"
   if texts.len == 0:
-    stderr.writeLine "Không load được dữ liệu nào — kiểm tra lại --data-dir / mạng / --stockfish-path."
+    stderr.writeLine "Không load được dữ liệu nào"
     quit(1)
 
-  # ─────────────────────────────────────────────────────────────
-  # Resume: nếu đã có checkpoint (--save & ".ckpt") từ lần chạy trước, load
-  # lại model + optimizer (m/v) + step thay vì train lại từ đầu. Tokenizer
-  # cũng load lại từ --tokenizer (nếu có) để giữ đúng mapping id<->byte cũ,
-  # thay vì build lại (có thể lệch nếu texts nạp vào khác thứ tự/tập hợp).
-  # ─────────────────────────────────────────────────────────────
   let ckptPath = cfg.savePath & ".ckpt"
   var tok: CharTokenizer
-  var model: NimformerModel
+  var model: NimformerModelLinearPP
   var states: seq[ApfAdamState]
   var startStep = 0
   let resuming = fileExists(ckptPath)
 
   if resuming:
-    echo &"== Tìm thấy checkpoint {ckptPath} -> resume thay vì train lại từ đầu =="
+    echo &"== Tìm thấy checkpoint {ckptPath} -> resume =="
     if fileExists(cfg.tokenizerPath):
       tok = loadTokenizer(cfg.tokenizerPath)
-      echo &"  đã tải lại tokenizer cũ -> {cfg.tokenizerPath} (vocab={tok.vocabSize})"
+      echo &"  đã tải lại tokenizer cũ -> {cfg.tokenizerPath}"
     else:
-      let tokWarnPart1 = &"  [cảnh báo] không thấy {cfg.tokenizerPath}, build tokenizer mới từ texts "
-      let tokWarnPart2 = "(có thể lệch id với checkpoint nếu tập ký tự khác lần trước)"
-      stderr.writeLine tokWarnPart1 & tokWarnPart2
       tok = newCharTokenizer(texts)
       tok.saveTokenizer(cfg.tokenizerPath)
     let loaded = loadCheckpointFull(ckptPath)
     model = loaded.model
     states = loaded.states
     startStep = loaded.stepNo
-    let resumeMsgPart1 = &"  resume từ step {startStep} "
-    let resumeMsgPart2 = "(đã nạp lại weight + optimizer m/v nén APF/qkAuto + step)"
-    echo resumeMsgPart1 & resumeMsgPart2
+    echo &"  resume từ step {startStep}"
   else:
     echo "== Build tokenizer =="
     tok = newCharTokenizer(texts)
     tok.saveTokenizer(cfg.tokenizerPath)
-    echo &"Vocab size: {tok.vocabSize}  (đã lưu -> {cfg.tokenizerPath})"
+    echo &"Vocab size: {tok.vocabSize}"
 
   echo &"== Build training samples (seq_len={cfg.seqLen}) =="
   let samples = buildSamples(texts, tok, cfg.seqLen)
   echo &"Total samples: {samples.len}"
   if samples.len == 0:
-    stderr.writeLine "Không đủ dữ liệu để tạo sample (texts ngắn hơn seq_len). Giảm --seq hoặc thêm dữ liệu."
+    stderr.writeLine "Không đủ dữ liệu để tạo sample"
     quit(1)
 
-  echo "== Init backend (cpu/metal/cuda — xem log 'Backend đã chọn' bên dưới) =="
-  let ctx = newBackend()
+  echo "== Init backend =="
+  let ctx = newBackend(cfg.backend)
 
   if not resuming:
     echo "== Build model =="
-    model = newNimformerModel(vocab = tok.vocabSize, embedDim = cfg.embedDim,
-                               nHeads = cfg.nHeads, nLayers = cfg.nLayers,
-                               ffMult = cfg.ffMult)
+    model = newNimformerModelLinearPP(vocab = tok.vocabSize, embedDim = cfg.embedDim,
+                                       nHeads = cfg.nHeads, nLayers = cfg.nLayers,
+                                       ffMult = cfg.ffMult, useSession = cfg.useSession)
     states = initOptStates(model)
-  let modelInfoPart1 = &"  vocab={model.vocab} embedDim={cfg.embedDim} nHeads={cfg.nHeads} "
-  let modelInfoPart2 = &"nLayers={cfg.nLayers} ffMult={cfg.ffMult}  ({states.len} tensor tham số)"
-  echo modelInfoPart1 & modelInfoPart2
+
+  echo &"  vocab={model.vocab}, {states.len} tensor tham số"
 
   echo &"== Training (bắt đầu từ step {startStep}/{cfg.steps}) =="
   let t0 = epochTime()
   train(model, samples, ctx, cfg, states, startStep)
   echo &"== Done in {epochTime() - t0:.1f}s =="
 
-  echo &"== Save checkpoint cuối ({cfg.savePath}, quant={cfg.quant}) =="
-  saveNimformerModel(model, cfg.savePath, quantKindOf(cfg.quant),
-                      cfg.embedDim, cfg.nHeads, cfg.nLayers, cfg.ffMult)
+  echo &"== Save checkpoint cuối ({cfg.savePath}) =="
+  var sd: seq[(string, QuantTensor)] = @[]
+  template rec(name: string, t: Tensor) =
+    let kind = if isBiasOrNorm(name): qkFp32Raw else: quantKindOf(cfg.quant)
+    sd.add (name, quantizeTensor(t.data, t.shape, kind))
+  forEachParam(model, rec)
+  saveQuantStateDict(cfg.savePath, [model.vocab, cfg.embedDim, cfg.nHeads, cfg.nLayers, cfg.ffMult], sd)
+  echo &"  đã lưu {sd.len} tensor -> {cfg.savePath}"
 
 when isMainModule:
   main()

@@ -5,6 +5,10 @@
 
 import vendor/bybylang/gpubackend as byby
 import customfloat
+export byby.GpuBackend, byby.SessionHandle, byby.sessionBegin, byby.sessionUpload,
+       byby.sessionUploadIndices, byby.sessionAllocScratch, byby.sessionMatmul,
+       byby.sessionSoftmax, byby.sessionVecOp, byby.sessionActivation, byby.sessionEnd,
+       byby.sessionRead, byby.sessionFree
 
 # -d:backend=cpu|metal|cuda|opencl|tsic|auto — mặc định "auto" (tự dò lúc runtime).
 const backend* {.strdefine.} = "auto"
@@ -20,7 +24,7 @@ type
   Backend* = object
     kind*: BackendKind
 
-proc toByby(bk: BackendKind): byby.GpuBackend =
+proc toByby*(bk: BackendKind): byby.GpuBackend =
   case bk
   of bkCpu: byby.gbCpu
   of bkMetal: byby.gbMetal
@@ -85,6 +89,25 @@ proc beMatmul*(ctx: Backend, a: openArray[float32], M, K: int,
   let aSeq = @a
   let bSeq = @b
   result = byby.gpuMatmul(ctx.kind.toByby(), aSeq, bSeq, M, K, N)
+
+proc beMatmulQ4*(ctx: Backend, a: openArray[float32], wq: openArray[uint8],
+                  scales, zeros: openArray[float32],
+                  M, K, N, groupSize, nGroupsPerRow: int): seq[float32] =
+  let aSeq = @a
+  let wqSeq = @wq
+  let scalesSeq = @scales
+  let zerosSeq = @zeros
+  result = byby.gpuMatmulQ4(ctx.kind.toByby(), aSeq, wqSeq, scalesSeq, zerosSeq,
+                             M, K, N, groupSize, nGroupsPerRow)
+  # === FIX: LUÔN ĐẢM BẢO KÍCH THƯỚC ĐÚNG ===
+  let expectedSize = M * N
+  if result.len != expectedSize:
+    # Tạo mảng mới đúng size, copy phần có sẵn, phần còn lại 0
+    var fixed = newSeq[float32](expectedSize)
+    let copyLen = min(result.len, expectedSize)
+    for i in 0 ..< copyLen:
+      fixed[i] = result[i]
+    result = fixed
 
 proc beMatmul2*(ctx: Backend,
                  a1: openArray[float32], M1, K1: int, b1: openArray[float32], K1b, N1: int,

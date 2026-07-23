@@ -23,6 +23,8 @@ type
   CUfunction* = pointer
   CUdevice* = int32
   CUresult* = int32
+  CUgraph* = pointer
+  CUgraphExec* = pointer
 
   CudaTensor* = object
     dptr*: CUdeviceptr
@@ -55,9 +57,16 @@ type
                           sharedMemBytes: uint32, stream: CUstream, kernelParams: pointer,
                           extra: pointer): CUresult {.cdecl.}
     cuMemsetD8Async: proc(dst: CUdeviceptr, value: uint8, byteCount: csize_t, stream: CUstream): CUresult {.cdecl.}
+    cuStreamBeginCapture: proc(stream: CUstream, mode: uint32): CUresult {.cdecl.}
+    cuStreamEndCapture: proc(stream: CUstream, phGraph: ptr CUgraph): CUresult {.cdecl.}
+    cuGraphInstantiate: proc(phGraphExec: ptr CUgraphExec, hGraph: CUgraph, flags: uint64): CUresult {.cdecl.}
+    cuGraphLaunch: proc(hGraphExec: CUgraphExec, stream: CUstream): CUresult {.cdecl.}
+    cuGraphDestroy: proc(hGraph: CUgraph): CUresult {.cdecl.}
+    cuGraphExecDestroy: proc(hGraphExec: CUgraphExec): CUresult {.cdecl.}
 
 const
   CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK: CUdevice_attribute = 1
+  CU_STREAM_CAPTURE_MODE_RELAXED: uint32 = 2
 
 # --------------------------------------------------------------------------
 # PTX kernels (tương đương nvcc -ptx cho 4 phép elementwise float32), nằm ở
@@ -145,6 +154,12 @@ proc tryLoad(): bool =
   lib.cuStreamSynchronize = cast[typeof(lib.cuStreamSynchronize)](lib.handle.symAddr("cuStreamSynchronize"))
   lib.cuLaunchKernel = cast[typeof(lib.cuLaunchKernel)](lib.handle.symAddr("cuLaunchKernel"))
   lib.cuMemsetD8Async = cast[typeof(lib.cuMemsetD8Async)](lib.handle.symAddr("cuMemsetD8Async"))
+  lib.cuStreamBeginCapture = cast[typeof(lib.cuStreamBeginCapture)](lib.handle.symAddr("cuStreamBeginCapture"))
+  lib.cuStreamEndCapture = cast[typeof(lib.cuStreamEndCapture)](lib.handle.symAddr("cuStreamEndCapture"))
+  lib.cuGraphInstantiate = cast[typeof(lib.cuGraphInstantiate)](lib.handle.symAddr("cuGraphInstantiate"))
+  lib.cuGraphLaunch = cast[typeof(lib.cuGraphLaunch)](lib.handle.symAddr("cuGraphLaunch"))
+  lib.cuGraphDestroy = cast[typeof(lib.cuGraphDestroy)](lib.handle.symAddr("cuGraphDestroy"))
+  lib.cuGraphExecDestroy = cast[typeof(lib.cuGraphExecDestroy)](lib.handle.symAddr("cuGraphExecDestroy"))
   result = lib.cuInit != nil and lib.cuLaunchKernel != nil
 
 proc cudaAvailable*(): bool =
@@ -181,6 +196,11 @@ proc ensureInit() =
 proc getStream*(): CUstream =
   ensureInit()
   result = gStream
+
+proc cuStreamSynchronize*(stream: CUstream): int32 =
+  ## Sync 1 CUDA stream cụ thể (wrapper public cho lib.cuStreamSynchronize private).
+  ensureInit()
+  result = lib.cuStreamSynchronize(stream)
 
 proc getFn(name: string): CUfunction =
   ## Cache CUfunction theo tên - tránh cuModuleGetFunction lặp lại.
@@ -702,3 +722,41 @@ proc cudaEmbeddingLookupR*(table, indices: CudaTensor, numIdx, vocab, dim: int):
   gpuCheck(lib.cuLaunchKernel(fn, gridFor(numIdx), 1, 1, getOptimalBlockSize(), 1, 1, 0, gStream,
                                 addr params[0], nil) == 0, "cudaEmbeddingLookupR launch failed")
   return CudaTensor(dptr: dY, bytes: bytesY, numel: numIdx * dim)
+
+type
+  CudaGraph* = object
+    graph: CUgraph
+    exec: CUgraphExec
+
+var gCudaGraph: CudaGraph
+var gCudaGraphCapturing: bool = false
+
+proc cuStreamBeginCapture*(stream: CUstream): bool =
+  ensureInit()
+  let res = lib.cuStreamBeginCapture(stream, CU_STREAM_CAPTURE_MODE_RELAXED)
+  if res == 0:
+    gCudaGraphCapturing = true
+    return true
+  return false
+
+proc cuStreamEndCapture*(stream: CUstream): bool =
+  if not gCudaGraphCapturing: return false
+  let res = lib.cuStreamEndCapture(stream, addr gCudaGraph.graph)
+  if res == 0:
+    gCudaGraphCapturing = false
+    return true
+  return false
+
+proc cuGraphInstantiate*(): bool =
+  let res = lib.cuGraphInstantiate(addr gCudaGraph.exec, gCudaGraph.graph, 0'u64)
+  return res == 0
+
+proc cuGraphLaunch*(stream: CUstream): bool =
+  let res = lib.cuGraphLaunch(gCudaGraph.exec, stream)
+  return res == 0
+
+proc cuGraphDestroy*() =
+  discard lib.cuGraphDestroy(gCudaGraph.graph)
+  discard lib.cuGraphExecDestroy(gCudaGraph.exec)
+
+proc isCudaGraphCapturing*(): bool = gCudaGraphCapturing

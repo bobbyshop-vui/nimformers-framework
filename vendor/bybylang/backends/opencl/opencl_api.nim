@@ -12,7 +12,7 @@ type
   cl_command_queue = pointer
   cl_program = pointer
   cl_kernel = pointer
-  cl_mem = pointer
+  cl_mem* = pointer
 
   OclLib = object
     handle: LibHandle
@@ -172,11 +172,104 @@ proc getBuf(bytes: csize_t, flags: uint64): cl_mem =
 proc putBuf(bytes: csize_t, flags: uint64, m: cl_mem) =
   gBufPool.mgetOrPut((bytes, flags), @[]).add(m)
 
+proc roundUpTile(x, tile: csize_t): csize_t = ((x + tile - 1) div tile) * tile
+
 proc openclAvailable*(): bool =
   if not tryLoad(): return false
   var platform: cl_platform_id
   var device: cl_device_id
   result = findPlatformAndDevice(addr platform, addr device)
+
+# ─────────────────────────────────────────────────────────────
+# SESSION API - THÊM: OpenCL trước đây gần như bỏ trống (mọi op session chỉ
+# discard/return false). Giờ implement thật bằng đúng hạ tầng đã có (getBuf/
+# getKernel/gQueue) - buffer ở lại trên GPU giữa các lệnh, không upload/
+# download qua CPU giữa từng op như openclVecOp/openclMatmul/... (bản
+# immediate-mode, mỗi lần gọi tự write+read riêng).
+# ─────────────────────────────────────────────────────────────
+
+proc openclSessionUpload*(data: seq[float32]): cl_mem =
+  ensureInit()
+  let bytes = csize_t(data.len * sizeof(float32))
+  var err: cl_int
+  result = lib.clCreateBuffer(gCtx, CL_MEM_READ_WRITE, bytes, nil, addr err)
+  gpuCheck(err == 0, "openclSessionUpload: clCreateBuffer failed")
+  var dataVar = data
+  gpuCheck(lib.clEnqueueWriteBuffer(gQueue, result, CL_FALSE, 0, bytes, addr dataVar[0], 0, nil, nil) == 0,
+    "openclSessionUpload: write failed")
+
+proc openclSessionAllocScratch*(n: int): cl_mem =
+  ensureInit()
+  let bytes = csize_t(n * sizeof(float32))
+  var err: cl_int
+  result = lib.clCreateBuffer(gCtx, CL_MEM_READ_WRITE, bytes, nil, addr err)
+  gpuCheck(err == 0, "openclSessionAllocScratch: clCreateBuffer failed")
+
+proc openclSessionRead*(buf: cl_mem, n: int): seq[float32] =
+  ensureInit()
+  result = newSeq[float32](n)
+  let bytes = csize_t(n * sizeof(float32))
+  gpuCheck(lib.clEnqueueReadBuffer(gQueue, buf, CL_TRUE, 0, bytes, addr result[0], 0, nil, nil) == 0,
+    "openclSessionRead: read failed")
+
+proc openclSessionFree*(buf: var cl_mem) =
+  if buf != nil:
+    discard lib.clReleaseMemObject(buf)
+    buf = nil
+
+proc openclSessionEnd*(): bool =
+  ensureInit()
+  result = lib.clFinish(gQueue) == 0
+
+proc openclSessionMatmulEnc*(a, b, c: cl_mem, M, K, N: int): bool =
+  ## Encode matmul thẳng trên buffer đã resident (a/b/c đến từ
+  ## openclSessionUpload/AllocScratch) - không write/read qua CPU.
+  ensureInit()
+  let kernel = getKernel("matmul_naive")
+  var aVar = a; var bVar = b; var cVar = c
+  var mArg = int32(M); var kArg = int32(K); var nArg = int32(N)
+  if lib.clSetKernelArg(kernel, 0, csize_t(sizeof(cl_mem)), addr aVar) != 0: return false
+  if lib.clSetKernelArg(kernel, 1, csize_t(sizeof(cl_mem)), addr bVar) != 0: return false
+  if lib.clSetKernelArg(kernel, 2, csize_t(sizeof(cl_mem)), addr cVar) != 0: return false
+  if lib.clSetKernelArg(kernel, 3, csize_t(sizeof(int32)), addr mArg) != 0: return false
+  if lib.clSetKernelArg(kernel, 4, csize_t(sizeof(int32)), addr kArg) != 0: return false
+  if lib.clSetKernelArg(kernel, 5, csize_t(sizeof(int32)), addr nArg) != 0: return false
+  const TILE = csize_t(32)  # SUA: khop BB_TILE=32 trong vecop_matmul.cl
+  var globalSize = [roundUpTile(csize_t(M), TILE), roundUpTile(csize_t(N), TILE)]
+  var localSize = [TILE, TILE]
+  result = lib.clEnqueueNDRangeKernel(gQueue, kernel, 2, nil, addr globalSize[0], addr localSize[0], 0, nil, nil) == 0
+
+proc openclSessionVecOpEnc*(op: string, a, b, c: cl_mem, n: int): bool =
+  ensureInit()
+  let kernel = getKernel("vecop_" & op)
+  var aVar = a; var bVar = b; var cVar = c
+  if lib.clSetKernelArg(kernel, 0, csize_t(sizeof(cl_mem)), addr aVar) != 0: return false
+  if lib.clSetKernelArg(kernel, 1, csize_t(sizeof(cl_mem)), addr bVar) != 0: return false
+  if lib.clSetKernelArg(kernel, 2, csize_t(sizeof(cl_mem)), addr cVar) != 0: return false
+  var globalSize = csize_t(n)
+  result = lib.clEnqueueNDRangeKernel(gQueue, kernel, 1, nil, addr globalSize, nil, 0, nil, nil) == 0
+
+proc openclSessionActivationEnc*(op: string, x, y: cl_mem, n: int): bool =
+  ensureInit()
+  let kernel = getKernel("vecop_" & op)
+  var xVar = x; var yVar = y
+  if lib.clSetKernelArg(kernel, 0, csize_t(sizeof(cl_mem)), addr xVar) != 0: return false
+  if lib.clSetKernelArg(kernel, 1, csize_t(sizeof(cl_mem)), addr yVar) != 0: return false
+  var globalSize = csize_t(n)
+  result = lib.clEnqueueNDRangeKernel(gQueue, kernel, 1, nil, addr globalSize, nil, 0, nil, nil) == 0
+
+proc openclSessionSoftmaxEnc*(x, y: cl_mem, rows, cols: int): bool =
+  ensureInit()
+  let kernel = getKernel("softmax_kernel")
+  var xVar = x; var yVar = y
+  var cArg = int32(cols)
+  if lib.clSetKernelArg(kernel, 0, csize_t(sizeof(cl_mem)), addr xVar) != 0: return false
+  if lib.clSetKernelArg(kernel, 1, csize_t(sizeof(cl_mem)), addr yVar) != 0: return false
+  if lib.clSetKernelArg(kernel, 2, csize_t(sizeof(int32)), addr cArg) != 0: return false
+  const BB_WG = csize_t(256)
+  var globalSize = csize_t(rows) * BB_WG
+  var localSize = BB_WG
+  result = lib.clEnqueueNDRangeKernel(gQueue, kernel, 1, nil, addr globalSize, addr localSize, 0, nil, nil) == 0
 
 proc openclVecOp*(op: string, a, b: seq[float32]): seq[float32] =
   ensureInit()
@@ -223,11 +316,61 @@ proc openclMatmul*(a, b: seq[float32], m, k, n: int): seq[float32] =
   gpuCheck(lib.clSetKernelArg(kernel, 3, csize_t(sizeof(int32)), addr mArg) == 0, "setArg failed")
   gpuCheck(lib.clSetKernelArg(kernel, 4, csize_t(sizeof(int32)), addr kArg) == 0, "setArg failed")
   gpuCheck(lib.clSetKernelArg(kernel, 5, csize_t(sizeof(int32)), addr nArg) == 0, "setArg failed")
-  const TILE = csize_t(16)
+  const TILE = csize_t(32)  # SUA: khop BB_TILE=32 trong vecop_matmul.cl
   proc roundUp(x, tile: csize_t): csize_t = ((x + tile - 1) div tile) * tile
   var globalSize2D = [roundUp(csize_t(m), TILE), roundUp(csize_t(n), TILE)]
   var localSize2D = [TILE, TILE]
   gpuCheck(lib.clEnqueueNDRangeKernel(gQueue, kernel, 2, nil, addr globalSize2D[0], addr localSize2D[0], 0, nil, nil) == 0, "clEnqueueNDRangeKernel failed")
+  gpuCheck(lib.clEnqueueReadBuffer(gQueue, bufC, CL_TRUE, 0, bytesC, addr result[0], 0, nil, nil) == 0, "read failed")
+
+proc openclMatmulQ4*(a: seq[float32], wq: seq[uint8], scales, zeros: seq[float32],
+                      m, k, n, groupSize, nGroupsPerRow: int): seq[float32] =
+  ## SUA (item 3 - quantization): ban sao openclMatmul() nhung nhan thang tren
+  ## weight int4 da pack + scale/zero_point, khong can dequant ra fp32 tren
+  ## CPU truoc (xem matmul_q4_naive trong vecop_matmul.cl va metalMatmulQ4 -
+  ## ban Metal - cho cung 1 cong thuc/layout). CHUA CHAY THU TREN OPENCL THAT.
+  ensureInit()
+  result = newSeq[float32](m * n)
+  let bytesA = csize_t(m * k * sizeof(float32))
+  let bytesPerRow = (k + 1) div 2
+  let bytesWq = csize_t(n * bytesPerRow * sizeof(uint8))
+  let bytesScales = csize_t(n * nGroupsPerRow * sizeof(float32))
+  let bytesC = csize_t(m * n * sizeof(float32))
+  let bufA = getBuf(bytesA, CL_MEM_READ_ONLY)
+  let bufWq = getBuf(bytesWq, CL_MEM_READ_ONLY)
+  let bufScales = getBuf(bytesScales, CL_MEM_READ_ONLY)
+  let bufZeros = getBuf(bytesScales, CL_MEM_READ_ONLY)
+  let bufC = getBuf(bytesC, CL_MEM_WRITE_ONLY)
+  defer:
+    putBuf(bytesA, CL_MEM_READ_ONLY, bufA)
+    putBuf(bytesWq, CL_MEM_READ_ONLY, bufWq)
+    putBuf(bytesScales, CL_MEM_READ_ONLY, bufScales)
+    putBuf(bytesScales, CL_MEM_READ_ONLY, bufZeros)
+    putBuf(bytesC, CL_MEM_WRITE_ONLY, bufC)
+  var aVar = a; var wqVar = wq; var scalesVar = scales; var zerosVar = zeros
+  gpuCheck(lib.clEnqueueWriteBuffer(gQueue, bufA, CL_FALSE, 0, bytesA, addr aVar[0], 0, nil, nil) == 0, "write failed")
+  gpuCheck(lib.clEnqueueWriteBuffer(gQueue, bufWq, CL_FALSE, 0, bytesWq, addr wqVar[0], 0, nil, nil) == 0, "write failed")
+  gpuCheck(lib.clEnqueueWriteBuffer(gQueue, bufScales, CL_FALSE, 0, bytesScales, addr scalesVar[0], 0, nil, nil) == 0, "write failed")
+  gpuCheck(lib.clEnqueueWriteBuffer(gQueue, bufZeros, CL_FALSE, 0, bytesScales, addr zerosVar[0], 0, nil, nil) == 0, "write failed")
+  let kernel = getKernel("matmul_q4_naive")
+  var bA = bufA; var bWq = bufWq; var bSc = bufScales; var bZp = bufZeros; var bC = bufC
+  var mArg = int32(m); var kArg = int32(k); var nArg = int32(n)
+  var gsArg = int32(groupSize); var ngArg = int32(nGroupsPerRow)
+  gpuCheck(lib.clSetKernelArg(kernel, 0, csize_t(sizeof(cl_mem)), addr bA) == 0, "setArg failed")
+  gpuCheck(lib.clSetKernelArg(kernel, 1, csize_t(sizeof(cl_mem)), addr bWq) == 0, "setArg failed")
+  gpuCheck(lib.clSetKernelArg(kernel, 2, csize_t(sizeof(cl_mem)), addr bSc) == 0, "setArg failed")
+  gpuCheck(lib.clSetKernelArg(kernel, 3, csize_t(sizeof(cl_mem)), addr bZp) == 0, "setArg failed")
+  gpuCheck(lib.clSetKernelArg(kernel, 4, csize_t(sizeof(cl_mem)), addr bC) == 0, "setArg failed")
+  gpuCheck(lib.clSetKernelArg(kernel, 5, csize_t(sizeof(int32)), addr mArg) == 0, "setArg failed")
+  gpuCheck(lib.clSetKernelArg(kernel, 6, csize_t(sizeof(int32)), addr kArg) == 0, "setArg failed")
+  gpuCheck(lib.clSetKernelArg(kernel, 7, csize_t(sizeof(int32)), addr nArg) == 0, "setArg failed")
+  gpuCheck(lib.clSetKernelArg(kernel, 8, csize_t(sizeof(int32)), addr gsArg) == 0, "setArg failed")
+  gpuCheck(lib.clSetKernelArg(kernel, 9, csize_t(sizeof(int32)), addr ngArg) == 0, "setArg failed")
+  # Khong tile (khac matmul_naive dung threadgroup mem) nen khong ep bo global
+  # size chia het cho local size - dung nil cho local_work_size, de driver tu
+  # chon, tranh phai roundUp/pad nhu ban tiled.
+  var globalSize2D = [csize_t(n), csize_t(m)]
+  gpuCheck(lib.clEnqueueNDRangeKernel(gQueue, kernel, 2, nil, addr globalSize2D[0], nil, 0, nil, nil) == 0, "clEnqueueNDRangeKernel failed")
   gpuCheck(lib.clEnqueueReadBuffer(gQueue, bufC, CL_TRUE, 0, bytesC, addr result[0], 0, nil, nil) == 0, "read failed")
 
 proc openclActivation*(op: string, x: seq[float32]): seq[float32] =

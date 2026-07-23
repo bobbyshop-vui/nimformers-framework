@@ -1043,7 +1043,14 @@ BB_LN_BWD_RET:
     .reg .b32 %r<100>;
     .reg .f32 %f<60>;
     .reg .b64 %rd<60>;
-    .shared .align 4 .f32 scores[256];
+    // SUA (theo yeu cau): khong dat gioi han cung nao nua. Bo han mang
+    // "shared scores[]" cap phat TINH luc bien dich (truoc la 256 roi 4096,
+    // van la 1 con so co the bi vuot). Thay vao do dung thang S_matrix
+    // (buffer GLOBAL, duoc cap phat dung S*S theo tung lan goi thuc te tu
+    // phia Nim, xem loadQuantStateDict/beAttentionFused) lam noi luu tam
+    // scores/softmax luon -> khong con con so nao de "vuot" duoc nua, S dai
+    // bao nhieu cung chay dung (chi ton them 1 vong doc/ghi global memory
+    // thay vi shared, cham hon mot chut nhung dung voi moi S).
     .shared .align 4 .f32 redBuf[512];
 
     // grid = (B*H, S, 1) ; block = (blockSize, 1, 1)
@@ -1071,7 +1078,6 @@ BB_LN_BWD_RET:
     ld.param.u64 %rd4, [attn_param_3];  // Out
     ld.param.u64 %rd5, [attn_param_4];  // S_matrix
 
-    mov.u64 %rd6, scores;
     mov.u64 %rd7, redBuf;
 
     mul.lo.s32 %r10, %r1, %r7;          // bh*S
@@ -1084,6 +1090,7 @@ BB_LN_BWD_RET:
     add.s64 %rd10, %rd4, %rd8;          // &Out[i,0]
     mul.wide.s32 %rd11, %r13, 4;
     add.s64 %rd12, %rd5, %rd11;         // &S_matrix[i,0]
+    mov.u64 %rd6, %rd12;                // "scores" base gio la chinh &S_matrix[i,0] (global, khong gioi han)
 
     // ================= PHASE A: scores[j] = scale * Q_i . K_j =================
     mov.f32 %f2, 0fFF800000;            // threadMax = -inf
@@ -1120,7 +1127,7 @@ BB_ATTN_DOT_DONE:
 
     mul.wide.s32 %rd18, %r14, 4;
     add.s64 %rd19, %rd6, %rd18;
-    st.shared.f32 [%rd19], %f3;         // scores[j] = score
+    st.global.f32 [%rd19], %f3;         // S_matrix[i,j] = score (scratch, chua normalize)
 
     setp.gt.f32 %p3, %f3, %f2;
     selp.f32 %f2, %f3, %f2, %p3;        // threadMax = max(threadMax, score)
@@ -1172,11 +1179,11 @@ BB_ATTN_EXP_LOOP:
 
     mul.wide.s32 %rd18, %r14, 4;
     add.s64 %rd19, %rd6, %rd18;
-    ld.shared.f32 %f11, [%rd19];
+    ld.global.f32 %f11, [%rd19];
     sub.f32 %f11, %f11, %f9;
     mul.f32 %f11, %f11, 0f3fb8aa3b;     // * log2(e)
     ex2.approx.f32 %f12, %f11;
-    st.shared.f32 [%rd19], %f12;
+    st.global.f32 [%rd19], %f12;
     add.f32 %f10, %f10, %f12;
 
     add.s32 %r14, %r14, %r4;
@@ -1223,18 +1230,16 @@ BB_ATTN_NORM_LOOP:
 
     mul.wide.s32 %rd18, %r14, 4;
     add.s64 %rd19, %rd6, %rd18;
-    ld.shared.f32 %f15, [%rd19];
+    ld.global.f32 %f15, [%rd19];
     mul.f32 %f15, %f15, %f14;
-    st.shared.f32 [%rd19], %f15;        // scores[j] = softmax weight
-
-    add.s64 %rd24, %rd12, %rd18;
-    st.global.f32 [%rd24], %f15;        // S_matrix[i,j] = weight
+    st.global.f32 [%rd19], %f15;        // S_matrix[i,j] = softmax weight (rd6==rd12, khong con ghi trung lap)
 
     add.s32 %r14, %r14, %r4;
     bra BB_ATTN_NORM_LOOP;
 
 BB_ATTN_NORM_DONE:
-    bar.sync 0;                         // dam bao scores[] ghi xong truoc khi Phase D doc
+    bar.sync 0;                         // dam bao S_matrix ghi xong truoc khi Phase D doc (bar.sync la full
+                                         // memory fence trong pham vi block, ap dung ca cho global memory)
 
     // ================= PHASE D: Out[i,d] = sum_j weight_j * V[j,d] =================
     mov.u32 %r20, %r3;                  // d = t
@@ -1252,7 +1257,7 @@ BB_ATTN_OUT_J_LOOP:
 
     mul.wide.s32 %rd18, %r14, 4;
     add.s64 %rd19, %rd6, %rd18;
-    ld.shared.f32 %f17, [%rd19];        // weight_j
+    ld.global.f32 %f17, [%rd19];        // weight_j
 
     add.s32 %r15, %r10, %r14;           // bh*S+j
     mul.lo.s32 %r16, %r15, %r8;
@@ -1303,8 +1308,16 @@ BB_ATTN_RET:
     .reg .b32 %r<100>;
     .reg .f32 %f<60>;
     .reg .b64 %rd<60>;
-    .shared .align 4 .f32 softmaxW[256];
-    .shared .align 4 .f32 dScoreArr[256];
+    // SUA: bo han "shared softmaxW[]" (truoc la 256 roi 4096, van la 1 con
+    // so co the vuot). softmaxW[j] chinh la S_ij da co san trong buffer
+    // S_matrix (global, khong gioi han, cap phat dung S*S tu phia Nim) nen
+    // doc thang tu do, khoi can copy qua shared nua. dScoreArr[] la gia tri
+    // trung gian tu tinh (dS_ij), KHONG co buffer global nao duoc truyen san
+    // de "muon" nhu S_matrix -> de bo gioi han that su can them 1 tham so
+    // buffer scratch moi vao kernel (sua ca phia goi kernel/cuda_driver.nim,
+    // khong chi sua file .ptx nay), nen tam giu 4096 (van la 1 tran, nhung
+    // backward chi dung khi TRAIN, khong dung khi generate()/inference).
+    .shared .align 4 .f32 dScoreArr[4096];
     .shared .align 4 .f32 redBuf[512];
 
     // grid = (B*H, S, 1) ; block = (blockSize, 1, 1)
@@ -1335,7 +1348,6 @@ BB_ATTN_RET:
     ld.param.u64 %rd7, [attn_bwd_param_6];  // dK
     ld.param.u64 %rd8, [attn_bwd_param_7];  // dV
 
-    mov.u64 %rd9, softmaxW;
     mov.u64 %rd10, dScoreArr;
     mov.u64 %rd11, redBuf;
 
@@ -1360,9 +1372,8 @@ BB_ATTN_BWD_LOAD_LOOP:
 
     mul.wide.s32 %rd18, %r14, 4;
     add.s64 %rd19, %rd17, %rd18;
-    ld.global.f32 %f2, [%rd19];         // S_ij
-    add.s64 %rd20, %rd9, %rd18;
-    st.shared.f32 [%rd20], %f2;         // softmaxW[j] = S_ij
+    // softmaxW[j] = S_ij da co san o dung dia chi nay trong S_matrix (global),
+    // khong can copy qua shared nua (xem giai thich o khai bao dScoreArr o tren)
 
     add.s32 %r15, %r10, %r14;           // bh*S+j
     mul.lo.s32 %r16, %r15, %r8;         // (bh*S+j)*D
@@ -1405,8 +1416,8 @@ BB_ATTN_BWD_DOT_LOOP:
     @%p3 bra BB_ATTN_BWD_DOT_DONE;
 
     mul.wide.s32 %rd18, %r14, 4;
-    add.s64 %rd20, %rd9, %rd18;
-    ld.shared.f32 %f7, [%rd20];         // softmaxW[j]
+    add.s64 %rd20, %rd17, %rd18;
+    ld.global.f32 %f7, [%rd20];         // softmaxW[j] = S_matrix[i,j] (global, khong gioi han)
     add.s64 %rd26, %rd10, %rd18;
     ld.shared.f32 %f8, [%rd26];         // dScoreArr[j] (dS_ij)
     fma.rn.f32 %f6, %f7, %f8, %f6;
@@ -1455,8 +1466,8 @@ BB_ATTN_BWD_DSCORE_LOOP:
     @%p3 bra BB_ATTN_BWD_DSCORE_DONE;
 
     mul.wide.s32 %rd18, %r14, 4;
-    add.s64 %rd20, %rd9, %rd18;
-    ld.shared.f32 %f13, [%rd20];        // softmaxW[j]
+    add.s64 %rd20, %rd17, %rd18;
+    ld.global.f32 %f13, [%rd20];        // softmaxW[j] = S_matrix[i,j]
     add.s64 %rd26, %rd10, %rd18;
     ld.shared.f32 %f14, [%rd26];        // dS_ij
     sub.f32 %f15, %f14, %f12;
@@ -1523,8 +1534,8 @@ BB_ATTN_BWD_DKV_J_LOOP:
     ld.shared.f32 %f19, [%rd26];        // dScoreArr[j]
     mul.f32 %f20, %f19, %f1;            // dScoreArr[j]*scale
 
-    add.s64 %rd20, %rd9, %rd18;
-    ld.shared.f32 %f21, [%rd20];        // softmaxW[j]
+    add.s64 %rd20, %rd17, %rd18;
+    ld.global.f32 %f21, [%rd20];        // softmaxW[j] = S_matrix[i,j]
 
     add.s32 %r15, %r10, %r14;           // bh*S+j
     mul.lo.s32 %r16, %r15, %r8;         // (bh*S+j)*D

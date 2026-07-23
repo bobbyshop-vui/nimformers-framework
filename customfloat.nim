@@ -13,13 +13,19 @@ type
     usesUint64*: bool
 
 proc newCustomFloat*(exponentBits, mantissaBits: int, name = ""): CustomFloat =
-  assert exponentBits >= 1 and mantissaBits >= 0
+  # === SỬA: cho phép exponentBits = 0 cho trường hợp int8/int4 ===
+  assert exponentBits >= 0 and mantissaBits >= 0  # Đổi từ >= 1 thành >= 0
   result.exponentBits = exponentBits
   result.mantissaBits = mantissaBits
   result.totalBits = 1 + exponentBits + mantissaBits
   result.itemSize = (result.totalBits + 7) div 8
-  result.bias = (1 shl (exponentBits - 1)) - 1
-  result.maxExp = (1 shl exponentBits) - 1
+  # === SỬA: nếu exponentBits = 0 thì bias = 0 ===
+  if exponentBits > 0:
+    result.bias = (1 shl (exponentBits - 1)) - 1
+    result.maxExp = (1 shl exponentBits) - 1
+  else:
+    result.bias = 0
+    result.maxExp = 0
   result.name = if name.len > 0: name
                 else: &"float{result.totalBits}_e{exponentBits}m{mantissaBits}"
   result.usesUint64 = result.totalBits <= 64

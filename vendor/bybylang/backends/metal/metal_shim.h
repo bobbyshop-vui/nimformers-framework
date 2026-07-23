@@ -17,6 +17,15 @@ int metal_vecop(const char* kernel_src, int op, const float* a, const float* b, 
 // C(m x n) = A(m x k) * B(k x n), row-major. Trả về 1 nếu chạy thành công, 0 nếu lỗi.
 int metal_matmul(const char* kernel_src, const float* a, const float* b, float* c, int m, int k, int n);
 
+// Matmul truc tiep tren weight int4-asymmetric DA PACK (khong dequant ra
+// fp32 tren CPU truoc). wq: packed bytes [N * ceil(K/2)]. scales/zeros:
+// [N * nGroupsPerRow] (nGroupsPerRow = ceil(K/groupSize), groupSize<=0 nghia
+// la 1 group/hang). Xem chu thich chi tiet trong vecop_matmul.metal
+// (matmul_q4_kernel) truoc khi dung - CHUA CHAY THU TREN GPU THAT.
+int metal_matmul_q4(const char* kernel_src, const float* a, const unsigned char* wq,
+                     const float* scales, const float* zeros, float* c,
+                     int m, int k, int n, int groupSize, int nGroupsPerRow);
+
 // Chạy 2 phép matmul ĐỘC LẬP (a1*b1->c1 và a2*b2->c2) trong CÙNG một command
 // buffer / một lần compile pipeline, chỉ commit+wait MỘT LẦN. Dùng khi cần
 // dispatch 2 matmul không phụ thuộc lẫn nhau (vd. dW và dX trong backward)

@@ -25,7 +25,7 @@ type
     name*: string
     instrs*: seq[TsicInstr]
 
-type TsicBackend = enum
+type TsicBackend* = enum
   tbUnknown, tbCuda, tbMetal, tbOpenCL
 
 var gTsicBackend = tbUnknown

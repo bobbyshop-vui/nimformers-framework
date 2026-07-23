@@ -1,10 +1,10 @@
 ## nimformer.nim
 ## Transformer đầy đủ với backward cho attention + custom transformer blocks
-## TẤT CẢ PHÉP TOÁN BACKWARD ĐỀU ĐƯỢC CHUYỂN SANG METAL (GPU) QUA MATH HELPERS
 
 import std/[math, random, strformat]
 import customfloat
 import backend  # Import Backend và các helper
+import quant     # QuantTensor, dequantizeTensor - giữ weight nén int4 trong RAM
 
 # ===================================================================
 # Tensor utilities (giữ nguyên)
@@ -33,6 +33,16 @@ proc randnTensor*(shape: seq[int], scale: float32): Tensor =
 proc addT*(a, b: Tensor): Tensor =
   result = a
   for i in 0 ..< result.data.len: result.data[i] += b.data[i]
+
+proc addT*(ctx: Backend, a, b: Tensor): Tensor =
+  ## SỬA: bản addT(a,b) ở trên chạy CPU thuần dù beAdd (GPU thật, có cài cho
+  ## cả CUDA/Metal/OpenCL) đã có sẵn - residual connection này chạy 2 LẦN MỖI
+  ## LAYER (attn + ff), tức 64 lần/token với model 32 layer, không phải phép
+  ## tính nhỏ có thể bỏ qua. Overload này route qua GPU đúng yêu cầu "không
+  ## được lặng lẽ chạy CPU". Giữ nguyên bản addT(a,b) cũ (không ctx) cho các
+  ## chỗ dùng khác không có Backend trong scope.
+  result = a
+  result.data = beAdd(ctx, a.data, b.data)
 
 proc subT*(a, b: Tensor): Tensor =
   result = a
@@ -63,7 +73,13 @@ proc transpose*(x: Tensor): Tensor =
 # ===================================================================
 type
   Linear* = object
-    weight*: Tensor
+    weight*: Tensor      ## fallback fp32 nhỏ (chỉ dùng cho random-init lúc chưa load weight thật)
+    weightQ*: QuantTensor ## THÊM: weight THẬT giữ nguyên dạng NÉN (int4/int8...) suốt vòng đời
+                           ## process, giống cách llama.cpp giữ quantized weight trong RAM -
+                           ## KHÔNG bao giờ expand hết ra fp32 một lần rồi giữ mãi (đó là
+                           ## nguyên nhân OOM trước đó: 6.7B tham số x 4 byte fp32 = ~27GB RAM).
+    useQuant*: bool        ## true sau khi loadLinear() gán weightQ thật (int4 nén, ~4GB tổng
+                            ## cho cả model thay vì ~27GB fp32)
     bias*: Tensor
     inF*, outF*: int
 
@@ -72,32 +88,49 @@ proc newLinear*(inF, outF: int): Linear =
   result.inF = inF
   result.outF = outF
   result.weight = randnTensor(@[outF, inF], scale)
+  result.useQuant = false
   result.bias = newTensor(@[outF])
 
+proc setQuantWeight*(l: var Linear, qt: QuantTensor) =
+  ## Gọi từ loadLinear() khi load weight thật từ file .nimq - giữ NGUYÊN
+  ## dạng nén (không dequant ngay), giải phóng luôn weight fp32 fallback
+  ## (không cần nữa, tốn RAM vô ích vì đã có weightQ).
+  l.weightQ = qt
+  l.useQuant = true
+  l.weight.data = @[]
 proc forward*(l: Linear, x: Tensor, ctx: Backend): Tensor =
-  ## Forward Linear: y = x @ W^T + b
   let (rows, cols) = flatten2D(x.shape)
   assert cols == l.inF
   var outShape = x.shape
   outShape[^1] = l.outF
   result = newTensor(outShape)
-  # l.weight lưu vật lý theo shape [outF, inF] (row-major). metalMatmul chỉ làm
-  # A@B thuần (không tự transpose B), nên phải transpose weight thành đúng
-  # [inF, outF] trước khi nhân, chứ không thể chỉ "khai" lại kích thước
-  # (l.inF, l.outF) trong khi dữ liệu vẫn nằm theo thứ tự [outF, inF] —
-  # làm vậy sẽ đọc sai phần tử bất cứ khi nào inF != outF.
-  let wT = transpose(l.weight)  # -> [inF, outF]
-  let y = beMatmul(ctx, x.data, rows, cols, wT.data, l.inF, l.outF)
-  # y là [rows, outF] phẳng row-major -> phần tử i có row = i div outF,
-  # col (= chỉ số output feature) = i mod outF. Bias phải cộng theo CỘT
-  # (mỗi output feature 1 giá trị bias, không phải theo hàng/sample).
-  # BUG CŨ: dùng "i div l.outF" (= chỉ số hàng) để tra bias (mảng dài outF)
-  # -> sai giá trị bias ngay cả khi rows nhỏ hơn outF (không crash nhưng cộng
-  # nhầm bias của "hàng thứ i div outF" thay vì bias của đúng feature), và
-  # OUT-OF-BOUNDS ngay khi rows > outF (đúng tình huống batch B*T lớn).
+
+  var y: seq[float32]
+  if l.useQuant and l.weightQ.kind == qkInt4Asymmetric and l.weightQ.groupSize > 0:
+    let nGroupsPerRow = (l.inF + l.weightQ.groupSize - 1) div l.weightQ.groupSize
+    y = beMatmulQ4(ctx, x.data, l.weightQ.data, l.weightQ.scale, l.weightQ.zero_point,
+                    rows, l.inF, l.outF, l.weightQ.groupSize, nGroupsPerRow)
+  else:
+    var wT: seq[float32]
+    if l.useQuant:
+      wT = dequantizeTensorTransposed(l.weightQ)
+    else:
+      wT = transpose(l.weight).data
+    y = beMatmul(ctx, x.data, rows, l.inF, wT, l.inF, l.outF)
+
+  # === FIX: LUÔN ĐẢM BẢO KÍCH THƯỚC ĐÚNG ===
+  let expectedSize = rows * l.outF
+  if y.len != expectedSize:
+    # Tạo mảng mới với kích thước đúng, copy những phần tử có sẵn, phần còn lại để 0
+    var fixed = newSeq[float32](expectedSize)
+    let copyLen = min(y.len, expectedSize)
+    for i in 0 ..< copyLen:
+      fixed[i] = y[i]
+    y = fixed
+
+  # Cộng bias (l.bias.data có độ dài l.outF)
   for i in 0 ..< y.len:
     result.data[i] = y[i] + l.bias.data[i mod l.outF]
-
 proc backward*(l: Linear, x: Tensor, dOut: Tensor, ctx: Backend): tuple[dX, dW, dB: Tensor] =
   ## Backward Linear: 
   ## dW = x^T @ dOut  (cộng dồn qua batch)
@@ -311,10 +344,10 @@ proc newTransformerBlock*(embedDim, nHeads, ffMult: int): TransformerBlock =
 proc forward*(blk: TransformerBlock, x: Tensor, ctx: Backend): Tensor =
   let x1 = blk.ln1.forward(x, ctx)
   let attnOut = blk.attn.forward(x1, ctx)
-  let x2 = addT(x, attnOut)
+  let x2 = addT(ctx, x, attnOut)
   let x3 = blk.ln2.forward(x2, ctx)
   let ffOut = blk.ff.forward(x3, ctx)
-  result = addT(x2, ffOut)
+  result = addT(ctx, x2, ffOut)
 
 proc backward*(blk: TransformerBlock, x: Tensor, dOut: Tensor, ctx: Backend): tuple[
     dX, dAttnQkvW, dAttnQkvB, dAttnProjW, dAttnProjB,
@@ -324,10 +357,10 @@ proc backward*(blk: TransformerBlock, x: Tensor, dOut: Tensor, ctx: Backend): tu
   # Forward lại (cần cho backward)
   let x1 = blk.ln1.forward(x, ctx)
   let attnOut = blk.attn.forward(x1, ctx)
-  let x2 = addT(x, attnOut)
+  let x2 = addT(ctx, x, attnOut)
   let x3 = blk.ln2.forward(x2, ctx)
   let ffOut = blk.ff.forward(x3, ctx)
-  let y = addT(x2, ffOut)
+  let y = addT(ctx, x2, ffOut)
   
   var dY = dOut
   let dFF = blk.ff.backward(x3, dY, ctx)

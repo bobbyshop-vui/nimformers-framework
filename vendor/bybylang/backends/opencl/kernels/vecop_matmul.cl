@@ -222,7 +222,9 @@ __kernel void embedding_lookup_kernel(__global const float* table, __global cons
 // ============================================================
 // MATMUL TILED
 // ============================================================
-#define BB_TILE 16
+// SUA: tang tu 16 len 32 (giong metal_shim.m / vecop_matmul.metal) - tile
+// lon hon giam so workgroup phai dispatch va tang data reuse tren local mem
+#define BB_TILE 32
 
 __kernel void matmul_naive(__global const float* a, __global const float* b, __global float* c,
                             const int M, const int K, const int N) {
@@ -254,6 +256,43 @@ __kernel void matmul_naive(__global const float* a, __global const float* b, __g
 }
 
 // ============================================================
+// MATMUL TRUC TIEP TREN INT4 ASYMMETRIC (packed, per-group scale/zero_point)
+// ============================================================
+// SUA: ban sao chinh xac cua matmul_q4_kernel ben Metal (vecop_matmul.metal)
+// - xem chu thich chi tiet o do va quant.nim/dequantizeTensorTransposed cho
+// dinh nghia layout. Thread (get_global_id(0)=n, get_global_id(1)=m).
+__kernel void matmul_q4_naive(__global const float* a, __global const uchar* wq,
+                               __global const float* scales, __global const float* zeros,
+                               __global float* c,
+                               const int M, const int K, const int N,
+                               const int groupSize, const int nGroupsPerRow) {
+    int n = get_global_id(0);
+    int m = get_global_id(1);
+    if (m >= M || n >= N) return;
+
+    int bytesPerRow = (K + 1) / 2;
+    int rowByteOff = n * bytesPerRow;
+    int rowGroupOff = n * nGroupsPerRow;
+
+    float sum = 0.0f;
+    int curGroup = -1;
+    float sc = 0.0f, zp = 0.0f;
+    for (int k = 0; k < K; k++) {
+        int g = groupSize > 0 ? (k / groupSize) : 0;
+        if (g != curGroup) {
+            curGroup = g;
+            sc = scales[rowGroupOff + g];
+            zp = zeros[rowGroupOff + g];
+        }
+        uchar byteVal = wq[rowByteOff + (k >> 1)];
+        uchar nibble = (k & 1) == 0 ? (byteVal & 0x0F) : ((byteVal >> 4) & 0x0F);
+        float wval = (((float)nibble) - zp) * sc;
+        sum += a[m * K + k] * wval;
+    }
+    c[m * N + n] = sum;
+}
+
+// ============================================================
 // ATOMIC ADD FLOAT
 // ============================================================
 inline void atomicAddFloatGlobal(volatile __global float* addr, float val) {
@@ -279,36 +318,40 @@ __kernel void attention_fused_kernel(__global const float* q, __global const flo
     if (bh < (B * H) && ti < S) {
         int base_idx = bh * S * D;
         int base_s = bh * S * S;
-        
-        float scores[256];
+        int row = base_s + ti * S;
+
+        // SUA: bo local array "float scores[256]" (tran neu S > 256). Dung
+        // thang s_matrix (global, da cap phat dung S*S theo tung lan goi)
+        // lam bo nho tam -> khong con gioi han cung nao ve S nua.
         float mx = -1e30f;
         for (int tj = 0; tj <= ti; ++tj) {
             float dot = 0.0f;
             for (int d = 0; d < D; ++d) {
                 dot += q[base_idx + ti * D + d] * k[base_idx + tj * D + d];
             }
-            scores[tj] = dot * scale;
-            if (scores[tj] > mx) mx = scores[tj];
+            float sc = dot * scale;
+            s_matrix[row + tj] = sc;
+            if (sc > mx) mx = sc;
         }
-        
+
         float sum_exp = 0.0f;
         for (int tj = 0; tj <= ti; ++tj) {
-            scores[tj] = exp(scores[tj] - mx);
-            sum_exp += scores[tj];
+            float e = exp(s_matrix[row + tj] - mx);
+            s_matrix[row + tj] = e;
+            sum_exp += e;
         }
-        
+
         for (int tj = 0; tj <= ti; ++tj) {
-            scores[tj] /= sum_exp;
-            s_matrix[base_s + ti * S + tj] = scores[tj];
+            s_matrix[row + tj] /= sum_exp;
         }
         for (int tj = ti + 1; tj < S; ++tj) {
-            s_matrix[base_s + ti * S + tj] = 0.0f;
+            s_matrix[row + tj] = 0.0f;
         }
-        
+
         for (int d = 0; d < D; ++d) {
             float acc = 0.0f;
             for (int tj = 0; tj <= ti; ++tj) {
-                acc += scores[tj] * v[base_idx + tj * D + d];
+                acc += s_matrix[row + tj] * v[base_idx + tj * D + d];
             }
             o[base_idx + ti * D + d] = acc;
         }
