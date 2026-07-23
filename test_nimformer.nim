@@ -355,7 +355,7 @@ proc defaultConfig(): Config =
   Config(
     seqLen: 128,
     batchSize: 32,
-    steps: 10000,
+    steps: 1581,
     lr: 3e-3'f32,
     embedDim: 128,
     nHeads: 4,
