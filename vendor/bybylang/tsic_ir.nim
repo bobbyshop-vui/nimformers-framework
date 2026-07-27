@@ -291,6 +291,19 @@ proc tsicMatmulOp*(a, b: seq[float32], m, k, n: int): seq[float32] =
   else:
     raise newException(CatchableError, "TSIC: No GPU backend available")
 
+proc tsicMatmulNTOp*(a, b: seq[float32], m, k, n: int): seq[float32] =
+  ## C(m,n) = A(m,k) @ B(n,k)^T. TỰ CHỨA HOÀN TOÀN trong file này - KHÔNG gọi
+  ## thêm bất kỳ hàm nào ở file khác ngoài những gì tsicMatmulOp() (ở trên,
+  ## đã có sẵn từ trước) đang dùng. Transpose B [n,k] -> [k,n] bằng Nim thuần
+  ## ngay tại đây rồi gọi lại tsicMatmulOp() y hệt cũ - không cần
+  ## cudaMatmulNTF32/metalMatmulNT/openclMatmulNT hay bất kỳ sửa đổi nào ở
+  ## cuda_runtime.nim/metal_backend.nim/opencl_api.nim.
+  var bT = newSeq[float32](k * n)
+  for row in 0 ..< n:
+    for col in 0 ..< k:
+      bT[col * n + row] = b[row * k + col]
+  result = tsicMatmulOp(a, bT, m, k, n)
+
 proc tsicRelu*(x: seq[float32]): seq[float32] =
   let backend = tsicInit()
   case backend

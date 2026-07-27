@@ -24,6 +24,25 @@ __kernel void vecop_div(__global const float* a, __global const float* b, __glob
 }
 
 // ============================================================
+// ROPE (rotate_half, in-place) - THÊM MỚI, tương ứng rope_kernel bên Metal
+// ============================================================
+__kernel void rope_kernel(__global float* x, __global const float* cosT, __global const float* sinT,
+                           const int Hn, const int D) {
+    int half_ = D / 2;
+    int i = get_global_id(0);
+    if (i >= half_) return;
+    int h = get_global_id(1);
+    int t = get_global_id(2);
+    int base = (t * Hn + h) * D;
+    float c = cosT[t * half_ + i];
+    float s = sinT[t * half_ + i];
+    float x1 = x[base + i];
+    float x2 = x[base + i + half_];
+    x[base + i]         = x1 * c - x2 * s;
+    x[base + i + half_] = x2 * c + x1 * s;
+}
+
+// ============================================================
 // ACTIVATIONS
 // ============================================================
 __kernel void vecop_relu(__global const float* x, __global float* y) {
@@ -222,38 +241,157 @@ __kernel void embedding_lookup_kernel(__global const float* table, __global cons
 // ============================================================
 // MATMUL TILED
 // ============================================================
-// SUA: tang tu 16 len 32 (giong metal_shim.m / vecop_matmul.metal) - tile
-// lon hon giam so workgroup phai dispatch va tang data reuse tren local mem
-#define BB_TILE 32
-
-__kernel void matmul_naive(__global const float* a, __global const float* b, __global float* c,
-                            const int M, const int K, const int N) {
-    __local float tileA[BB_TILE][BB_TILE];
-    __local float tileB[BB_TILE][BB_TILE];
-
-    int tx = get_local_id(0), ty = get_local_id(1);
-    int row = get_group_id(0) * BB_TILE + ty;
-    int col = get_group_id(1) * BB_TILE + tx;
-
-    float sum = 0.0f;
-    int numTiles = (K + BB_TILE - 1) / BB_TILE;
-    for (int t = 0; t < numTiles; t++) {
-        int aCol = t * BB_TILE + tx;
-        int bRow = t * BB_TILE + ty;
-        tileA[ty][tx] = (row < M && aCol < K) ? a[row * K + aCol] : 0.0f;
-        tileB[ty][tx] = (bRow < K && col < N) ? b[bRow * N + col] : 0.0f;
-        barrier(CLK_LOCAL_MEM_FENCE);
-
-        #pragma unroll
-        for (int p = 0; p < BB_TILE; p++) {
-            sum += tileA[ty][p] * tileB[p][tx];
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-    if (row < M && col < N) {
-        c[row * N + col] = sum;
-    }
+// SUA BUG THAT (nguyen nhan "loi kernel o matmul" tren OpenCL): ban truoc
+// hard-code BB_TILE=32 -> local_work_size = 32*32 = 1024 work-items/workgroup
+// cho MOI thiet bi, roi enqueue thang trong opencl_api.nim KHONG he query
+// CL_DEVICE_MAX_WORK_GROUP_SIZE / CL_KERNEL_WORK_GROUP_SIZE truoc. Rat nhieu
+// GPU (dac biet iGPU Intel/AMD doi cu, mot so mobile GPU) gioi han work-group
+// toi da chi 256 (hoac it hon) -> clEnqueueNDRangeKernel tra ve
+// CL_INVALID_WORK_GROUP_SIZE (-54) ngay lap tuc, KHONG chay duoc kernel nao.
+// FIX: build san 3 bien the tile 8/16/32 (macro sinh code, khong dung
+// compile-option macro rieng vi __local array size can literal ro rang).
+// Phia opencl_api.nim se query CL_KERNEL_WORK_GROUP_SIZE that cua tung
+// kernel qua clGetKernelWorkGroupInfo() sau khi tao, chon bien the lon nhat
+// ma local_work_size (TILE*TILE) <= gioi han that, cache lai, dung xuyen
+// suot vong doi process (khong query lai moi lan goi).
+#define BB_MATMUL_VARIANT(TILE, KFUNC) \
+__kernel void KFUNC(__global const float* a, __global const float* b, __global float* c, const int M, const int K, const int N) { \
+    __local float tileA[TILE][TILE]; \
+    __local float tileB[TILE][TILE]; \
+    int tx = get_local_id(0), ty = get_local_id(1); \
+    int row = get_group_id(0) * TILE + ty; \
+    int col = get_group_id(1) * TILE + tx; \
+    float sum = 0.0f; \
+    int numTiles = (K + TILE - 1) / TILE; \
+    for (int t = 0; t < numTiles; t++) { \
+        int aCol = t * TILE + tx; \
+        int bRow = t * TILE + ty; \
+        tileA[ty][tx] = (row < M && aCol < K) ? a[row * K + aCol] : 0.0f; \
+        tileB[ty][tx] = (bRow < K && col < N) ? b[bRow * N + col] : 0.0f; \
+        barrier(CLK_LOCAL_MEM_FENCE); \
+        for (int p = 0; p < TILE; p++) { \
+            sum += tileA[ty][p] * tileB[p][tx]; \
+        } \
+        barrier(CLK_LOCAL_MEM_FENCE); \
+    } \
+    if (row < M && col < N) { \
+        c[row * N + col] = sum; \
+    } \
 }
+
+// 3 bien the - opencl_api.nim chon 1 trong 3 tuy CL_KERNEL_WORK_GROUP_SIZE
+// that cua tung kernel tren device dang chay (8x8=64, 16x16=256, 32x32=1024
+// work-items/workgroup).
+BB_MATMUL_VARIANT(8,  matmul_kernel_t8)
+BB_MATMUL_VARIANT(16, matmul_kernel_t16)
+BB_MATMUL_VARIANT(32, matmul_kernel_t32)
+
+// Giu ten cu "matmul_naive" = alias tile 8 (an toan nhat, gan nhu moi GPU
+// deu ho tro toi thieu 64 work-items/workgroup) de code nao con goi thang
+// ten nay (chua qua duong chon-tile-dong) van compile va chay duoc, KHONG
+// BAO GIO dispatch ten nay voi local_work_size > 8x8.
+BB_MATMUL_VARIANT(8, matmul_naive)
+
+// ============================================================
+// MATMUL TILED - VECTORIZED (float4), THEM MOI, KHONG DUNG DE THAY THE
+// ============================================================
+// Muc dich: kernel scalar o tren (BB_MATMUL_VARIANT) doc/ghi tung float mot
+// -> khong tan dung duoc bang thong bo nho vector cua GPU (2-4x tren nhieu
+// iGPU/dGPU khi doc float4 lien tuc thay vi 4 lan doc float rieng le).
+// Dieu kien dung: K % 4 == 0 VA N % 4 == 0 (kiem tra o phia Nim truoc khi
+// chon kernel nay - neu khong thoa, fallback ve BB_MATMUL_VARIANT scalar
+// o tren, KHONG dispatch kernel nay voi K/N le boi 4).
+// tileA van luu float (de load hang A voi remainder-check binh thuong vi A
+// thuong la activation, hang M nho/le); tileB doc bang float4 vi B (weight)
+// duoc duyet theo cot lien tuc trong bo nho (rowByteOff... khong, day la
+// ma tran fp32 thuong, xem lai gia dinh b la row-major [K,N]).
+#define BB_MATMUL_VARIANT_VEC4(TILE, KFUNC) \
+__kernel void KFUNC(__global const float* a, __global const float* b, __global float* c, const int M, const int K, const int N) { \
+    __local float tileA[TILE][TILE]; \
+    __local float tileB[TILE][TILE]; \
+    int tx = get_local_id(0), ty = get_local_id(1); \
+    int row = get_group_id(0) * TILE + ty; \
+    int col = get_group_id(1) * TILE + tx; \
+    float sum = 0.0f; \
+    int numTiles = K / TILE; \
+    for (int t = 0; t < numTiles; t++) { \
+        int aCol = t * TILE + tx; \
+        int bRow = t * TILE + ty; \
+        /* SUA: them lai check aCol<K / bRow<K (giong het ban scalar tren) - */ \
+        /* tuy numTiles=K/TILE (floor, khong phai ceil nhu ban scalar) khien */ \
+        /* aCol/bRow luon <K VE MAT LY THUYET trong vong lap tile, nhung day */ \
+        /* la INVARIANT NGAM khong duoc kiem chung tren phan cung OpenCL that */ \
+        /* (khac Metal - Metal KHONG CO bien the vec4 nay, chi dung 1 kernel */ \
+        /* scalar duy nhat voi numTiles=ceil(K/TILE) + check day du ca 2 dieu */ \
+        /* kien). Day chinh la CHO KHAC BIET DUY NHAT giua backend OpenCL va */ \
+        /* Metal cho phep GEMM tile - them check tuong minh o day de khong con */ \
+        /* phu thuoc suy luan toan hoc, phong truong hop driver/compiler nao */ \
+        /* do optimize sai gia dinh hoac K truyen vao khong dung uoc tinh. */ \
+        tileA[ty][tx] = (row < M && aCol < K) ? a[row * K + aCol] : 0.0f; \
+        tileB[ty][tx] = (bRow < K && col < N) ? b[bRow * N + col] : 0.0f; \
+        barrier(CLK_LOCAL_MEM_FENCE); \
+        int p = 0; \
+        for (; p + 4 <= TILE; p += 4) { \
+            float4 av = (float4)(tileA[ty][p], tileA[ty][p+1], tileA[ty][p+2], tileA[ty][p+3]); \
+            float4 bv = (float4)(tileB[p][tx], tileB[p+1][tx], tileB[p+2][tx], tileB[p+3][tx]); \
+            sum += dot(av, bv); \
+        } \
+        for (; p < TILE; p++) sum += tileA[ty][p] * tileB[p][tx]; \
+        barrier(CLK_LOCAL_MEM_FENCE); \
+    } \
+    /* phan du K khong chia het TILE (numTiles*TILE < K) - xu ly scalar */ \
+    for (int k = numTiles * TILE; k < K; k++) { \
+        if (row < M && col < N) sum += a[row * K + k] * b[k * N + col]; \
+    } \
+    if (row < M && col < N) { \
+        c[row * N + col] = sum; \
+    } \
+}
+
+BB_MATMUL_VARIANT_VEC4(16, matmul_kernel_t16_vec4)
+BB_MATMUL_VARIANT_VEC4(32, matmul_kernel_t32_vec4)
+
+// ============================================================
+// MATMUL TILED "NT" (C = A @ B^T, B lưu row-major [N,K] - KHÔNG transpose
+// vật lý). THÊM MỚI: dùng cho attention decode (K-cache/V-cache đều lưu tự
+// nhiên theo layout [S,D] - chính là [N,K] nếu coi N=S, K=headDim) - loại bỏ
+// hoàn toàn bước transpose CPU O(S*D)/token mà bản cũ phải làm để build
+// kBlockT trước khi upload. Bounds check ĐẦY ĐỦ như bản scalar an toàn phía
+// trên (numTiles = ceil(K/TILE)), KHÔNG dùng biến thể vec4 (tránh lặp lại
+// rủi ro invariant ngầm đã thấy ở bản vec4).
+// ============================================================
+#define BB_MATMUL_NT_VARIANT(TILE, KFUNC) \
+__kernel void KFUNC(__global const float* a, __global const float* b, __global float* c, const int M, const int K, const int N) { \
+    __local float tileA[TILE][TILE]; \
+    __local float tileB[TILE][TILE]; \
+    int tx = get_local_id(0), ty = get_local_id(1); \
+    int rowBase = get_group_id(0) * TILE; \
+    int colBase = get_group_id(1) * TILE; \
+    int row = rowBase + ty; \
+    int col = colBase + tx; \
+    float sum = 0.0f; \
+    int numTiles = (K + TILE - 1) / TILE; \
+    for (int t = 0; t < numTiles; t++) { \
+        int aK = t * TILE + tx; \
+        int bCol = colBase + ty;  /* doc lap voi 'col' cua thread nay - dung ty lam chi so cot khi load B */ \
+        int bK = t * TILE + tx; \
+        tileA[ty][tx] = (row < M && aK < K) ? a[row * K + aK] : 0.0f; \
+        /* B row-major [N,K]: tileB[ty][tx] = B[colBase+ty][t*TILE+tx] - khong transpose */ \
+        tileB[ty][tx] = (bCol < N && bK < K) ? b[bCol * K + bK] : 0.0f; \
+        barrier(CLK_LOCAL_MEM_FENCE); \
+        for (int p = 0; p < TILE; p++) { \
+            sum += tileA[ty][p] * tileB[tx][p]; \
+        } \
+        barrier(CLK_LOCAL_MEM_FENCE); \
+    } \
+    if (row < M && col < N) { \
+        c[row * N + col] = sum; \
+    } \
+}
+
+BB_MATMUL_NT_VARIANT(8,  matmul_nt_kernel_t8)
+BB_MATMUL_NT_VARIANT(16, matmul_nt_kernel_t16)
+BB_MATMUL_NT_VARIANT(32, matmul_nt_kernel_t32)
 
 // ============================================================
 // MATMUL TRUC TIEP TREN INT4 ASYMMETRIC (packed, per-group scale/zero_point)

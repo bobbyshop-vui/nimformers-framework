@@ -82,6 +82,8 @@ type
                             ## cho cả model thay vì ~27GB fp32)
     bias*: Tensor
     inF*, outF*: int
+    residentW*: ResidentWeightHandle  ## weight đã upload GPU 1 LẦN (xem uploadResident)
+    residentReady*: bool               ## true sau uploadResident() thành công
 
 proc newLinear*(inF, outF: int): Linear =
   let scale = sqrt(2'f32 / float32(inF))
@@ -98,6 +100,17 @@ proc setQuantWeight*(l: var Linear, qt: QuantTensor) =
   l.weightQ = qt
   l.useQuant = true
   l.weight.data = @[]
+proc uploadResident*(l: var Linear, ctx: Backend) =
+  ## Upload weight lên GPU MỘT LẦN (gọi từ loadLlamaWeightsL sau khi load
+  ## xong, KHÔNG gọi trong vòng lặp decode). Chỉ hỗ trợ đường int4-per-group
+  ## thật (đường llama.cpp-style) - Linear random-init/không quant không cần
+  ## resident (không nằm trong hot loop mỗi token).
+  if l.useQuant and l.weightQ.kind == qkInt4Asymmetric and l.weightQ.groupSize > 0:
+    let nGroupsPerRow = (l.inF + l.weightQ.groupSize - 1) div l.weightQ.groupSize
+    l.residentW = beResidentUploadQ4(ctx, l.weightQ.data, l.weightQ.scale, l.weightQ.zero_point,
+                                      l.inF, l.outF, l.weightQ.groupSize, nGroupsPerRow)
+    l.residentReady = true
+
 proc forward*(l: Linear, x: Tensor, ctx: Backend): Tensor =
   let (rows, cols) = flatten2D(x.shape)
   assert cols == l.inF
@@ -106,17 +119,23 @@ proc forward*(l: Linear, x: Tensor, ctx: Backend): Tensor =
   result = newTensor(outShape)
 
   var y: seq[float32]
-  if l.useQuant and l.weightQ.kind == qkInt4Asymmetric and l.weightQ.groupSize > 0:
-    let nGroupsPerRow = (l.inF + l.weightQ.groupSize - 1) div l.weightQ.groupSize
-    y = beMatmulQ4(ctx, x.data, l.weightQ.data, l.weightQ.scale, l.weightQ.zero_point,
-                    rows, l.inF, l.outF, l.weightQ.groupSize, nGroupsPerRow)
-  else:
-    var wT: seq[float32]
-    if l.useQuant:
-      wT = dequantizeTensorTransposed(l.weightQ)
+  if l.residentReady:
+    y = beResidentLinearQ4(ctx, x.data, l.residentW, rows)  # chỉ upload activation, weight resident sẵn
+
+  if y.len == 0:
+    # Chưa resident, hoặc backend hiện tại không hỗ trợ đường resident (vd
+    # CPU/tsic) -> rơi về đường cũ (vẫn đúng, chỉ mất phần tăng tốc resident).
+    if l.useQuant and l.weightQ.kind == qkInt4Asymmetric and l.weightQ.groupSize > 0:
+      let nGroupsPerRow = (l.inF + l.weightQ.groupSize - 1) div l.weightQ.groupSize
+      y = beMatmulQ4(ctx, x.data, l.weightQ.data, l.weightQ.scale, l.weightQ.zero_point,
+                      rows, l.inF, l.outF, l.weightQ.groupSize, nGroupsPerRow)
     else:
-      wT = transpose(l.weight).data
-    y = beMatmul(ctx, x.data, rows, l.inF, wT, l.inF, l.outF)
+      var wT: seq[float32]
+      if l.useQuant:
+        wT = dequantizeTensorTransposed(l.weightQ)
+      else:
+        wT = transpose(l.weight).data
+      y = beMatmul(ctx, x.data, rows, l.inF, wT, l.inF, l.outF)
 
   # === FIX: LUÔN ĐẢM BẢO KÍCH THƯỚC ĐÚNG ===
   let expectedSize = rows * l.outF
@@ -344,10 +363,21 @@ proc newTransformerBlock*(embedDim, nHeads, ffMult: int): TransformerBlock =
 proc forward*(blk: TransformerBlock, x: Tensor, ctx: Backend): Tensor =
   let x1 = blk.ln1.forward(x, ctx)
   let attnOut = blk.attn.forward(x1, ctx)
-  let x2 = addT(ctx, x, attnOut)
-  let x3 = blk.ln2.forward(x2, ctx)
+  # SỬA (tối ưu): "add rồi layernorm ngay sau" trước đây là 2 lệnh GPU rời
+  # rạc (addT rồi ln2.forward, mỗi cái tự mở/đóng command buffer riêng) -
+  # gộp vào 1 session bằng beAddLayernormFused (xem backend.nim), trả về
+  # CẢ residual thô (x2Raw, cần cho lần cộng cuối block) LẪN bản đã qua
+  # layernorm (x3) từ ĐÚNG 1 lần upload/commit/wait - không tính add 2 lần.
+  # Backend chưa hỗ trợ (CUDA/OpenCL/CPU) tự rơi về đúng 2 lệnh cũ bên trong.
+  let (rows2, cols2) = flatten2D(x.shape)
+  let fused = beAddLayernormFused(ctx, x.data, attnOut.data, blk.ln2.gamma.data, blk.ln2.beta.data,
+                                   rows2, cols2, blk.ln2.eps)
+  var x2Raw = newTensor(x.shape)
+  x2Raw.data = fused.summed
+  var x3 = newTensor(x.shape)
+  x3.data = fused.normed
   let ffOut = blk.ff.forward(x3, ctx)
-  result = addT(ctx, x2, ffOut)
+  result = addT(ctx, x2Raw, ffOut)
 
 proc backward*(blk: TransformerBlock, x: Tensor, dOut: Tensor, ctx: Backend): tuple[
     dX, dAttnQkvW, dAttnQkvB, dAttnProjW, dAttnProjB,
@@ -446,10 +476,20 @@ proc forwardBatch*(m: NimformerModel, idsBatch: seq[seq[int]], ctx: Backend): Te
   ## gọi — Linear/LayerNorm coi B*T là số "hàng" nên GPU nhận hẳn M=B*T dòng
   ## trong mỗi matmul, thay vì bị gọi B lần tuần tự (mỗi lần B=1) như trước.
   ## Trả logits shape [B, T, vocab].
-  var x = m.embed.lookupBatch(idsBatch, ctx)
-  for blk in m.blocks:
-    x = blk.forward(x, ctx)
-  result = m.outProj.forward(x, ctx)
+  ##
+  ## FIX: mở 1 session Metal DUY NHẤT bao trọn cả forward (embed -> 32 layer
+  ## -> outProj) thay vì để mỗi beResidentLinearQ4 tự commit+waitUntilCompleted
+  ## riêng. Trước fix: ~7 Linear/layer x 32 layer = ~224 lần commit+wait MỖI
+  ## TOKEN. Sau fix: đúng 1 lần commit+wait/token (beForwardSessionEnd ở cuối,
+  ## kể cả khi lỗi/raise giữa chừng nhờ try/finally).
+  discard beForwardSessionBegin(ctx)
+  try:
+    var x = m.embed.lookupBatch(idsBatch, ctx)
+    for blk in m.blocks:
+      x = blk.forward(x, ctx)
+    result = m.outProj.forward(x, ctx)
+  finally:
+    beForwardSessionEnd(ctx)
 
 proc forward*(m: NimformerModel, ids: seq[int], ctx: Backend): Tensor =
   ## Tiện ích cho 1 chuỗi đơn (giữ nguyên API cũ cho test_nimformer.nim) —

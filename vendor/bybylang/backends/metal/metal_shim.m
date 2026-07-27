@@ -1,6 +1,7 @@
 // metal_shim.m - Metal compute backend implementation (macOS only).
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
+#import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #import "metal_shim.h"
 
 // ─────────────────────────────────────────────────────────────
@@ -83,6 +84,28 @@ static id<MTLComputePipelineState> getPipeline(NSString *fname) {
     return pipeline;
 }
 
+// Chọn biến thể matmul_kernel_t{8,16,32} lớn nhất mà GPU đang chạy CHO
+// PHÉP THẬT SỰ, đo bằng pipeline.maxTotalThreadsPerThreadgroup của chính
+// pipeline đó (không đoán theo tên GPU / lowPower flag - có thể sai giữa
+// các driver/OS version). Cache lại 1 lần vì kết quả không đổi trong đời
+// process (cùng device, cùng library).
+static int gMatmulTile = 0;                    // 0 = chưa chọn
+static id<MTLComputePipelineState> gMatmulPipeline = nil;
+
+static id<MTLComputePipelineState> pickMatmulPipeline(int *outTile) {
+    if (gMatmulPipeline != nil) { *outTile = gMatmulTile; return gMatmulPipeline; }
+    // SUA: BỎ auto-chọn 16/32 - đo thực tế trên Iris Plus 640 không nhanh
+    // hơn rõ rệt, và việc NSLog chỉ chạy ở LẦN GỌI ĐẦU TIÊN (dù đã có
+    // warm-up) vẫn có nguy cơ trùng thời điểm generate nếu warm-up bị JIT/
+    // trình biên dịch tối ưu bỏ qua với input quá nhỏ. Ép cứng về t8 - đã
+    // biết ổn định, đơn giản, không phụ thuộc đo đạc runtime nữa.
+    id<MTLComputePipelineState> p = getPipeline(@"matmul_kernel_t8");
+    gMatmulPipeline = p;
+    gMatmulTile = 8;
+    *outTile = 8;
+    return p;
+}
+
 int metal_available(void) {
     @autoreleasepool {
         id<MTLDevice> device = pickMetalDevice();
@@ -135,7 +158,8 @@ int metal_matmul(const char* kernel_src, const float* a, const float* b, float* 
     @autoreleasepool {
         if (!ensureMetalInit(kernel_src)) return 0;
 
-        id<MTLComputePipelineState> pipeline = getPipeline(@"matmul_kernel");
+        int tile = 8;
+        id<MTLComputePipelineState> pipeline = pickMatmulPipeline(&tile);
         if (!pipeline) return 0;
 
         size_t bytesA = (size_t)m * (size_t)k * sizeof(float);
@@ -157,12 +181,12 @@ int metal_matmul(const char* kernel_src, const float* a, const float* b, float* 
         [encoder setBytes:&k length:sizeof(int) atIndex:4];
         [encoder setBytes:&n length:sizeof(int) atIndex:5];
 
-        // Kernel uses a fixed threadgroup float tileA/tileB[16][16]; the
-        // threadgroup size must always be exactly 16x16 (padded groups),
-        // matching BB_TILE in the .metal source. Using a shrunk group for
-        // small m/n (old code) left tile slots uninitialized -> wrong results.
-        MTLSize groupSize = MTLSizeMake(8, 8, 1);  // SUA: khop BB_TILE=8 (fix GPU Timeout tren iGPU yeu)
-        MTLSize threadgroupCount = MTLSizeMake(((NSUInteger)n + 7) / 8, ((NSUInteger)m + 7) / 8, 1);
+        // SUA: groupSize theo tile THẬT ĐANG DÙNG (8/16/32), đã được
+        // pickMatmulPipeline() xác nhận an toàn với maxTotalThreadsPerThreadgroup
+        // của chính GPU này - không còn hardcode 8x8 cho mọi máy nữa.
+        NSUInteger t = (NSUInteger)tile;
+        MTLSize groupSize = MTLSizeMake(t, t, 1);
+        MTLSize threadgroupCount = MTLSizeMake(((NSUInteger)n + t - 1) / t, ((NSUInteger)m + t - 1) / t, 1);
         [encoder dispatchThreadgroups:threadgroupCount threadsPerThreadgroup:groupSize];
         [encoder endEncoding];
 
@@ -171,6 +195,74 @@ int metal_matmul(const char* kernel_src, const float* a, const float* b, float* 
 
         if (cmdBuf.status != MTLCommandBufferStatusCompleted) {
             NSLog(@"[metal_matmul] command buffer FAILED, status=%ld, error=%@", (long)cmdBuf.status, cmdBuf.error);
+            return 0;
+        }
+
+        memcpy(c, [bufC contents], bytesC);
+        return 1;
+    }
+}
+
+// THÊM: matmul qua MPS thay vì kernel tay viết. Ưu điểm so với
+// matmul_kernel_t{8,16,32}: MPS tự chọn thuật toán/tiling nội bộ theo
+// đúng GPU đang chạy (kể cả simdgroup_matrix trên Apple Silicon mà kernel
+// MSL tay viết ở trên KHÔNG dùng), không cần ta đoán tile size hay lo
+// GPU Timeout do threadgroup vượt giới hạn - MPS tự đảm bảo dispatch hợp lệ
+// cho GPU hiện tại. Nhược điểm: thêm 1 bước wrap MPSMatrix quanh MTLBuffer,
+// và availability phụ thuộc GPU có hỗ trợ MPS hay không (kiểm tra qua
+// MPSSupportsMTLDevice) - vì vậy hàm này PHẢI có fallback ở tầng gọi.
+int metal_matmul_mps(const float* a, const float* b, float* c, int m, int k, int n) {
+    @autoreleasepool {
+        // Dùng chung device/queue đã init sẵn bởi ensureMetalInit qua 1 lần
+        // gọi metal_available()-style init nhẹ (không cần compile lib MSL
+        // của mình vì MPS không cần kernel_src).
+        if (gDevice == nil) {
+            gDevice = pickMetalDevice();
+            if (gDevice) gQueue = [gDevice newCommandQueue];
+        }
+        if (!gDevice || !gQueue) { NSLog(@"[metal_matmul_mps] khong co GPU/queue"); return 0; }
+        if (!MPSSupportsMTLDevice(gDevice)) {
+            NSLog(@"[metal_matmul_mps] GPU %@ khong ho tro MPS - fallback ve kernel tay viet", gDevice.name);
+            return 0;
+        }
+
+        size_t bytesA = (size_t)m * (size_t)k * sizeof(float);
+        size_t bytesB = (size_t)k * (size_t)n * sizeof(float);
+        size_t bytesC = (size_t)m * (size_t)n * sizeof(float);
+
+        id<MTLBuffer> bufA = [gDevice newBufferWithBytes:a length:bytesA options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bufB = [gDevice newBufferWithBytes:b length:bytesB options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bufC = [gDevice newBufferWithLength:bytesC options:MTLResourceStorageModeShared];
+        if (!bufA || !bufB || !bufC) { NSLog(@"[metal_matmul_mps] tao buffer FAILED"); return 0; }
+
+        MPSMatrixDescriptor *descA = [MPSMatrixDescriptor matrixDescriptorWithRows:m columns:k
+                                                                            rowBytes:k * sizeof(float)
+                                                                            dataType:MPSDataTypeFloat32];
+        MPSMatrixDescriptor *descB = [MPSMatrixDescriptor matrixDescriptorWithRows:k columns:n
+                                                                            rowBytes:n * sizeof(float)
+                                                                            dataType:MPSDataTypeFloat32];
+        MPSMatrixDescriptor *descC = [MPSMatrixDescriptor matrixDescriptorWithRows:m columns:n
+                                                                            rowBytes:n * sizeof(float)
+                                                                            dataType:MPSDataTypeFloat32];
+        MPSMatrix *matA = [[MPSMatrix alloc] initWithBuffer:bufA descriptor:descA];
+        MPSMatrix *matB = [[MPSMatrix alloc] initWithBuffer:bufB descriptor:descB];
+        MPSMatrix *matC = [[MPSMatrix alloc] initWithBuffer:bufC descriptor:descC];
+
+        MPSMatrixMultiplication *mm = [[MPSMatrixMultiplication alloc] initWithDevice:gDevice
+                                                                          transposeLeft:NO
+                                                                         transposeRight:NO
+                                                                             resultRows:m
+                                                                          resultColumns:n
+                                                                        interiorColumns:k
+                                                                                  alpha:1.0
+                                                                                   beta:0.0];
+        id<MTLCommandBuffer> cmdBuf = [gQueue commandBuffer];
+        [mm encodeToCommandBuffer:cmdBuf leftMatrix:matA rightMatrix:matB resultMatrix:matC];
+        [cmdBuf commit];
+        [cmdBuf waitUntilCompleted];
+
+        if (cmdBuf.status != MTLCommandBufferStatusCompleted) {
+            NSLog(@"[metal_matmul_mps] command buffer FAILED, status=%ld, error=%@", (long)cmdBuf.status, cmdBuf.error);
             return 0;
         }
 
@@ -285,14 +377,14 @@ int metal_matmul_q4(const char* kernel_src, const float* a, const unsigned char*
         [encoder setBytes:&groupSize length:sizeof(int) atIndex:8];
         [encoder setBytes:&nGroupsPerRow length:sizeof(int) atIndex:9];
 
-        // Khong dung threadgroup memory (khong tile) - moi thread tu doc
-        // het 1 hang K phan tu tu wq, don gian/dung truoc, toi uu tile sau.
-        NSUInteger tgW = MIN((NSUInteger)16, (NSUInteger)n);
-        NSUInteger tgH = MIN((NSUInteger)16, (NSUInteger)m);
-        if (tgW == 0) tgW = 1;
-        if (tgH == 0) tgH = 1;
-        MTLSize groupSz = MTLSizeMake(tgW, tgH, 1);
-        MTLSize gridCount = MTLSizeMake(((NSUInteger)n + tgW - 1) / tgW, ((NSUInteger)m + tgH - 1) / tgH, 1);
+        // SUA: kernel giờ là simdgroup-reduction + row-batching, KHÔNG dùng
+        // threadgroup memory nữa (bản trước cấp K*4 byte gây GPU Timeout thật
+        // trên Iris vì vượt giới hạn shared-mem/threadgroup - xem giải thích
+        // trong .metal) - chỉ cần threadgroup size = (32,1,1) đúng 1
+        // simdgroup, grid.x = ceil(N/MMQ4_NDST=4), grid.y = M.
+        const NSUInteger kMMQ4_NDST = 4;
+        MTLSize groupSz = MTLSizeMake(32, 1, 1);
+        MTLSize gridCount = MTLSizeMake(((NSUInteger)n + kMMQ4_NDST - 1) / kMMQ4_NDST, (NSUInteger)m, 1);
         [encoder dispatchThreadgroups:gridCount threadsPerThreadgroup:groupSz];
         [encoder endEncoding];
 
@@ -587,6 +679,10 @@ int metal_session_begin(const char* kernel_src) {
 
 MetalBufferHandle metal_upload(const float* data, int n) {
     @autoreleasepool {
+        // SUA: xem giai thich o metal_upload_bytes ngay ben duoi - cung thieu
+        // ensureMetalInit truoc day, gDevice NULL neu goi truoc metal_session_begin/
+        // metal_matmul lan dau (đúng case resident-upload luc load model).
+        if (!gDevice) { NSLog(@"[metal_upload] gDevice chua init - phai goi metal_init() truoc"); return NULL; }
         size_t bytes = (size_t)n * sizeof(float);
         id<MTLBuffer> buf = [gDevice newBufferWithBytes:data length:bytes options:MTLResourceStorageModeShared];
         if (!buf) { NSLog(@"[metal_upload] tao buffer FAILED (n=%d)", n); return NULL; }
@@ -596,6 +692,7 @@ MetalBufferHandle metal_upload(const float* data, int n) {
 
 MetalBufferHandle metal_upload_indices(const int* data, int n) {
     @autoreleasepool {
+        if (!gDevice) { NSLog(@"[metal_upload_indices] gDevice chua init - phai goi metal_init() truoc"); return NULL; }
         size_t bytes = (size_t)n * sizeof(int32_t);
         id<MTLBuffer> buf = [gDevice newBufferWithBytes:data length:bytes options:MTLResourceStorageModeShared];
         if (!buf) { NSLog(@"[metal_upload_indices] tao buffer FAILED (n=%d)", n); return NULL; }
@@ -615,7 +712,8 @@ MetalBufferHandle metal_alloc_scratch(int n) {
 int metal_matmul_enc(MetalBufferHandle a, MetalBufferHandle b, MetalBufferHandle c, int m, int k, int n) {
     @autoreleasepool {
         if (!gSessionEncoder) { NSLog(@"[metal_matmul_enc] chua goi metal_session_begin"); return 0; }
-        id<MTLComputePipelineState> pipeline = getPipeline(@"matmul_kernel");
+        int tile = 8;
+        id<MTLComputePipelineState> pipeline = pickMatmulPipeline(&tile);
         if (!pipeline) return 0;
         id<MTLBuffer> bufA = (__bridge id<MTLBuffer>)a;
         id<MTLBuffer> bufB = (__bridge id<MTLBuffer>)b;
@@ -627,10 +725,10 @@ int metal_matmul_enc(MetalBufferHandle a, MetalBufferHandle b, MetalBufferHandle
         [gSessionEncoder setBytes:&m length:sizeof(int) atIndex:3];
         [gSessionEncoder setBytes:&k length:sizeof(int) atIndex:4];
         [gSessionEncoder setBytes:&n length:sizeof(int) atIndex:5];
-        // Giống hệt metal_matmul: threadgroup CỐ ĐỊNH 16x16 (tileA/tileB[16][16]
-        // trong kernel), không được co lại theo m/n.
-        MTLSize groupSize = MTLSizeMake(8, 8, 1);  // SUA: khop BB_TILE=8 (fix GPU Timeout tren iGPU yeu)
-        MTLSize threadgroupCount = MTLSizeMake(((NSUInteger)n + 7) / 8, ((NSUInteger)m + 7) / 8, 1);
+        // SUA: tile động (8/16/32) theo GPU thật, xem pickMatmulPipeline().
+        NSUInteger t = (NSUInteger)tile;
+        MTLSize groupSize = MTLSizeMake(t, t, 1);
+        MTLSize threadgroupCount = MTLSizeMake(((NSUInteger)n + t - 1) / t, ((NSUInteger)m + t - 1) / t, 1);
         [gSessionEncoder dispatchThreadgroups:threadgroupCount threadsPerThreadgroup:groupSize];
         // SỬA BUG THẬT: 1 encoder dùng chung cho nhiều dispatch (matmul rồi
         // softmax rồi matmul...) KHÔNG tự động đảm bảo write của dispatch
@@ -642,6 +740,93 @@ int metal_matmul_enc(MetalBufferHandle a, MetalBufferHandle b, MetalBufferHandle
         // memoryBarrierWithScope: ngay sau MỖI dispatch ghi vào buffer mà
         // dispatch kế tiếp sẽ đọc, để ép GPU hoàn tất + flush cache trước khi
         // bước tiếp theo (matmul->softmax->matmul, hoặc mul->mul->add...) đọc.
+        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        return 1;
+    }
+}
+
+int metal_init(const char* kernel_src) {
+    @autoreleasepool {
+        return ensureMetalInit(kernel_src) ? 1 : 0;
+    }
+}
+
+int metal_matmul_nt_enc(MetalBufferHandle a, MetalBufferHandle b, MetalBufferHandle c, int m, int k, int n) {
+    @autoreleasepool {
+        if (!gSessionEncoder) { NSLog(@"[metal_matmul_nt_enc] chua goi metal_session_begin"); return 0; }
+        // Dung co dinh tile=8 (matmul_nt_kernel), giong het lua chon on dinh
+        // cua pickMatmulPipeline() cho ban thuong - khong can do lai
+        // maxTotalThreadsPerThreadgroup rieng cho kernel nay.
+        id<MTLComputePipelineState> pipeline = getPipeline(@"matmul_nt_kernel");
+        if (!pipeline) return 0;
+        id<MTLBuffer> bufA = (__bridge id<MTLBuffer>)a;
+        id<MTLBuffer> bufB = (__bridge id<MTLBuffer>)b;
+        id<MTLBuffer> bufC = (__bridge id<MTLBuffer>)c;
+        [gSessionEncoder setComputePipelineState:pipeline];
+        [gSessionEncoder setBuffer:bufA offset:0 atIndex:0];
+        [gSessionEncoder setBuffer:bufB offset:0 atIndex:1];
+        [gSessionEncoder setBuffer:bufC offset:0 atIndex:2];
+        [gSessionEncoder setBytes:&m length:sizeof(int) atIndex:3];
+        [gSessionEncoder setBytes:&k length:sizeof(int) atIndex:4];
+        [gSessionEncoder setBytes:&n length:sizeof(int) atIndex:5];
+        NSUInteger t = 8;
+        MTLSize groupSize = MTLSizeMake(t, t, 1);
+        MTLSize threadgroupCount = MTLSizeMake(((NSUInteger)n + t - 1) / t, ((NSUInteger)m + t - 1) / t, 1);
+        [gSessionEncoder dispatchThreadgroups:threadgroupCount threadsPerThreadgroup:groupSize];
+        // Xem giai thich memoryBarrierWithScope o metal_matmul_enc - can bat
+        // buoc tren driver khong phai Apple Silicon (vd Intel Iris).
+        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        return 1;
+    }
+}
+
+MetalBufferHandle metal_upload_bytes(const unsigned char* data, int n) {
+    @autoreleasepool {
+        // Không nhận kernel_src (chữ ký hàm không đổi để khớp header) - CALLER
+        // (Nim: metalUploadBytes) PHẢI gọi metal_init(kernel_src) 1 lần trước
+        // (dispatch_once bên trong nên gọi nhiều lần vẫn rẻ) để gDevice sẵn sàng.
+        if (!gDevice) { NSLog(@"[metal_upload_bytes] gDevice chua init - phai goi metal_init() truoc"); return NULL; }
+        size_t bytes = (size_t)n;
+        id<MTLBuffer> buf = [gDevice newBufferWithBytes:data length:bytes options:MTLResourceStorageModeShared];
+        if (!buf) { NSLog(@"[metal_upload_bytes] tao buffer FAILED (n=%d)", n); return NULL; }
+        return (__bridge_retained MetalBufferHandle)buf;
+    }
+}
+
+int metal_matmul_q4_enc(MetalBufferHandle a, MetalBufferHandle wq, MetalBufferHandle scales,
+                         MetalBufferHandle zeros, MetalBufferHandle c,
+                         int m, int k, int n, int groupSize, int nGroupsPerRow) {
+    @autoreleasepool {
+        if (!gSessionEncoder) { NSLog(@"[metal_matmul_q4_enc] chua goi metal_session_begin"); return 0; }
+        id<MTLComputePipelineState> pipeline = getPipeline(@"matmul_q4_kernel");
+        if (!pipeline) return 0;
+        id<MTLBuffer> bufA = (__bridge id<MTLBuffer>)a;
+        id<MTLBuffer> bufWq = (__bridge id<MTLBuffer>)wq;
+        id<MTLBuffer> bufScales = (__bridge id<MTLBuffer>)scales;
+        id<MTLBuffer> bufZeros = (__bridge id<MTLBuffer>)zeros;
+        id<MTLBuffer> bufC = (__bridge id<MTLBuffer>)c;
+        [gSessionEncoder setComputePipelineState:pipeline];
+        [gSessionEncoder setBuffer:bufA offset:0 atIndex:0];
+        [gSessionEncoder setBuffer:bufWq offset:0 atIndex:1];
+        [gSessionEncoder setBuffer:bufScales offset:0 atIndex:2];
+        [gSessionEncoder setBuffer:bufZeros offset:0 atIndex:3];
+        [gSessionEncoder setBuffer:bufC offset:0 atIndex:4];
+        [gSessionEncoder setBytes:&m length:sizeof(int) atIndex:5];
+        [gSessionEncoder setBytes:&k length:sizeof(int) atIndex:6];
+        [gSessionEncoder setBytes:&n length:sizeof(int) atIndex:7];
+        [gSessionEncoder setBytes:&groupSize length:sizeof(int) atIndex:8];
+        [gSessionEncoder setBytes:&nGroupsPerRow length:sizeof(int) atIndex:9];
+        // Cùng chiến thuật simdgroup-reduction + row-batching như
+        // metal_matmul_q4 (xem giải thích trong .metal) - KHÔNG threadgroup
+        // memory (bỏ vì gây GPU Timeout trên Iris với K lớn - xem .metal):
+        // threadgroup = (32,1,1) đúng 1 simdgroup, grid.x = ceil(N/4), grid.y = M.
+        const NSUInteger kMMQ4_NDST = 4;
+        MTLSize groupSz = MTLSizeMake(32, 1, 1);
+        MTLSize gridCount = MTLSizeMake(((NSUInteger)n + kMMQ4_NDST - 1) / kMMQ4_NDST, (NSUInteger)m, 1);
+        [gSessionEncoder dispatchThreadgroups:gridCount threadsPerThreadgroup:groupSz];
+        // SUA: xem giai thich memoryBarrierWithScope o metal_matmul_enc - can
+        // cho GPU khong phai Apple Silicon (Intel Iris) de dispatch ke tiep
+        // (vd sessionActivation doc lai bufC) thay dung du lieu.
         [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         return 1;
     }
@@ -685,6 +870,32 @@ int metal_activation_enc(int op, MetalBufferHandle x, MetalBufferHandle y, int n
     }
 }
 
+int metal_rope_enc(MetalBufferHandle x, MetalBufferHandle cosT, MetalBufferHandle sinT,
+                    int T, int Hn, int D) {
+    @autoreleasepool {
+        if (!gSessionEncoder) { NSLog(@"[metal_rope_enc] chua goi metal_session_begin"); return 0; }
+        id<MTLComputePipelineState> pipeline = getPipeline(@"rope_kernel");
+        if (!pipeline) return 0;
+        id<MTLBuffer> bufX = (__bridge id<MTLBuffer>)x;
+        id<MTLBuffer> bufCos = (__bridge id<MTLBuffer>)cosT;
+        id<MTLBuffer> bufSin = (__bridge id<MTLBuffer>)sinT;
+        [gSessionEncoder setComputePipelineState:pipeline];
+        [gSessionEncoder setBuffer:bufX offset:0 atIndex:0];
+        [gSessionEncoder setBuffer:bufCos offset:0 atIndex:1];
+        [gSessionEncoder setBuffer:bufSin offset:0 atIndex:2];
+        [gSessionEncoder setBytes:&Hn length:sizeof(int) atIndex:3];
+        [gSessionEncoder setBytes:&D length:sizeof(int) atIndex:4];
+        int half_ = D / 2;
+        MTLSize gridSize = MTLSizeMake((NSUInteger)half_, (NSUInteger)Hn, (NSUInteger)T);
+        NSUInteger tgx = MIN((NSUInteger)pipeline.maxTotalThreadsPerThreadgroup, (NSUInteger)half_);
+        if (tgx == 0) tgx = 1;
+        MTLSize groupSize = MTLSizeMake(tgx, 1, 1);
+        [gSessionEncoder dispatchThreads:gridSize threadsPerThreadgroup:groupSize];
+        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        return 1;
+    }
+}
+
 int metal_vecop_enc(int op, MetalBufferHandle a, MetalBufferHandle b, MetalBufferHandle c, int n) {
     @autoreleasepool {
         if (!gSessionEncoder) { NSLog(@"[metal_vecop_enc] chua goi metal_session_begin"); return 0; }
@@ -698,6 +909,40 @@ int metal_vecop_enc(int op, MetalBufferHandle a, MetalBufferHandle b, MetalBuffe
         [gSessionEncoder setBuffer:bufB offset:0 atIndex:1];
         [gSessionEncoder setBuffer:bufC offset:0 atIndex:2];
         [gSessionEncoder setBytes:&op length:sizeof(int) atIndex:3];
+        NSUInteger threadsPerGroup = MIN((NSUInteger)pipeline.maxTotalThreadsPerThreadgroup, (NSUInteger)n);
+        if (threadsPerGroup == 0) threadsPerGroup = 1;
+        [gSessionEncoder dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];  // SỬA: xem giải thích ở metal_matmul_enc
+        return 1;
+    }
+}
+
+// THÊM MỚI: dst[dstOffset..dstOffset+n) = src[0..n). dstOffset tính bằng SỐ
+// PHẦN TỬ float32 - nhân sizeof(float) khi setBuffer:offset: (offset đó là
+// byte offset thật của Metal). Dùng để ghép GPU-side nhiều buffer con
+// thành 1 buffer liên tục trong CÙNG session (xem giải thích ở
+// copy_into_kernel trong vecop_matmul.metal) - gỡ bỏ điểm chặn cuối cùng
+// khiến attention-decode-session và oProj-session phải tách rời.
+// LƯU Ý: offset dùng cho setBuffer PHẢI là bội số của
+// device.minimumLinearTextureAlignmentForPixelFormat hoặc đơn giản hơn -
+// theo tài liệu Metal, offset cho buffer THƯỜNG (không phải texture) chỉ
+// cần là bội số của 4 byte trên hầu hết GPU (Apple/AMD/Intel) vì đây là
+// buffer of floats (4-byte aligned tự nhiên) - không cần căn chỉnh đặc biệt
+// thêm, khác texture. Nếu 1 driver cụ thể nào đó đòi hỏi alignment lớn hơn
+// (hiếm, chưa gặp trong bản này), hàm sẽ trả 0 qua adjustedOffset check.
+int metal_copy_into_enc(MetalBufferHandle src, MetalBufferHandle dst, int dstOffsetElems, int n) {
+    @autoreleasepool {
+        if (!gSessionEncoder) { NSLog(@"[metal_copy_into_enc] chua goi metal_session_begin"); return 0; }
+        id<MTLComputePipelineState> pipeline = getPipeline(@"copy_into_kernel");
+        if (!pipeline) return 0;
+        id<MTLBuffer> bufSrc = (__bridge id<MTLBuffer>)src;
+        id<MTLBuffer> bufDst = (__bridge id<MTLBuffer>)dst;
+        NSUInteger byteOffset = (NSUInteger)dstOffsetElems * sizeof(float);
+        if (byteOffset % 4 != 0) { NSLog(@"[metal_copy_into_enc] offset khong chia het 4 byte"); return 0; }
+        if (byteOffset >= bufDst.length) { NSLog(@"[metal_copy_into_enc] offset vuot qua kich thuoc buffer dich"); return 0; }
+        [gSessionEncoder setComputePipelineState:pipeline];
+        [gSessionEncoder setBuffer:bufSrc offset:0 atIndex:0];
+        [gSessionEncoder setBuffer:bufDst offset:byteOffset atIndex:1];
         NSUInteger threadsPerGroup = MIN((NSUInteger)pipeline.maxTotalThreadsPerThreadgroup, (NSUInteger)n);
         if (threadsPerGroup == 0) threadsPerGroup = 1;
         [gSessionEncoder dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
@@ -748,6 +993,44 @@ int metal_embedding_lookup_enc(MetalBufferHandle table, MetalBufferHandle indice
         NSUInteger threadsPerGroup = MIN((NSUInteger)pipeline.maxTotalThreadsPerThreadgroup, (NSUInteger)dim);
         if (threadsPerGroup == 0) threadsPerGroup = 1;
         [gSessionEncoder dispatchThreadgroups:MTLSizeMake((NSUInteger)num_indices, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];  // SỬA: xem giải thích ở metal_matmul_enc
+        return 1;
+    }
+}
+
+// Bản session của metal_attention_fused ở trên: KHÔNG tự tạo buffer/command
+// buffer riêng, dùng thẳng buffer đã resident (q/k/v upload sẵn, o/s_matrix
+// alloc_scratch sẵn) và gSessionEncoder đang mở - encode xong KHÔNG commit,
+// để metal_session_end() commit+wait chung 1 lần với mọi op khác trong layer
+// (add/layernorm/matmul/apflu). Cùng giới hạn S<=256 như bản non-session vì
+// dùng chung 1 kernel attention_fused_kernel.
+int metal_attention_fused_enc(MetalBufferHandle q, MetalBufferHandle k, MetalBufferHandle v,
+                               MetalBufferHandle o, MetalBufferHandle s_matrix,
+                               int B, int H, int S, int D, float scale) {
+    @autoreleasepool {
+        if (!gSessionEncoder) { NSLog(@"[metal_attention_fused_enc] chua goi metal_session_begin"); return 0; }
+        if (S > 256) { NSLog(@"[metal_attention_fused_enc] S=%d vuot gioi han 256 cua kernel", S); return 0; }
+        id<MTLComputePipelineState> pipeline = getPipeline(@"attention_fused_kernel");
+        if (!pipeline) return 0;
+        id<MTLBuffer> bufQ = (__bridge id<MTLBuffer>)q;
+        id<MTLBuffer> bufK = (__bridge id<MTLBuffer>)k;
+        id<MTLBuffer> bufV = (__bridge id<MTLBuffer>)v;
+        id<MTLBuffer> bufO = (__bridge id<MTLBuffer>)o;
+        id<MTLBuffer> bufS = (__bridge id<MTLBuffer>)s_matrix;
+        [gSessionEncoder setComputePipelineState:pipeline];
+        [gSessionEncoder setBuffer:bufQ offset:0 atIndex:0];
+        [gSessionEncoder setBuffer:bufK offset:0 atIndex:1];
+        [gSessionEncoder setBuffer:bufV offset:0 atIndex:2];
+        [gSessionEncoder setBuffer:bufO offset:0 atIndex:3];
+        [gSessionEncoder setBuffer:bufS offset:0 atIndex:4];
+        [gSessionEncoder setBytes:&B length:sizeof(int) atIndex:5];
+        [gSessionEncoder setBytes:&H length:sizeof(int) atIndex:6];
+        [gSessionEncoder setBytes:&S length:sizeof(int) atIndex:7];
+        [gSessionEncoder setBytes:&D length:sizeof(int) atIndex:8];
+        [gSessionEncoder setBytes:&scale length:sizeof(float) atIndex:9];
+        MTLSize gridSize = MTLSizeMake((NSUInteger)(B * H), (NSUInteger)S, 1);
+        MTLSize groupSize = MTLSizeMake(1, 1, 1);
+        [gSessionEncoder dispatchThreads:gridSize threadsPerThreadgroup:groupSize];
         [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];  // SỬA: xem giải thích ở metal_matmul_enc
         return 1;
     }

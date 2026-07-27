@@ -28,6 +28,7 @@ const
   cudaMemcpyHostToDevice: int32 = 1
   cudaMemcpyDeviceToHost: int32 = 2
   CUBLAS_OP_N: cublasOperation_t = 0
+  CUBLAS_OP_T: cublasOperation_t = 1
   CUBLAS_DEFAULT_MATH: cublasMath_t = 0
   CUBLAS_TENSOR_OP_MATH: cublasMath_t = 1
 
@@ -177,4 +178,40 @@ proc cudaMatmulF32R*(a, b: CudaTensor, m, k, n: int): CudaTensor =
                                   addr alpha, pB, int32(n), pA, int32(k),
                                   addr beta, pC, int32(n)) == 0, "cudaMatmulF32R: cublasSgemm failed")
   debugLog("cudaMatmulF32R m=" & $m & " k=" & $k & " n=" & $n)
+  result = CudaTensor(dptr: cast[cuda_driver.CUdeviceptr](dC), bytes: bytesC, numel: m * n)
+
+proc cudaMatmulNTF32R*(a, b: CudaTensor, m, k, n: int): CudaTensor =
+  ## C(row-major m x n) = A(row-major m x k) @ B(row-major n x k)^T.
+  ## B GIU NGUYEN layout goc [n,k] (vd K-cache/V-cache [S,D] tu nhien) -
+  ## KHONG can transpose CPU truoc khi upload, chi can 1 co CUBLAS_OP_T.
+  ##
+  ## Suy dan (cublasSgemm luon coi ma tran la COLUMN-MAJOR):
+  ## - A row-major (m x k) doc lai theo column-major chinh la (k x m) = A^T.
+  ## - B row-major (n x k) doc lai theo column-major chinh la (k x n) = B^T.
+  ##   Ta muon dung B (khong phai B^T) trong tich A@B^T -> ap them 1 lan
+  ##   CUBLAS_OP_T len B^T (da co san tu viec doc lai bit) se cho lai dung B.
+  ## - Ket qua: cublasSgemm(opT tren B [ld=k], opN tren A [ld=k]) tinh ra
+  ##   C^T (column-major n x m) - chinh la C (row-major m x n) can, khong
+  ##   phai xu ly gi them.
+  gpuCheck(tryLoadCudart(), "cudaMatmulNTF32R: libcudart not found")
+  gpuCheck(tryLoadCublas(), "cudaMatmulNTF32R: libcublas not found")
+  gpuCheck(a.dptr != 0 and b.dptr != 0, "cudaMatmulNTF32R: input tensor rỗng/đã free")
+  gpuCheck(a.numel == m * k, "cudaMatmulNTF32R: a.numel=" & $a.numel & " != m*k=" & $(m*k))
+  gpuCheck(b.numel == n * k, "cudaMatmulNTF32R: b.numel=" & $b.numel & " != n*k=" & $(n*k))
+
+  let handle = ensureHandle()
+  let bytesC = csize_t(m * n * sizeof(float32))
+  let dC = cuda_driver.getDeviceBuf(bytesC)
+
+  let pA = cast[pointer](a.dptr)
+  let pB = cast[pointer](b.dptr)
+  let pC = cast[pointer](dC)
+
+  var alpha: float32 = 1.0'f32
+  var beta: float32 = 0.0'f32
+  gpuCheck(cublas.cublasSgemm_v2(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                                  int32(n), int32(m), int32(k),
+                                  addr alpha, pB, int32(k), pA, int32(k),
+                                  addr beta, pC, int32(n)) == 0, "cudaMatmulNTF32R: cublasSgemm failed")
+  debugLog("cudaMatmulNTF32R m=" & $m & " k=" & $k & " n=" & $n)
   result = CudaTensor(dptr: cast[cuda_driver.CUdeviceptr](dC), bytes: bytesC, numel: m * n)

@@ -375,7 +375,6 @@ proc defaultConfig(): Config =
     soMaxPages: 100,
     wikiMaxPages: 10,
     seed: 1337,
-    backend: "metal",
     useSession: true
   )
 
@@ -782,7 +781,6 @@ proc applyGrads(model: var NimformerModelLinearPP, grads: seq[Tensor],
 
 proc isBiasOrNorm(name: string): bool =
   name.endsWith(".bias") or name.endsWith(".gamma") or name.endsWith(".beta")
-
 proc saveCheckpoint*(model: NimformerModelLinearPP, states: seq[ApfAdamState], stepNo: int,
                       path: string, weightKind: QuantKind,
                       embedDim, nHeads, nLayers, ffMult: int) =
@@ -796,14 +794,19 @@ proc saveCheckpoint*(model: NimformerModelLinearPP, states: seq[ApfAdamState], s
     inc idx
   forEachParam(model, rec)
   sd.add ("__step__", quantizeTensor(@[float32(stepNo)], @[1], qkFp32Raw))
+  # ❌ KHÔNG LƯU BACKEND STATE!
+  # sd.add ("__backend__", quantizeTensor(...))  # ĐÃ XÓA
   saveQuantStateDict(path, [model.vocab, embedDim, nHeads, nLayers, ffMult], sd)
   echo "  đã lưu checkpoint (weight+optimizer, step=" & $stepNo & ") -> " & path
-
-proc loadCheckpointFull*(path: string): tuple[model: NimformerModelLinearPP, states: seq[ApfAdamState], stepNo: int] =
+proc loadCheckpointFull*(path: string, forceBackend: string = ""): tuple[model: NimformerModelLinearPP, states: seq[ApfAdamState], stepNo: int] =
   let (arch, sd) = loadQuantStateDict(path)
   let vocab = arch[0]; let embedDim = arch[1]; let nHeads = arch[2]
   let nLayers = arch[3]; let ffMult = arch[4]
-  var model = newNimformerModelLinearPP(vocab, embedDim, nHeads, nLayers, ffMult, true)
+  
+  # 👉 Dùng forceBackend để quyết định useSession
+  let useSession = forceBackend != "cpu" and forceBackend != ""
+  var model = newNimformerModelLinearPP(vocab, embedDim, nHeads, nLayers, ffMult, useSession)
+  
   var byName = initTable[string, QuantTensor]()
   for (name, qt) in sd: byName[name] = qt
 
@@ -827,6 +830,7 @@ proc loadCheckpointFull*(path: string): tuple[model: NimformerModelLinearPP, sta
     if byName.hasKey(name & ".opt_v"): st.v = dequantizeTensor(byName[name & ".opt_v"])
     states.add st
 
+  # Load tất cả weights và optimizer states (giữ nguyên như cũ)
   loadWithOpt("outProj.weight", model.outProj.weight)
   loadWithOpt("outProj.bias", model.outProj.bias)
   for bi in countdown(model.blocks.len - 1, 0):
@@ -857,7 +861,6 @@ proc loadCheckpointFull*(path: string): tuple[model: NimformerModelLinearPP, sta
   loadWithOpt("embed.weight", model.embed.weight)
 
   result = (model, states, stepNo)
-
 # ═══════════════════════════════════════════════════════════════
 # TRAINING LOOP
 # ═══════════════════════════════════════════════════════════════
@@ -898,7 +901,6 @@ proc train(model: var NimformerModelLinearPP, samples: seq[Sample], ctx: Backend
 # ═══════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════
-
 proc main() =
   let cfg = parseArgs()
   randomize(cfg.seed)
@@ -930,11 +932,11 @@ proc main() =
     else:
       tok = newCharTokenizer(texts)
       tok.saveTokenizer(cfg.tokenizerPath)
-    let loaded = loadCheckpointFull(ckptPath)
+    let loaded = loadCheckpointFull(ckptPath, cfg.backend)
     model = loaded.model
     states = loaded.states
     startStep = loaded.stepNo
-    echo &"  resume từ step {startStep}"
+    echo &"  resume từ step {startStep} với backend {cfg.backend}"
   else:
     echo "== Build tokenizer =="
     tok = newCharTokenizer(texts)
@@ -953,9 +955,10 @@ proc main() =
 
   if not resuming:
     echo "== Build model =="
+    let useSession = cfg.backend != "cpu" and cfg.backend != ""
     model = newNimformerModelLinearPP(vocab = tok.vocabSize, embedDim = cfg.embedDim,
                                        nHeads = cfg.nHeads, nLayers = cfg.nLayers,
-                                       ffMult = cfg.ffMult, useSession = cfg.useSession)
+                                       ffMult = cfg.ffMult, useSession = useSession)
     states = initOptStates(model)
 
   echo &"  vocab={model.vocab}, {states.len} tensor tham số"
@@ -973,6 +976,5 @@ proc main() =
   forEachParam(model, rec)
   saveQuantStateDict(cfg.savePath, [model.vocab, cfg.embedDim, cfg.nHeads, cfg.nLayers, cfg.ffMult], sd)
   echo &"  đã lưu {sd.len} tensor -> {cfg.savePath}"
-
 when isMainModule:
   main()

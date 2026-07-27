@@ -17,6 +17,16 @@ int metal_vecop(const char* kernel_src, int op, const float* a, const float* b, 
 // C(m x n) = A(m x k) * B(k x n), row-major. Trả về 1 nếu chạy thành công, 0 nếu lỗi.
 int metal_matmul(const char* kernel_src, const float* a, const float* b, float* c, int m, int k, int n);
 
+// Giống metal_matmul nhưng dùng MPSMatrixMultiplication (Metal Performance
+// Shaders) của Apple thay vì kernel tile tự viết tay. MPS chọn thuật toán
+// (simdgroup_matrix trên Apple Silicon, đường tối ưu riêng cho Intel/AMD)
+// và autotune theo GPU thực tế đang chạy - luôn >= kernel tay viết, thường
+// nhanh hơn nhiều. KHÔNG cần kernel_src (không dùng thư viện MSL tự biên
+// dịch của mình cho đường này). Trả về 1 nếu chạy thành công, 0 nếu lỗi
+// (vd. framework MetalPerformanceShaders không có / GPU không hỗ trợ) -
+// caller PHẢI fallback về metal_matmul() khi hàm này trả 0.
+int metal_matmul_mps(const float* a, const float* b, float* c, int m, int k, int n);
+
 // Matmul truc tiep tren weight int4-asymmetric DA PACK (khong dequant ra
 // fp32 tren CPU truoc). wq: packed bytes [N * ceil(K/2)]. scales/zeros:
 // [N * nGroupsPerRow] (nGroupsPerRow = ceil(K/groupSize), groupSize<=0 nghia
@@ -96,11 +106,48 @@ MetalBufferHandle metal_alloc_scratch(int n);
 int metal_vecop_enc(int op, MetalBufferHandle a, MetalBufferHandle b, MetalBufferHandle c, int n);
 int metal_activation_enc(int op, MetalBufferHandle x, MetalBufferHandle y, int n);
 int metal_softmax_enc(MetalBufferHandle x, MetalBufferHandle y, int rows, int cols);
+int metal_copy_into_enc(MetalBufferHandle src, MetalBufferHandle dst, int dstOffsetElems, int n);
 int metal_layernorm_enc(MetalBufferHandle x, MetalBufferHandle gamma, MetalBufferHandle beta,
                          MetalBufferHandle y, int rows, int cols, float eps);
 int metal_embedding_lookup_enc(MetalBufferHandle table, MetalBufferHandle indices,
                                 MetalBufferHandle y, int vocab, int dim, int num_indices);
 int metal_matmul_enc(MetalBufferHandle a, MetalBufferHandle b, MetalBufferHandle c, int m, int k, int n);
+// C(m,n) = A(m,k) @ B(n,k)^T - B truyen vao GIU NGUYEN layout goc [n,k]
+// (khong transpose CPU truoc). Dung cho attention decode (K/V-cache).
+int metal_matmul_nt_enc(MetalBufferHandle a, MetalBufferHandle b, MetalBufferHandle c, int m, int k, int n);
+// RoPE rotate_half in-place trong session đang mở. x: [T,Hn,D]. cosT/sinT: [T,D/2]
+// (đã cắt đúng đoạn cần dùng phía CPU trước khi upload). Không đọc CPU giữa chừng.
+int metal_rope_enc(MetalBufferHandle x, MetalBufferHandle cosT, MetalBufferHandle sinT,
+                    int T, int Hn, int D);
+// Encode attention_fused_kernel vào session đang mở (KHÔNG commit). q,k,v đã
+// là buffer resident (metal_upload trước đó), o/s_matrix là buffer scratch
+// (metal_alloc_scratch). S phải <= 256 (giới hạn kernel, giống bản non-session).
+int metal_attention_fused_enc(MetalBufferHandle q, MetalBufferHandle k, MetalBufferHandle v,
+                               MetalBufferHandle o, MetalBufferHandle s_matrix,
+                               int B, int H, int S, int D, float scale);
+// Upload byte thô (weight int4 đã pack) -> MTLBuffer resident, dùng cho
+// metal_matmul_q4_enc bên dưới. Handle sống tới khi gọi metal_buffer_free -
+// gọi UPLOAD 1 LẦN lúc load model, giữ handle suốt vòng đời process, KHÔNG
+// gọi lại mỗi token (đó là toàn bộ mục đích của resident weight).
+// SUA (bug thật gặp lúc chạy): metal_upload/metal_upload_bytes (dùng cho
+// resident weight - gọi TRƯỚC bất kỳ metal_session_begin/metal_matmul nào,
+// ngay lúc load model) trước đây KHÔNG gọi ensureMetalInit() như mọi hàm
+// khác trong file này -> gDevice vẫn NULL -> newBufferWithBytes trên device
+// nil trả về nil -> "tao buffer FAILED" hàng loạt (thấy trực tiếp trên log
+// máy Intel Iris thật). Thêm hàm init tường minh, gọi 1 LẦN trước khi upload
+// resident đầu tiên - ensureMetalInit() dùng dispatch_once nên gọi nhiều lần
+// vẫn an toàn/rẻ (chỉ init thật ở lần gọi đầu).
+int metal_init(const char* kernel_src);
+
+MetalBufferHandle metal_upload_bytes(const unsigned char* data, int n);
+// Bản resident/session của metal_matmul_q4 (xem metal_matmul_q4 phía trên):
+// wq/scales/zeros là handle đã upload SẴN 1 LẦN (metal_upload_bytes/metal_upload),
+// KHÔNG memcpy lại mỗi lần gọi hàm này - chỉ activation `a` mới nhỏ/đổi mỗi
+// token. Encode vào session đang mở (giữa metal_session_begin/metal_session_end),
+// giống hệt metal_matmul_enc nhưng đọc thẳng int4 packed thay vì fp32.
+int metal_matmul_q4_enc(MetalBufferHandle a, MetalBufferHandle wq, MetalBufferHandle scales,
+                         MetalBufferHandle zeros, MetalBufferHandle c,
+                         int m, int k, int n, int groupSize, int nGroupsPerRow);
 // Commit + wait MỘT LẦN cho toàn bộ op đã encode từ lúc metal_session_begin.
 // Sau khi gọi hàm này, mọi MetalBufferHandle trong phiên đã có dữ liệu đúng,
 // đọc được bằng metal_buffer_read.
