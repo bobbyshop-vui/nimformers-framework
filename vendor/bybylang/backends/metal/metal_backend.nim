@@ -5,7 +5,7 @@ when defined(macosx):
   const metalDir = currentSourcePath().parentDir()
   {.passC: "-I" & metalDir.}
   {.passC: "-fobjc-arc".}
-  {.passL: "-framework Metal -framework Foundation".}
+  {.passL: "-framework Metal -framework Foundation -framework MetalPerformanceShaders".}
   {.compile: "metal_shim.m".}
 
   const kMetalKernelSrc = staticRead(metalDir / "kernels" / "vecop_matmul.metal")
@@ -15,6 +15,8 @@ when defined(macosx):
     {.importc: "metal_vecop", header: "metal_shim.h".}
   proc metal_matmul_c(kernelSrc: cstring, a, b: ptr float32, c: ptr float32, m, k, n: cint): cint
     {.importc: "metal_matmul", header: "metal_shim.h".}
+  proc metal_matmul_mps_c(a, b: ptr float32, c: ptr float32, m, k, n: cint): cint
+    {.importc: "metal_matmul_mps", header: "metal_shim.h".}
   proc metal_matmul2_c(kernelSrc: cstring,
                         a1, b1: ptr float32, c1: ptr float32, m1, k1, n1: cint,
                         a2, b2: ptr float32, c2: ptr float32, m2, k2, n2: cint): cint
@@ -64,10 +66,48 @@ when defined(macosx):
     if ok == 0:
       raise newException(CatchableError, "metal_vecop failed")
 
+  # ─────────────────────────────────────────────────────────────────────
+  # CÔNG TẮC BẬT/TẮT MPS - sửa trực tiếp giá trị này để chọn đường matmul.
+  #   bmUseMps    -> luôn dùng MPSMatrixMultiplication (fallback tự động
+  #                  về kernel tay viết nếu máy không hỗ trợ / lỗi).
+  #   bmUseKernel -> luôn dùng kernel tay viết matmul_kernel_t{8,16,32}
+  #                  (bỏ qua MPS hoàn toàn - dùng khi cần so sánh benchmark
+  #                  hoặc nghi ngờ MPS cho kết quả sai trên 1 GPU cụ thể).
+  # ─────────────────────────────────────────────────────────────────────
+  type BbMatmulBackend = enum
+    bmUseMps, bmUseKernel
+
+  const bbMatmulBackend: BbMatmulBackend = bmUseKernel   # <<< SỬA Ở ĐÂY
+  # SUA: đổi mặc định từ bmUseMps -> bmUseKernel. Đo thực tế trên Iris Plus
+  # 640: MPS chậm HƠN kernel tay viết cho workload decode LLM (16942ms/token
+  # so với ~7000-7800ms/token trước đó). Lý do: mỗi bước decode chỉ nhân
+  # M=1 (1 token) - thực chất là matrix-VECTOR chứ không phải GEMM lớn, mà
+  # MPS được tối ưu cho ma trận lớn/batch lớn. Trên GPU yếu, overhead setup
+  # nội bộ của MPS (chọn thuật toán, validate descriptor...) cho M=1 lớn
+  # hơn cả phần tính toán thật -> phản tác dụng. Vẫn giữ code MPS lại (bật
+  # bmUseMps để so sánh nếu cần, hoặc dùng cho prefill M lớn sau này).
+
+  var gMpsFailedOnce = false  # SUA: nếu MPS lỗi 1 lần (vd. GPU không hỗ trợ),
+                              # đừng thử lại mỗi token - tốn 1 lần gọi native
+                              # thất bại mỗi bước. Fallback hẳn về kernel tay
+                              # viết cho phần đời còn lại của process.
+
   proc metalMatmul*(a, b: seq[float32], m, k, n: int): seq[float32] =
     result = newSeq[float32](m * n)
     var aVar = a
     var bVar = b
+    # SUA (#3 - dùng MPS): ưu tiên MPSMatrixMultiplication trước - Apple tự
+    # chọn thuật toán tối ưu theo đúng GPU đang chạy, thường nhanh hơn đáng
+    # kể so với matmul_kernel_t{8,16,32} tay viết, và không cần lo threadgroup
+    # limit / tile size gì nữa. Fallback về kernel tay viết (đã có tile động
+    # ở #A) nếu MPS không khả dụng trên máy này hoặc lỗi. Có thể tắt hẳn
+    # bằng cách đổi bbMatmulBackend ở trên thành bmUseKernel.
+    if bbMatmulBackend == bmUseMps and not gMpsFailedOnce:
+      let okMps = metal_matmul_mps_c(addr aVar[0], addr bVar[0], addr result[0], cint(m), cint(k), cint(n))
+      if okMps != 0:
+        return
+      gMpsFailedOnce = true
+      stderr.write("[metal] MPS matmul khong kha dung/loi - chuyen han ve kernel tay viet cho phan con lai cua phien\n")
     let ok = metal_matmul_c(kMetalKernelSrc.cstring, addr aVar[0], addr bVar[0], addr result[0], cint(m), cint(k), cint(n))
     if ok == 0:
       raise newException(CatchableError, "metal_matmul failed")
@@ -210,15 +250,35 @@ when defined(macosx):
   proc metal_upload_c(data: ptr float32, n: cint): MetalBufferHandle {.importc: "metal_upload", header: "metal_shim.h".}
   proc metal_alloc_scratch_c(n: cint): MetalBufferHandle {.importc: "metal_alloc_scratch", header: "metal_shim.h".}
   proc metal_matmul_enc_c(a, b, c: MetalBufferHandle, m, k, n: cint): cint {.importc: "metal_matmul_enc", header: "metal_shim.h".}
+  proc metal_matmul_nt_enc_c(a, b, c: MetalBufferHandle, m, k, n: cint): cint {.importc: "metal_matmul_nt_enc", header: "metal_shim.h".}
+  proc metal_init_c(kernelSrc: cstring): cint {.importc: "metal_init", header: "metal_shim.h".}
+  proc metal_upload_bytes_c(data: ptr uint8, n: cint): MetalBufferHandle {.importc: "metal_upload_bytes", header: "metal_shim.h".}
+  proc metal_matmul_q4_enc_c(a, wq, scales, zeros, c: MetalBufferHandle, m, k, n, groupSize, nGroupsPerRow: cint): cint
+    {.importc: "metal_matmul_q4_enc", header: "metal_shim.h".}
+  proc metal_copy_into_enc_c(src, dst: MetalBufferHandle, dstOffsetElems, n: cint): cint {.importc: "metal_copy_into_enc", header: "metal_shim.h".}
   proc metal_softmax_enc_c(x, y: MetalBufferHandle, rows, cols: cint): cint {.importc: "metal_softmax_enc", header: "metal_shim.h".}
+  proc metal_layernorm_enc_c(x, gamma, beta, y: MetalBufferHandle, rows, cols: cint, eps: cfloat): cint
+    {.importc: "metal_layernorm_enc", header: "metal_shim.h".}
+  proc metal_embedding_lookup_enc_c(table, indices, y: MetalBufferHandle, vocab, dim, numIndices: cint): cint
+    {.importc: "metal_embedding_lookup_enc", header: "metal_shim.h".}
+  proc metal_attention_fused_enc_c(q, k, v, o, sMatrix: MetalBufferHandle, B, H, S, D: cint, scale: cfloat): cint
+    {.importc: "metal_attention_fused_enc", header: "metal_shim.h".}
   proc metal_session_end_c(): cint {.importc: "metal_session_end", header: "metal_shim.h".}
   proc metal_buffer_read_c(h: MetalBufferHandle, outData: ptr float32, n: cint): cint {.importc: "metal_buffer_read", header: "metal_shim.h".}
   proc metal_buffer_free_c(h: MetalBufferHandle) {.importc: "metal_buffer_free", header: "metal_shim.h".}
+
+  proc metalInit*(): bool =
+    ## Gọi ensureMetalInit() tường minh (dispatch_once bên trong - gọi nhiều
+    ## lần vẫn rẻ). PHẢI gọi trước metalUploadBytes/metalSessionUpload nếu
+    ## chưa có metalSessionBegin nào chạy trước đó (đúng case resident-upload
+    ## lúc load model, trước khi vào decode loop).
+    metal_init_c(kMetalKernelSrc.cstring) != 0
 
   proc metalSessionBegin*(): bool =
     metal_session_begin_c(kMetalKernelSrc.cstring) != 0
 
   proc metalSessionUpload*(data: seq[float32]): MetalBufferHandle =
+    discard metalInit()  # SUA: an toàn khi gọi resident-upload TRƯỚC session begin đầu tiên
     var d = data
     metal_upload_c(addr d[0], cint(d.len))
 
@@ -228,8 +288,35 @@ when defined(macosx):
   proc metalSessionMatmulEnc*(a, b, c: MetalBufferHandle, m, k, n: int): bool =
     metal_matmul_enc_c(a, b, c, cint(m), cint(k), cint(n)) != 0
 
+  proc metalSessionMatmulNTEnc*(a, b, c: MetalBufferHandle, m, k, n: int): bool =
+    ## C(m,n) = A(m,k) @ B(n,k)^T - B GIU NGUYEN layout goc [n,k] (khong
+    ## transpose CPU truoc). Dung cho attention decode (K/V-cache).
+    metal_matmul_nt_enc_c(a, b, c, cint(m), cint(k), cint(n)) != 0
+
+  proc metalUploadBytes*(data: seq[uint8]): MetalBufferHandle =
+    discard metalInit()
+    var d = data
+    metal_upload_bytes_c(addr d[0], cint(d.len))
+
+  proc metalSessionMatmulQ4Enc*(a, wq, scales, zeros, c: MetalBufferHandle,
+                                 m, k, n, groupSize, nGroupsPerRow: int): bool =
+    metal_matmul_q4_enc_c(a, wq, scales, zeros, c,
+      cint(m), cint(k), cint(n), cint(groupSize), cint(nGroupsPerRow)) != 0
+
+  proc metalSessionCopyIntoEnc*(src, dst: MetalBufferHandle, dstOffsetElems, n: int): bool =
+    metal_copy_into_enc_c(src, dst, cint(dstOffsetElems), cint(n)) != 0
+
   proc metalSessionSoftmaxEnc*(x, y: MetalBufferHandle, rows, cols: int): bool =
     metal_softmax_enc_c(x, y, cint(rows), cint(cols)) != 0
+
+  proc metalSessionLayernormEnc*(x, gamma, beta, y: MetalBufferHandle, rows, cols: int, eps: float32): bool =
+    metal_layernorm_enc_c(x, gamma, beta, y, cint(rows), cint(cols), cfloat(eps)) != 0
+
+  proc metalSessionEmbeddingLookupEnc*(table, indices, y: MetalBufferHandle, vocab, dim, numIndices: int): bool =
+    metal_embedding_lookup_enc_c(table, indices, y, cint(vocab), cint(dim), cint(numIndices)) != 0
+
+  proc metalSessionAttentionFusedEnc*(q, k, v, o, sMatrix: MetalBufferHandle, B, H, S, D: int, scale: float32): bool =
+    metal_attention_fused_enc_c(q, k, v, o, sMatrix, cint(B), cint(H), cint(S), cint(D), cfloat(scale)) != 0
 
   proc metalSessionEnd*(): bool =
     metal_session_end_c() != 0
@@ -249,7 +336,16 @@ else:
   proc metalSessionUpload*(data: seq[float32]): MetalBufferHandle = nil
   proc metalSessionAllocScratch*(n: int): MetalBufferHandle = nil
   proc metalSessionMatmulEnc*(a, b, c: MetalBufferHandle, m, k, n: int): bool = false
+  proc metalSessionMatmulNTEnc*(a, b, c: MetalBufferHandle, m, k, n: int): bool = false
+  proc metalInit*(): bool = false
+  proc metalUploadBytes*(data: seq[uint8]): MetalBufferHandle = nil
+  proc metalSessionMatmulQ4Enc*(a, wq, scales, zeros, c: MetalBufferHandle,
+                                 m, k, n, groupSize, nGroupsPerRow: int): bool = false
+  proc metalSessionCopyIntoEnc*(src, dst: MetalBufferHandle, dstOffsetElems, n: int): bool = false
   proc metalSessionSoftmaxEnc*(x, y: MetalBufferHandle, rows, cols: int): bool = false
+  proc metalSessionLayernormEnc*(x, gamma, beta, y: MetalBufferHandle, rows, cols: int, eps: float32): bool = false
+  proc metalSessionEmbeddingLookupEnc*(table, indices, y: MetalBufferHandle, vocab, dim, numIndices: int): bool = false
+  proc metalSessionAttentionFusedEnc*(q, k, v, o, sMatrix: MetalBufferHandle, B, H, S, D: int, scale: float32): bool = false
   proc metalSessionEnd*(): bool = false
   proc metalSessionRead*(h: MetalBufferHandle, n: int): seq[float32] = @[]
   proc metalSessionFree*(h: MetalBufferHandle) = discard

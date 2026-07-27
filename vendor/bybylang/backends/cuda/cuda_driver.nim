@@ -51,6 +51,7 @@ type
     cuMemcpyDtoH: proc(dst: pointer, src: CUdeviceptr, byteCount: csize_t): CUresult {.cdecl.}
     cuMemcpyHtoDAsync: proc(dst: CUdeviceptr, src: pointer, byteCount: csize_t, stream: CUstream): CUresult {.cdecl.}
     cuMemcpyDtoHAsync: proc(dst: pointer, src: CUdeviceptr, byteCount: csize_t, stream: CUstream): CUresult {.cdecl.}
+    cuMemcpyDtoDAsync: proc(dst: CUdeviceptr, src: CUdeviceptr, byteCount: csize_t, stream: CUstream): CUresult {.cdecl.}
     cuStreamCreate: proc(phStream: ptr CUstream, flags: uint32): CUresult {.cdecl.}
     cuStreamSynchronize: proc(stream: CUstream): CUresult {.cdecl.}
     cuLaunchKernel: proc(f: CUfunction, gridX, gridY, gridZ, blockX, blockY, blockZ,
@@ -150,6 +151,7 @@ proc tryLoad(): bool =
   lib.cuMemcpyDtoH = cast[typeof(lib.cuMemcpyDtoH)](lib.handle.symAddr("cuMemcpyDtoH_v2"))
   lib.cuMemcpyHtoDAsync = cast[typeof(lib.cuMemcpyHtoDAsync)](lib.handle.symAddr("cuMemcpyHtoDAsync_v2"))
   lib.cuMemcpyDtoHAsync = cast[typeof(lib.cuMemcpyDtoHAsync)](lib.handle.symAddr("cuMemcpyDtoHAsync_v2"))
+  lib.cuMemcpyDtoDAsync = cast[typeof(lib.cuMemcpyDtoDAsync)](lib.handle.symAddr("cuMemcpyDtoDAsync_v2"))
   lib.cuStreamCreate = cast[typeof(lib.cuStreamCreate)](lib.handle.symAddr("cuStreamCreate"))
   lib.cuStreamSynchronize = cast[typeof(lib.cuStreamSynchronize)](lib.handle.symAddr("cuStreamSynchronize"))
   lib.cuLaunchKernel = cast[typeof(lib.cuLaunchKernel)](lib.handle.symAddr("cuLaunchKernel"))
@@ -581,6 +583,42 @@ proc cudaAttentionFused*(q, k, v, mask: seq[float32], B, H, S, D: int, scale: fl
   gpuCheck(lib.cuMemcpyDtoHAsync(addr result.s_matrix[0], dS, bytesS, gStream) == 0, "D2H S failed")
   gpuCheck(lib.cuStreamSynchronize(gStream) == 0, "stream sync failed")
 
+proc cudaAttentionFusedR*(q, k, v: CudaTensor, B, H, S, D: int, scale: float32): tuple[o, s_matrix: CudaTensor] =
+  ## Bản "resident" của cudaAttentionFused ở trên: nhận thẳng CudaTensor đã
+  ## resident trên device (không phải seq[float32] trên host), launch kernel
+  ## lên CÙNG stream (gStream) và KHÔNG gọi cuStreamSynchronize/D2H - để lời
+  ## gọi này encode xong là quay về ngay, y hệt cudaLayernormR/cudaVecOpR.
+  ## Dùng cho session API (xem gpubackend.nim: sessionAttentionFusedEnc) -
+  ## nhiều lệnh launch nối tiếp lên cùng stream, chỉ sync đúng 1 lần ở
+  ## sessionEnd(), thay vì mỗi attention tự đứng chờ GPU xong ngay tại chỗ.
+  ensureInit()
+  let qkvLen = B * H * S * D
+  let sLen = B * H * S * S
+  let bytesQKV = csize_t(qkvLen * sizeof(float32))
+  let bytesS = csize_t(sLen * sizeof(float32))
+
+  let dOut = getDeviceBuf(bytesQKV)
+  let dS = getDeviceBuf(bytesS)
+
+  let fn = getFn("attention_fused_kernel")
+  var bQ = q.dptr; var bK = k.dptr; var bV = v.dptr; var bOut = dOut; var bS = dS
+  var bArg = int32(B); var hArg = int32(H); var sArg = int32(S); var dArg = int32(D); var scArg = float32(scale)
+
+  var params: array[10, pointer] = [
+    cast[pointer](addr bQ), cast[pointer](addr bK), cast[pointer](addr bV),
+    cast[pointer](addr bOut), cast[pointer](addr bS),
+    cast[pointer](addr bArg), cast[pointer](addr hArg),
+    cast[pointer](addr sArg), cast[pointer](addr dArg),
+    cast[pointer](addr scArg)
+  ]
+
+  let blockSize = getOptimalBlockSize()
+  gpuCheck(lib.cuLaunchKernel(fn, uint32(B*H), uint32(S), 1, blockSize, 1, 1, 0, gStream,
+                                addr params[0], nil) == 0, "attention_fused_kernel (resident) launch failed")
+
+  result.o = CudaTensor(dptr: dOut, bytes: bytesQKV, numel: qkvLen)
+  result.s_matrix = CudaTensor(dptr: dS, bytes: bytesS, numel: sLen)
+
 # ============================================================
 # ATTENTION FUSED BACKWARD
 # ============================================================
@@ -709,6 +747,59 @@ proc cudaLayernormR*(x, gamma, beta: CudaTensor, rows, cols: int, eps: float32):
                                 addr params[0], nil) == 0, "cudaLayernormR launch failed")
   return CudaTensor(dptr: dY, bytes: bytesX, numel: n)
 
+# ============================================================
+# ROPE (rotate_half, in-place) - mirror của rope_kernel bên Metal/OpenCL.
+# CẦN: entry point "rope_kernel" phải có trong kernels/vecop.ptx (build từ
+# rope_kernel.cu bằng `nvcc -ptx` rồi nối vào file .ptx hiện có). Nếu module
+# PTX đang nạp CHƯA có entry này, getFn sẽ raise CatchableError như mọi kernel
+# khác - proc gọi nó ở gpubackend.nim (sessionRope) BẮT lỗi này và coi là
+# "chưa hỗ trợ", rơi về CPU, giống hệt hành vi cũ trước khi kernel tồn tại.
+# ============================================================
+proc cudaRopeR*(x, cosT, sinT: CudaTensor, T, Hn, D: int) =
+  ## In-place: ghi đè thẳng lên x.dptr, không cấp/trả buffer mới.
+  ensureInit()
+  let fn = getFn("rope_kernel")
+  let halfD = D div 2
+
+  var dXv = x.dptr; var dCv = cosT.dptr; var dSv = sinT.dptr
+  var hnParam = int32(Hn)
+  var dParam = int32(D)
+  var params: array[5, pointer] = [
+    cast[pointer](addr dXv), cast[pointer](addr dCv), cast[pointer](addr dSv),
+    cast[pointer](addr hnParam), cast[pointer](addr dParam)
+  ]
+
+  # grid.x phủ D/2 (chia theo block size tối ưu của GPU), grid.y = Hn, grid.z = T
+  # - đúng layout đã dùng bên Metal/OpenCL (gid.x=i, gid.y=h, gid.z=t).
+  let blockSize = getOptimalBlockSize()
+  let gridX = uint32((halfD + int(blockSize) - 1) div int(blockSize))
+  gpuCheck(lib.cuLaunchKernel(fn, gridX, uint32(Hn), uint32(T), blockSize, 1, 1, 0, gStream,
+                                addr params[0], nil) == 0, "rope_kernel launch failed")
+  gpuCheck(lib.cuStreamSynchronize(gStream) == 0, "cudaRopeR sync failed")
+
+# ============================================================
+# COPY INTO (GPU-side concat) - THÊM MỚI: dst[dstOffsetElems ..< +n] =
+# src[0 ..< n], device-to-device, KHÔNG cần kernel riêng (khác Metal/OpenCL,
+# CUDA driver có sẵn cuMemcpyDtoDAsync). Dùng để ghép nhiều buffer con (vd
+# outHeads từng KV-head trong attention decode) thành 1 buffer liên tục
+# NGAY TRÊN GPU trong session đang mở, tránh phải đọc về CPU rồi upload lại
+# chỉ để nối mảng - đây là điểm chặn cuối cùng khiến session attention-decode
+# và session oProj không gộp được làm 1 (xem giải thích tương tự bên
+# metal_copy_into_enc/openclSessionCopyIntoEnc).
+# LƯU Ý: dst PHẢI đã được cấp đủ (dstOffsetElems + n) phần tử từ trước
+# (cuAllocScratch) - hàm này không tự resize.
+# ============================================================
+proc cudaCopyIntoR*(src, dst: CudaTensor, dstOffsetElems, n: int) =
+  ensureInit()
+  let byteOffset = csize_t(dstOffsetElems * sizeof(float32))
+  let n64 = csize_t(n * sizeof(float32))
+  gpuCheck(byteOffset + n64 <= dst.bytes, "cudaCopyIntoR: dstOffset+n vuot qua kich thuoc buffer dich")
+  gpuCheck(lib.cuMemcpyDtoDAsync(dst.dptr + byteOffset, src.dptr, n64, gStream) == 0,
+           "cuMemcpyDtoDAsync failed (cudaCopyIntoR)")
+  # Không cuStreamSynchronize ở đây - giữ đúng semantics session: các lệnh
+  # khác (matmul/vecop/rope...) trên CÙNG gStream vẫn nối tiếp không blocking,
+  # chỉ sync 1 lần ở sessionEnd (giống mọi thao tác khác trong session CUDA).
+
 proc cudaEmbeddingLookupR*(table, indices: CudaTensor, numIdx, vocab, dim: int): CudaTensor =
   ensureInit()
   let bytesY = csize_t(numIdx * dim * sizeof(float32))
@@ -760,3 +851,67 @@ proc cuGraphDestroy*() =
   discard lib.cuGraphExecDestroy(gCudaGraph.exec)
 
 proc isCudaGraphCapturing*(): bool = gCudaGraphCapturing
+
+# ============================================================
+# MATMUL INT4 ASYMMETRIC (packed, per-group scale/zero_point) - THÊM MỚI
+# ============================================================
+# Mirror của matmul_q4_kernel_naive (Metal) / matmul_q4_naive (OpenCL). Cần
+# entry "matmul_q4_kernel" có trong module PTX đang nạp (kernels/vecop.ptx) -
+# xem hướng dẫn build trong kernels/matmul_q4_kernel.cu. Nếu module hiện tại
+# CHƯA có entry này, getFn() sẽ raise CatchableError - nơi gọi (gpubackend.nim)
+# BẮT lỗi này và tự rơi về cpuDequantMatmulQ4Fallback, KHÔNG làm sập process.
+
+proc uploadBytesAsync*(data: seq[uint8]): CudaTensor =
+  ## Upload byte thô (weight int4 đã pack) - dùng resident 1 lần lúc load
+  ## model (giống uploadAsync ở trên nhưng cho uint8 thay vì float32).
+  ensureInit()
+  let bytes = csize_t(data.len)
+  let dptr = getDeviceBuf(bytes)
+  gpuCheck(lib.cuMemcpyHtoDAsync(dptr, unsafeAddr data[0], bytes, gStream) == 0, "uploadBytesAsync H2D failed")
+  return CudaTensor(dptr: dptr, bytes: bytes, numel: data.len)
+
+proc cudaMatmulQ4R*(a: CudaTensor, wq, scales, zeros: CudaTensor,
+                     M, K, N, groupSize, nGroupsPerRow: int): CudaTensor =
+  ## Bản resident: a/wq/scales/zeros đã ở trên GPU (a đến từ uploadAsync mỗi
+  ## token, wq/scales/zeros đến từ uploadBytesAsync/uploadAsync MỘT LẦN lúc
+  ## load model qua residentUploadQ4). Không upload lại weight mỗi lần gọi -
+  ## đây chính là điểm CUDA đang THIẾU so với Metal/OpenCL (xem comment ở
+  ## gpubackend.nim::ResidentWeightHandle).
+  ensureInit()
+  let bytesC = csize_t(M * N * sizeof(float32))
+  let dC = getDeviceBuf(bytesC)
+
+  let fn = getFn("matmul_q4_kernel")
+  var dAv = a.dptr; var dWqv = wq.dptr; var dScv = scales.dptr; var dZpv = zeros.dptr; var dCv = dC
+  var mArg = int32(M); var kArg = int32(K); var nArg = int32(N)
+  var gsArg = int32(groupSize); var ngArg = int32(nGroupsPerRow)
+  var params: array[9, pointer] = [
+    cast[pointer](addr dAv), cast[pointer](addr dWqv), cast[pointer](addr dScv), cast[pointer](addr dZpv),
+    cast[pointer](addr dCv), cast[pointer](addr mArg), cast[pointer](addr kArg), cast[pointer](addr nArg),
+    cast[pointer](addr gsArg)]
+  # block (16,16): tile 16 khớp Metal/OpenCL tile mặc định, an toàn trên mọi
+  # GPU NVIDIA (256 thread/block, không vượt giới hạn của bất kỳ compute
+  # capability nào từ sm_20 trở lên). grid.y ceilDiv(M,16) - M thường = 1 lúc
+  # decode nên grid.y = 1, không lãng phí block rỗng.
+  let blockX = 16'u32; let blockY = 16'u32
+  let gridX = uint32((N + 15) div 16)
+  let gridY = uint32((M + 15) div 16)
+  gpuCheck(lib.cuLaunchKernel(fn, gridX, gridY, 1, blockX, blockY, 1, 0, gStream,
+                                addr params[0], nil) == 0, "matmul_q4_kernel launch failed")
+  return CudaTensor(dptr: dC, bytes: bytesC, numel: M * N)
+
+proc cudaMatmulQ4*(a: seq[float32], wq: seq[uint8], scales, zeros: seq[float32],
+                    M, K, N, groupSize, nGroupsPerRow: int): seq[float32] =
+  ## Bản immediate (không resident) - dùng khi gọi rời rạc ngoài session dài
+  ## hơi (tương đương openclMatmulQ4/metalMatmulQ4). Upload+launch+download
+  ## trong 1 lượt, giải phóng buffer ngay sau khi đọc kết quả về.
+  ensureInit()
+  let ta = uploadAsync(a)
+  let twq = uploadBytesAsync(wq)
+  let tsc = uploadAsync(scales)
+  let tzp = uploadAsync(zeros)
+  var tc = cudaMatmulQ4R(ta, twq, tsc, tzp, M, K, N, groupSize, nGroupsPerRow)
+  gpuCheck(lib.cuStreamSynchronize(gStream) == 0, "cudaMatmulQ4 sync failed")
+  result = downloadSync(tc)
+  var taV = ta; var twqV = twq; var tscV = tsc; var tzpV = tzp
+  freeResident(taV); freeResident(twqV); freeResident(tscV); freeResident(tzpV); freeResident(tc)

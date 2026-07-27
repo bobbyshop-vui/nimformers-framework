@@ -5,10 +5,12 @@
 
 import vendor/bybylang/gpubackend as byby
 import customfloat
-export byby.GpuBackend, byby.SessionHandle, byby.sessionBegin, byby.sessionUpload,
-       byby.sessionUploadIndices, byby.sessionAllocScratch, byby.sessionMatmul,
+export byby.GpuBackend, byby.SessionHandle, byby.sessionBegin, byby.sessionUpload, byby.sessionRope,
+       byby.sessionUploadIndices, byby.sessionAllocScratch, byby.sessionMatmul, byby.sessionMatmulNT,
        byby.sessionSoftmax, byby.sessionVecOp, byby.sessionActivation, byby.sessionEnd,
-       byby.sessionRead, byby.sessionFree
+       byby.sessionRead, byby.sessionFree, byby.sessionCopyInto,
+       byby.ResidentWeightHandle, byby.residentUploadQ4, byby.sessionMatmulQ4, byby.residentFreeQ4,
+       byby.sessionLayernormEnc, byby.sessionAttentionFusedEnc
 
 # -d:backend=cpu|metal|cuda|opencl|tsic|auto — mặc định "auto" (tự dò lúc runtime).
 const backend* {.strdefine.} = "auto"
@@ -109,6 +111,68 @@ proc beMatmulQ4*(ctx: Backend, a: openArray[float32], wq: openArray[uint8],
       fixed[i] = result[i]
     result = fixed
 
+proc beResidentUploadQ4*(ctx: Backend, wq: openArray[uint8], scales, zeros: openArray[float32],
+                          k, n, groupSize, nGroupsPerRow: int): ResidentWeightHandle =
+  ## Upload 1 weight int4 lên GPU MỘT LẦN (lúc load model). Gọi 1 lần/Linear,
+  ## giữ kết quả lại (vd. trong Linear.residentW) suốt vòng đời process.
+  byby.residentUploadQ4(ctx.kind.toByby(), @wq, @scales, @zeros, k, n, groupSize, nGroupsPerRow)
+
+var gOuterSessionOpen = false  ## true khi forward() cấp NGOÀI đã mở 1 session
+                                ## dùng chung cho CẢ model (xem beForwardSessionBegin/End
+                                ## bên dưới). Khi true, beResidentLinearQ4 KHÔNG được tự
+                                ## commit/wait riêng nữa - chỉ encode vào session đang mở.
+
+proc beForwardSessionBegin*(ctx: Backend): bool =
+  ## Gọi 1 LẦN DUY NHẤT ở đầu forward() của NimformerModel (mỗi token),
+  ## KHÔNG gọi trong từng Linear/layer. Mọi beResidentLinearQ4 gọi sau đó
+  ## trong cùng token sẽ dùng chung 1 command buffer, chỉ commit+wait 1 lần
+  ## ở beForwardSessionEnd - thay vì ~224 lần/token (7 Linear x 32 layer) như
+  ## trước khi sessionBegin/End nằm trong beResidentLinearQ4.
+  let be = ctx.kind.toByby()
+  if gOuterSessionOpen: return true
+  result = sessionBegin(be)
+  if result: gOuterSessionOpen = true
+
+proc beForwardSessionEnd*(ctx: Backend) =
+  ## Gọi 1 LẦN DUY NHẤT ở cuối forward() (sau khi đã lấy xong logits token
+  ## này). Đây là nơi thực sự commit + waitUntilCompleted.
+  let be = ctx.kind.toByby()
+  if gOuterSessionOpen:
+    discard sessionEnd(be)
+    gOuterSessionOpen = false
+
+proc beResidentLinearQ4*(ctx: Backend, x: openArray[float32], w: ResidentWeightHandle, M: int): seq[float32] =
+  ## Forward Linear dùng weight ĐÃ resident (w từ beResidentUploadQ4): mỗi
+  ## lần gọi hàm này chỉ upload activation `x` (nhỏ, đổi mỗi token) - KHÔNG
+  ## đụng lại tới bytes weight. Trả về seq rỗng nếu backend không hỗ trợ
+  ## (caller phải tự fallback về beMatmulQ4 khi đó).
+  ##
+  ## QUAN TRỌNG: hàm này KHÔNG còn tự sessionBegin/sessionEnd (không còn tự
+  ## commit+wait riêng). Nếu gOuterSessionOpen=false (caller quên gọi
+  ## beForwardSessionBegin trước) thì tự mở/đóng 1 session RIÊNG cho lần gọi
+  ## này để vẫn đúng - nhưng đây là đường fallback chậm (như code cũ), CHỈ
+  ## nên xảy ra nếu có bug ở caller.
+  let be = ctx.kind.toByby()
+  let ownSession = not gOuterSessionOpen
+  if ownSession:
+    if not sessionBegin(be): return @[]
+  var hA = sessionUpload(be, @x)
+  var hC = sessionAllocScratch(be, M * w.n)
+  if not sessionMatmulQ4(be, hA, w, hC, M):
+    if ownSession: discard sessionEnd(be)
+    sessionFree(be, hA); sessionFree(be, hC)
+    return @[]
+  if ownSession:
+    if not sessionEnd(be):
+      sessionFree(be, hA); sessionFree(be, hC)
+      return @[]
+  result = sessionRead(be, hC, M * w.n)
+  sessionFree(be, hA)
+  sessionFree(be, hC)
+
+proc beResidentFreeQ4*(w: var ResidentWeightHandle) =
+  byby.residentFreeQ4(w)
+
 proc beMatmul2*(ctx: Backend,
                  a1: openArray[float32], M1, K1: int, b1: openArray[float32], K1b, N1: int,
                  a2: openArray[float32], M2, K2: int, b2: openArray[float32], K2b, N2: int):
@@ -148,6 +212,43 @@ proc beSoftmax*(ctx: Backend, x: openArray[float32], rows, cols: int): seq[float
 
 proc beLayernorm*(ctx: Backend, x: openArray[float32], gamma, beta: openArray[float32], rows, cols: int, eps: float32): seq[float32] =
   result = byby.gpuLayernorm(ctx.kind.toByby(), @x, @gamma, @beta, rows, cols, eps)
+
+proc beAddLayernormFused*(ctx: Backend, a, b: openArray[float32], gamma, beta: openArray[float32],
+                           rows, cols: int, eps: float32): tuple[summed, normed: seq[float32]] =
+  ## Gộp "residual add rồi layernorm ngay sau" (đúng pattern lặp lại 2
+  ## lần/layer trong TransformerBlock.forward) vào 1 session GPU duy nhất -
+  ## 1 lần upload/commit/wait thay vì 2 lần riêng biệt (beAdd rồi
+  ## beLayernorm, mỗi cái tự alloc buffer + command buffer + wait). Trả về
+  ## CẢ HAI: `summed` (a+b thô, dùng làm residual cho lần cộng cuối block)
+  ## VÀ `normed` (đã qua layernorm) - để caller không phải cộng lại lần 2.
+  ## CHỈ có lợi thật trên backend đã có sessionLayernormEnc (hiện tại:
+  ## Metal). Nếu backend không hỗ trợ (CUDA/OpenCL/CPU/TSIC hiện tại, hoặc
+  ## encode lỗi lúc chạy) -> rơi về ĐÚNG đường cũ (beAdd rồi beLayernorm),
+  ## không đổi hành vi/độ chính xác, chỉ mất phần tăng tốc.
+  let be = ctx.kind.toByby()
+  let n = rows * cols
+  block fused:
+    if not sessionBegin(be): break fused
+    var hA = sessionUpload(be, @a)
+    var hB = sessionUpload(be, @b)
+    var hGamma = sessionUpload(be, @gamma)
+    var hBeta = sessionUpload(be, @beta)
+    var hSum = sessionAllocScratch(be, n)
+    var hOut = sessionAllocScratch(be, n)
+    let ok = sessionVecOp(be, "add", hA, hB, hSum, n) and
+             sessionLayernormEnc(be, hSum, hGamma, hBeta, hOut, rows, cols, eps)
+    if not ok or not sessionEnd(be):
+      sessionFree(be, hA); sessionFree(be, hB); sessionFree(be, hGamma)
+      sessionFree(be, hBeta); sessionFree(be, hSum); sessionFree(be, hOut)
+      break fused
+    result.summed = sessionRead(be, hSum, n)
+    result.normed = sessionRead(be, hOut, n)
+    sessionFree(be, hA); sessionFree(be, hB); sessionFree(be, hGamma)
+    sessionFree(be, hBeta); sessionFree(be, hSum); sessionFree(be, hOut)
+    return
+  # Fallback: đường cũ, 2 lệnh GPU riêng biệt.
+  result.summed = beAdd(ctx, a, b)
+  result.normed = beLayernorm(ctx, result.summed, gamma, beta, rows, cols, eps)
 
 proc beEmbeddingLookup*(ctx: Backend, table: openArray[float32], indices: openArray[int32], vocab, dim: int): seq[float32] =
   result = byby.gpuEmbeddingLookup(ctx.kind.toByby(), @table, @indices, vocab, dim)
