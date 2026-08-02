@@ -2,12 +2,67 @@
 ## File DUY NHẤT: nimformer_llama (RoPE + RMSNorm + SwiGLU + GQA + KV-cache paged)
 ## + tokenizer + vòng lặp sinh văn bản, gộp chung 1 file theo yêu cầu.
 
-import std/[math, random, sequtils, tables, algorithm, os, strformat, times, json]
+import std/[math, random, sequtils, tables, algorithm, os, strformat, times, json, sets]
 import nimformer  # Tensor, Linear, newLinear, flatten2D, transpose, Embedding, addT...
 import backend
+import tensor_ops  # beMax, beArgMax, beExp (GPU thật cho sampleTopP)
 import customfloat
 import quant       # loadQuantStateDict, dequantizeTensor, QuantTensor
 import nimpy
+
+# ─────────────────────────────────────────────────────────────
+# DEBUG: BYBY_DEBUG_PATH=1 để biết CHÍNH XÁC layer đầu tiên đang chạy đường
+# fused/resident (nhanh, 1 session/nhóm-op) hay rơi về đường LEGACY (mỗi
+# Linear/RMSNorm tự mở session riêng, hoặc tệ hơn: dequant lại toàn bộ
+# weight trên CPU mỗi token) ở từng điểm quyết định (QKV / attn+oProj /
+# FFN). Đây LÀ điểm khác biệt duy nhất giữa "~1 tok/s" và "0.3 tok/s" bạn
+# đang thấy - in ĐÚNG 1 LẦN/điểm (không spam mỗi token/layer) để không ảnh
+# hưởng tốc độ đo được. Bật: BYBY_DEBUG_PATH=1 ./nim_inference ...
+# Nếu bạn thấy BẤT KỲ dòng nào in "LEGACY fallback" cho layer 0 -> đó chính
+# là nguyên nhân chậm: residentReady/residentFp32Ready của Linear tương ứng
+# đang false (xem uploadResident() trong nimformer.nim) hoặc sessionBegin/
+# sessionMatmulQ4/sessionMatmul đang fail ngay từ lệnh gọi đầu tiên.
+# ─────────────────────────────────────────────────────────────
+var gDebugPathOn = existsEnv("BYBY_DEBUG_PATH")
+# ─────────────────────────────────────────────────────────────
+# KV-CACHE GPU-RESIDENT: TRƯỚC ĐÂY forwardDecode copy TOÀN BỘ lịch sử K/V
+# (S token đã sinh) từ CPU cache RỒI upload lại lên GPU MỖI TOKEN, MỖI
+# LAYER, MỖI KV-HEAD - chi phí O(S) mỗi bước, O(S^2) toàn phiên sinh, PHÌNH
+# DẦN theo độ dài đã sinh (độc lập hoàn toàn với buffer-pool hay
+# whole-session - đây là lượng DỮ LIỆU thật phải di chuyển CPU->GPU, không
+# phải overhead tạo object mà buffer-pool giải quyết). llama.cpp không bao
+# giờ làm vậy - KV cache của nó Ở LẠI GPU vĩnh viễn suốt phiên sinh, mỗi
+# token chỉ ghi thêm ĐÚNG 1 dòng mới.
+# FIX: mỗi (layer, kv-head) có 1 buffer GPU cố định [maxSeqLen*headDim],
+# cấp phát 1 LẦN (ensurePersistentKV, gọi NGOÀI mọi session - giống hệt
+# cách uploadResident() cấp resident weight 1 lần trong nimformer.nim).
+# Mỗi token chỉ upload ĐÚNG 1 dòng mới (headDim phần tử, KHÔNG phải
+# S*headDim) rồi sessionCopyInto() ghi thẳng vào đúng vị trí
+# (offset = cache.seqLen*headDim) trong buffer GPU-resident đó - dữ liệu cũ
+# (S-1 token trước) không bao giờ bị đụng lại. Attention matmul dùng THẲNG
+# buffer này (offset 0, đọc S*D phần tử đầu, phần còn lại trong buffer chưa
+# dùng tới không ảnh hưởng gì vì matmul chỉ nhận đúng N=S) làm hK/hV.
+var gPersistK = initTable[int, seq[SessionHandle]]()
+var gPersistV = initTable[int, seq[SessionHandle]]()
+
+proc ensurePersistentKV(be: GpuBackend, layerIdx, HKV, maxSeqLen, D: int) =
+  if layerIdx in gPersistK: return
+  var ks = newSeq[SessionHandle](HKV)
+  var vs = newSeq[SessionHandle](HKV)
+  for h in 0 ..< HKV:
+    ks[h] = sessionAllocScratch(be, maxSeqLen * D)
+    vs[h] = sessionAllocScratch(be, maxSeqLen * D)
+  gPersistK[layerIdx] = ks
+  gPersistV[layerIdx] = vs
+var gDebugPathSeen = initHashSet[string]()
+proc debugPathOnce(tag: string, usedFast: bool, extra: string = "") =
+  if not gDebugPathOn: return
+  if tag in gDebugPathSeen: return
+  gDebugPathSeen.incl(tag)
+  let verdict = if usedFast: "FUSED/RESIDENT (nhanh)"
+                else: "LEGACY fallback (CHAM - session rieng le hoac dequant CPU moi token)"
+  stderr.writeLine "[BYBY_DEBUG_PATH] " & tag & " -> " & verdict &
+    (if extra.len > 0: "  (" & extra & ")" else: "")
 
 # ===================================================================
 # Helper GHÉP SESSION cross-submodule: trước đây MỖI submodule (RMSNorm,
@@ -99,6 +154,17 @@ proc linearFast(l: Linear, xData: seq[float32], rows: int, ctx: Backend): seq[fl
     # đổi mỗi token) rồi matmul thẳng với handle weight có sẵn, không đụng
     # lại bytes weight. Đây chính là đường loại bỏ "upload 4.5GB mỗi token".
     result = beResidentLinearQ4(ctx, xData, l.residentW, rows)
+  elif l.residentFp32Ready:
+    # SỬA (BUG THẬT, NGUYÊN NHÂN "0.44 token/s"): trước đây hàm này chỉ kiểm
+    # tra residentReady (nhánh int4-asymmetric-per-group) rồi rơi THẲNG xuống
+    # dequant CPU toàn bộ ma trận + upload lại fp32 MỖI TOKEN cho MỌI weight
+    # khác (int8, int4-symmetric, fp32/tied-embedding lm_head) - dù
+    # nimformer.nim's Linear.forward() đã có sẵn tầng resident fp32 này từ
+    # trước (uploadResident() upload 1 lần lúc load model). File này
+    # (nim_inference.nim, dùng cho đường fused decode thật) đơn giản là quên
+    # gọi tầng đó. Giờ dùng chung residentFp32 + beResidentLinearFp32 giống
+    # hệt nimformer.nim, chỉ upload activation nhỏ mỗi token.
+    result = beResidentLinearFp32(ctx, xData, l.residentFp32, rows, l.inF, l.outF)
 
   if result.len == 0:
     # Chưa resident, hoặc backend hiện tại (vd cpu/tsic) không hỗ trợ đường
@@ -525,11 +591,15 @@ proc fusedNormQKVRoPE(attn: GQAAttention, norm: RMSNormL, x: Tensor, rope: RoPEL
   let (rows, inF) = flatten2D(x.shape)
   let n = rows * inF
 
-  # ---- CPU bắt buộc TRƯỚC session: chỉ phần reduce RMSNorm (đọc sumSq nhỏ
-  # để chạy sqrt) - KHÔNG còn dequant/ghép weight QKV ở đây nữa (xem
-  # linearFast ở trên: matmul chạy thẳng trên int4 nén, không cần dequant
-  # trước) ----
-  let (invBroadcast, wBroadcast, _) = rmsNormPrep(norm, x, ctx)
+  # SỬA (bug thật): TRƯỚC ĐÂY rmsNormPrep() (chạm CPU để chạy sqrt + tốn 1
+  # lượt GPU round-trip beMul/beMatmul riêng) bị gọi VÔ ĐIỀU KIỆN ở đây, TRƯỚC
+  # CẢ khi biết đường fused GPU thật (sessionRmsnormEnc bên dưới, mean+rsqrt+
+  # scale gộp hết trong 1 kernel GPU) có chạy được hay không. Nghĩa là ngay
+  # cả khi sessionRmsnormEnc THÀNH CÔNG (đường nhanh nhất, không đụng CPU),
+  # code vẫn tốn thêm 1 lượt GPU thừa + 1 lần chạm CPU vô ích MỖI TOKEN MỖI
+  # LAYER cho 1 giá trị (invBroadcast/wBroadcast) không hề dùng tới. Giờ chỉ
+  # gọi rmsNormPrep() ở ĐÚNG những nhánh fallback thật sự cần nó (xem các chỗ
+  # gọi `rmsNormPrep(norm, x, ctx)` bên dưới).
 
   let be = ctx.kind.toByby()
   var normed: seq[float32]
@@ -552,31 +622,69 @@ proc fusedNormQKVRoPE(attn: GQAAttention, norm: RMSNormL, x: Tensor, rope: RoPEL
   # dù resident đã sẵn sàng. Nếu token ra lại đúng khi bật cờ này trên
   # backend opencl -> bug chắc chắn nằm trong nhánh usedSession/sessionRope
   # của OpenCL (không phải ở kernel matmul/softmax cơ bản dùng chung).
-  let qkvResident = (not existsEnv("BYBY_FORCE_LEGACY_QKV")) and
-    attn.qProj.residentReady and attn.kProj.residentReady and attn.vProj.residentReady
+  # FIX (tiếp): TRƯỚC ĐÂY nhánh gộp-session này CHỈ kích hoạt khi Q/K/V
+  # resident theo đường int4-asymmetric thật (sessionMatmulQ4) - model
+  # export bằng --int8 (mặc định của export_to_nimq.py) hoặc --int4
+  # symmetric KHÔNG có residentReady=true nên qkvResident luôn false, rơi
+  # thẳng xuống "ĐƯỜNG CŨ" bên dưới: RMSNorm tự 1 session + Q/K/V mỗi cái
+  # lại tự mở 1 session riêng (residentFp32Ready, xem nimformer.forward) ->
+  # vẫn 4 lượt commit+wait GPU/layer dù đã có resident fp32. Giờ nhánh gộp
+  # dùng ĐƯỢC CẢ residentFp32 (sessionMatmul thường, không cần kernel int4
+  # riêng) -> model int8/tied cũng chỉ còn 1 session cho RMSNorm+QKV, y hệt
+  # đường Q4.
+  let qkvResidentQ4 = attn.qProj.residentReady and attn.kProj.residentReady and attn.vProj.residentReady
+  let qkvResidentFp32 = (not qkvResidentQ4) and attn.qProj.residentFp32Ready and
+    attn.kProj.residentFp32Ready and attn.vProj.residentFp32Ready
+  let qkvResident = (not existsEnv("BYBY_FORCE_LEGACY_QKV")) and (qkvResidentQ4 or qkvResidentFp32)
+  debugPathOnce("qkv.resident_ready", qkvResidentQ4 or qkvResidentFp32,
+    "Q4=" & $qkvResidentQ4 & " Fp32=" & $qkvResidentFp32 &
+    " (false ca 2 => uploadResident() chua chay hoac chay that bai cho qProj/kProj/vProj)")
   var usedSession = qkvResident and sessionBegin(be)
   # SỬA (gộp RoPE vào CÙNG session với QKV, xem sessionRope trong
-  # gpubackend.nim + rope_kernel trong vecop_matmul.metal): trước đây RoPE
-  # BẮT BUỘC phải là 1 session riêng ("Session #2" bên dưới) vì session API
-  # cũ không có kernel gather/rotate_half. Giờ nếu sessionRope() chạy được
-  # (hiện chỉ Metal có cài đặt thật - CUDA/OpenCL trả về false có chủ đích),
-  # ta xoay Q/K NGAY TRONG session QKV, TRƯỚC sessionEnd - Q/K đọc về CPU ở
-  # dưới đã là kết quả RoPE xong, không cần Session #2 nữa. Nếu sessionRope
-  # trả về false (chưa hỗ trợ / lỗi), ropeFused vẫn là false -> code cũ bên
-  # dưới (Session #2 / đường CPU) chạy y hệt như trước, không đổi hành vi.
+  # gpubackend.nim + rope_kernel trong vecop_matmul.metal/.cl): trước đây
+  # RoPE BẮT BUỘC phải là 1 session riêng ("Session #2" bên dưới) vì session
+  # API cũ không có kernel gather/rotate_half. Giờ Metal VÀ OpenCL đều có
+  # kernel rope_kernel thật (openclSessionRopeEnc/metalSessionRopeEnc), chỉ
+  # CUDA còn thiếu (cần build rope_kernel.cu bằng nvcc thành .ptx trước, xem
+  # cudaRopeR trong cuda_driver.nim) - sessionRope() tự trả về false cho CUDA
+  # nếu getFn("rope_kernel") không tìm thấy trong PTX đang nạp. Nếu
+  # sessionRope() chạy được, ta xoay Q/K NGAY TRONG session QKV, TRƯỚC
+  # sessionEnd - Q/K đọc về CPU ở dưới đã là kết quả RoPE xong, không cần
+  # Session #2 nữa. Nếu sessionRope trả về false (chưa hỗ trợ / lỗi),
+  # ropeFused vẫn là false -> code cũ bên dưới (Session #2 / đường CPU) chạy
+  # y hệt như trước, không đổi hành vi.
   var ropeFused = false
+  let tryFastRmsnorm = usedSession and not existsEnv("BYBY_DISABLE_SESSION_RMSNORM")
   if usedSession:
     var hX = sessionUpload(be, x.data)
-    var hInv = sessionUpload(be, invBroadcast)
-    var hW = sessionUpload(be, wBroadcast)
-    let hT1 = sVecOp(be, "mul", hX, hInv, n)
-    var hNormed = sVecOp(be, "mul", hT1, hW, n)
+    var hGamma: SessionHandle
+    var hInv, hW: SessionHandle
+    var hT1: SessionHandle
+    var hNormed: SessionHandle
+    var normedFast = false
+    if tryFastRmsnorm:
+      hGamma = sessionUpload(be, norm.weight.data)
+      var hNormedTry = sessionAllocScratch(be, n)
+      if sessionRmsnormEnc(be, hX, hGamma, hNormedTry, rows, inF, norm.eps):
+        hNormed = hNormedTry
+        normedFast = true
+      else:
+        sessionFree(be, hNormedTry)   # tránh leak scratch buffer khi thất bại
+    if not normedFast:
+      let (invBroadcast, wBroadcast, _) = rmsNormPrep(norm, x, ctx)
+      hInv = sessionUpload(be, invBroadcast)
+      hW = sessionUpload(be, wBroadcast)
+      hT1 = sVecOp(be, "mul", hX, hInv, n)
+      hNormed = sVecOp(be, "mul", hT1, hW, n)
     var hQ = sessionAllocScratch(be, rows * attn.qProj.outF)
     var hK = sessionAllocScratch(be, rows * attn.kProj.outF)
     var hV = sessionAllocScratch(be, rows * attn.vProj.outF)
-    let okQ = sessionMatmulQ4(be, hNormed, attn.qProj.residentW, hQ, rows)
-    let okK = sessionMatmulQ4(be, hNormed, attn.kProj.residentW, hK, rows)
-    let okV = sessionMatmulQ4(be, hNormed, attn.vProj.residentW, hV, rows)
+    let okQ = if qkvResidentQ4: sessionMatmulQ4(be, hNormed, attn.qProj.residentW, hQ, rows)
+              else: sessionMatmul(be, hNormed, attn.qProj.residentFp32, hQ, rows, attn.qProj.inF, attn.qProj.outF)
+    let okK = if qkvResidentQ4: sessionMatmulQ4(be, hNormed, attn.kProj.residentW, hK, rows)
+              else: sessionMatmul(be, hNormed, attn.kProj.residentFp32, hK, rows, attn.kProj.inF, attn.kProj.outF)
+    let okV = if qkvResidentQ4: sessionMatmulQ4(be, hNormed, attn.vProj.residentW, hV, rows)
+              else: sessionMatmul(be, hNormed, attn.vProj.residentFp32, hV, rows, attn.vProj.inF, attn.vProj.outF)
 
     var hCosT, hSinT: SessionHandle
     if okQ and okK:
@@ -600,9 +708,13 @@ proc fusedNormQKVRoPE(attn: GQAAttention, norm: RMSNormL, x: Tensor, rope: RoPEL
       qFlat0 = sessionRead(be, hQ, rows * attn.qProj.outF)  # đã xoay RoPE sẵn nếu ropeFused
       kFlat0 = sessionRead(be, hK, rows * attn.kProj.outF)  # đã xoay RoPE sẵn nếu ropeFused
       vFlat = sessionRead(be, hV, rows * attn.vProj.outF)
-    sessionFree(be, hX); sessionFree(be, hInv); sessionFree(be, hW)
-    var hT1v = hT1
-    sessionFree(be, hT1v); sessionFree(be, hNormed)
+    sessionFree(be, hX)
+    if tryFastRmsnorm: sessionFree(be, hGamma)
+    if not normedFast:
+      sessionFree(be, hInv); sessionFree(be, hW)
+      var hT1v = hT1
+      sessionFree(be, hT1v)
+    sessionFree(be, hNormed)
     sessionFree(be, hQ); sessionFree(be, hK); sessionFree(be, hV)
     if okQ and okK:
       sessionFree(be, hCosT); sessionFree(be, hSinT)
@@ -610,9 +722,11 @@ proc fusedNormQKVRoPE(attn: GQAAttention, norm: RMSNormL, x: Tensor, rope: RoPEL
       usedSession = false   # sessionMatmulQ4 fail (backend không hỗ trợ) -> rơi về đường cũ bên dưới
       ropeFused = false     # an toàn: nếu session coi như thất bại, KHÔNG được tin đã RoPE xong
 
+  debugPathOnce("qkv.path", usedSession)
   if not usedSession:
     # ĐƯỜNG CŨ (backend không phải Metal/OpenCL, hoặc resident chưa sẵn sàng,
     # hoặc sessionMatmulQ4 thất bại) - vẫn đúng, chỉ mất phần gộp session.
+    let (invBroadcast, wBroadcast, _) = rmsNormPrep(norm, x, ctx)
     var usedSessionOld = sessionBegin(be)
     if usedSessionOld:
       var hX = sessionUpload(be, x.data)
@@ -787,29 +901,54 @@ proc forwardDecode*(attn: GQAAttention, norm: RMSNormL, x: Tensor, rope: RoPEL, 
 
   var outHeads = newSeq[float32](H * D)
   let maxS = cache.maxSeqLen
+  let backend = ctx.kind.toByby()
 
-  # Gom dữ liệu từng group trước (CPU, rẻ) để có thể encode hết vào 1 session
-  #
-  # SỬA (loại bỏ hẳn transpose CPU O(S*D)/token): thêm sessionMatmulNT
-  # (C=A@B^T, B giữ nguyên layout gốc [N,K]) cho cả OpenCL/Metal/CUDA - K và
-  # V giờ đều chỉ cần 1 copyMem liền mạch từ cache, KHÔNG transpose vật lý
-  # nữa. kBlockT chỉ được build (lazy, đúng lúc cần) nếu backend hiện tại
-  # không hỗ trợ NT (fallback an toàn, không đổi kết quả).
-  var kBlocks = newSeq[seq[float32]](HKV)
-  var vBlocks = newSeq[seq[float32]](HKV)
+  ensurePersistentKV(backend, layerIdx, HKV, maxS, D)
+  var persistK = gPersistK[layerIdx]
+  var persistV = gPersistV[layerIdx]
+
+  # Ghi ĐÚNG 1 dòng mới (kNew/vNew, T=1, layout [HKV,D]) vào buffer
+  # GPU-resident của layer này - KHÔNG đụng lại S-1 dòng cũ đã có sẵn trên
+  # GPU từ các bước trước (xem giải thích ở ensurePersistentKV phía trên).
+  var kvWriteOk = sessionBegin(backend)
+  if kvWriteOk:
+    for hkv in 0 ..< HKV:
+      var kSlice = newSeq[float32](D)
+      var vSlice = newSeq[float32](D)
+      for d in 0 ..< D:
+        kSlice[d] = kNew[hkv * D + d]
+        vSlice[d] = vNew[hkv * D + d]
+      let hKNew = sessionUpload(backend, kSlice)
+      let hVNew = sessionUpload(backend, vSlice)
+      let okK = sessionCopyInto(backend, hKNew, persistK[hkv], cache.seqLen * D, D)
+      let okV = sessionCopyInto(backend, hVNew, persistV[hkv], cache.seqLen * D, D)
+      sessionFree(backend, hKNew); sessionFree(backend, hVNew)
+      if not (okK and okV): kvWriteOk = false
+    kvWriteOk = sessionEnd(backend) and kvWriteOk
+
+  # Fallback AN TOÀN (hiếm - chỉ khi sessionCopyInto không khả dụng trên
+  # backend/máy hiện tại): quay lại đúng đường CŨ (copy CPU cache + upload
+  # full-S mỗi head, chậm nhưng ĐÚNG) - dùng kBlocks/vBlocks CPU y hệt bản
+  # trước, KHÔNG đổi kết quả, chỉ mất phần tăng tốc GPU-resident.
+  var kBlocksFallback = newSeq[seq[float32]](HKV)
+  var vBlocksFallback = newSeq[seq[float32]](HKV)
+  if not kvWriteOk:
+    for hkv in 0 ..< HKV:
+      let headBase = hkv * maxS * D
+      var kBlock = newSeq[float32](S * D)
+      copyMem(addr kBlock[0], unsafeAddr cache.layers[layerIdx].k[headBase], S * D * sizeof(float32))
+      kBlocksFallback[hkv] = kBlock
+      var vBlock = newSeq[float32](S * D)
+      copyMem(addr vBlock[0], unsafeAddr cache.layers[layerIdx].v[headBase], S * D * sizeof(float32))
+      vBlocksFallback[hkv] = vBlock
+
+  proc getHK(hkv: int): SessionHandle =
+    if kvWriteOk: persistK[hkv] else: sessionUpload(backend, kBlocksFallback[hkv])
+  proc getHV(hkv: int): SessionHandle =
+    if kvWriteOk: persistV[hkv] else: sessionUpload(backend, vBlocksFallback[hkv])
+
   var qGroups = newSeq[seq[float32]](HKV)
   for hkv in 0 ..< HKV:
-    let headBase = hkv * maxS * D
-    # K, V: cache layout [nKVHeads, maxSeqLen, headDim] -> với hkv cố định, S
-    # token đầu ĐÃ contiguous sẵn -> chỉ cần copyMem, không transpose.
-    var kBlock = newSeq[float32](S * D)
-    copyMem(addr kBlock[0], unsafeAddr cache.layers[layerIdx].k[headBase], S * D * sizeof(float32))
-    kBlocks[hkv] = kBlock
-
-    var vBlock = newSeq[float32](S * D)
-    copyMem(addr vBlock[0], unsafeAddr cache.layers[layerIdx].v[headBase], S * D * sizeof(float32))
-    vBlocks[hkv] = vBlock
-
     var qGroup = newSeq[float32](nRep * D)
     for r in 0 ..< nRep:
       let h = hkv * nRep + r
@@ -826,7 +965,20 @@ proc forwardDecode*(attn: GQAAttention, norm: RMSNormL, x: Tensor, rope: RoPEL, 
       for d in 0 ..< D:
         result[d * S + s] = kBlock[s * D + d]
 
-  let backend = ctx.kind.toByby()
+  proc buildKBlockFromCache(hkv: int): seq[float32] =
+    ## Dùng CHO transposeKBlock fallback (rất hiếm - chỉ khi sessionMatmulNT
+    ## không hỗ trợ) - luôn đúng bất kể kvWriteOk vì appendKV() ở trên đã ghi
+    ## vào cache.layers CPU rồi, không phụ thuộc gì vào GPU-resident buffer.
+    let headBase = hkv * maxS * D
+    result = newSeq[float32](S * D)
+    copyMem(addr result[0], unsafeAddr cache.layers[layerIdx].k[headBase], S * D * sizeof(float32))
+
+  proc buildVBlockFromCache(hkv: int): seq[float32] =
+    ## Dùng CHO nhánh KHÔNG session nào chạy được (fallback sâu nhất, CPU
+    ## thuần) - cùng lý do như buildKBlockFromCache ở trên.
+    let headBase = hkv * maxS * D
+    result = newSeq[float32](S * D)
+    copyMem(addr result[0], unsafeAddr cache.layers[layerIdx].v[headBase], S * D * sizeof(float32))
   # SỬA (GỘP THÊM 1 BƯỚC NỮA - session attention-decode giờ nối thẳng vào
   # oProj, KHÔNG còn tách 2 session như bản trước): trước đây phải
   # sessionRead() outHeads về CPU giữa attention và oProj CHỈ ĐỂ ghép nRep*D
@@ -845,7 +997,11 @@ proc forwardDecode*(attn: GQAAttention, norm: RMSNormL, x: Tensor, rope: RoPEL, 
   # quay lại đường 2-session cũ (đã tự tay xác nhận đúng) nếu phát hiện sai
   # lệch/crash khi build thật.
   let legacyAttnOProj = existsEnv("BYBY_LEGACY_ATTN_OPROJ")
-  let oProjResidentMerged = (not legacyAttnOProj) and attn.oProj.residentReady
+  let oProjResidentMergedQ4 = (not legacyAttnOProj) and attn.oProj.residentReady
+  let oProjResidentMergedFp32 = (not legacyAttnOProj) and (not oProjResidentMergedQ4) and attn.oProj.residentFp32Ready
+  let oProjResidentMerged = oProjResidentMergedQ4 or oProjResidentMergedFp32
+  debugPathOnce("attn_oproj.resident_ready", oProjResidentMerged,
+    "Q4=" & $oProjResidentMergedQ4 & " Fp32=" & $oProjResidentMergedFp32)
   var usedMergedSession = oProjResidentMerged and sessionBegin(backend)
   var oProjOutMerged: seq[float32]
   if usedMergedSession:
@@ -855,9 +1011,10 @@ proc forwardDecode*(attn: GQAAttention, norm: RMSNormL, x: Tensor, rope: RoPEL, 
     allHandles.add(hOutHeads)
     for hkv in 0 ..< HKV:
       let hQ = sessionUpload(backend, qGroups[hkv])
-      let hK = sessionUpload(backend, kBlocks[hkv])
-      let hV = sessionUpload(backend, vBlocks[hkv])
-      allHandles.add(hQ); allHandles.add(hK); allHandles.add(hV)
+      let hK = getHK(hkv)
+      let hV = getHV(hkv)
+      allHandles.add(hQ)
+      if not kvWriteOk: allHandles.add(hK); allHandles.add(hV)  # buffer GPU-resident KHONG duoc free
 
       var hScores: SessionHandle
       let (ntHandle, ntOk) = sMatmulNT(backend, hQ, nRep, D, hK, S)
@@ -865,7 +1022,7 @@ proc forwardDecode*(attn: GQAAttention, norm: RMSNormL, x: Tensor, rope: RoPEL, 
         hScores = ntHandle
         allHandles.add(hScores)
       else:
-        let hKT = sessionUpload(backend, transposeKBlock(kBlocks[hkv]))
+        let hKT = sessionUpload(backend, transposeKBlock(buildKBlockFromCache(hkv)))
         allHandles.add(hKT)
         hScores = sMatmul(backend, hQ, nRep, D, hKT, S)
         allHandles.add(hScores)
@@ -883,7 +1040,8 @@ proc forwardDecode*(attn: GQAAttention, norm: RMSNormL, x: Tensor, rope: RoPEL, 
 
     var hOProjOut = sessionAllocScratch(backend, C)
     allHandles.add(hOProjOut)
-    let okO = okAll and sessionMatmulQ4(backend, hOutHeads, attn.oProj.residentW, hOProjOut, 1)
+    let okO = okAll and (if oProjResidentMergedQ4: sessionMatmulQ4(backend, hOutHeads, attn.oProj.residentW, hOProjOut, 1)
+                          else: sessionMatmul(backend, hOutHeads, attn.oProj.residentFp32, hOProjOut, 1, attn.oProj.inF, attn.oProj.outF))
     usedMergedSession = sessionEnd(backend)
     if usedMergedSession and okO:
       oProjOutMerged = sessionRead(backend, hOProjOut, C)
@@ -893,6 +1051,7 @@ proc forwardDecode*(attn: GQAAttention, norm: RMSNormL, x: Tensor, rope: RoPEL, 
     elif attn.oProj.bias.data.len == C:
       for o in 0 ..< C: oProjOutMerged[o] += attn.oProj.bias.data[o]
 
+  debugPathOnce("attn_oproj.path", usedMergedSession)
   if usedMergedSession:
     result = newTensor(@[1, 1, C])
     result.data = oProjOutMerged
@@ -910,9 +1069,10 @@ proc forwardDecode*(attn: GQAAttention, norm: RMSNormL, x: Tensor, rope: RoPEL, 
     var allHandles = newSeq[SessionHandle]()
     for hkv in 0 ..< HKV:
       let hQ = sessionUpload(backend, qGroups[hkv])
-      let hK = sessionUpload(backend, kBlocks[hkv])
-      let hV = sessionUpload(backend, vBlocks[hkv])
-      allHandles.add(hQ); allHandles.add(hK); allHandles.add(hV)
+      let hK = getHK(hkv)
+      let hV = getHV(hkv)
+      allHandles.add(hQ)
+      if not kvWriteOk: allHandles.add(hK); allHandles.add(hV)  # buffer GPU-resident KHONG duoc free
 
       var hScores: SessionHandle
       let (ntHandle, ntOk) = sMatmulNT(backend, hQ, nRep, D, hK, S)
@@ -920,7 +1080,7 @@ proc forwardDecode*(attn: GQAAttention, norm: RMSNormL, x: Tensor, rope: RoPEL, 
         hScores = ntHandle
         allHandles.add(hScores)
       else:
-        let hKT = sessionUpload(backend, transposeKBlock(kBlocks[hkv]))
+        let hKT = sessionUpload(backend, transposeKBlock(buildKBlockFromCache(hkv)))
         allHandles.add(hKT)
         hScores = sMatmul(backend, hQ, nRep, D, hKT, S)
         allHandles.add(hScores)
@@ -941,10 +1101,10 @@ proc forwardDecode*(attn: GQAAttention, norm: RMSNormL, x: Tensor, rope: RoPEL, 
 
   if not usedSession:
     for hkv in 0 ..< HKV:
-      let kBlockT = transposeKBlock(kBlocks[hkv])
+      let kBlockT = transposeKBlock(buildKBlockFromCache(hkv))
       var scores = beMatmul(ctx, qGroups[hkv], nRep, D, kBlockT, D, S)
       let probs = beSoftmax(ctx, scores, nRep, S)
-      let outGroup = beMatmul(ctx, probs, nRep, S, vBlocks[hkv], S, D)
+      let outGroup = beMatmul(ctx, probs, nRep, S, buildVBlockFromCache(hkv), S, D)
       for r in 0 ..< nRep:
         let h = hkv * nRep + r
         for d in 0 ..< D:
@@ -952,12 +1112,15 @@ proc forwardDecode*(attn: GQAAttention, norm: RMSNormL, x: Tensor, rope: RoPEL, 
 
   let legacyOProj = existsEnv("BYBY_LEGACY_OPROJ")
   var oProjOut: seq[float32]
-  let oProjResident = (not legacyOProj) and attn.oProj.residentReady
+  let oProjResidentQ4 = (not legacyOProj) and attn.oProj.residentReady
+  let oProjResidentFp32 = (not legacyOProj) and (not oProjResidentQ4) and attn.oProj.residentFp32Ready
+  let oProjResident = oProjResidentQ4 or oProjResidentFp32
   var usedOProjSession = oProjResident and sessionBegin(backend)
   if usedOProjSession:
     var hIn = sessionUpload(backend, outHeads)
     var hOut = sessionAllocScratch(backend, C)
-    let okO = sessionMatmulQ4(backend, hIn, attn.oProj.residentW, hOut, 1)
+    let okO = if oProjResidentQ4: sessionMatmulQ4(backend, hIn, attn.oProj.residentW, hOut, 1)
+              else: sessionMatmul(backend, hIn, attn.oProj.residentFp32, hOut, 1, attn.oProj.inF, attn.oProj.outF)
     usedOProjSession = sessionEnd(backend)
     if usedOProjSession and okO:
       oProjOut = sessionRead(backend, hOut, C)
@@ -1014,8 +1177,11 @@ proc fusedResidualNormFFN(norm: RMSNormL, ff: SwiGLUL, x, attnOut: Tensor, ctx: 
   # chính là phần tốn thời gian nhất trước đây (3 ma trận full-size giải nén
   # + upload lại MỖI TOKEN, MỖI LAYER dù trọng số không hề đổi giữa các
   # token) - xem linearFast() ở đầu file.
+  # SỬA (bug thật, cùng loại với fusedNormQKVRoPE ở trên): rmsNormPrep() chỉ
+  # gọi LAZY ở đúng nhánh fallback cần nó bên dưới, không gọi vô điều kiện ở
+  # đây nữa (trước đây tốn 1 lượt GPU + 1 lần chạm CPU thừa mỗi token/layer
+  # kể cả khi sessionRmsnormEnc chạy được, không cần giá trị này).
   let x2 = addT(ctx, x, attnOut)
-  let (invBroadcast, wBroadcast, _) = rmsNormPrep(norm, x2, ctx)
   let interF = ff.gateProj.outF
   let nInter = rows * interF
 
@@ -1023,7 +1189,8 @@ proc fusedResidualNormFFN(norm: RMSNormL, ff: SwiGLUL, x, attnOut: Tensor, ctx: 
   var normed: seq[float32]
   var gateRaw, upRaw: seq[float32]
 
-  let gateUpResident = ff.gateProj.residentReady and ff.upProj.residentReady
+  let gateUpResidentQ4 = ff.gateProj.residentReady and ff.upProj.residentReady
+  let gateUpResidentFp32 = (not gateUpResidentQ4) and ff.gateProj.residentFp32Ready and ff.upProj.residentFp32Ready
 
   # SỬA (gộp 2 session FFN thành 1, thử TRƯỚC TIÊN): gate/up-matmul ->
   # (+bias GPU) -> sigmoid -> mul -> mul -> down-matmul -> (+bias GPU) chạy
@@ -1035,18 +1202,46 @@ proc fusedResidualNormFFN(norm: RMSNormL, ff: SwiGLUL, x, attnOut: Tensor, ctx: 
   # là nguồn overhead chính, xem phân tích ở generate()).
   var ffOut: seq[float32]
   let legacyFFN = existsEnv("BYBY_LEGACY_FFN")  # cửa thoát hiểm: set BYBY_LEGACY_FFN=1 để tắt đường gộp mới
-  let allResident = (not legacyFFN) and gateUpResident and ff.downProj.residentReady
+  let downResidentQ4 = ff.downProj.residentReady
+  let downResidentFp32 = (not downResidentQ4) and ff.downProj.residentFp32Ready
+  # FIX: TRƯỚC ĐÂY chỉ nhận resident Q4 (model --q4km) - model int8/int4-
+  # symmetric (mặc định export_to_nimq.py) luôn rơi về "ĐƯỜNG CŨ" bên dưới dù
+  # đã có resident fp32, mất hết phần gộp session. Giờ allResident đúng khi
+  # CẢ 3 Linear đi CÙNG 1 đường (toàn Q4 hoặc toàn fp32) - model dùng đồng
+  # nhất 1 kind cho mọi Linear nên trong thực tế luôn rơi vào 1 trong 2 nhánh.
+  let allResidentQ4 = gateUpResidentQ4 and downResidentQ4
+  let allResidentFp32 = gateUpResidentFp32 and downResidentFp32
+  let allResident = (not legacyFFN) and (allResidentQ4 or allResidentFp32)
+  debugPathOnce("ffn.resident_ready", allResidentQ4 or allResidentFp32,
+    "Q4=" & $allResidentQ4 & " Fp32=" & $allResidentFp32 & " legacyFFN=" & $legacyFFN)
   var usedSessionFused = allResident and sessionBegin(be)
+  let tryFastRmsnormFFN = usedSessionFused and not existsEnv("BYBY_DISABLE_SESSION_RMSNORM")
   if usedSessionFused:
     var hX2 = sessionUpload(be, x2.data)
-    var hInv = sessionUpload(be, invBroadcast)
-    var hW = sessionUpload(be, wBroadcast)
-    let hT1 = sVecOp(be, "mul", hX2, hInv, n)
-    var hNormed = sVecOp(be, "mul", hT1, hW, n)
+    var hGamma: SessionHandle
+    var hInv, hW, hT1: SessionHandle
+    var hNormed: SessionHandle
+    var normedFastFFN = false
+    if tryFastRmsnormFFN:
+      hGamma = sessionUpload(be, norm.weight.data)
+      var hNormedTry = sessionAllocScratch(be, n)
+      if sessionRmsnormEnc(be, hX2, hGamma, hNormedTry, rows, hidden, norm.eps):
+        hNormed = hNormedTry
+        normedFastFFN = true
+      else:
+        sessionFree(be, hNormedTry)
+    if not normedFastFFN:
+      let (invBroadcast, wBroadcast, _) = rmsNormPrep(norm, x2, ctx)
+      hInv = sessionUpload(be, invBroadcast)
+      hW = sessionUpload(be, wBroadcast)
+      hT1 = sVecOp(be, "mul", hX2, hInv, n)
+      hNormed = sVecOp(be, "mul", hT1, hW, n)
     var hGate = sessionAllocScratch(be, nInter)
     var hUp = sessionAllocScratch(be, nInter)
-    let okG = sessionMatmulQ4(be, hNormed, ff.gateProj.residentW, hGate, rows)
-    let okU = sessionMatmulQ4(be, hNormed, ff.upProj.residentW, hUp, rows)
+    let okG = if allResidentQ4: sessionMatmulQ4(be, hNormed, ff.gateProj.residentW, hGate, rows)
+              else: sessionMatmul(be, hNormed, ff.gateProj.residentFp32, hGate, rows, ff.gateProj.inF, ff.gateProj.outF)
+    let okU = if allResidentQ4: sessionMatmulQ4(be, hNormed, ff.upProj.residentW, hUp, rows)
+              else: sessionMatmul(be, hNormed, ff.upProj.residentFp32, hUp, rows, ff.upProj.inF, ff.upProj.outF)
     # Cộng bias GPU (nếu có) - thay cho vòng for CPU cũ, giữ session mở liền mạch.
     if ff.gateProj.bias.data.len == ff.gateProj.outF:
       let hGB = sessionUpload(be, broadcastBias(ff.gateProj.bias, rows, ff.gateProj.outF))
@@ -1060,7 +1255,8 @@ proc fusedResidualNormFFN(norm: RMSNormL, ff: SwiGLUL, x, attnOut: Tensor, ctx: 
     let hSilu = sVecOp(be, "mul", hGate, hSig, nInter)
     var hGated = sVecOp(be, "mul", hSilu, hUp, nInter)
     var hOut = sessionAllocScratch(be, rows * ff.downProj.outF)
-    let okD = sessionMatmulQ4(be, hGated, ff.downProj.residentW, hOut, rows)
+    let okD = if allResidentQ4: sessionMatmulQ4(be, hGated, ff.downProj.residentW, hOut, rows)
+              else: sessionMatmul(be, hGated, ff.downProj.residentFp32, hOut, rows, ff.downProj.inF, ff.downProj.outF)
     if ff.downProj.bias.data.len == ff.downProj.outF:
       let hDB = sessionUpload(be, broadcastBias(ff.downProj.bias, rows, ff.downProj.outF))
       let hOut2 = sVecOp(be, "add", hOut, hDB, rows * ff.downProj.outF)
@@ -1072,7 +1268,7 @@ proc fusedResidualNormFFN(norm: RMSNormL, ff: SwiGLUL, x, attnOut: Tensor, ctx: 
       usedSessionFused = false
     # free hết handle trung gian - không quan trọng free đúng cái nào 2 lần
     # vì sessionFree trên handle đã free là no-op an toàn trong gpubackend.nim
-    sessionFree(be, hX2); sessionFree(be, hInv); sessionFree(be, hW)
+    sessionFree(be, hX2); sessionFree(be, hInv); sessionFree(be, hW); sessionFree(be, hGamma)
     var hT1v = hT1; var hNormedV = hNormed
     sessionFree(be, hT1v); sessionFree(be, hNormedV)
     sessionFree(be, hGate); sessionFree(be, hUp)
@@ -1080,9 +1276,11 @@ proc fusedResidualNormFFN(norm: RMSNormL, ff: SwiGLUL, x, attnOut: Tensor, ctx: 
     sessionFree(be, hSigV); sessionFree(be, hSiluV); sessionFree(be, hGated)
     sessionFree(be, hOut)
 
+  debugPathOnce("ffn.path", usedSessionFused)
   if not usedSessionFused:
     # ĐƯỜNG CŨ (fallback nếu chưa resident hết hoặc session thất bại giữa
     # chừng) - giữ nguyên y hệt logic 2-session trước đây, KHÔNG đổi hành vi.
+    let (invBroadcast, wBroadcast, _) = rmsNormPrep(norm, x2, ctx)
     let gateUpResidentOld = ff.gateProj.residentReady and ff.upProj.residentReady
     var usedSession = gateUpResidentOld and sessionBegin(be)
     if usedSession:
@@ -1184,16 +1382,26 @@ proc fusedResidualNormFFN(norm: RMSNormL, ff: SwiGLUL, x, attnOut: Tensor, ctx: 
   result = newTensor(x.shape)
   result.data = beAdd(ctx, x2.data, ffOut)   # residual-add cuối
 
+var gAttnTime*: float = 0.0
+var gFfnTime*: float = 0.0
+
 proc forward*(blk: TransformerBlockLlama, x: Tensor, rope: RoPEL, ctx: Backend,
               cache: var KVCacheL, layerIdx: int, isPrefill: bool): Tensor =
   ## RMSNorm(input) nằm BÊN TRONG forwardPrefill/forwardDecode (gộp với QKV+
   ## RoPE - xem fusedNormQKVRoPE), và residual+RMSNorm(post-attn)+FFN+residual
   ## nằm trong fusedResidualNormFFN - cả block giờ chỉ còn 2 session GPU thay
   ## vì 4+ session rời rạc theo từng submodule như trước.
+  # ĐO: tách thời gian attn (QKV+RoPE+attention+oProj) và FFN riêng, cộng dồn
+  # qua mọi layer/token - để biết chính xác thời gian rơi vào đâu thay vì đoán.
+  let t0 = epochTime()
   let attnOut =
     if isPrefill: forwardPrefill(blk.attn, blk.inputNorm, x, rope, ctx, cache, layerIdx)
     else: forwardDecode(blk.attn, blk.inputNorm, x, rope, ctx, cache, layerIdx)
+  let t1 = epochTime()
   result = fusedResidualNormFFN(blk.postAttnNorm, blk.ff, x, attnOut, ctx)
+  let t2 = epochTime()
+  gAttnTime += (t1 - t0)
+  gFfnTime += (t2 - t1)
 
 # ===================================================================
 # LlamaModelL — model đầy đủ
@@ -1239,10 +1447,16 @@ proc forwardStep*(m: LlamaModelL, ids: seq[int], ctx: Backend, cache: var KVCach
     x = m.blocks[idx].forward(x, m.rope, ctx, cache, idx, isPrefill)
     # GC: với --gc:arc (ref-counting), GC_fullCollect() là no-op hoàn toàn —
     # bộ nhớ tạm của mỗi layer được giải phóng ngay khi ra khỏi scope, không
-    # tích luỹ. Giữ lại call này để tương thích nếu build không có --gc:arc
-    # (khi đó vẫn ép dọn mỗi 8 layer thay vì 4 — mỗi layer tạm ~50-100MB
-    # x 8 = ~800MB tích luỹ tối đa, vẫn dưới ngưỡng OOM trên máy 16GB).
-    if (idx + 1) mod 8 == 0 or idx == m.blocks.len - 1:
+    # tích luỹ. SỬA: CHỈ ép dọn khi đang prefill (chạy đúng 1 lần/prompt, T
+    # token cùng lúc nên tạm thời có thể phình to) - decode (T=1/bước, chạy
+    # LẶP LẠI mỗi token) không còn ép GC nữa. Trước đây gọi vô điều kiện cả
+    # lúc decode -> nếu build không dùng --gc:arc, mỗi token phải trả thêm 4
+    # lần full stop-the-world scan (mod 8 x 32 layer + layer cuối), một chi
+    # phí CPU thuần cộng dồn như nhau trên CPU/Metal/CUDA/OpenCL, không liên
+    # quan gì kernel GPU - góp phần giải thích vì sao cả 3 backend GPU cùng
+    # chậm bất thường như nhau so với llama.cpp.
+    if (isPrefill or existsEnv("BYBY_LEGACY_DECODE_GC")) and
+       ((idx + 1) mod 8 == 0 or idx == m.blocks.len - 1):
       GC_fullCollect()
     when defined(debugStates):
       if idx == 0:
@@ -1404,7 +1618,7 @@ proc applyChatTemplate*(tok: HFTokenizer, userText: string, systemText: string =
   let messages = jsonMod.loads($msgs)
   result = tok.tok.apply_chat_template(messages, tokenize = true, add_generation_prompt = true).to(seq[int])
 
-proc sampleTopP(logits: seq[float32], temperature: float32 = 0.7'f32, topP: float32 = 0.9'f32,
+proc sampleTopP(ctx: Backend, logits: seq[float32], temperature: float32 = 0.7'f32, topP: float32 = 0.9'f32,
                  recentIds: openArray[int] = [], repeatPenalty: float32 = 1.3'f32,
                  noPenaltyIds: openArray[int] = []): int =
   # SỬA: thêm repetition penalty (kiểu llama.cpp) - không có cái này model
@@ -1422,49 +1636,392 @@ proc sampleTopP(logits: seq[float32], temperature: float32 = 0.7'f32, topP: floa
   # (\n, space, tab) không nên bị coi là "lặp lại nội dung" như token
   # thường. Fix: nhận thêm noPenaltyIds (id của \n/space/tab/thụt lề lấy
   # từ tokenizer), bỏ qua các id này khi áp penalty.
-  var adjLogits = logits
-  if repeatPenalty != 1.0'f32:
-    for id in recentIds:
-      if id >= 0 and id < adjLogits.len:
-        var skip = false
-        for npid in noPenaltyIds:
-          if id == npid:
-            skip = true
-            break
-        if skip: continue
-        if adjLogits[id] > 0'f32: adjLogits[id] = adjLogits[id] / repeatPenalty
-        else: adjLogits[id] = adjLogits[id] * repeatPenalty
+  # SỬA: phạt lặp từ giờ chạy qua beRepeatPenalty (GPU thật khi ctx là
+  # backend GPU - xem gpuRepeatPenalty trong gpubackend.nim, kernel
+  # repeat_penalty_kernel trong vecop_matmul.metal/.cl/vecop_ext_kernel.cu).
+  # Đây là bước CUỐI CÙNG còn chạm CPU trong sampleTopP (scatter-write rời
+  # rạc theo index, không phải elementwise/reduce/sort đơn giản) - giờ đã có
+  # kernel riêng, dedupe id chỉ đụng vài chục số nguyên nhỏ (không phải
+  # vector logits/vocab lớn).
+  var adjLogits = beRepeatPenalty(ctx, logits, recentIds, repeatPenalty, noPenaltyIds)
 
   if temperature <= 0'f32:
-    var best = 0
-    for i in 1 ..< adjLogits.len:
-      if adjLogits[i] > adjLogits[best]: best = i
-    return best
-  var probs = newSeq[float32](adjLogits.len)
-  var maxL = adjLogits[0]
-  for v in adjLogits:
-    if v > maxL: maxL = v
-  var sumExp = 0'f32
-  for i in 0 ..< adjLogits.len:
-    probs[i] = exp((adjLogits[i] - maxL) / temperature)
-    sumExp += probs[i]
-  for i in 0 ..< probs.len: probs[i] /= sumExp
+    # SỬA: dùng beArgMax (GPU thật khi ctx là backend GPU - xem gpuReduce/
+    # metalReduce op="argmax" trong gpubackend.nim) thay vì vòng for CPU thuần
+    # trước đây. Trên backend cpu, beArgMax tự rơi về đúng cùng thuật toán
+    # linear-scan này (không đổi kết quả, chỉ đổi nơi chạy).
+    return beArgMax(adjLogits, backend = $ctx.kind)
+  # SỬA: max-find và exp giờ chạy qua beMax/beExp (GPU thật khi ctx là
+  # backend GPU) thay vì 2 vòng for CPU thuần trước đây - đây là 2 lượt quét
+  # toàn bộ vector logits (kích thước = vocab, có thể tới 150k phần tử).
+  var probs: seq[float32]
+  block:
+    let maxArr = beMax(adjLogits, @[adjLogits.len], 0, backend = $ctx.kind)
+    let maxL = maxArr[0]
+    let shiftedRaw = beSub(adjLogits, newSeqWith(adjLogits.len, maxL), backend = $ctx.kind)
+    let shifted = beDiv(shiftedRaw, newSeqWith(adjLogits.len, temperature), backend = $ctx.kind)
+    probs = beExp(shifted, backend = $ctx.kind)
+  let sumExp = beSum(probs, @[probs.len], 0, backend = $ctx.kind)[0]
+  probs = beDiv(probs, newSeqWith(probs.len, sumExp), backend = $ctx.kind)
 
-  var idx = toSeq(0 ..< probs.len)
-  idx.sort(proc(a, b: int): int = cmp(probs[b], probs[a]))
-  var cum = 0'f32
+  # SỬA: sort giảm dần giờ chạy qua beSortDescIdx (bitonic sort GPU thật khi
+  # ctx là backend GPU - xem gpuSortDescPadded trong gpubackend.nim, kernel
+  # bitonic_sort_kernel trong vecop_matmul.metal/.cl/vecop_ext_kernel.cu).
+  # Đây là bước CUỐI CÙNG của sampleTopP từng buộc phải chạm CPU (sort/so
+  # sánh cặp không phải elementwise/reduce đơn giản) - giờ đã có kernel riêng.
+  let (sortedProbs, idx) = beSortDescIdx(probs, backend = $ctx.kind)
+  let cumArr = beCumsum(sortedProbs, @[sortedProbs.len], 0, backend = $ctx.kind)
   var cutoff = idx.len
-  for i, id in idx:
-    cum += probs[id]
-    if cum >= topP:
+  for i, c in cumArr:
+    if c >= topP:
       cutoff = i + 1
       break
+  let cum = cumArr[cutoff - 1]
   var r = rand(1.0'f32) * cum
   var acc = 0'f32
   for i in 0 ..< cutoff:
     acc += probs[idx[i]]
     if acc >= r: return idx[i]
   return idx[cutoff - 1]
+
+
+## whole_model_session_decode.nim
+## ============================================================================
+## SỬA (bản 3 - sau khi bản layer-session/1-session-mỗi-layer VẪN lag và
+## chậm hơn cả đường forwardDecode cũ ở trên): quay lại đúng yêu cầu ban đầu
+## - "session toàn model" (1 sessionBegin/sessionEnd DUY NHẤT cho CẢ 32 layer
+## + finalNorm + lm_head, MỖI TOKEN) - nhưng sửa 2 lỗi THẬT đã gây lag/chậm ở
+## các bản trước, không phải do bản thân ý tưởng "1 session/token" sai:
+##
+## 1) LEAK BUFFER (nguyên nhân lag máy tích luỹ qua nhiều token): bản 1-
+##    session/token ĐẦU TIÊN gọi sessionUpload/sessionAllocScratch cho MỌI
+##    buffer tạm (hGamma, hNormed, hQh/hKh/hVh, hScores, hProbs...) nhưng
+##    KHÔNG BAO GIỜ gọi sessionFree - mỗi MTLBuffer là 1 object Objective-C
+##    retain bằng __bridge_retained (xem metal_shim.m), sống mãi tới khi
+##    process thoát nếu không free tay. Với ~15-20 buffer tạm/layer x 32
+##    layer x hàng chục/hàng trăm token sinh ra = hàng chục nghìn buffer
+##    RAM/VRAM không giải phóng -> máy lag dần, đúng triệu chứng quan sát
+##    được. Bản này free NGAY sau sessionEnd() (khi buffer đã an toàn để
+##    release - GPU đã waitUntilCompleted xong).
+##
+## 2) RE-UPLOAD TOÀN BỘ KV-CACHE MỖI TOKEN (nguyên nhân "chậm hơn cả bản
+##    cũ", CÀNG SINH DÀI CÀNG CHẬM): forwardDecode() ở TRÊN (đường "cũ")
+##    lưu KV-cache dạng mảng CPU (KVCacheL.layers[].k/v) rồi COPY + UPLOAD
+##    LẠI TOÀN BỘ S*D phần tử (S = độ dài đã sinh tới hiện tại) lên GPU MỖI
+##    TOKEN MỖI LAYER qua sessionUpload(kBlock)/sessionUpload(vBlock) - đây
+##    là O(S) băng thông upload/token, tăng dần tuyến tính theo độ dài đã
+##    sinh (token 200 upload nhiều gấp 10 token 20) - đây MỚI là lý do chính
+##    khiến sinh càng lâu càng chậm, ĐỘC LẬP với số lượng session/token.
+##    Nếu giữ nguyên cách lưu KV-cache này mà chỉ gộp session lại (bản
+##    layer-session ở trên), phần O(S) upload KHÔNG hề giảm -> vẫn chậm dần,
+##    đúng như quan sát "vẫn chậm hơn cả bản cũ".
+##    Fix: KV-cache chuyển hẳn sang buffer GPU THƯỜNG TRÚ (SessionHandle,
+##    cấp phát 1 LẦN DUY NHẤT lúc chuẩn bị, kích thước maxSeqLen*headDim),
+##    APPEND đúng 1 token/lần bằng sessionCopyInto (ghi D phần tử vào đúng
+##    offset pos*D, KHÔNG đụng lại phần đã ghi trước đó) - upload O(1)/token
+##    thay vì O(S)/token, và KHÔNG rời GPU nên gộp thẳng vào session toàn
+##    model được.
+##
+## Q/K/V projection của mỗi layer được TÁCH thành N_KV_HEADS resident-weight
+## Q4 riêng (thay vì 1 resident lớn rồi cắt) vì sessionCopyInto hiện tại CHỈ
+## hỗ trợ offset ĐÍCH, không hỗ trợ offset NGUỒN (xem gpubackend.nim) - tách
+## theo dải hàng là cách duy nhất để mỗi KV-head có 1 buffer kết quả matmul
+## riêng biệt, không cần cắt buffer chung. KHÔNG đổi giá trị toán học.
+##
+## !! CHƯA BUILD-TEST TRÊN PHẦN CỨNG THẬT (không có compiler/GPU ở môi
+## trường viết code này) !! Trước khi tin kết quả sinh ra:
+##   1. Build thử, sinh vài chục token, so token id với đường forwardDecode
+##      cũ (BYBY_WHOLE_SESSION=0) trên CÙNG 1 prompt - lệch token là có bug.
+##   2. Theo dõi RAM/VRAM qua Activity Monitor trong lúc sinh dài (200+
+##      token) - nếu vẫn tăng dần đều, còn leak buffer ở đâu đó chưa free.
+## ============================================================================
+
+proc sliceResidentQ4ByRowsW(ctx: Backend, qt: QuantTensor, rowsPerChunk, nChunks: int): seq[ResidentWeightHandle] =
+  ## Giống hệt logic tách GPTQ theo dải hàng đã dùng ở uploadResident()/
+  ## linearFast() phía trên (xem đầu file) - chỉ khác chỗ TRẢ VỀ N phần
+  ## riêng thay vì 1 khối, để mỗi KV-head có ResidentWeightHandle độc lập.
+  ## Nếu weight không phải int4-per-group -> trả @[] rỗng, caller PHẢI coi
+  ## là "không đi được đường whole-session", fallback forwardStep/forwardDecode cũ.
+  result = @[]
+  if qt.kind != qkInt4Asymmetric or qt.groupSize <= 0:
+    return
+  let k = qt.shape[1]
+  let bytesPerRow = (k + 1) div 2
+  let nGroupsPerRow = (k + qt.groupSize - 1) div qt.groupSize
+  for c in 0 ..< nChunks:
+    let rowStart = c * rowsPerChunk
+    let rowEnd = rowStart + rowsPerChunk
+    let byteStart = rowStart * bytesPerRow
+    let byteEnd = rowEnd * bytesPerRow
+    let sgStart = rowStart * nGroupsPerRow
+    let sgEnd = rowEnd * nGroupsPerRow
+    let dataSlice = qt.data[byteStart ..< byteEnd]
+    let scaleSlice = qt.scale[sgStart ..< sgEnd]
+    let zeroSlice = qt.zero_point[sgStart ..< sgEnd]
+    let h = beResidentUploadQ4(ctx, dataSlice, scaleSlice, zeroSlice,
+                                k, rowsPerChunk, qt.groupSize, nGroupsPerRow)
+    result.add(h)
+
+type
+  LayerWholeState = object
+    ready*: bool
+    qHeadW*, kHeadW*, vHeadW*: seq[ResidentWeightHandle]   # len = nKVHeads
+    kCacheH*, vCacheH*: seq[SessionHandle]                  # len = nKVHeads, mỗi cái [maxSeqLen*headDim] - THƯỜNG TRÚ
+
+  WholeModelSessionState* = object
+    layers*: seq[LayerWholeState]
+    maxSeqLen*: int
+    ready*: bool
+
+proc prepareWholeModelSession*(m: LlamaModelL, ctx: Backend, maxSeqLen: int): WholeModelSessionState =
+  ## Gọi 1 LẦN duy nhất, NGAY SAU uploadAllResidentWeights(). Cấp KV-cache
+  ## GPU thường trú (kCacheH/vCacheH) - SỐNG SUỐT vòng đời generate(), khác
+  ## hẳn KVCacheL (CPU-array) mà forwardDecode() cũ dùng - 2 đường KHÔNG
+  ## dùng chung bộ nhớ, chỉ dùng chung `cache.seqLen` để biết vị trí hiện tại.
+  result.maxSeqLen = maxSeqLen
+  result.ready = true
+  result.layers = newSeq[LayerWholeState](m.blocks.len)
+  for li in 0 ..< m.blocks.len:
+    let attn = m.blocks[li].attn
+    let H = attn.nHeads
+    let HKV = attn.nKVHeads
+    let D = attn.headDim
+    let nRep = H div HKV
+    var st: LayerWholeState
+    st.qHeadW = sliceResidentQ4ByRowsW(ctx, attn.qProj.weightQ, nRep * D, HKV)
+    st.kHeadW = sliceResidentQ4ByRowsW(ctx, attn.kProj.weightQ, D, HKV)
+    st.vHeadW = sliceResidentQ4ByRowsW(ctx, attn.vProj.weightQ, D, HKV)
+    let ffReadyQ4 = m.blocks[li].ff.gateProj.residentReady and m.blocks[li].ff.upProj.residentReady and
+                    m.blocks[li].ff.downProj.residentReady
+    let oProjReadyQ4 = attn.oProj.residentReady
+    st.ready = st.qHeadW.len == HKV and st.kHeadW.len == HKV and st.vHeadW.len == HKV and
+               ffReadyQ4 and oProjReadyQ4
+    if not st.ready:
+      result.ready = false
+      result.layers[li] = st
+      continue
+    let be = ctx.kind.toByby()
+    discard sessionBegin(be)
+    st.kCacheH = newSeq[SessionHandle](HKV)
+    st.vCacheH = newSeq[SessionHandle](HKV)
+    let zeros = newSeq[float32](maxSeqLen * D)
+    for hkv in 0 ..< HKV:
+      st.kCacheH[hkv] = sessionUpload(be, zeros)
+      st.vCacheH[hkv] = sessionUpload(be, zeros)
+    discard sessionEnd(be)
+    result.layers[li] = st
+
+proc forwardStepDecodeWholeSession*(m: LlamaModelL, tokenId: int, ctx: Backend,
+                                     cache: var KVCacheL, whole: WholeModelSessionState): Tensor =
+  ## Forward 1 token qua TOÀN BỘ model trong ĐÚNG 1 sessionBegin/sessionEnd.
+  ## Trả Tensor(shape=@[]) nếu bất kỳ bước nào fail -> caller PHẢI fallback
+  ## `m.forwardStep(@[tokenId], ctx, cache, isPrefill=false)`.
+  if not whole.ready:
+    return Tensor(shape: @[])
+  let C = m.config.hiddenSize
+  let be = ctx.kind.toByby()
+  let pos = cache.seqLen
+
+  if not sessionBegin(be):
+    return Tensor(shape: @[])
+
+  # TẤT CẢ buffer tạm của CẢ 32 layer (không gồm resident weight/KV-cache
+  # thường trú) được gom vào đây, free ĐÚNG 1 LẦN ngay sau sessionEnd() -
+  # đây là điểm sửa lỗi leak chính so với bản 1-session/token đầu tiên.
+  var freeList: seq[SessionHandle] = @[]
+  template failWhole(): untyped =
+    discard sessionEnd(be)
+    for fh in freeList.mitems: sessionFree(be, fh)
+    return Tensor(shape: @[])
+
+  var xData = newSeq[float32](C)
+  block:
+    let embOff = tokenId * C
+    for c in 0 ..< C: xData[c] = m.embed.weight.data[embOff + c]
+  var hX = sessionUpload(be, xData)
+  freeList.add(hX)
+
+  for li in 0 ..< m.blocks.len:
+    let blk = m.blocks[li]
+    let attn = blk.attn
+    let lst = whole.layers[li]
+    let H = attn.nHeads
+    let HKV = attn.nKVHeads
+    let D = attn.headDim
+    let nRep = H div HKV
+    let scale = attn.scale
+
+    # ---- RMSNorm(inputNorm) ----
+    var hGamma1 = sessionUpload(be, blk.inputNorm.weight.data)
+    freeList.add(hGamma1)
+    var hNormed: SessionHandle
+    if not sessionRmsnormEnc(be, hX, hGamma1, hNormed, 1, C, blk.inputNorm.eps): failWhole()
+    freeList.add(hNormed)
+
+    # ---- Q/K/V projection, per-KV-head, resident Q4 riêng từng phần ----
+    var hQh = newSeq[SessionHandle](HKV)
+    var hKh = newSeq[SessionHandle](HKV)
+    var hVh = newSeq[SessionHandle](HKV)
+    for hkv in 0 ..< HKV:
+      if not sessionMatmulQ4(be, hNormed, lst.qHeadW[hkv], hQh[hkv], 1): failWhole()
+      if not sessionMatmulQ4(be, hNormed, lst.kHeadW[hkv], hKh[hkv], 1): failWhole()
+      if not sessionMatmulQ4(be, hNormed, lst.vHeadW[hkv], hVh[hkv], 1): failWhole()
+      freeList.add(hQh[hkv]); freeList.add(hKh[hkv]); freeList.add(hVh[hkv])
+
+    # ---- RoPE(Q head-group), RoPE(K head) ----
+    let half = D div 2
+    var cosSlice = newSeq[float32](half)
+    var sinSlice = newSeq[float32](half)
+    for i in 0 ..< half:
+      cosSlice[i] = m.rope.cosT[pos * half + i]
+      sinSlice[i] = m.rope.sinT[pos * half + i]
+    # Q phải nhân attn.scale TRƯỚC Q@K^T (giống forwardDecode cũ). RoPE
+    # tuyến tính: rotate(Q)*s == rotate_với(cos*s, sin*s)(Q) - gộp scale
+    # thẳng vào cos/sin CHỈ dùng cho Q (KHÔNG áp cho K).
+    var cosSliceQ = newSeq[float32](half)
+    var sinSliceQ = newSeq[float32](half)
+    for i in 0 ..< half:
+      cosSliceQ[i] = cosSlice[i] * scale
+      sinSliceQ[i] = sinSlice[i] * scale
+    var hCos = sessionUpload(be, cosSlice)
+    var hSin = sessionUpload(be, sinSlice)
+    var hCosQ = sessionUpload(be, cosSliceQ)
+    var hSinQ = sessionUpload(be, sinSliceQ)
+    freeList.add(hCos); freeList.add(hSin); freeList.add(hCosQ); freeList.add(hSinQ)
+    for hkv in 0 ..< HKV:
+      # hQh[hkv] chứa nRep head liên tiếp (mỗi head D phần tử) -> coi mỗi
+      # "sub-head" như 1 token độc lập cho sessionRope: T=nRep, Hn=1, D=D.
+      if not sessionRope(be, hQh[hkv], hCosQ, hSinQ, nRep, 1, D): failWhole()
+      if not sessionRope(be, hKh[hkv], hCos, hSin, 1, 1, D): failWhole()
+
+    # ---- Append K/V mới vào GPU-resident cache (dst-offset only, O(1)/token
+    #      - KHÔNG upload lại lịch sử, khác hẳn kBlocks/vBlocks re-upload
+    #      O(S) của forwardDecode cũ ở trên). KV-cache là buffer THƯỜNG TRÚ
+    #      (không nằm trong freeList) - sống sang token SAU. ----
+    for hkv in 0 ..< HKV:
+      var dstK = lst.kCacheH[hkv]
+      var dstV = lst.vCacheH[hkv]
+      if not sessionCopyInto(be, hKh[hkv], dstK, pos * D, D): failWhole()
+      if not sessionCopyInto(be, hVh[hkv], dstV, pos * D, D): failWhole()
+
+    # ---- Attention: mỗi KV-head, Q gồm nRep head con, K/V = toàn bộ cache
+    #      đến vị trí pos (đã gồm token mới) ----
+    let S = pos + 1
+    var hOutHeads = sessionAllocScratch(be, H * D)
+    freeList.add(hOutHeads)
+    for hkv in 0 ..< HKV:
+      var hScores: SessionHandle
+      # sessionMatmulNT: C(MxN)=A(MxK)@B(NxK)^T. a=hQh[hkv] (nRep x D),
+      # b=kCacheH[hkv] (đọc N=S hàng ĐẦU của buffer maxSeqLen*D) -> C=nRep x S.
+      # GIẢ ĐỊNH kernel NT đọc đúng S*D phần tử ĐẦU của buffer lớn hơn (token
+      # mới nhất luôn ở cuối vùng đã dùng, layout liên tục theo token) -
+      # **CẦN KIỂM CHỨNG TRÊN PHẦN CỨNG THẬT**, giống hệt rủi ro đã ghi ở
+      # bản layer-session trước đó.
+      if not sessionMatmulNT(be, hQh[hkv], lst.kCacheH[hkv], hScores, nRep, D, S): failWhole()
+      freeList.add(hScores)
+      var hProbs: SessionHandle
+      if not sessionSoftmax(be, hScores, hProbs, nRep, S): failWhole()
+      freeList.add(hProbs)
+      var hOutGroup: SessionHandle
+      if not sessionMatmul(be, hProbs, lst.vCacheH[hkv], hOutGroup, nRep, S, D): failWhole()
+      freeList.add(hOutGroup)
+      var dstOut = hOutHeads
+      if not sessionCopyInto(be, hOutGroup, dstOut, hkv * nRep * D, nRep * D): failWhole()
+
+    # ---- oProj ----
+    var hAttnProj: SessionHandle
+    if not sessionMatmulQ4(be, hOutHeads, attn.oProj.residentW, hAttnProj, 1): failWhole()
+    freeList.add(hAttnProj)
+
+    # ---- residual #1 ----
+    var hX2: SessionHandle
+    if not sessionVecOp(be, "add", hX, hAttnProj, hX2, C): failWhole()
+    freeList.add(hX2)
+
+    # ---- RMSNorm(postAttnNorm) ----
+    var hGamma2 = sessionUpload(be, blk.postAttnNorm.weight.data)
+    freeList.add(hGamma2)
+    var hNormed2: SessionHandle
+    if not sessionRmsnormEnc(be, hX2, hGamma2, hNormed2, 1, C, blk.postAttnNorm.eps): failWhole()
+    freeList.add(hNormed2)
+
+    # ---- FFN (SwiGLU) ----
+    var hGate, hUp: SessionHandle
+    if not sessionMatmulQ4(be, hNormed2, blk.ff.gateProj.residentW, hGate, 1): failWhole()
+    if not sessionMatmulQ4(be, hNormed2, blk.ff.upProj.residentW, hUp, 1): failWhole()
+    freeList.add(hGate); freeList.add(hUp)
+    let interF = blk.ff.gateProj.outF
+    var hSig: SessionHandle
+    if not sessionActivation(be, "sigmoid", hGate, hSig, interF): failWhole()
+    freeList.add(hSig)
+    var hSilu: SessionHandle
+    if not sessionVecOp(be, "mul", hGate, hSig, hSilu, interF): failWhole()
+    freeList.add(hSilu)
+    var hGated: SessionHandle
+    if not sessionVecOp(be, "mul", hSilu, hUp, hGated, interF): failWhole()
+    freeList.add(hGated)
+    var hFfOut: SessionHandle
+    if not sessionMatmulQ4(be, hGated, blk.ff.downProj.residentW, hFfOut, 1): failWhole()
+    freeList.add(hFfOut)
+
+    # ---- residual #2 -> hX cho layer kế tiếp (VẪN Ở TRÊN GPU, không đọc
+    #      về CPU - đây là điểm khác biệt chính so với bản layer-session:
+    #      KHÔNG có round-trip CPU giữa các layer nữa). ----
+    var hXNext: SessionHandle
+    if not sessionVecOp(be, "add", hX2, hFfOut, hXNext, C): failWhole()
+    freeList.add(hXNext)
+    hX = hXNext
+
+  # ---- RMSNorm cuối + lm_head (VẪN TRONG CÙNG session đang mở) ----
+  var hGammaF = sessionUpload(be, m.finalNorm.weight.data)
+  freeList.add(hGammaF)
+  var hFinal: SessionHandle
+  if not sessionRmsnormEnc(be, hX, hGammaF, hFinal, 1, C, m.finalNorm.eps): failWhole()
+  freeList.add(hFinal)
+
+  var hLogits: SessionHandle
+  let vocab = m.config.vocabSize
+  if m.lmHead.residentReady:
+    if not sessionMatmulQ4(be, hFinal, m.lmHead.residentW, hLogits, 1): failWhole()
+  elif m.lmHead.residentFp32Ready:
+    if not sessionMatmul(be, hFinal, m.lmHead.residentFp32, hLogits, 1, C, vocab): failWhole()
+  else:
+    failWhole()   # lm_head chưa resident dạng nào -> không đi được đường whole-session
+  freeList.add(hLogits)
+
+  if not sessionEnd(be):
+    for fh in freeList.mitems: sessionFree(be, fh)
+    return Tensor(shape: @[])
+
+  let logitsData = sessionRead(be, hLogits, vocab)
+  for fh in freeList.mitems: sessionFree(be, fh)
+  if logitsData.len != vocab:
+    return Tensor(shape: @[])
+  cache.seqLen += 1
+  result = Tensor(data: logitsData, shape: @[1, 1, vocab])
+
+proc forwardStepDecodeSafeWhole*(m: LlamaModelL, tokenId: int, ctx: Backend,
+                                  cache: var KVCacheL, whole: WholeModelSessionState): Tensor =
+  ## Gọi hàm này thay cho forwardStep() trong vòng lặp decode. Tự fallback
+  ## đường cũ (forwardStep/forwardDecode, 100% đã xác nhận đúng trước đây)
+  ## nếu whole-session fail hoặc bị tắt qua BYBY_WHOLE_SESSION=0.
+  ## CẢNH BÁO: nếu whole-session fail GIỮA CHỪNG 1 lần sinh (không phải fail
+  ## ngay từ đầu do resident chưa sẵn sàng), fallback về forwardStep() cho
+  ## bước đó sẽ ĐỌC SAI KV-cache (forwardStep dùng KVCacheL.layers CPU, chưa
+  ## được ghi bởi các bước đã chạy qua đường whole-session GPU-resident) -
+  ## đây là rủi ro CỐ HỮU của thiết kế 2 đường KV-cache song song, giống hệt
+  ## rủi ro đã có ở bản layer-session trước đó. Trong thực tế `whole.ready`
+  ## được quyết định 1 LẦN lúc chuẩn bị (residency tĩnh, không đổi theo
+  ## token) nên nhánh fallback giữa chừng gần như không xảy ra, nhưng vẫn
+  ## PHẢI biết rủi ro này nếu thấy log "whole_session fail" xuất hiện.
+  let forceOff = existsEnv("BYBY_WHOLE_SESSION") and getEnv("BYBY_WHOLE_SESSION") == "0"
+  if whole.ready and not forceOff:
+    let r = forwardStepDecodeWholeSession(m, tokenId, ctx, cache, whole)
+    if r.shape.len > 0:
+      return r
+    stderr.writeLine "[whole_session] session toan model fail/khong ho tro -> fallback forwardStep cu cho buoc nay"
+  result = m.forwardStep(@[tokenId], ctx, cache, isPrefill = false)
+
 
 proc generate*(m: LlamaModelL, tok: HFTokenizer, ctx: Backend, promptIds: seq[int],
                maxNewTokens: int = 128, temperature: float32 = 0.7'f32, topP: float32 = 0.9'f32): string =
@@ -1482,6 +2039,17 @@ proc generate*(m: LlamaModelL, tok: HFTokenizer, ctx: Backend, promptIds: seq[in
   var cache = newKVCacheL(m.config.nLayers, m.config.nKVHeads,
                            m.config.hiddenSize div m.config.nHeads,
                            neededSeqLen)
+  # THÊM: chuẩn bị 1 LẦN đường session-toàn-model (1 sessionBegin/End cho cả
+  # 32 layer + finalNorm + lm_head MỖI TOKEN, KV-cache GPU-resident append
+  # O(1)/token - xem comment ở forwardStepDecodeWholeSession phía trên). Nếu
+  # model không đi được đường này (chưa đủ resident Q4 ở đâu đó) ->
+  # whole.ready=false, decode loop bên dưới tự fallback 100% về
+  # m.forwardStep() cũ, KHÔNG đổi hành vi/kết quả.
+  let whole = prepareWholeModelSession(m, ctx, neededSeqLen)
+  if whole.ready:
+    stderr.writeLine "[whole_session] session toan model SAN SANG (thi nghiem, chua kiem chung phan cung - xem canh bao dau file)"
+  else:
+    stderr.writeLine "[whole_session] session toan model KHONG du dieu kien (thieu resident Q4 o dau do) -> dung duong cu"
 
   stdout.write(tok.decode(promptIds))
 
@@ -1504,8 +2072,10 @@ proc generate*(m: LlamaModelL, tok: HFTokenizer, ctx: Backend, promptIds: seq[in
 
   var logits = m.forwardStep(promptIds, ctx, cache, isPrefill = true)
   let prefillTime = epochTime() - prefillStart
+  gAttnTime = 0.0
+  gFfnTime = 0.0
   let lastRow = logits.data[(logits.shape[1] - 1) * m.config.vocabSize ..< logits.shape[1] * m.config.vocabSize]
-  var nextId = sampleTopP(lastRow, temperature, topP, promptIds[max(0, promptIds.len - 64) ..< promptIds.len],
+  var nextId = sampleTopP(ctx, lastRow, temperature, topP, promptIds[max(0, promptIds.len - 64) ..< promptIds.len],
                            noPenaltyIds = noPenaltyIds)
 
   var allIds = promptIds
@@ -1532,8 +2102,8 @@ proc generate*(m: LlamaModelL, tok: HFTokenizer, ctx: Backend, promptIds: seq[in
     if nextId == tok.eosId: break
 
     let stepStart = epochTime()
-    let stepLogits = m.forwardStep(@[nextId], ctx, cache, isPrefill = false)
-    nextId = sampleTopP(stepLogits.data, temperature, topP, allIds[max(0, allIds.len - 64) ..< allIds.len],
+    let stepLogits = forwardStepDecodeSafeWhole(m, nextId, ctx, cache, whole)
+    nextId = sampleTopP(ctx, stepLogits.data, temperature, topP, allIds[max(0, allIds.len - 64) ..< allIds.len],
                          noPenaltyIds = noPenaltyIds)
     let stepTime = epochTime() - stepStart
     allIds.add(nextId)
@@ -1585,6 +2155,8 @@ proc generate*(m: LlamaModelL, tok: HFTokenizer, ctx: Backend, promptIds: seq[in
   let decodedCount = generated - 1   # không tính token đầu (sinh trong lúc prefill)
   stdout.write("\n")
   stderr.write("\n== Thống kê tốc độ ==\n")
+  stderr.write(&"Decode - attn (QKV+RoPE+attention+oProj): {gAttnTime:.3f}s | FFN: {gFfnTime:.3f}s | " &
+               &"tổng 2 phần: {(gAttnTime+gFfnTime):.3f}s\n")
   stderr.write(&"Prefill: {promptIds.len} token trong {prefillTime:.3f}s -> {(promptIds.len.float/prefillTime):.2f} tok/s\n")
   if decodedCount > 0 and decodeTime > 0:
     stderr.write(&"Decode:  {decodedCount} token trong {decodeTime:.3f}s -> {(decodedCount.float/decodeTime):.2f} tok/s ({(decodeTime*1000/decodedCount.float):.1f} ms/token)\n")

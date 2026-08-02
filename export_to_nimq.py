@@ -774,11 +774,62 @@ def export_to_nimq(
     print(f"   File size: {file_size:.2f} GB")
     print(f"   Time: {elapsed:.1f}s")
 
+    # === FIX (trước đây): export tokenizer.json là 1 bảng byte-identity GIẢ
+    # {"vocab_size": 256, "bytes": [0..255]} - hoàn toàn không phải tokenizer
+    # thật của model (model thật dùng subword BPE hàng chục nghìn token, có
+    # merges hẳn hoi). Giờ xuất ĐÚNG vocab + merges thật từ chính
+    # AutoTokenizer đã load, theo cùng schema với BPETokenizer bên
+    # test_nimformer.nim: {"vocab_size", "vocab": {token_str: id}, "merges":
+    # ["a b", ...]} - để 2 bên đọc/ghi qua lại được, không còn giả byte-map.
     tokenizer_path = os.path.join(os.path.dirname(output_path) or ".", "tokenizer.json")
-    vocab_bytes = list(range(min(256, config["vocab_size"])))
-    with open(tokenizer_path, 'w') as g:
-        json.dump({"vocab_size": min(256, config["vocab_size"]), "bytes": vocab_bytes}, g)
-    print(f"   Tokenizer saved to {tokenizer_path}")
+    exported = False
+    if getattr(tokenizer, "is_fast", False):
+        try:
+            backend_json = json.loads(tokenizer.backend_tokenizer.to_str())
+            model_block = backend_json.get("model", {})
+            vocab = model_block.get("vocab")
+            merges_raw = model_block.get("merges")
+            if vocab is not None and merges_raw is not None:
+                # merges trong tokenizers lib có thể là list[str] "a b" hoặc
+                # list[list[str]] [a, b] tuỳ phiên bản - chuẩn hoá về "a b".
+                merges = []
+                for m in merges_raw:
+                    if isinstance(m, (list, tuple)):
+                        merges.append(f"{m[0]} {m[1]}")
+                    else:
+                        merges.append(m)
+                with open(tokenizer_path, 'w') as g:
+                    json.dump({
+                        "vocab_size": len(vocab),
+                        "vocab": vocab,
+                        "merges": merges,
+                    }, g)
+                print(f"   Tokenizer (BPE thật, {len(vocab)} token, {len(merges)} merge) saved to {tokenizer_path}")
+                exported = True
+        except Exception as e:
+            print(f"   ⚠️  Không lấy được vocab/merges từ backend_tokenizer ({e}), sẽ fallback")
+
+    if not exported:
+        # Fallback: tokenizer không phải BPE dạng "fast" chuẩn (vd SentencePiece
+        # unigram thuần) - vẫn xuất vocab thật (id -> token string) qua
+        # get_vocab(), KHÔNG còn xuất bảng byte giả nữa. merges để rỗng
+        # (model phía Nim khi thấy merges rỗng sẽ tokenize ở mức "vocab
+        # lookup toàn từ" thay vì BPE-merge, vẫn đúng semantics tối thiểu).
+        try:
+            vocab = tokenizer.get_vocab()
+            with open(tokenizer_path, 'w') as g:
+                json.dump({
+                    "vocab_size": len(vocab),
+                    "vocab": vocab,
+                    "merges": [],
+                }, g)
+            print(f"   ⚠️  Tokenizer không phải fast-BPE chuẩn: xuất vocab thật ({len(vocab)} token, "
+                  f"không có merges) tới {tokenizer_path}")
+        except Exception as e:
+            raise RuntimeError(
+                f"Không thể xuất tokenizer thật cho model này ({e}). "
+                f"Từ chối fallback về bảng byte giả vì sẽ làm sai lệch tokenization khi infer."
+            )
 
     config_path = os.path.join(os.path.dirname(output_path) or ".", "config.nim.json")
     with open(config_path, 'w') as g:
