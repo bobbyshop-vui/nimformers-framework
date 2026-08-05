@@ -65,15 +65,16 @@ var L = gpuTanh(gpuBackendSelected, A)
 var APFLURES = gpuApflu(gpuBackendSelected, A, 0.1, 1.0)
 var APFLURESB = gpuApflu(gpuBackendSelected, B, 0.1'f32, 1.0'f32)
 var M = gpuSoftmax(gpuBackendSelected, A, 1, 8)
-var N = gpuMatmul(gpuBackendSelected, A, B, 8, 8, 1)
+var N = gpuMatmul(gpuBackendSelected, A, B, 1, A.len, 1)
 var LAYERNORMRES = gpuLayernorm(gpuBackendSelected, A, B, C, 8, 1, 1e-5)
 var DY: seq[float32] = @[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8].mapIt(it.float32)
 let lnBwd = gpuLayernormBackward(gpuBackendSelected, DY, A, B, C, 8, 1, 1e-5)
 var DX = lnBwd.dx
 var DGAMMA = lnBwd.dgamma
 var DBETA = lnBwd.dbeta
+var EMB_TABLE: seq[float32] = @[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64].mapIt(it.float32)
 var indices = [0, 1, 2, 3, 4, 5, 6, 7]
-var EMBEDRES = gpuEmbeddingLookup(gpuBackendSelected, E, indices.mapIt(int32(it)), 8, 8)
+var EMBEDRES = gpuEmbeddingLookup(gpuBackendSelected, EMB_TABLE, indices.mapIt(int32(it)), 8, 8)
 var Q: seq[float32] = @[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16].mapIt(it.float32)
 var MatKey: seq[float32] = @[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6].mapIt(it.float32)
 var V: seq[float32] = @[2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32].mapIt(it.float32)
@@ -85,6 +86,40 @@ let attnBwd = gpuAttentionFusedBackward(gpuBackendSelected, Q, MatKey, V, ATTENT
 var DQ = attnBwd.dq
 var DK = attnBwd.dk
 var DV = attnBwd.dv
+var SESSC: seq[float32] = @[]
+var SESSD: seq[float32] = @[]
+var SESSE: seq[float32] = @[]
+var SESSM: seq[float32] = @[]
+block:
+  var sessOk = sessionBegin(gpuBackendSelected)
+  if sessOk:
+    var sh1 = sessionUpload(gpuBackendSelected, A)
+    var sh2 = sessionUpload(gpuBackendSelected, B)
+    var sh3: SessionHandle
+    var sh4: SessionHandle
+    var sh5: SessionHandle
+    var sh6: SessionHandle
+    discard sessionVecOp(gpuBackendSelected, "add", sh1, sh2, sh3, 8)
+    discard sessionVecOp(gpuBackendSelected, "mul", sh3, sh1, sh4, 8)
+    discard sessionActivation(gpuBackendSelected, "relu", sh4, sh5, 8)
+    discard sessionSoftmax(gpuBackendSelected, sh1, sh6, 1, 8)
+    discard sessionEnd(gpuBackendSelected)
+    SESSC = sessionRead(gpuBackendSelected, sh3, 8)
+    SESSD = sessionRead(gpuBackendSelected, sh4, 8)
+    SESSE = sessionRead(gpuBackendSelected, sh5, 8)
+    SESSM = sessionRead(gpuBackendSelected, sh6, 1 * 8)
+    sessionFree(gpuBackendSelected, sh3)
+    sessionFree(gpuBackendSelected, sh4)
+    sessionFree(gpuBackendSelected, sh5)
+    sessionFree(gpuBackendSelected, sh6)
+    sessionFree(gpuBackendSelected, sh2)
+    sessionFree(gpuBackendSelected, sh1)
+  else:
+    echo "[WARN] session không khởi tạo được, fallback sang immediate"
+    SESSC = gpuOp("add", gpuBackendSelected, A, B)
+    SESSD = gpuOp("mul", gpuBackendSelected, SESSC, A)
+    SESSE = gpuRelu(gpuBackendSelected, SESSD)
+    SESSM = gpuSoftmax(gpuBackendSelected, A, 1, 8)
 echo "=== GPU VECTOR OPERATIONS ==="
 echo "GPU add result:"
 echo C
@@ -136,6 +171,15 @@ echo "GPU attention backward DK:"
 echo DK
 echo "GPU attention backward DV:"
 echo DV
+echo "=== SESSION RESULTS ==="
+echo "GPU session add result (A+B):"
+echo SESSC
+echo "GPU session mul result (SESSC*A):"
+echo SESSD
+echo "GPU session relu result (SESSD):"
+echo SESSE
+echo "GPU session softmax result (A):"
+echo SESSM
 var x = 5
 if x > 0:
   echo "x duong"

@@ -29,6 +29,9 @@ when defined(macosx):
   proc metalSessionActivationEnc*(op: cint, x, y: MetalBufferHandle, n: int): cint {.
     importc: "metal_activation_enc", header: "metal_shim.h".}
 
+  proc metalSessionRopeEnc*(x, cosT, sinT: MetalBufferHandle, T, Hn, D: cint): cint {.
+    importc: "metal_rope_enc", header: "metal_shim.h".}
+
 type
   GpuBackend* = enum
     gbAuto, gbCpu, gbCuda, gbMetal, gbOpenCL, gbTsic
@@ -669,6 +672,12 @@ proc gpuMatmulQ4*(backend: GpuBackend, a: seq[float32], wq: seq[uint8], scales, 
       return metalMatmulQ4(a, wq, scales, zeros, m, k, n, groupSize, nGroupsPerRow)
     of gbOpenCL:
       return openclMatmulQ4(a, wq, scales, zeros, m, k, n, groupSize, nGroupsPerRow)
+    of gbCuda:
+      try:
+        return cuda_driver.cudaMatmulQ4(a, wq, scales, zeros, m, k, n, groupSize, nGroupsPerRow)
+      except CatchableError as e:
+        stderr.write("[cuda] matmul_q4_kernel launch thất bại (" & e.msg & "), fallback CPU dequant\n")
+        return cpuDequantMatmulQ4Fallback(a, wq, scales, zeros, m, k, n, groupSize, nGroupsPerRow)
     else:
       return cpuDequantMatmulQ4Fallback(a, wq, scales, zeros, m, k, n, groupSize, nGroupsPerRow)
   except CatchableError as e:
@@ -723,6 +732,15 @@ proc cuSoftmaxR*(x: CudaResidentTensor, rows, cols: int): CudaResidentTensor =
 
 proc cuLayernormR*(x, gamma, beta: CudaResidentTensor, rows, cols: int, eps: float32): CudaResidentTensor =
   cudaDrv.cudaLayernormR(x, gamma, beta, rows, cols, eps)
+
+proc cuAttentionFusedR*(q, k, v: CudaResidentTensor, B, H, S, D: int, scale: float32): tuple[o, s_matrix: CudaResidentTensor] =
+  cudaDrv.cudaAttentionFusedR(q, k, v, B, H, S, D, scale)
+
+proc cuCopyIntoR*(src, dst: CudaResidentTensor, dstOffsetElems, n: int) =
+  cudaDrv.cudaCopyIntoR(src, dst, dstOffsetElems, n)
+
+proc cuRopeR*(x, cosT, sinT: CudaResidentTensor, T, Hn, D: int) =
+  cudaDrv.cudaRopeR(x, cosT, sinT, T, Hn, D)
 
 proc cuEmbeddingLookupR*(table, indices: CudaResidentTensor, numIdx, vocab, dim: int): CudaResidentTensor =
   cudaDrv.cudaEmbeddingLookupR(table, indices, numIdx, vocab, dim)
@@ -783,6 +801,35 @@ proc sessionUpload*(backend: GpuBackend, data: seq[float32]): SessionHandle =
   else:
     discard
 
+proc sessionUploadPrivate*(backend: GpuBackend, data: seq[float32]): SessionHandle =
+  ## Bản Private-storage của sessionUpload - CHỈ dùng cho weight RESIDENT
+  ## (upload 1 LẦN lúc load model, CPU không đọc/ghi lại sau đó) - hiện dùng
+  ## cho beResidentUploadFp32 (weight int8/int4-symmetric/tied-embedding qua
+  ## uploadResident trong nimformer.nim). Metal: MTLResourceStorageModePrivate.
+  ## OpenCL: CL_MEM_READ_ONLY|CL_MEM_HOST_NO_ACCESS (openclSessionUploadPrivate) -
+  ## cùng ý nghĩa "host không đụng lại sau upload". CUDA: alias thẳng về
+  ## cuUpload thường - VRAM CUDA vốn đã tách biệt CPU hoàn toàn (không có
+  ## khái niệm Shared/Private như Metal UMA hay hint như OpenCL), nên không
+  ## có gì thêm để tối ưu ở đây.
+  var chosen = backend
+  if chosen == gbAuto: chosen = detectBackend()
+  if chosen == gbTsic: chosen = resolveTsicBackend()
+
+  result.kind = chosen
+  case chosen
+  of gbMetal:
+    when defined(macosx):
+      result.metalHandle = metalUploadPrivate(data)
+    else:
+      result.metalHandle = nil
+  of gbCuda:
+    let t = cuUpload(data)
+    result.cudaHandle = t
+  of gbOpenCL:
+    result.openclHandle = openclSessionUploadPrivate(data)
+  else:
+    discard
+
 proc sessionUploadIndices*(backend: GpuBackend, data: seq[int32]): SessionHandle =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
@@ -835,6 +882,15 @@ proc sessionMatmul*(backend: GpuBackend, a, b: SessionHandle, c: var SessionHand
   case chosen
   of gbMetal:
     when defined(macosx):
+      # SỬA BUG: c có thể chưa được cấp buffer (codegen chỉ khai báo
+      # 'var hc: SessionHandle' rồi truyền thẳng vào đây, không gọi
+      # sessionAllocScratch trước) - khác CUDA (tự cấp bên dưới), Metal
+      # dùng thẳng buffer có sẵn trong c nên nếu c.metalHandle là nil,
+      # kernel ghi vào buffer NULL, sessionRead sau đó đọc ra NULL và raise
+      # "metal_buffer_read failed". Tự cấp phát nếu chưa có, để khớp hợp
+      # đồng ngầm mà CUDA đã có từ trước.
+      if c.metalHandle == nil:
+        c.metalHandle = metalSessionAllocScratch(M * N)
       return metalSessionMatmulEnc(a.metalHandle, b.metalHandle, c.metalHandle, M, K, N)
     else:
       return false
@@ -848,7 +904,44 @@ proc sessionMatmul*(backend: GpuBackend, a, b: SessionHandle, c: var SessionHand
     if old.dptr != 0: (var oldVar = old; cuFree(oldVar))
     return true
   of gbOpenCL:
+    # SỬA BUG: xem giải thích ở nhánh gbMetal ngay trên - OpenCL cũng dùng
+    # thẳng buffer có sẵn trong c, không tự cấp phát.
+    if c.openclHandle == nil:
+      c.openclHandle = openclSessionAllocScratch(M * N)
     return openclSessionMatmulEnc(cl_mem(a.openclHandle), cl_mem(b.openclHandle), cl_mem(c.openclHandle), M, K, N)
+  else:
+    return false
+
+proc sessionMatmulNT*(backend: GpuBackend, a, b: SessionHandle, c: var SessionHandle, M, K, N: int): bool =
+  ## Encode matmul-NT vào session: C(M x N) = A(M x K) @ B(N x K)^T.
+  ## B GIỮ NGUYÊN layout gốc [N,K] (vd K-cache/V-cache [S,D] tự nhiên) -
+  ## KHÔNG cần transpose CPU trước khi upload/gọi hàm này. Dùng cho attention
+  ## decode để loại bỏ hoàn toàn chi phí transpose O(S*D)/token trước đây.
+  ## Nếu backend không hỗ trợ (trả về false) - caller PHẢI tự fallback về
+  ## sessionMatmul với B đã transpose sẵn (đường cũ), KHÔNG coi false là lỗi.
+  var chosen = backend
+  if chosen == gbAuto: chosen = detectBackend()
+  if chosen == gbTsic: chosen = resolveTsicBackend()
+
+  case chosen
+  of gbMetal:
+    when defined(macosx):
+      # SỬA BUG: xem giải thích chi tiết ở sessionMatmul - c cần được cấp
+      # buffer trước khi dùng làm output trên Metal/OpenCL.
+      if c.metalHandle == nil:
+        c.metalHandle = metalSessionAllocScratch(M * N)
+      return metalSessionMatmulNTEnc(a.metalHandle, b.metalHandle, c.metalHandle, M, K, N)
+    else:
+      return false
+  of gbCuda:
+    let old = c.cudaHandle
+    c.cudaHandle = cudaMatmulNTF32R(a.cudaHandle, b.cudaHandle, M, K, N)
+    if old.dptr != 0: (var oldVar = old; cuFree(oldVar))
+    return true
+  of gbOpenCL:
+    if c.openclHandle == nil:
+      c.openclHandle = openclSessionAllocScratch(M * N)
+    return openclSessionMatmulNTEnc(cl_mem(a.openclHandle), cl_mem(b.openclHandle), cl_mem(c.openclHandle), M, K, N)
   else:
     return false
 
@@ -860,6 +953,9 @@ proc sessionSoftmax*(backend: GpuBackend, x: SessionHandle, y: var SessionHandle
   case chosen
   of gbMetal:
     when defined(macosx):
+      # SỬA BUG: xem giải thích chi tiết ở sessionMatmul.
+      if y.metalHandle == nil:
+        y.metalHandle = metalSessionAllocScratch(rows * cols)
       return metalSessionSoftmaxEnc(x.metalHandle, y.metalHandle, rows, cols)
     else:
       return false
@@ -869,7 +965,129 @@ proc sessionSoftmax*(backend: GpuBackend, x: SessionHandle, y: var SessionHandle
     if old.dptr != 0: (var oldVar = old; cuFree(oldVar))
     return true
   of gbOpenCL:
+    if y.openclHandle == nil:
+      y.openclHandle = openclSessionAllocScratch(rows * cols)
     return openclSessionSoftmaxEnc(cl_mem(x.openclHandle), cl_mem(y.openclHandle), rows, cols)
+  else:
+    return false
+
+proc sessionLayernormEnc*(backend: GpuBackend, x, gamma, beta: SessionHandle, y: var SessionHandle,
+                           rows, cols: int, eps: float32): bool =
+  ## Encode layernorm vào session hiện tại.
+  ## Metal: metal_layernorm_enc (đã có sẵn trong shim, giờ mới bind ra Nim).
+  ## CUDA: cuLayernormR đã tồn tại từ trước và VỐN DĨ đã launch async lên
+  ## cùng gStream không sync - dùng thẳng được, chỉ cần giải phóng buffer cũ
+  ## của y (như sessionMatmul/sessionVecOp CUDA đã làm) để không leak VRAM.
+  ## OpenCL: openclSessionLayernormEnc (mới thêm - kernel layernorm_kernel
+  ## đã có sẵn trong vecop_matmul.cl từ trước, chỉ chưa có bản "enqueue vào
+  ## queue đang mở, không tự write/read/finish" - giờ đã thêm).
+  var chosen = backend
+  if chosen == gbAuto: chosen = detectBackend()
+  if chosen == gbTsic: chosen = resolveTsicBackend()
+  case chosen
+  of gbMetal:
+    when defined(macosx):
+      # SỬA BUG: xem giải thích chi tiết ở sessionMatmul.
+      if y.metalHandle == nil:
+        y.metalHandle = metalSessionAllocScratch(rows * cols)
+      return metalSessionLayernormEnc(x.metalHandle, gamma.metalHandle, beta.metalHandle, y.metalHandle, rows, cols, eps)
+    else:
+      return false
+  of gbCuda:
+    let old = y.cudaHandle
+    y.cudaHandle = cuLayernormR(x.cudaHandle, gamma.cudaHandle, beta.cudaHandle, rows, cols, eps)
+    if old.dptr != 0: (var oldVar = old; cuFree(oldVar))
+    return true
+  of gbOpenCL:
+    if y.openclHandle == nil:
+      y.openclHandle = openclSessionAllocScratch(rows * cols)
+    return openclSessionLayernormEnc(cl_mem(x.openclHandle), cl_mem(gamma.openclHandle),
+                                      cl_mem(beta.openclHandle), cl_mem(y.openclHandle), rows, cols, eps)
+  else:
+    return false
+
+proc sessionRmsnormEnc*(backend: GpuBackend, x, gamma: SessionHandle, y: var SessionHandle,
+                         rows, cols: int, eps: float32): bool =
+  ## Encode RMSNorm (không trừ mean, không beta - khác layernorm) vào session
+  ## hiện tại. Mirror của sessionLayernormEnc ở trên.
+  ## Metal: metalSessionRmsnormEnc (metal_backend.nim - trả về false nếu build
+  ## không phải macosx).
+  ## CUDA: cudaRmsnormR - nếu kernel "rmsnorm_kernel" chưa có trong .ptx đang
+  ## nạp, getFn raise CatchableError; BẮT lỗi đó ở đây và coi là "chưa hỗ
+  ## trợ" (trả về false) để nim_inference.nim rơi về đường CPU cũ, KHÔNG cần
+  ## bật env var nào để dùng được đường nhanh này.
+  ## OpenCL: openclSessionRmsnormEnc.
+  var chosen = backend
+  if chosen == gbAuto: chosen = detectBackend()
+  if chosen == gbTsic: chosen = resolveTsicBackend()
+  case chosen
+  of gbMetal:
+    when defined(macosx):
+      if y.metalHandle == nil:
+        y.metalHandle = metalSessionAllocScratch(rows * cols)
+      return metalSessionRmsnormEnc(x.metalHandle, gamma.metalHandle, y.metalHandle, rows, cols, eps)
+    else:
+      return false
+  of gbCuda:
+    try:
+      let old = y.cudaHandle
+      y.cudaHandle = cudaRmsnormR(x.cudaHandle, gamma.cudaHandle, rows, cols, eps)
+      if old.dptr != 0: (var oldVar = old; cuFree(oldVar))
+      return true
+    except CatchableError:
+      return false
+  of gbOpenCL:
+    if y.openclHandle == nil:
+      y.openclHandle = openclSessionAllocScratch(rows * cols)
+    return openclSessionRmsnormEnc(cl_mem(x.openclHandle), cl_mem(gamma.openclHandle),
+                                    cl_mem(y.openclHandle), rows, cols, eps)
+  else:
+    return false
+
+proc sessionAttentionFusedEnc*(backend: GpuBackend, q, k, v: SessionHandle, o, sMatrix: var SessionHandle,
+                                B, H, S, D: int, scale: float32): bool =
+  ## Encode attention_fused vào session hiện tại.
+  ## Metal: metal_attention_fused_enc (mới viết).
+  ## CUDA: cuAttentionFusedR (mới viết, mirror cudaLayernormR - launch async
+  ## lên gStream, không tự sync).
+  ## OpenCL: openclSessionAttentionFusedEnc (mới thêm). Kernel
+  ## attention_fused_kernel VỐN DĨ đã có sẵn trong vecop_matmul.cl (dùng bởi
+  ## openclAttentionFused bản immediate từ trước) - chỉ chưa có bản session
+  ## không tự write/read/finish, giờ đã thêm. Cùng giới hạn S<=256 như bản
+  ## immediate (chung 1 kernel).
+  var chosen = backend
+  if chosen == gbAuto: chosen = detectBackend()
+  if chosen == gbTsic: chosen = resolveTsicBackend()
+  case chosen
+  of gbMetal:
+    when defined(macosx):
+      # SỬA BUG: xem giải thích chi tiết ở sessionMatmul - 2 output (o,
+      # sMatrix) đều cần buffer trước. o có kích thước B*H*S*D (giống
+      # q/k/v), sMatrix là ma trận điểm attention B*H*S*S.
+      if o.metalHandle == nil:
+        o.metalHandle = metalSessionAllocScratch(B * H * S * D)
+      if sMatrix.metalHandle == nil:
+        sMatrix.metalHandle = metalSessionAllocScratch(B * H * S * S)
+      return metalSessionAttentionFusedEnc(q.metalHandle, k.metalHandle, v.metalHandle,
+                                            o.metalHandle, sMatrix.metalHandle, B, H, S, D, scale)
+    else:
+      return false
+  of gbCuda:
+    let oldO = o.cudaHandle
+    let oldS = sMatrix.cudaHandle
+    let r = cuAttentionFusedR(q.cudaHandle, k.cudaHandle, v.cudaHandle, B, H, S, D, scale)
+    o.cudaHandle = r.o
+    sMatrix.cudaHandle = r.s_matrix
+    if oldO.dptr != 0: (var oldVar = oldO; cuFree(oldVar))
+    if oldS.dptr != 0: (var oldVar = oldS; cuFree(oldVar))
+    return true
+  of gbOpenCL:
+    if o.openclHandle == nil:
+      o.openclHandle = openclSessionAllocScratch(B * H * S * D)
+    if sMatrix.openclHandle == nil:
+      sMatrix.openclHandle = openclSessionAllocScratch(B * H * S * S)
+    return openclSessionAttentionFusedEnc(cl_mem(q.openclHandle), cl_mem(k.openclHandle), cl_mem(v.openclHandle),
+                                           cl_mem(o.openclHandle), cl_mem(sMatrix.openclHandle), B, H, S, D, scale)
   else:
     return false
 
@@ -888,6 +1106,9 @@ proc sessionVecOp*(backend: GpuBackend, op: string, a, b: SessionHandle, c: var 
         of "mul": 2
         of "div": 3
         else: 0
+      # SỬA BUG: xem giải thích chi tiết ở sessionMatmul.
+      if c.metalHandle == nil:
+        c.metalHandle = metalSessionAllocScratch(n)
       return metalSessionVecOpEnc(opCode.cint, a.metalHandle, b.metalHandle, c.metalHandle, n.cint) != 0
     else:
       return false
@@ -897,7 +1118,80 @@ proc sessionVecOp*(backend: GpuBackend, op: string, a, b: SessionHandle, c: var 
     if old.dptr != 0: (var oldVar = old; cuFree(oldVar))
     return true
   of gbOpenCL:
+    if c.openclHandle == nil:
+      c.openclHandle = openclSessionAllocScratch(n)
     return openclSessionVecOpEnc(op, cl_mem(a.openclHandle), cl_mem(b.openclHandle), cl_mem(c.openclHandle), n)
+  else:
+    return false
+
+proc sessionRope*(backend: GpuBackend, x: SessionHandle, cosT, sinT: SessionHandle,
+                   T, Hn, D: int): bool =
+  ## RoPE rotate_half in-place, encode vào session đang mở. CHỈ có cài đặt
+  ## thật trên Metal hiện tại (xem metal_rope_enc trong metal_shim.m). Trên
+  ## CUDA/OpenCL trả về false có chủ đích - caller (fusedNormQKVRoPE) PHẢI
+  ## coi false là "chưa hỗ trợ, rơi về đường CPU cũ", KHÔNG được coi false là
+  ## đã chạy xong, để tránh sinh token rác do RoPE bị bỏ qua trên các
+  ## backend chưa implement kernel này.
+  var chosen = backend
+  if chosen == gbAuto: chosen = detectBackend()
+  if chosen == gbTsic: chosen = resolveTsicBackend()
+
+  case chosen
+  of gbMetal:
+    when defined(macosx):
+      return metalSessionRopeEnc(x.metalHandle, cosT.metalHandle, sinT.metalHandle,
+                                  T.cint, Hn.cint, D.cint) != 0
+    else:
+      return false
+  of gbOpenCL:
+    return openclSessionRopeEnc(cl_mem(x.openclHandle), cl_mem(cosT.openclHandle),
+                                 cl_mem(sinT.openclHandle), T, Hn, D)
+  of gbCuda:
+    # Kernel thật: rope_kernel.cu -> nvcc -ptx -> nối vào kernels/vecop.ptx.
+    # cudaRopeR (cuda_driver.nim) gọi getFn("rope_kernel"); nếu module PTX
+    # đang nạp trong process CHƯA có entry này (chưa build/nối lại .ptx),
+    # getFn raise CatchableError - bắt ở đây và trả về false, GIỮ NGUYÊN
+    # đúng hợp đồng cũ của hàm này: false = "chưa hỗ trợ, rơi về CPU",
+    # không bao giờ để lọt ngoại lệ ra ngoài khiến caller tưởng đã chạy xong.
+    try:
+      cuRopeR(x.cudaHandle, cosT.cudaHandle, sinT.cudaHandle, T, Hn, D)
+      return true
+    except CatchableError:
+      return false
+  else:
+    return false
+
+proc sessionCopyInto*(backend: GpuBackend, src: SessionHandle, dst: var SessionHandle,
+                       dstOffsetElems, n: int): bool =
+  ## dst[dstOffsetElems ..< +n] = src[0 ..< n], device-to-device, encode vào
+  ## session đang mở - dùng để ghép GPU-side nhiều handle con thành 1 buffer
+  ## liên tục (vd nối outHeads từng KV-head lại thành [H*D] để feed thẳng
+  ## vào oProj matmul mà không cần sessionRead()+sessionUpload() ở giữa).
+  ## dst PHẢI đã cấp đủ chỗ từ trước (sessionAllocScratch) - hàm này chỉ ghi
+  ## vào 1 vùng con của buffer đã có, không tự resize/alloc.
+  ## Có cài đặt thật trên cả 3 backend (Metal: copy_into_kernel; CUDA:
+  ## cuMemcpyDtoDAsync thẳng, không cần kernel; OpenCL: clEnqueueCopyBuffer
+  ## thẳng) - KHÔNG có nhánh "chưa hỗ trợ, rơi về CPU" nào ở đây vì cả 3 đều
+  ## có primitive tương ứng sẵn trong driver/runtime, khác sessionRope
+  ## (cần 1 kernel elementwise thật mới làm được rotate_half).
+  var chosen = backend
+  if chosen == gbAuto: chosen = detectBackend()
+  if chosen == gbTsic: chosen = resolveTsicBackend()
+
+  case chosen
+  of gbMetal:
+    when defined(macosx):
+      return metalSessionCopyIntoEnc(src.metalHandle, dst.metalHandle, dstOffsetElems, n)
+    else:
+      return false
+  of gbCuda:
+    try:
+      cuCopyIntoR(src.cudaHandle, dst.cudaHandle, dstOffsetElems, n)
+      return true
+    except CatchableError:
+      return false
+  of gbOpenCL:
+    return openclSessionCopyIntoEnc(cl_mem(src.openclHandle), cl_mem(dst.openclHandle), dstOffsetElems, n)
   else:
     return false
 
@@ -916,6 +1210,9 @@ proc sessionActivation*(backend: GpuBackend, op: string, x: SessionHandle, y: va
         of "tanh": 2
         of "apflu": 3
         else: 0
+      # SỬA BUG: xem giải thích chi tiết ở sessionMatmul.
+      if y.metalHandle == nil:
+        y.metalHandle = metalSessionAllocScratch(n)
       return metalSessionActivationEnc(opCode.cint, x.metalHandle, y.metalHandle, n.cint) != 0
     else:
       return false
@@ -925,6 +1222,8 @@ proc sessionActivation*(backend: GpuBackend, op: string, x: SessionHandle, y: va
     if old.dptr != 0: (var oldVar = old; cuFree(oldVar))
     return true
   of gbOpenCL:
+    if y.openclHandle == nil:
+      y.openclHandle = openclSessionAllocScratch(n)
     return openclSessionActivationEnc(op, cl_mem(x.openclHandle), cl_mem(y.openclHandle), n)
   else:
     return false
@@ -1004,6 +1303,195 @@ proc sessionFree*(backend: GpuBackend, h: var SessionHandle) =
 # SỬ DỤNG: Linear++ Attention với Session API CHUNG
 # ─────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────
+# RESIDENT WEIGHT (Q4) - upload weight MỘT LẦN lúc load model, giữ nguyên
+# trên GPU suốt vòng đời process. Mỗi bước forward chỉ upload activation
+# (nhỏ, đổi mỗi token) qua SessionHandle bình thường rồi gọi sessionMatmulQ4
+# với handle weight đã resident sẵn - KHÔNG đụng lại vào bytes weight.
+# API CHUNG cho cả 3 backend GPU thật (Metal/OpenCL có kernel int4 gốc chạy
+# thẳng trên bytes đã pack; CUDA CHƯA có nguồn .cu cho kernel int4 (chỉ có
+# vecop.ptx nhị phân sẵn, không có .cu đi kèm để sửa/build lại - xem
+# cpuDequantMatmulQ4Fallback ở trên) nên dequant MỘT LẦN duy nhất lúc upload
+# rồi giữ resident dạng fp32 qua sessionUpload thường - vẫn tránh được việc
+# dequant+upload lại mỗi token, chỉ khác không tiết kiệm được băng thông
+# 4-bit như Metal/OpenCL).
+# ─────────────────────────────────────────────────────────────
+type
+  ResidentWeightHandle* = object
+    kind*: GpuBackend
+    k*, n*, groupSize*, nGroupsPerRow*: int
+    metalWq*, metalScales*, metalZeros*: MetalBufferHandle
+    openclWq*, openclScales*, openclZeros*: pointer
+    cudaWq*, cudaScales*, cudaZeros*: CudaTensor  ## THÊM MỚI: CUDA giờ có
+      ## kernel int4 gốc (matmul_q4_kernel.cu) - không cần dequant-giữ-fp32
+      ## nữa. Yêu cầu build lại vecop.ptx với entry "matmul_q4_kernel" (xem
+      ## hướng dẫn trong file .cu). Nếu module PTX đang chạy CHƯA có entry
+      ## này, cudaMatmulQ4R sẽ raise -> catch ở gpuMatmulQ4/sessionMatmulQ4
+      ## và tự rơi về fallbackFp32/cpuDequantMatmulQ4Fallback bên dưới.
+    fallbackFp32*: SessionHandle    ## CPU-fallback: weight dequant 1 lần,
+                                     ## resident dạng fp32 qua session chung.
+    cudaQ4Ready*: bool  ## true nếu cudaWq/cudaScales/cudaZeros đã upload
+                         ## thành công (tách khỏi fallbackFp32 để biết dùng
+                         ## đường nào ở sessionMatmulQ4/gpuMatmulQ4)
+
+proc residentUploadQ4*(backend: GpuBackend, wq: seq[uint8], scales, zeros: seq[float32],
+                        k, n, groupSize, nGroupsPerRow: int): ResidentWeightHandle =
+  ## Upload weight int4 (đã pack) lên GPU MỘT LẦN. Gọi lúc load model
+  ## (loadLlamaWeightsL), giữ result lại, KHÔNG gọi lại mỗi token.
+  var chosen = backend
+  if chosen == gbAuto: chosen = detectBackend()
+  if chosen == gbTsic: chosen = resolveTsicBackend()
+
+  result.kind = chosen
+  result.k = k; result.n = n
+  result.groupSize = groupSize; result.nGroupsPerRow = nGroupsPerRow
+
+  case chosen
+  of gbMetal:
+    when defined(macosx):
+      # SỬA: Private storage (không phải Shared) - wq/scales/zeros CHỈ được
+      # GPU đọc lại mỗi token sau lúc này, CPU không bao giờ đụng lại. Tốn
+      # thêm 1 lần blit qua staging buffer CHỈ ở đây (lúc load model), không
+      # lặp lại mỗi token.
+      result.metalWq = metalUploadBytesPrivate(wq)
+      result.metalScales = metalUploadPrivate(scales)
+      result.metalZeros = metalUploadPrivate(zeros)
+    else:
+      discard
+  of gbOpenCL:
+    result.openclWq = openclSessionUploadBytes(wq)
+    result.openclScales = openclSessionUploadPrivate(scales)
+    result.openclZeros = openclSessionUploadPrivate(zeros)
+  of gbCuda:
+    # THÊM MỚI: thử kernel int4 gốc trước (matmul_q4_kernel.cu) - chỉ cần
+    # upload bytes thô + scale/zero, KHÔNG dequant CPU, KHÔNG giữ bản fp32
+    # nặng gấp 8 lần. Bọc try/except vì getFn("matmul_q4_kernel") sẽ raise
+    # nếu vecop.ptx đang chạy CHƯA được build lại với entry này (repo vốn
+    # chỉ có vecop.ptx nhị phân sẵn, xem hướng dẫn nvcc trong file .cu).
+    try:
+      result.cudaWq = cudaDrv.uploadBytesAsync(wq)
+      result.cudaScales = cudaDrv.uploadAsync(scales)
+      result.cudaZeros = cudaDrv.uploadAsync(zeros)
+      discard cudaDrv.cuStreamSynchronize(cudaDrv.getStream())
+      result.cudaQ4Ready = true
+    except CatchableError:
+      result.cudaQ4Ready = false
+      stderr.write("[cuda] matmul_q4_kernel chưa có trong vecop.ptx đang chạy - " &
+        "fallback CPU-dequant-giữ-fp32 (xem kernels/matmul_q4_kernel.cu để build lại)\n")
+    if not result.cudaQ4Ready:
+      # ĐƯỜNG CŨ: dequant MỘT LẦN duy nhất rồi upload resident dạng fp32.
+      let bytesPerRow = (k + 1) div 2
+      var wT = newSeq[float32](k * n)
+      var lut: array[16, float32]
+      for row in 0 ..< n:
+        let rowByteOff = row * bytesPerRow
+        let rowGroupOff = row * nGroupsPerRow
+        var g = -1
+        for c in 0 ..< k:
+          let gNew = if groupSize > 0: c div groupSize else: 0
+          if gNew != g:
+            g = gNew
+            let sc = scales[rowGroupOff + g]
+            let zp = zeros[rowGroupOff + g]
+            for kk in 0 ..< 16: lut[kk] = (float32(kk) - zp) * sc
+          let byteIdx = rowByteOff + c div 2
+          let nibble = if c mod 2 == 0: wq[byteIdx] and 0x0F'u8 else: (wq[byteIdx] shr 4) and 0x0F'u8
+          wT[c * n + row] = lut[int(nibble)]
+      result.fallbackFp32 = sessionUpload(chosen, wT)
+  else:
+    # CPU: dequant MỘT LẦN duy nhất (không phải mỗi token) rồi upload
+    # resident dạng fp32 [K, N] transposed, dùng chung sessionUpload/sessionMatmul.
+    let bytesPerRow = (k + 1) div 2
+    var wT = newSeq[float32](k * n)
+    var lut: array[16, float32]
+    for row in 0 ..< n:
+      let rowByteOff = row * bytesPerRow
+      let rowGroupOff = row * nGroupsPerRow
+      var g = -1
+      for c in 0 ..< k:
+        let gNew = if groupSize > 0: c div groupSize else: 0
+        if gNew != g:
+          g = gNew
+          let sc = scales[rowGroupOff + g]
+          let zp = zeros[rowGroupOff + g]
+          for kk in 0 ..< 16: lut[kk] = (float32(kk) - zp) * sc
+        let byteIdx = rowByteOff + c div 2
+        let nibble = if c mod 2 == 0: wq[byteIdx] and 0x0F'u8 else: (wq[byteIdx] shr 4) and 0x0F'u8
+        wT[c * n + row] = lut[int(nibble)]
+    result.fallbackFp32 = sessionUpload(chosen, wT)
+
+proc sessionMatmulQ4*(backend: GpuBackend, a: SessionHandle, w: ResidentWeightHandle,
+                       c: var SessionHandle, M: int): bool =
+  ## Encode matmul C(M x N) = A(M x K) @ Wq(K x N) vào session đang mở, dùng
+  ## weight resident đã upload qua residentUploadQ4. K/N/groupSize lấy từ w.
+  var chosen = backend
+  if chosen == gbAuto: chosen = detectBackend()
+  if chosen == gbTsic: chosen = resolveTsicBackend()
+
+  case chosen
+  of gbMetal:
+    when defined(macosx):
+      # SỬA BUG NGHIÊM TRỌNG (nguồn gốc token rác): c CHƯA được cấp buffer
+      # trước khi dùng làm output - giống hệt bug đã fix ở sessionMatmul (xem
+      # comment ở đó) nhưng hàm NÀY (dùng cho MỌI Q/K/V/O/gate/up/down
+      # projection của model Q4-per-group) lại thiếu đúng bước đó. Caller gọi
+      # kiểu sessionMatmulQ4(be, x, w, hOut, M) với hOut là SessionHandle mặc
+      # định (metalHandle=nil) - kernel ghi vào buffer không hợp lệ -> logits
+      # sai hoàn toàn nhưng KHÔNG crash rõ ràng -> đúng khớp triệu chứng token
+      # rác. Model int8/fp32 KHÔNG đi qua hàm này (dùng sessionMatmul đã fix
+      # từ trước) nên không bị ảnh hưởng bởi bug này.
+      if c.metalHandle == nil:
+        c.metalHandle = metalSessionAllocScratch(M * w.n)
+      return metalSessionMatmulQ4Enc(a.metalHandle, w.metalWq, w.metalScales, w.metalZeros,
+                                      c.metalHandle, M, w.k, w.n, w.groupSize, w.nGroupsPerRow)
+    else:
+      return false
+  of gbOpenCL:
+    # SỬA BUG - cùng lỗi thiếu cấp phát như nhánh gbMetal ở trên.
+    if c.openclHandle == nil:
+      c.openclHandle = openclSessionAllocScratch(M * w.n)
+    return openclSessionMatmulQ4Enc(cl_mem(a.openclHandle), cl_mem(w.openclWq),
+                                     cl_mem(w.openclScales), cl_mem(w.openclZeros),
+                                     cl_mem(c.openclHandle), M, w.k, w.n, w.groupSize, w.nGroupsPerRow)
+  of gbCuda:
+    if w.cudaQ4Ready:
+      try:
+        let old = c.cudaHandle
+        c.cudaHandle = cudaDrv.cudaMatmulQ4R(a.cudaHandle, w.cudaWq, w.cudaScales, w.cudaZeros,
+                                              M, w.k, w.n, w.groupSize, w.nGroupsPerRow)
+        if old.dptr != 0: (var oldVar = old; cudaDrv.freeResident(oldVar))
+        return true
+      except CatchableError:
+        discard  # rơi xuống fallbackFp32 bên dưới, KHÔNG sập process
+    return sessionMatmul(chosen, a, w.fallbackFp32, c, M, w.k, w.n)
+  else:
+    # CPU: dùng lại sessionMatmul chung trên bản fp32 đã resident.
+    return sessionMatmul(chosen, a, w.fallbackFp32, c, M, w.k, w.n)
+
+proc residentFreeQ4*(w: var ResidentWeightHandle) =
+  ## Giải phóng weight resident - chỉ gọi lúc unload model/thoát process,
+  ## KHÔNG gọi giữa các token.
+  case w.kind
+  of gbMetal:
+    when defined(macosx):
+      metalSessionFree(w.metalWq)
+      metalSessionFree(w.metalScales)
+      metalSessionFree(w.metalZeros)
+  of gbOpenCL:
+    var wq = cl_mem(w.openclWq); var sc = cl_mem(w.openclScales); var zp = cl_mem(w.openclZeros)
+    openclSessionFree(wq); openclSessionFree(sc); openclSessionFree(zp)
+  of gbCuda:
+    if w.cudaQ4Ready:
+      var wq = w.cudaWq; var sc = w.cudaScales; var zp = w.cudaZeros
+      cudaDrv.freeResident(wq); cudaDrv.freeResident(sc); cudaDrv.freeResident(zp)
+    else:
+      var f = w.fallbackFp32
+      sessionFree(w.kind, f)
+  else:
+    var f = w.fallbackFp32
+    sessionFree(w.kind, f)
+    w.fallbackFp32 = f
+
 proc linearPlusAttentionSession*(backend: GpuBackend, q, k, v: seq[float32],
                                   B, H, T, D: int, scale: float32): seq[float32] =
   ## Linear++ Attention dùng Session API chung - chạy trên Metal/CUDA/OpenCL
@@ -1011,23 +1499,7 @@ proc linearPlusAttentionSession*(backend: GpuBackend, q, k, v: seq[float32],
   result = newSeq[float32](qkvLen)
 
   if not sessionBegin(backend):
-    # Fallback CPU
-    for b in 0 ..< B:
-      for h in 0 ..< H:
-        let base = (b * H + h) * T * D
-        let norm = 1'f32 / sqrt(float32(T))
-        for ti in 0 ..< T:
-          let qOff = base + ti * D
-          for tj in 0 ..< T:
-            var kv = 0'f32
-            for d in 0 ..< D:
-              kv += k[base + tj * D + d] * v[base + ti * D + d]
-            result[base + ti * D + tj] = kv * norm
-          for d in 0 ..< D:
-            var acc = 0'f32
-            for tj in 0 ..< T:
-              acc += q[qOff + tj] * result[base + tj * D + d]
-            result[base + ti * D + d] = acc * scale
+    echo "Session begin failed,stop"
     return
 
   # Upload dữ liệu
@@ -1045,26 +1517,7 @@ proc linearPlusAttentionSession*(backend: GpuBackend, q, k, v: seq[float32],
 
   # Kết thúc session
   if not sessionEnd(backend):
-    # Fallback CPU nếu session fail
-    for b in 0 ..< B:
-      for h in 0 ..< H:
-        let base = (b * H + h) * T * D
-        let norm = 1'f32 / sqrt(float32(T))
-        for ti in 0 ..< T:
-          let qOff = base + ti * D
-          for tj in 0 ..< T:
-            var kv = 0'f32
-            for d in 0 ..< D:
-              kv += k[base + tj * D + d] * v[base + ti * D + d]
-            result[base + ti * D + tj] = kv * norm
-          for d in 0 ..< D:
-            var acc = 0'f32
-            for tj in 0 ..< T:
-              acc += q[qOff + tj] * result[base + tj * D + d]
-            result[base + ti * D + d] = acc * scale
-    sessionFree(backend, hQ); sessionFree(backend, hK)
-    sessionFree(backend, hV); sessionFree(backend, hKV)
-    sessionFree(backend, hO)
+    echo "Session failed,stop"
     return
 
   # Đọc kết quả

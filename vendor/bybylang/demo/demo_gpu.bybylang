@@ -28,7 +28,7 @@ gpu apflu B -> APFLURESB beta 0.2 alpha 0.05
 gpu softmax A -> M rows 1 cols 8
 
 # 6. Matmul
-gpu matmul A, B -> N m 8 k 8 n 1
+gpu matmul A, B -> N m 1 k A.len n 1
 
 # 7. Layernorm forward
 gpu layernorm A, B, C -> LAYERNORMRES rows 8 cols 1 eps 1e-5
@@ -38,8 +38,9 @@ gpu array DY = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
 gpu layernorm_backward DY, A, B, C -> DX, DGAMMA, DBETA rows 8 cols 1 eps 1e-5
 
 # 9. Embedding Lookup
+gpu array EMB_TABLE = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64]
 indices = [0, 1, 2, 3, 4, 5, 6, 7]
-gpu embedding E, indices -> EMBEDRES vocab 8 dim 8
+gpu embedding EMB_TABLE, indices -> EMBEDRES vocab 8 dim 8
 
 # 10. Fused Attention Forward
 gpu array Q = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
@@ -51,7 +52,16 @@ gpu attention Q, MatKey, V -> ATTENTIONO, ATTENTIONS B 1 H 1 S 4 D 4 scale 0.707
 gpu array DYATTN = [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.11, 0.12, 0.13, 0.14, 0.15, 0.16]
 gpu attention_backward Q, MatKey, V, ATTENTIONS, DYATTN -> DQ, DK, DV B 1 H 1 S 4 D 4 scale 0.7071
 
-# 12. In ket qua
+# 12. Session API - gop nhieu lenh gpu vao 1 session GPU duy nhat (giam so
+# lan commit+wait GPU so voi goi tung lenh "gpu ..." roi rac). Neu backend
+# khong ho tro session se tu dong fallback ve tung lenh immediate nhu cu.
+session:
+  gpu add A, B -> SESSC size 8
+  gpu mul SESSC, A -> SESSD size 8
+  gpu relu SESSD -> SESSE
+  gpu softmax A -> SESSM rows 1 cols 8
+
+# 13. In ket qua
 print "=== GPU VECTOR OPERATIONS ==="
 print "GPU add result:"
 print C
@@ -110,7 +120,17 @@ print DK
 print "GPU attention backward DV:"
 print DV
 
-# 13. Control flow test
+print "=== SESSION RESULTS ==="
+print "GPU session add result (A+B):"
+print SESSC
+print "GPU session mul result (SESSC*A):"
+print SESSD
+print "GPU session relu result (SESSD):"
+print SESSE
+print "GPU session softmax result (A):"
+print SESSM
+
+# 14. Control flow test
 x = 5
 if x > 0:
     print "x duong"

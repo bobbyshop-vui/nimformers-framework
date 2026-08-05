@@ -1,7 +1,7 @@
 # Makefile — build project Nimformer
 
 NIM      := nim
-NIMFLAGS := -d:release --hints:off
+NIMFLAGS := -d:release --hints:off --gc:arc --opt:speed
 
 TEST_SRC  := test_nimformer.nim
 
@@ -77,4 +77,4 @@ else
 endif
 run-cuda:
 	nim c -d:release --hints:off -d:backend=cuda test_nimformer.nim
-	./test_nimformer$(EXE)
+	./test_nimformer$(EXE_EXT)

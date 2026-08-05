@@ -41,12 +41,19 @@ type
     clEnqueueReadBuffer: proc(command_queue: cl_command_queue, buffer: cl_mem, blocking_read: uint32,
                                offset, size: csize_t, ptrData: pointer, num_events: cl_uint,
                                wait_list: pointer, event: pointer): cl_int {.cdecl.}
+    clEnqueueCopyBuffer: proc(command_queue: cl_command_queue, src_buffer, dst_buffer: cl_mem,
+                               src_offset, dst_offset, size: csize_t, num_events: cl_uint,
+                               wait_list: pointer, event: pointer): cl_int {.cdecl.}
     clFinish: proc(command_queue: cl_command_queue): cl_int {.cdecl.}
     clReleaseMemObject: proc(memobj: cl_mem): cl_int {.cdecl.}
     clReleaseContext: proc(context: cl_context): cl_int {.cdecl.}
     clReleaseCommandQueue: proc(command_queue: cl_command_queue): cl_int {.cdecl.}
     clReleaseProgram: proc(program: cl_program): cl_int {.cdecl.}
     clReleaseKernel: proc(kernel: cl_kernel): cl_int {.cdecl.}
+    clGetKernelWorkGroupInfo: proc(kernel: cl_kernel, device: cl_device_id, param_name: cl_uint,
+                                    param_value_size: csize_t, param_value: pointer, param_value_size_ret: ptr csize_t): cl_int {.cdecl.}
+    clGetDeviceInfo: proc(device: cl_device_id, param_name: cl_uint, param_value_size: csize_t,
+                           param_value: pointer, param_value_size_ret: ptr csize_t): cl_int {.cdecl.}
 
 const kernelSource = staticRead(currentSourcePath().parentDir() / "kernels" / "vecop_matmul.cl")
 
@@ -54,6 +61,14 @@ const CL_DEVICE_TYPE_ALL: uint64 = 0xFFFFFFFF'u64
 const CL_MEM_READ_ONLY: uint64 = 4
 const CL_MEM_WRITE_ONLY: uint64 = 2
 const CL_MEM_READ_WRITE: uint64 = 1
+# THÊM MỚI: tương đương ý nghĩa "Private" của Metal (MTLResourceStorageModePrivate) -
+# báo driver rằng HOST (CPU) sẽ KHÔNG BAO GIỜ đọc/ghi buffer này SAU LẦN
+# ghi ban đầu -> driver được tự do đặt dữ liệu tối ưu thuần cho device (một
+# số driver OpenCL, đặc biệt trên GPU rời, có thể đặt vào VRAM riêng thay vì
+# giữ ở vùng nhớ có thể host truy cập). Dùng cho resident weight (Q4:
+# scales/zeros, hoặc fp32-resident: int8/tied-embedding) - KHÔNG dùng cho
+# activation buffer (host còn phải upload mỗi token / đọc kết quả về).
+const CL_MEM_HOST_NO_ACCESS: uint64 = 512  # 1 << 9, theo cl.h chuẩn (OpenCL 1.2+)
 const CL_TRUE: uint32 = 1
 const CL_FALSE: uint32 = 0
 
@@ -92,12 +107,15 @@ proc tryLoad(): bool =
   lib.clEnqueueNDRangeKernel = cast[typeof(lib.clEnqueueNDRangeKernel)](lib.handle.symAddr("clEnqueueNDRangeKernel"))
   lib.clEnqueueWriteBuffer = cast[typeof(lib.clEnqueueWriteBuffer)](lib.handle.symAddr("clEnqueueWriteBuffer"))
   lib.clEnqueueReadBuffer = cast[typeof(lib.clEnqueueReadBuffer)](lib.handle.symAddr("clEnqueueReadBuffer"))
+  lib.clEnqueueCopyBuffer = cast[typeof(lib.clEnqueueCopyBuffer)](lib.handle.symAddr("clEnqueueCopyBuffer"))
   lib.clFinish = cast[typeof(lib.clFinish)](lib.handle.symAddr("clFinish"))
   lib.clReleaseMemObject = cast[typeof(lib.clReleaseMemObject)](lib.handle.symAddr("clReleaseMemObject"))
   lib.clReleaseContext = cast[typeof(lib.clReleaseContext)](lib.handle.symAddr("clReleaseContext"))
   lib.clReleaseCommandQueue = cast[typeof(lib.clReleaseCommandQueue)](lib.handle.symAddr("clReleaseCommandQueue"))
   lib.clReleaseProgram = cast[typeof(lib.clReleaseProgram)](lib.handle.symAddr("clReleaseProgram"))
   lib.clReleaseKernel = cast[typeof(lib.clReleaseKernel)](lib.handle.symAddr("clReleaseKernel"))
+  lib.clGetKernelWorkGroupInfo = cast[typeof(lib.clGetKernelWorkGroupInfo)](lib.handle.symAddr("clGetKernelWorkGroupInfo"))
+  lib.clGetDeviceInfo = cast[typeof(lib.clGetDeviceInfo)](lib.handle.symAddr("clGetDeviceInfo"))
   result = lib.clGetPlatformIDs != nil and lib.clCreateContext != nil
 
 proc findPlatformAndDevice(platform_ret: ptr cl_platform_id, device_ret: ptr cl_device_id): bool =
@@ -160,6 +178,228 @@ proc getKernel(name: string): cl_kernel =
   gKernelCache[name] = k
   result = k
 
+# ============================================================
+# Q4 MATMUL - subgroup-reduction kernel (kernels/vecop_matmul_q4sg.cl),
+# mirror của matmul_q4_kernel bên Metal (simd_sum) / CUDA (__shfl_down_sync).
+# Build thành 1 program TÁCH RIÊNG khỏi gProgram (xem giải thích trong
+# vecop_matmul_q4sg.cl) - nếu device/driver không hỗ trợ cl_khr_subgroups,
+# build sẽ thất bại NHƯNG chỉ ảnh hưởng riêng kernel này, tự fallback về
+# matmul_q4_naive trong gProgram (vốn luôn build được), không làm hỏng bất
+# kỳ kernel nào khác của backend.
+# ============================================================
+const kernelSourceQ4Sg = staticRead(currentSourcePath().parentDir() / "kernels" / "vecop_matmul_q4sg.cl")
+
+var gQ4SgTried = false
+var gQ4SgAvailable = false
+var gProgramSg: cl_program
+var gKernelQ4Sg: cl_kernel
+
+proc tryBuildQ4SgProgram() =
+  ## Thử build + tạo kernel subgroup 1 LẦN DUY NHẤT lúc gọi đầu tiên, cache
+  ## kết quả (thành công hay thất bại) cho suốt vòng đời process - không
+  ## thử build lại mỗi lần gọi matmul Q4 (tốn 1 lần build/compile GPU mỗi
+  ## lần nếu không cache).
+  if gQ4SgTried: return
+  gQ4SgTried = true
+  var err: cl_int
+  var srcPtr = kernelSourceQ4Sg.cstring
+  let prog = lib.clCreateProgramWithSource(gCtx, 1, addr srcPtr, nil, addr err)
+  if err != 0 or prog == nil:
+    stderr.write("[opencl] Q4 subgroup kernel: khong tao duoc program, fallback ve matmul_q4_naive\n")
+    return
+  if lib.clBuildProgram(prog, 1, addr gDevice, nil, nil, nil) != 0:
+    stderr.write("[opencl] Q4 subgroup kernel: build that bai (co the device khong ho tro " &
+      "cl_khr_subgroups) - fallback ve matmul_q4_naive\n")
+    discard lib.clReleaseProgram(prog)
+    return
+  var kerr: cl_int
+  let k = lib.clCreateKernel(prog, "matmul_q4_kernel_sg".cstring, addr kerr)
+  if kerr != 0 or k == nil:
+    stderr.write("[opencl] Q4 subgroup kernel: clCreateKernel that bai, fallback ve matmul_q4_naive\n")
+    discard lib.clReleaseProgram(prog)
+    return
+  gProgramSg = prog
+  gKernelQ4Sg = k
+  gQ4SgAvailable = true
+
+proc q4UsesSubgroup(): bool =
+  ensureInit()
+  tryBuildQ4SgProgram()
+  gQ4SgAvailable
+
+const MMQ4_NDST = 4
+const MMQ4_SG_SIZE = 32  # kich thuoc subgroup gia dinh - dung cho hau het GPU
+                         # Intel/NVIDIA/AMD hien dai (giong warp CUDA / simdgroup
+                         # Metal). Neu device dung subgroup size khac (vd 16 tren
+                         # 1 so iGPU), kernel van dung (dispatch dua tren local
+                         # size nay, get_sub_group_size() ben trong kernel tu
+                         # phan anh dung gia tri that cua driver, vong lap "k +=
+                         # sgSize" trong .cl doc lap voi gia dinh nay).
+
+const CL_KERNEL_WORK_GROUP_SIZE: cl_uint = 0x11B0
+const CL_DEVICE_MAX_WORK_ITEM_SIZES: cl_uint = 0x1005
+
+var gMatmulKernelName = ""  # cache: chọn 1 lần, dùng suốt vòng đời process
+var gMatmulTile: csize_t = 0
+
+# THÊM MỚI: cache riêng cho biến thể vectorized (float4) - chỉ dùng khi
+# K % 4 == 0 và N % 4 == 0 (kiểm tra ở call site trong
+# openclSessionMatmulEnc/openclMatmul trước khi gọi pickMatmulVariant(true)).
+var gMatmulVec4KernelName = ""
+var gMatmulVec4Tile: csize_t = 0
+var gMatmulVec4Checked = false  # true nếu đã thử chọn (kể cả khi thất bại)
+
+proc pickMatmulVariantVec4(): tuple[name: string, tile: csize_t] =
+  ## Giống pickMatmulVariant() nhưng cho 2 kernel float4
+  ## (matmul_kernel_t16_vec4 / matmul_kernel_t32_vec4). Nếu build/query lỗi
+  ## (vd kernel chưa build được trên driver cũ không hỗ trợ OpenCL 1.2 float4
+  ## đầy đủ) thì trả về ("", 0) - caller PHẢI fallback về pickMatmulVariant()
+  ## scalar, KHÔNG được coi ("", 0) là hợp lệ để dispatch.
+  ##
+  ## THÊM: escape hatch BYBY_DISABLE_MATMUL_VEC4 - đây là biến thể kernel DUY
+  ## NHẤT tồn tại trên OpenCL mà KHÔNG có tương đương bên Metal (Metal chỉ có
+  ## 1 kernel scalar dùng ceil(K/TILE) cho mọi trường hợp). Nếu nghi ngờ vec4
+  ## là nguồn gây token rác trên OpenCL (mà Metal không bị) - set biến môi
+  ## trường này để ép toàn bộ về đường scalar (giống hệt code path Metal
+  ## đang dùng) và so sánh, thay vì phải đoán.
+  if existsEnv("BYBY_DISABLE_MATMUL_VEC4"):
+    gMatmulVec4Checked = true
+    gMatmulVec4KernelName = ""
+    gMatmulVec4Tile = 0
+    return ("", csize_t(0))
+  if gMatmulVec4Checked:
+    return (gMatmulVec4KernelName, gMatmulVec4Tile)
+  gMatmulVec4Checked = true
+
+  var maxItemSizes: array[3, csize_t]
+  let diErr = lib.clGetDeviceInfo(gDevice, CL_DEVICE_MAX_WORK_ITEM_SIZES,
+    csize_t(sizeof(maxItemSizes)), addr maxItemSizes[0], nil)
+  let maxDim0 = if diErr == 0: maxItemSizes[0] else: csize_t(8)
+  let maxDim1 = if diErr == 0: maxItemSizes[1] else: csize_t(8)
+
+  const candidates = [("matmul_kernel_t32_vec4", csize_t(32)),
+                       ("matmul_kernel_t16_vec4", csize_t(16))]
+  for (name, tile) in candidates:
+    if tile > maxDim0 or tile > maxDim1:
+      continue
+    var err: cl_int
+    let k = lib.clCreateKernel(gProgram, name.cstring, addr err)
+    if err != 0 or k == nil:
+      stderr.write("[opencl] matmul-vec4: clCreateKernel " & name & " loi (err=" & $err & "), bo qua vec4\n")
+      continue
+    var wgSize: csize_t = 0
+    let infoErr = lib.clGetKernelWorkGroupInfo(k, gDevice, CL_KERNEL_WORK_GROUP_SIZE,
+      csize_t(sizeof(csize_t)), addr wgSize, nil)
+    if infoErr == 0 and wgSize >= tile * tile:
+      gKernelCache[name] = k
+      gMatmulVec4KernelName = name
+      gMatmulVec4Tile = tile
+      stderr.write("[opencl] matmul-vec4: chon kernel " & name & " (tile=" & $tile & ")\n")
+      return (name, tile)
+    else:
+      discard lib.clReleaseKernel(k)
+  stderr.write("[opencl] matmul-vec4: khong bien the nao qua dieu kien, dung scalar path\n")
+  return ("", csize_t(0))
+
+proc pickMatmulVariant(): tuple[name: string, tile: csize_t] =
+  ## SUA (fix bug "loi kernel o matmul" OpenCL): truoc day dispatch thang
+  ## "matmul_naive" voi local_work_size=32x32=1024 CO DINH, khong biet GPU
+  ## that co cho phep khong -> CL_INVALID_WORK_GROUP_SIZE tren nhieu may.
+  ## Gio query 2 gioi han THAT truoc khi chon:
+  ##   1. CL_KERNEL_WORK_GROUP_SIZE (tong so work-item/workgroup toi da MA
+  ##      kernel nay duoc phep dung, phu thuoc register/local-mem no chiem).
+  ##   2. CL_DEVICE_MAX_WORK_ITEM_SIZES (gioi han TOI DA THEO TUNG CHIEU rieng
+  ##      cua device - vd mot so GPU cho tong workgroup 1024 nhung moi chieu
+  ##      lai chi cho toi da 16 hoac 64). Day la cai truoc day BI BO SOT: chi
+  ##      check tong (wgSize >= tile*tile) la CHUA DU, phai check ca
+  ##      "tile <= maxWorkItemSizes[0]" va "tile <= maxWorkItemSizes[1]" vi
+  ##      kernel nay dispatch 2D (tx, ty) deu = tile.
+  ## Chon bien the LON NHAT thoa CA HAI dieu kien, fallback dan xuong tile
+  ## nho hon neu khong thoa (giong cach metal_shim.m da lam ben Metal).
+  if gMatmulKernelName.len > 0:
+    return (gMatmulKernelName, gMatmulTile)
+
+  var maxItemSizes: array[3, csize_t]
+  let diErr = lib.clGetDeviceInfo(gDevice, CL_DEVICE_MAX_WORK_ITEM_SIZES,
+    csize_t(sizeof(maxItemSizes)), addr maxItemSizes[0], nil)
+  # Neu query loi vi ly do gi do, dung 8 lam gioi han an toan tuyet doi thay
+  # vi gia dinh khong gioi han (moi GPU thuc te deu >= 8 cho ca 3 chieu).
+  let maxDim0 = if diErr == 0: maxItemSizes[0] else: csize_t(8)
+  let maxDim1 = if diErr == 0: maxItemSizes[1] else: csize_t(8)
+
+  const candidates = [("matmul_kernel_t32", csize_t(32)),
+                       ("matmul_kernel_t16", csize_t(16)),
+                       ("matmul_kernel_t8", csize_t(8))]
+  for (name, tile) in candidates:
+    if tile > maxDim0 or tile > maxDim1:
+      stderr.write("[opencl] matmul: bo qua " & name & " (tile=" & $tile &
+        " vuot CL_DEVICE_MAX_WORK_ITEM_SIZES=[" & $maxDim0 & "," & $maxDim1 & "])\n")
+      continue
+    var err: cl_int
+    let k = lib.clCreateKernel(gProgram, name.cstring, addr err)
+    if err != 0 or k == nil:
+      stderr.write("[opencl] matmul: clCreateKernel " & name & " loi (err=" & $err & ")\n")
+      continue
+    gKernelCache[name] = k
+    var wgSize: csize_t = 0
+    let infoErr = lib.clGetKernelWorkGroupInfo(k, gDevice, CL_KERNEL_WORK_GROUP_SIZE,
+      csize_t(sizeof(csize_t)), addr wgSize, nil)
+    if infoErr == 0 and wgSize >= tile * tile:
+      gMatmulKernelName = name
+      gMatmulTile = tile
+      stderr.write("[opencl] matmul: chon kernel " & name & " (tile=" & $tile &
+        ", CL_KERNEL_WORK_GROUP_SIZE=" & $wgSize &
+        ", CL_DEVICE_MAX_WORK_ITEM_SIZES=[" & $maxDim0 & "," & $maxDim1 & "])\n")
+      return (name, tile)
+    else:
+      stderr.write("[opencl] matmul: bo qua " & name & " (tile=" & $tile &
+        ", CL_KERNEL_WORK_GROUP_SIZE=" & $wgSize & " khong du " & $(tile*tile) & ")\n")
+  # Khong bien the nao khop (cuc hiem) - fallback an toan tuyet doi ve tile 8,
+  # dung ten alias "matmul_naive" (tile 8, gan nhu chac chan chay duoc tren
+  # moi device that su ho tro OpenCL 1.x tro len).
+  gMatmulKernelName = "matmul_naive"
+  gMatmulTile = 8
+  stderr.write("[opencl] matmul: khong bien the nao qua het dieu kien, fallback tile=8 (matmul_naive)\n")
+  return (gMatmulKernelName, gMatmulTile)
+
+var gMatmulQ4WgKernelName = ""
+var gMatmulQ4Wg: csize_t = 0
+
+proc pickMatmulQ4WgVariant(): tuple[name: string, wg: csize_t] =
+  ## Chon bien the matmul_q4_kernel_wg{64,128,256} lon nhat ma
+  ## CL_KERNEL_WORK_GROUP_SIZE that cua device cho phep - day la duong dan
+  ## TOI UU CHINH tren cac device khong co cl_khr_subgroups (macOS: Apple
+  ## khoa cung OpenCL o 1.2, KHONG BAO GIO co subgroup - xem giai thich
+  ## trong vecop_matmul.cl). Cung logic fallback-dan nhu pickMatmulVariant().
+  if gMatmulQ4WgKernelName.len > 0:
+    return (gMatmulQ4WgKernelName, gMatmulQ4Wg)
+  const candidates = [("matmul_q4_kernel_wg256", csize_t(256)),
+                       ("matmul_q4_kernel_wg128", csize_t(128)),
+                       ("matmul_q4_kernel_wg64", csize_t(64))]
+  for (name, wg) in candidates:
+    var err: cl_int
+    let k = lib.clCreateKernel(gProgram, name.cstring, addr err)
+    if err != 0 or k == nil:
+      stderr.write("[opencl] matmul_q4: clCreateKernel " & name & " loi (err=" & $err & ")\n")
+      continue
+    gKernelCache[name] = k
+    var wgSize: csize_t = 0
+    let infoErr = lib.clGetKernelWorkGroupInfo(k, gDevice, CL_KERNEL_WORK_GROUP_SIZE,
+      csize_t(sizeof(csize_t)), addr wgSize, nil)
+    if infoErr == 0 and wgSize >= wg:
+      gMatmulQ4WgKernelName = name
+      gMatmulQ4Wg = wg
+      stderr.write("[opencl] matmul_q4: chon kernel " & name & " (wg=" & $wg &
+        ", CL_KERNEL_WORK_GROUP_SIZE=" & $wgSize & ")\n")
+      return (name, wg)
+    else:
+      stderr.write("[opencl] matmul_q4: bo qua " & name & " (wg=" & $wg &
+        ", CL_KERNEL_WORK_GROUP_SIZE=" & $wgSize & " khong du)\n")
+  gMatmulQ4WgKernelName = "matmul_q4_naive"
+  gMatmulQ4Wg = 0
+  stderr.write("[opencl] matmul_q4: khong bien the wg nao qua het dieu kien, fallback matmul_q4_naive\n")
+  return (gMatmulQ4WgKernelName, gMatmulQ4Wg)
+
 proc getBuf(bytes: csize_t, flags: uint64): cl_mem =
   let key = (bytes, flags)
   if gBufPool.hasKey(key) and gBufPool[key].len > 0:
@@ -195,7 +435,20 @@ proc openclSessionUpload*(data: seq[float32]): cl_mem =
   result = lib.clCreateBuffer(gCtx, CL_MEM_READ_WRITE, bytes, nil, addr err)
   gpuCheck(err == 0, "openclSessionUpload: clCreateBuffer failed")
   var dataVar = data
-  gpuCheck(lib.clEnqueueWriteBuffer(gQueue, result, CL_FALSE, 0, bytes, addr dataVar[0], 0, nil, nil) == 0,
+  # SỬA BUG THẬT (nguyên nhân token rác chỉ trên OpenCL, không phải Metal):
+  # trước đây dùng CL_FALSE (ghi KHÔNG BLOCKING) rồi return NGAY - proc trả
+  # về, biến cục bộ `dataVar` ra khỏi scope, bị ARC/ORC (--gc:arc) GIẢI
+  # PHÓNG NGAY LẬP TỨC (không như GC tracing truyền thống trì hoãn thu hồi).
+  # Nhưng clEnqueueWriteBuffer(CL_FALSE) chỉ ENQUEUE 1 lệnh DMA bất đồng bộ -
+  # driver có thể đọc addr dataVar[0] TẠI BẤT KỲ THỜI ĐIỂM NÀO SAU ĐÓ, có
+  # thể là SAU KHI bộ nhớ đó đã bị free/ghi đè bởi allocation khác trên CPU.
+  # Kết quả: GPU buffer nhận dữ liệu rác/một phần/dữ liệu của biến khác ->
+  # đúng triệu chứng "token rác ngẫu nhiên, không crash". Metal không bị vì
+  # newBufferWithBytes: copy đồng bộ (memcpy ngay lúc gọi, xem metal_upload
+  # trong metal_shim.m) - không có độ trễ nào giữa "trả con trỏ" và "đọc dữ
+  # liệu" như OpenCL. Đổi CL_FALSE -> CL_TRUE: chờ DMA ghi xong THẬT SỰ rồi
+  # mới return, đảm bảo dataVar còn sống nguyên vẹn suốt lúc driver đọc nó.
+  gpuCheck(lib.clEnqueueWriteBuffer(gQueue, result, CL_TRUE, 0, bytes, addr dataVar[0], 0, nil, nil) == 0,
     "openclSessionUpload: write failed")
 
 proc openclSessionAllocScratch*(n: int): cl_mem =
@@ -225,7 +478,21 @@ proc openclSessionMatmulEnc*(a, b, c: cl_mem, M, K, N: int): bool =
   ## Encode matmul thẳng trên buffer đã resident (a/b/c đến từ
   ## openclSessionUpload/AllocScratch) - không write/read qua CPU.
   ensureInit()
-  let kernel = getKernel("matmul_naive")
+  # THÊM MỚI: ưu tiên kernel float4 nếu K,N chia hết 4 (đa số hidden_size/
+  # intermediate_size của LLM hiện đại đều bội số 4, thậm chí 128+) - kernel
+  # vec4 KHÔNG hỗ trợ remainder tile (numTiles = K div TILE, phần dư xử lý
+  # scalar riêng trong kernel) nên vẫn đúng cả khi K không chia hết TILE,
+  # chỉ cần K,N chia hết 4 là an toàn.
+  var kName: string
+  var TILE: csize_t
+  if K mod 4 == 0 and N mod 4 == 0:
+    let (vName, vTile) = pickMatmulVariantVec4()
+    if vName.len > 0:
+      kName = vName
+      TILE = vTile
+  if kName.len == 0:
+    (kName, TILE) = pickMatmulVariant()
+  let kernel = getKernel(kName)
   var aVar = a; var bVar = b; var cVar = c
   var mArg = int32(M); var kArg = int32(K); var nArg = int32(N)
   if lib.clSetKernelArg(kernel, 0, csize_t(sizeof(cl_mem)), addr aVar) != 0: return false
@@ -234,10 +501,189 @@ proc openclSessionMatmulEnc*(a, b, c: cl_mem, M, K, N: int): bool =
   if lib.clSetKernelArg(kernel, 3, csize_t(sizeof(int32)), addr mArg) != 0: return false
   if lib.clSetKernelArg(kernel, 4, csize_t(sizeof(int32)), addr kArg) != 0: return false
   if lib.clSetKernelArg(kernel, 5, csize_t(sizeof(int32)), addr nArg) != 0: return false
-  const TILE = csize_t(32)  # SUA: khop BB_TILE=32 trong vecop_matmul.cl
   var globalSize = [roundUpTile(csize_t(M), TILE), roundUpTile(csize_t(N), TILE)]
   var localSize = [TILE, TILE]
-  result = lib.clEnqueueNDRangeKernel(gQueue, kernel, 2, nil, addr globalSize[0], addr localSize[0], 0, nil, nil) == 0
+  let clErr = lib.clEnqueueNDRangeKernel(gQueue, kernel, 2, nil, addr globalSize[0], addr localSize[0], 0, nil, nil)
+  if clErr != 0:
+    stderr.write("[opencl] openclSessionMatmulEnc that bai: clEnqueueNDRangeKernel tra ve " & $clErr &
+      " (kernel=" & kName & ", tile=" & $TILE & ", M=" & $M & ", K=" & $K & ", N=" & $N &
+      ", global=[" & $globalSize[0] & "," & $globalSize[1] & "], local=[" & $localSize[0] & "," & $localSize[1] & "])\n")
+  result = clErr == 0
+
+var gMatmulNTKernelName = ""
+var gMatmulNTTile: csize_t = 0
+
+proc pickMatmulNTVariant(): tuple[name: string, tile: csize_t] =
+  ## Giống pickMatmulVariant() nhưng cho 3 kernel "NT" (C = A @ B^T, B lưu
+  ## row-major [N,K] - không cần transpose vật lý trước khi upload). Dùng
+  ## bounds check đầy đủ (không phải biến thể vec4) để an toàn tối đa.
+  if gMatmulNTKernelName.len > 0:
+    return (gMatmulNTKernelName, gMatmulNTTile)
+
+  var maxItemSizes: array[3, csize_t]
+  let diErr = lib.clGetDeviceInfo(gDevice, CL_DEVICE_MAX_WORK_ITEM_SIZES,
+    csize_t(sizeof(maxItemSizes)), addr maxItemSizes[0], nil)
+  let maxDim0 = if diErr == 0: maxItemSizes[0] else: csize_t(8)
+  let maxDim1 = if diErr == 0: maxItemSizes[1] else: csize_t(8)
+
+  const candidates = [("matmul_nt_kernel_t32", csize_t(32)),
+                       ("matmul_nt_kernel_t16", csize_t(16)),
+                       ("matmul_nt_kernel_t8", csize_t(8))]
+  for (name, tile) in candidates:
+    if tile > maxDim0 or tile > maxDim1: continue
+    var err: cl_int
+    let k = lib.clCreateKernel(gProgram, name.cstring, addr err)
+    if err != 0 or k == nil: continue
+    gKernelCache[name] = k
+    var wgSize: csize_t = 0
+    let infoErr = lib.clGetKernelWorkGroupInfo(k, gDevice, CL_KERNEL_WORK_GROUP_SIZE,
+      csize_t(sizeof(csize_t)), addr wgSize, nil)
+    if infoErr == 0 and wgSize >= tile * tile:
+      gMatmulNTKernelName = name
+      gMatmulNTTile = tile
+      stderr.write("[opencl] matmul-nt: chon kernel " & name & " (tile=" & $tile & ")\n")
+      return (name, tile)
+  gMatmulNTKernelName = "matmul_nt_kernel_t8"
+  gMatmulNTTile = 8
+  stderr.write("[opencl] matmul-nt: khong bien the nao qua het dieu kien, fallback tile=8\n")
+  return (gMatmulNTKernelName, gMatmulNTTile)
+
+proc openclSessionMatmulNTEnc*(a, b, c: cl_mem, M, K, N: int): bool =
+  ## C(MxN) = A(MxK) @ B(NxK)^T - B truyen vao GIỮ NGUYÊN layout gốc [N,K]
+  ## (vd trực tiếp K-cache/V-cache [S,D]), KHÔNG transpose CPU trước khi gọi.
+  ensureInit()
+  let (kName, TILE) = pickMatmulNTVariant()
+  let kernel = getKernel(kName)
+  var aVar = a; var bVar = b; var cVar = c
+  var mArg = int32(M); var kArg = int32(K); var nArg = int32(N)
+  if lib.clSetKernelArg(kernel, 0, csize_t(sizeof(cl_mem)), addr aVar) != 0: return false
+  if lib.clSetKernelArg(kernel, 1, csize_t(sizeof(cl_mem)), addr bVar) != 0: return false
+  if lib.clSetKernelArg(kernel, 2, csize_t(sizeof(cl_mem)), addr cVar) != 0: return false
+  if lib.clSetKernelArg(kernel, 3, csize_t(sizeof(int32)), addr mArg) != 0: return false
+  if lib.clSetKernelArg(kernel, 4, csize_t(sizeof(int32)), addr kArg) != 0: return false
+  if lib.clSetKernelArg(kernel, 5, csize_t(sizeof(int32)), addr nArg) != 0: return false
+  var globalSize = [roundUpTile(csize_t(M), TILE), roundUpTile(csize_t(N), TILE)]
+  var localSize = [TILE, TILE]
+  let clErr = lib.clEnqueueNDRangeKernel(gQueue, kernel, 2, nil, addr globalSize[0], addr localSize[0], 0, nil, nil)
+  if clErr != 0:
+    stderr.write("[opencl] openclSessionMatmulNTEnc that bai: clEnqueueNDRangeKernel tra ve " & $clErr & "\n")
+  result = clErr == 0
+
+proc openclSessionUploadPrivate*(data: seq[float32]): cl_mem =
+  ## Bản "Private" (tương đương Metal MTLResourceStorageModePrivate) của
+  ## openclSessionUpload - CHỈ dùng cho weight RESIDENT (fp32-resident: int8/
+  ## int4-symmetric/tied-embedding qua beResidentUploadFp32) mà host KHÔNG
+  ## đọc/ghi lại sau lúc upload. Dùng CL_MEM_READ_ONLY | CL_MEM_HOST_NO_ACCESS
+  ## thay vì CL_MEM_READ_WRITE (đang dùng cho MỌI buffer, kể cả loại này, ở
+  ## openclSessionUpload phía trên) - báo driver tối ưu chỗ đặt bộ nhớ cho
+  ## GPU-only access. Giữ nguyên fix CL_TRUE (blocking write) đã có ở
+  ## openclSessionUpload (tránh use-after-free) - xem giải thích ở đó.
+  ensureInit()
+  let bytes = csize_t(data.len * sizeof(float32))
+  var err: cl_int
+  result = lib.clCreateBuffer(gCtx, CL_MEM_READ_ONLY or CL_MEM_HOST_NO_ACCESS, bytes, nil, addr err)
+  gpuCheck(err == 0, "openclSessionUploadPrivate: clCreateBuffer failed")
+  var dataVar = data
+  gpuCheck(lib.clEnqueueWriteBuffer(gQueue, result, CL_TRUE, 0, bytes, addr dataVar[0], 0, nil, nil) == 0,
+    "openclSessionUploadPrivate: write failed")
+
+proc openclSessionUploadBytes*(data: seq[uint8]): cl_mem =
+  ## Upload byte tho (weight int4 da pack) thanh cl_mem resident, dung cho
+  ## openclSessionMatmulQ4Enc - goi 1 LAN luc load model, giu handle suot
+  ## vong doi process (khac openclMatmulQ4 tao buffer moi + release moi lan goi).
+  ensureInit()
+  let bytes = csize_t(data.len)
+  var err: cl_int
+  result = lib.clCreateBuffer(gCtx, CL_MEM_READ_ONLY or CL_MEM_HOST_NO_ACCESS, bytes, nil, addr err)
+  gpuCheck(err == 0, "openclSessionUploadBytes: clCreateBuffer failed")
+  var dataVar = data
+  # Xem giải thích đầy đủ ở openclSessionUpload() bên trên - cùng 1 bug
+  # use-after-free do CL_FALSE (async) + return ngay khiến dataVar bị free
+  # trước khi driver kịp đọc. Đổi sang CL_TRUE (blocking).
+  gpuCheck(lib.clEnqueueWriteBuffer(gQueue, result, CL_TRUE, 0, bytes, addr dataVar[0], 0, nil, nil) == 0,
+    "openclSessionUploadBytes: write failed")
+
+proc openclSessionMatmulQ4Enc*(a, wq, scales, zeros, c: cl_mem, m, k, n, groupSize, nGroupsPerRow: int): bool =
+  ## Ban resident cua openclMatmulQ4: wq/scales/zeros da resident san (tu
+  ## openclSessionUploadBytes/openclSessionUpload), khong write lai moi lan
+  ## goi - chi `a` (activation) la nho/doi moi token.
+  ##
+  ## SUA: uu tien kernel subgroup-reduction (matmul_q4_kernel_sg, mirror cua
+  ## Metal matmul_q4_kernel dung simd_sum) neu device ho tro - day chinh la
+  ## phan OpenCL con thieu khien no cham hon Metal ro ret cho Q4 matmul (op
+  ## chiem phan lon thoi gian moi token luc decode). Fallback ve
+  ## matmul_q4_naive neu device/driver khong ho tro cl_khr_subgroups.
+  ensureInit()
+  if q4UsesSubgroup():
+    let kernel = gKernelQ4Sg
+    var aVar = a; var wqVar = wq; var scVar = scales; var zpVar = zeros; var cVar = c
+    var mArg = int32(m); var kArg = int32(k); var nArg = int32(n)
+    var gsArg = int32(groupSize); var ngArg = int32(nGroupsPerRow)
+    if lib.clSetKernelArg(kernel, 0, csize_t(sizeof(cl_mem)), addr aVar) != 0: return false
+    if lib.clSetKernelArg(kernel, 1, csize_t(sizeof(cl_mem)), addr wqVar) != 0: return false
+    if lib.clSetKernelArg(kernel, 2, csize_t(sizeof(cl_mem)), addr scVar) != 0: return false
+    if lib.clSetKernelArg(kernel, 3, csize_t(sizeof(cl_mem)), addr zpVar) != 0: return false
+    if lib.clSetKernelArg(kernel, 4, csize_t(sizeof(cl_mem)), addr cVar) != 0: return false
+    if lib.clSetKernelArg(kernel, 5, csize_t(sizeof(int32)), addr mArg) != 0: return false
+    if lib.clSetKernelArg(kernel, 6, csize_t(sizeof(int32)), addr kArg) != 0: return false
+    if lib.clSetKernelArg(kernel, 7, csize_t(sizeof(int32)), addr nArg) != 0: return false
+    if lib.clSetKernelArg(kernel, 8, csize_t(sizeof(int32)), addr gsArg) != 0: return false
+    if lib.clSetKernelArg(kernel, 9, csize_t(sizeof(int32)), addr ngArg) != 0: return false
+    # 1 subgroup/rowBlock xu ly MMQ4_NDST=4 hang output - global.x =
+    # ceilDiv(N,4)*sgSize, local.x = sgSize (dispatch dung 1 subgroup/group).
+    let rowBlocks = csize_t((n + MMQ4_NDST - 1) div MMQ4_NDST)
+    var globalSize = [rowBlocks * csize_t(MMQ4_SG_SIZE), csize_t(m)]
+    var localSize = [csize_t(MMQ4_SG_SIZE), csize_t(1)]
+    if lib.clEnqueueNDRangeKernel(gQueue, kernel, 2, nil, addr globalSize[0], addr localSize[0], 0, nil, nil) == 0:
+      return true
+    stderr.write("[opencl] matmul_q4_kernel_sg enqueue that bai, fallback ve matmul_q4_naive cho lan goi nay\n")
+    # roi xuong ben duoi de thu lai bang kernel naive thay vi that bai han
+
+  # SUA: khong co subgroup (vd macOS - Apple khoa cung OpenCL 1.2, KHONG
+  # BAO GIO co cl_khr_subgroups) -> dung kernel workgroup-local-memory
+  # reduction (matmul_q4_kernel_wg{64,128,256}) THAY VI roi thang xuong
+  # naive. Day moi la duong dan nhanh THAT SU tren macOS/OpenCL 1.2, khong
+  # phu thuoc extension nao ca (thuan core OpenCL 1.2).
+  ensureInit()
+  let (wgKernelName, wg) = pickMatmulQ4WgVariant()
+  if wgKernelName != "matmul_q4_naive":
+    let kernelWg = getKernel(wgKernelName)
+    var aVar2 = a; var wqVar2 = wq; var scVar2 = scales; var zpVar2 = zeros; var cVar2 = c
+    var mArg2 = int32(m); var kArg2 = int32(k); var nArg2 = int32(n)
+    var gsArg2 = int32(groupSize); var ngArg2 = int32(nGroupsPerRow)
+    if lib.clSetKernelArg(kernelWg, 0, csize_t(sizeof(cl_mem)), addr aVar2) != 0: return false
+    if lib.clSetKernelArg(kernelWg, 1, csize_t(sizeof(cl_mem)), addr wqVar2) != 0: return false
+    if lib.clSetKernelArg(kernelWg, 2, csize_t(sizeof(cl_mem)), addr scVar2) != 0: return false
+    if lib.clSetKernelArg(kernelWg, 3, csize_t(sizeof(cl_mem)), addr zpVar2) != 0: return false
+    if lib.clSetKernelArg(kernelWg, 4, csize_t(sizeof(cl_mem)), addr cVar2) != 0: return false
+    if lib.clSetKernelArg(kernelWg, 5, csize_t(sizeof(int32)), addr mArg2) != 0: return false
+    if lib.clSetKernelArg(kernelWg, 6, csize_t(sizeof(int32)), addr kArg2) != 0: return false
+    if lib.clSetKernelArg(kernelWg, 7, csize_t(sizeof(int32)), addr nArg2) != 0: return false
+    if lib.clSetKernelArg(kernelWg, 8, csize_t(sizeof(int32)), addr gsArg2) != 0: return false
+    if lib.clSetKernelArg(kernelWg, 9, csize_t(sizeof(int32)), addr ngArg2) != 0: return false
+    let rowBlocksWg = csize_t((n + MMQ4_NDST - 1) div MMQ4_NDST)
+    var globalSizeWg = [rowBlocksWg * wg, csize_t(m)]
+    var localSizeWg = [wg, csize_t(1)]
+    if lib.clEnqueueNDRangeKernel(gQueue, kernelWg, 2, nil, addr globalSizeWg[0], addr localSizeWg[0], 0, nil, nil) == 0:
+      return true
+    stderr.write("[opencl] " & wgKernelName & " enqueue that bai, fallback ve matmul_q4_naive cho lan goi nay\n")
+
+  let kernel = getKernel("matmul_q4_naive")
+  var aVar = a; var wqVar = wq; var scVar = scales; var zpVar = zeros; var cVar = c
+  var mArg = int32(m); var kArg = int32(k); var nArg = int32(n)
+  var gsArg = int32(groupSize); var ngArg = int32(nGroupsPerRow)
+  if lib.clSetKernelArg(kernel, 0, csize_t(sizeof(cl_mem)), addr aVar) != 0: return false
+  if lib.clSetKernelArg(kernel, 1, csize_t(sizeof(cl_mem)), addr wqVar) != 0: return false
+  if lib.clSetKernelArg(kernel, 2, csize_t(sizeof(cl_mem)), addr scVar) != 0: return false
+  if lib.clSetKernelArg(kernel, 3, csize_t(sizeof(cl_mem)), addr zpVar) != 0: return false
+  if lib.clSetKernelArg(kernel, 4, csize_t(sizeof(cl_mem)), addr cVar) != 0: return false
+  if lib.clSetKernelArg(kernel, 5, csize_t(sizeof(int32)), addr mArg) != 0: return false
+  if lib.clSetKernelArg(kernel, 6, csize_t(sizeof(int32)), addr kArg) != 0: return false
+  if lib.clSetKernelArg(kernel, 7, csize_t(sizeof(int32)), addr nArg) != 0: return false
+  if lib.clSetKernelArg(kernel, 8, csize_t(sizeof(int32)), addr gsArg) != 0: return false
+  if lib.clSetKernelArg(kernel, 9, csize_t(sizeof(int32)), addr ngArg) != 0: return false
+  var globalSize = [csize_t(n), csize_t(m)]
+  result = lib.clEnqueueNDRangeKernel(gQueue, kernel, 2, nil, addr globalSize[0], nil, 0, nil, nil) == 0
 
 proc openclSessionVecOpEnc*(op: string, a, b, c: cl_mem, n: int): bool =
   ensureInit()
@@ -248,6 +694,35 @@ proc openclSessionVecOpEnc*(op: string, a, b, c: cl_mem, n: int): bool =
   if lib.clSetKernelArg(kernel, 2, csize_t(sizeof(cl_mem)), addr cVar) != 0: return false
   var globalSize = csize_t(n)
   result = lib.clEnqueueNDRangeKernel(gQueue, kernel, 1, nil, addr globalSize, nil, 0, nil, nil) == 0
+
+proc openclSessionRopeEnc*(x, cosT, sinT: cl_mem, T, Hn, D: int): bool =
+  ## RoPE rotate_half in-place, encode vào queue (tương ứng metal_rope_enc).
+  ensureInit()
+  let kernel = getKernel("rope_kernel")
+  var xVar = x; var cosVar = cosT; var sinVar = sinT
+  var hnArg = int32(Hn); var dArg = int32(D)
+  if lib.clSetKernelArg(kernel, 0, csize_t(sizeof(cl_mem)), addr xVar) != 0: return false
+  if lib.clSetKernelArg(kernel, 1, csize_t(sizeof(cl_mem)), addr cosVar) != 0: return false
+  if lib.clSetKernelArg(kernel, 2, csize_t(sizeof(cl_mem)), addr sinVar) != 0: return false
+  if lib.clSetKernelArg(kernel, 3, csize_t(sizeof(int32)), addr hnArg) != 0: return false
+  if lib.clSetKernelArg(kernel, 4, csize_t(sizeof(int32)), addr dArg) != 0: return false
+  var globalSize: array[3, csize_t] = [csize_t(D div 2), csize_t(Hn), csize_t(T)]
+  result = lib.clEnqueueNDRangeKernel(gQueue, kernel, 3, nil, addr globalSize[0], nil, 0, nil, nil) == 0
+
+proc openclSessionCopyIntoEnc*(src, dst: cl_mem, dstOffsetElems, n: int): bool =
+  ## dst[dstOffsetElems ..< +n] = src[0 ..< n]. Dùng clEnqueueCopyBuffer thẳng
+  ## (device-to-device, không cần kernel riêng - giống cudaCopyIntoR bên
+  ## CUDA) thay vì viết 1 copy_into_kernel.cl mới. offset/size tính bằng
+  ## BYTE (khác Metal dùng phần tử) vì đó là đơn vị API của
+  ## clEnqueueCopyBuffer. Dùng để ghép GPU-side nhiều buffer con (vd
+  ## outHeads từng KV-head trong attention decode) thành 1 buffer liên tục
+  ## trong CÙNG session/queue - gỡ điểm chặn cuối cùng khiến session
+  ## attention-decode và session oProj không gộp được làm 1.
+  ensureInit()
+  let byteOffset = csize_t(dstOffsetElems * sizeof(float32))
+  let nBytes = csize_t(n * sizeof(float32))
+  result = lib.clEnqueueCopyBuffer(gQueue, src, dst, csize_t(0), byteOffset, nBytes,
+                                    0, nil, nil) == 0
 
 proc openclSessionActivationEnc*(op: string, x, y: cl_mem, n: int): bool =
   ensureInit()
@@ -270,6 +745,69 @@ proc openclSessionSoftmaxEnc*(x, y: cl_mem, rows, cols: int): bool =
   var globalSize = csize_t(rows) * BB_WG
   var localSize = BB_WG
   result = lib.clEnqueueNDRangeKernel(gQueue, kernel, 1, nil, addr globalSize, addr localSize, 0, nil, nil) == 0
+
+proc openclSessionRmsnormEnc*(x, gamma, y: cl_mem, rows, cols: int, eps: float32): bool =
+  ## Ban session cua RMSNorm (khong tru mean, khong co beta - khac layernorm).
+  ## Mirror openclSessionLayernormEnc ngay duoi day y het, chi bot 2 tham so.
+  ensureInit()
+  let kernel = getKernel("rmsnorm_kernel")
+  var xVar = x; var gammaVar = gamma; var yVar = y
+  var cArg = int32(cols); var eArg = eps
+  if lib.clSetKernelArg(kernel, 0, csize_t(sizeof(cl_mem)), addr xVar) != 0: return false
+  if lib.clSetKernelArg(kernel, 1, csize_t(sizeof(cl_mem)), addr gammaVar) != 0: return false
+  if lib.clSetKernelArg(kernel, 2, csize_t(sizeof(cl_mem)), addr yVar) != 0: return false
+  if lib.clSetKernelArg(kernel, 3, csize_t(sizeof(int32)), addr cArg) != 0: return false
+  if lib.clSetKernelArg(kernel, 4, csize_t(sizeof(float32)), addr eArg) != 0: return false
+  const BB_WG = csize_t(256)
+  var globalSize = csize_t(rows) * BB_WG
+  var localSize = BB_WG
+  result = lib.clEnqueueNDRangeKernel(gQueue, kernel, 1, nil, addr globalSize, addr localSize, 0, nil, nil) == 0
+
+proc openclSessionLayernormEnc*(x, gamma, beta, y: cl_mem, rows, cols: int, eps: float32): bool =
+  ## Ban session cua openclLayernorm: x/gamma/beta/y da la cl_mem resident
+  ## (tu openclSessionUpload/AllocScratch) - chi enqueue kernel, KHONG
+  ## clEnqueueWriteBuffer/ReadBuffer o day (khac ban immediate-mode
+  ## openclLayernorm tu ghi+doc rieng moi lan goi). Nhieu lenh nhu the nay
+  ## co the enqueue lien tiep len CUNG 1 gQueue, chi can 1 lan clFinish o
+  ## openclSessionEnd() cho ca chuoi, thay vi moi op tu cho GPU xong ngay.
+  ensureInit()
+  let kernel = getKernel("layernorm_kernel")
+  var xVar = x; var gammaVar = gamma; var betaVar = beta; var yVar = y
+  var cArg = int32(cols); var eArg = eps
+  if lib.clSetKernelArg(kernel, 0, csize_t(sizeof(cl_mem)), addr xVar) != 0: return false
+  if lib.clSetKernelArg(kernel, 1, csize_t(sizeof(cl_mem)), addr gammaVar) != 0: return false
+  if lib.clSetKernelArg(kernel, 2, csize_t(sizeof(cl_mem)), addr betaVar) != 0: return false
+  if lib.clSetKernelArg(kernel, 3, csize_t(sizeof(cl_mem)), addr yVar) != 0: return false
+  if lib.clSetKernelArg(kernel, 4, csize_t(sizeof(int32)), addr cArg) != 0: return false
+  if lib.clSetKernelArg(kernel, 5, csize_t(sizeof(float32)), addr eArg) != 0: return false
+  const BB_WG = csize_t(256)
+  var globalSize = csize_t(rows) * BB_WG
+  var localSize = BB_WG
+  result = lib.clEnqueueNDRangeKernel(gQueue, kernel, 1, nil, addr globalSize, addr localSize, 0, nil, nil) == 0
+
+proc openclSessionAttentionFusedEnc*(q, k, v, o, sMatrix: cl_mem, B, H, S, D: int, scale: float32): bool =
+  ## Ban session cua openclAttentionFused: q/k/v/o/sMatrix deu la cl_mem
+  ## resident san. Cung gioi han S<=256 nhu ban immediate (kernel dung
+  ## chung attention_fused_kernel trong vecop_matmul.cl).
+  ensureInit()
+  if S > 256:
+    stderr.writeLine "[openclSessionAttentionFusedEnc] S=" & $S & " vuot gioi han 256"
+    return false
+  let kernel = getKernel("attention_fused_kernel")
+  var bQ = q; var bK = k; var bV = v; var bO = o; var bS = sMatrix
+  var bArg = int32(B); var hArg = int32(H); var sArg = int32(S); var dArg = int32(D); var scArg = scale
+  if lib.clSetKernelArg(kernel, 0, csize_t(sizeof(cl_mem)), addr bQ) != 0: return false
+  if lib.clSetKernelArg(kernel, 1, csize_t(sizeof(cl_mem)), addr bK) != 0: return false
+  if lib.clSetKernelArg(kernel, 2, csize_t(sizeof(cl_mem)), addr bV) != 0: return false
+  if lib.clSetKernelArg(kernel, 3, csize_t(sizeof(cl_mem)), addr bO) != 0: return false
+  if lib.clSetKernelArg(kernel, 4, csize_t(sizeof(cl_mem)), addr bS) != 0: return false
+  if lib.clSetKernelArg(kernel, 5, csize_t(sizeof(int32)), addr bArg) != 0: return false
+  if lib.clSetKernelArg(kernel, 6, csize_t(sizeof(int32)), addr hArg) != 0: return false
+  if lib.clSetKernelArg(kernel, 7, csize_t(sizeof(int32)), addr sArg) != 0: return false
+  if lib.clSetKernelArg(kernel, 8, csize_t(sizeof(int32)), addr dArg) != 0: return false
+  if lib.clSetKernelArg(kernel, 9, csize_t(sizeof(float32)), addr scArg) != 0: return false
+  var globalSize2D = [csize_t(B * H), csize_t(S)]
+  result = lib.clEnqueueNDRangeKernel(gQueue, kernel, 2, nil, addr globalSize2D[0], nil, 0, nil, nil) == 0
 
 proc openclVecOp*(op: string, a, b: seq[float32]): seq[float32] =
   ensureInit()
@@ -307,7 +845,8 @@ proc openclMatmul*(a, b: seq[float32], m, k, n: int): seq[float32] =
   var aVar = a; var bVar = b
   gpuCheck(lib.clEnqueueWriteBuffer(gQueue, bufA, CL_FALSE, 0, bytesA, addr aVar[0], 0, nil, nil) == 0, "write failed")
   gpuCheck(lib.clEnqueueWriteBuffer(gQueue, bufB, CL_FALSE, 0, bytesB, addr bVar[0], 0, nil, nil) == 0, "write failed")
-  let kernel = getKernel("matmul_naive")
+  let (kName2, TILE) = pickMatmulVariant()
+  let kernel = getKernel(kName2)
   var bA = bufA; var bB = bufB; var bC = bufC
   var mArg = int32(m); var kArg = int32(k); var nArg = int32(n)
   gpuCheck(lib.clSetKernelArg(kernel, 0, csize_t(sizeof(cl_mem)), addr bA) == 0, "setArg failed")
@@ -316,11 +855,48 @@ proc openclMatmul*(a, b: seq[float32], m, k, n: int): seq[float32] =
   gpuCheck(lib.clSetKernelArg(kernel, 3, csize_t(sizeof(int32)), addr mArg) == 0, "setArg failed")
   gpuCheck(lib.clSetKernelArg(kernel, 4, csize_t(sizeof(int32)), addr kArg) == 0, "setArg failed")
   gpuCheck(lib.clSetKernelArg(kernel, 5, csize_t(sizeof(int32)), addr nArg) == 0, "setArg failed")
-  const TILE = csize_t(32)  # SUA: khop BB_TILE=32 trong vecop_matmul.cl
   proc roundUp(x, tile: csize_t): csize_t = ((x + tile - 1) div tile) * tile
   var globalSize2D = [roundUp(csize_t(m), TILE), roundUp(csize_t(n), TILE)]
   var localSize2D = [TILE, TILE]
-  gpuCheck(lib.clEnqueueNDRangeKernel(gQueue, kernel, 2, nil, addr globalSize2D[0], addr localSize2D[0], 0, nil, nil) == 0, "clEnqueueNDRangeKernel failed")
+  let clErr2 = lib.clEnqueueNDRangeKernel(gQueue, kernel, 2, nil, addr globalSize2D[0], addr localSize2D[0], 0, nil, nil)
+  gpuCheck(clErr2 == 0, "clEnqueueNDRangeKernel failed, cl_err=" & $clErr2 & " (kernel=" & kName2 &
+    ", tile=" & $TILE & ", m=" & $m & ", k=" & $k & ", n=" & $n &
+    ", global=[" & $globalSize2D[0] & "," & $globalSize2D[1] & "])")
+  gpuCheck(lib.clEnqueueReadBuffer(gQueue, bufC, CL_TRUE, 0, bytesC, addr result[0], 0, nil, nil) == 0, "read failed")
+
+proc openclMatmulNT*(a, b: seq[float32], m, k, n: int): seq[float32] =
+  ## C(m,n) = A(m,k) @ B(n,k)^T - B GIU NGUYEN layout goc [n,k] (khong
+  ## transpose CPU truoc). Ban immediate-mode dung boi tsicMatmulNTOp.
+  ensureInit()
+  result = newSeq[float32](m * n)
+  let bytesA = csize_t(m * k * sizeof(float32))
+  let bytesB = csize_t(n * k * sizeof(float32))
+  let bytesC = csize_t(m * n * sizeof(float32))
+  let bufA = getBuf(bytesA, CL_MEM_READ_ONLY)
+  let bufB = getBuf(bytesB, CL_MEM_READ_ONLY)
+  let bufC = getBuf(bytesC, CL_MEM_WRITE_ONLY)
+  defer:
+    putBuf(bytesA, CL_MEM_READ_ONLY, bufA); putBuf(bytesB, CL_MEM_READ_ONLY, bufB); putBuf(bytesC, CL_MEM_WRITE_ONLY, bufC)
+  var aVar = a; var bVar = b
+  gpuCheck(lib.clEnqueueWriteBuffer(gQueue, bufA, CL_FALSE, 0, bytesA, addr aVar[0], 0, nil, nil) == 0, "write failed")
+  gpuCheck(lib.clEnqueueWriteBuffer(gQueue, bufB, CL_FALSE, 0, bytesB, addr bVar[0], 0, nil, nil) == 0, "write failed")
+  let (kName2, TILE) = pickMatmulNTVariant()
+  let kernel = getKernel(kName2)
+  var bA = bufA; var bB = bufB; var bC = bufC
+  var mArg = int32(m); var kArg = int32(k); var nArg = int32(n)
+  gpuCheck(lib.clSetKernelArg(kernel, 0, csize_t(sizeof(cl_mem)), addr bA) == 0, "setArg failed")
+  gpuCheck(lib.clSetKernelArg(kernel, 1, csize_t(sizeof(cl_mem)), addr bB) == 0, "setArg failed")
+  gpuCheck(lib.clSetKernelArg(kernel, 2, csize_t(sizeof(cl_mem)), addr bC) == 0, "setArg failed")
+  gpuCheck(lib.clSetKernelArg(kernel, 3, csize_t(sizeof(int32)), addr mArg) == 0, "setArg failed")
+  gpuCheck(lib.clSetKernelArg(kernel, 4, csize_t(sizeof(int32)), addr kArg) == 0, "setArg failed")
+  gpuCheck(lib.clSetKernelArg(kernel, 5, csize_t(sizeof(int32)), addr nArg) == 0, "setArg failed")
+  proc roundUp2(x, tile: csize_t): csize_t = ((x + tile - 1) div tile) * tile
+  var globalSize2D = [roundUp2(csize_t(m), TILE), roundUp2(csize_t(n), TILE)]
+  var localSize2D = [TILE, TILE]
+  let clErr2 = lib.clEnqueueNDRangeKernel(gQueue, kernel, 2, nil, addr globalSize2D[0], addr localSize2D[0], 0, nil, nil)
+  gpuCheck(clErr2 == 0, "clEnqueueNDRangeKernel(NT) failed, cl_err=" & $clErr2 & " (kernel=" & kName2 &
+    ", tile=" & $TILE & ", m=" & $m & ", k=" & $k & ", n=" & $n &
+    ", global=[" & $globalSize2D[0] & "," & $globalSize2D[1] & "])")
   gpuCheck(lib.clEnqueueReadBuffer(gQueue, bufC, CL_TRUE, 0, bytesC, addr result[0], 0, nil, nil) == 0, "read failed")
 
 proc openclMatmulQ4*(a: seq[float32], wq: seq[uint8], scales, zeros: seq[float32],
@@ -352,25 +928,77 @@ proc openclMatmulQ4*(a: seq[float32], wq: seq[uint8], scales, zeros: seq[float32
   gpuCheck(lib.clEnqueueWriteBuffer(gQueue, bufWq, CL_FALSE, 0, bytesWq, addr wqVar[0], 0, nil, nil) == 0, "write failed")
   gpuCheck(lib.clEnqueueWriteBuffer(gQueue, bufScales, CL_FALSE, 0, bytesScales, addr scalesVar[0], 0, nil, nil) == 0, "write failed")
   gpuCheck(lib.clEnqueueWriteBuffer(gQueue, bufZeros, CL_FALSE, 0, bytesScales, addr zerosVar[0], 0, nil, nil) == 0, "write failed")
-  let kernel = getKernel("matmul_q4_naive")
-  var bA = bufA; var bWq = bufWq; var bSc = bufScales; var bZp = bufZeros; var bC = bufC
-  var mArg = int32(m); var kArg = int32(k); var nArg = int32(n)
-  var gsArg = int32(groupSize); var ngArg = int32(nGroupsPerRow)
-  gpuCheck(lib.clSetKernelArg(kernel, 0, csize_t(sizeof(cl_mem)), addr bA) == 0, "setArg failed")
-  gpuCheck(lib.clSetKernelArg(kernel, 1, csize_t(sizeof(cl_mem)), addr bWq) == 0, "setArg failed")
-  gpuCheck(lib.clSetKernelArg(kernel, 2, csize_t(sizeof(cl_mem)), addr bSc) == 0, "setArg failed")
-  gpuCheck(lib.clSetKernelArg(kernel, 3, csize_t(sizeof(cl_mem)), addr bZp) == 0, "setArg failed")
-  gpuCheck(lib.clSetKernelArg(kernel, 4, csize_t(sizeof(cl_mem)), addr bC) == 0, "setArg failed")
-  gpuCheck(lib.clSetKernelArg(kernel, 5, csize_t(sizeof(int32)), addr mArg) == 0, "setArg failed")
-  gpuCheck(lib.clSetKernelArg(kernel, 6, csize_t(sizeof(int32)), addr kArg) == 0, "setArg failed")
-  gpuCheck(lib.clSetKernelArg(kernel, 7, csize_t(sizeof(int32)), addr nArg) == 0, "setArg failed")
-  gpuCheck(lib.clSetKernelArg(kernel, 8, csize_t(sizeof(int32)), addr gsArg) == 0, "setArg failed")
-  gpuCheck(lib.clSetKernelArg(kernel, 9, csize_t(sizeof(int32)), addr ngArg) == 0, "setArg failed")
-  # Khong tile (khac matmul_naive dung threadgroup mem) nen khong ep bo global
-  # size chia het cho local size - dung nil cho local_work_size, de driver tu
-  # chon, tranh phai roundUp/pad nhu ban tiled.
-  var globalSize2D = [csize_t(n), csize_t(m)]
-  gpuCheck(lib.clEnqueueNDRangeKernel(gQueue, kernel, 2, nil, addr globalSize2D[0], nil, 0, nil, nil) == 0, "clEnqueueNDRangeKernel failed")
+  # SUA: uu tien kernel subgroup-reduction (matmul_q4_kernel_sg) - xem giai
+  # thich day du trong openclSessionMatmulQ4Enc/vecop_matmul_q4sg.cl. Day la
+  # duong dan chinh (immediate-mode) dung boi cac test/harness goi truc
+  # tiep openclMatmulQ4 chu khong qua session - can duoc toi uu giong het
+  # ban session, khong chi de rieng session nhanh con ban nay van cham.
+  var enqueued = false
+  if q4UsesSubgroup():
+    let kernelSg = gKernelQ4Sg
+    var bA = bufA; var bWq = bufWq; var bSc = bufScales; var bZp = bufZeros; var bC = bufC
+    var mArg = int32(m); var kArg = int32(k); var nArg = int32(n)
+    var gsArg = int32(groupSize); var ngArg = int32(nGroupsPerRow)
+    if lib.clSetKernelArg(kernelSg, 0, csize_t(sizeof(cl_mem)), addr bA) == 0 and
+       lib.clSetKernelArg(kernelSg, 1, csize_t(sizeof(cl_mem)), addr bWq) == 0 and
+       lib.clSetKernelArg(kernelSg, 2, csize_t(sizeof(cl_mem)), addr bSc) == 0 and
+       lib.clSetKernelArg(kernelSg, 3, csize_t(sizeof(cl_mem)), addr bZp) == 0 and
+       lib.clSetKernelArg(kernelSg, 4, csize_t(sizeof(cl_mem)), addr bC) == 0 and
+       lib.clSetKernelArg(kernelSg, 5, csize_t(sizeof(int32)), addr mArg) == 0 and
+       lib.clSetKernelArg(kernelSg, 6, csize_t(sizeof(int32)), addr kArg) == 0 and
+       lib.clSetKernelArg(kernelSg, 7, csize_t(sizeof(int32)), addr nArg) == 0 and
+       lib.clSetKernelArg(kernelSg, 8, csize_t(sizeof(int32)), addr gsArg) == 0 and
+       lib.clSetKernelArg(kernelSg, 9, csize_t(sizeof(int32)), addr ngArg) == 0:
+      let rowBlocks = csize_t((n + MMQ4_NDST - 1) div MMQ4_NDST)
+      var globalSizeSg = [rowBlocks * csize_t(MMQ4_SG_SIZE), csize_t(m)]
+      var localSizeSg = [csize_t(MMQ4_SG_SIZE), csize_t(1)]
+      if lib.clEnqueueNDRangeKernel(gQueue, kernelSg, 2, nil, addr globalSizeSg[0], addr localSizeSg[0], 0, nil, nil) == 0:
+        enqueued = true
+  # SUA: khong co subgroup (macOS/OpenCL 1.2) -> thu kernel workgroup-local-
+  # memory reduction TRUOC KHI roi thang ve naive - day moi la duong nhanh
+  # thuc su tren macOS (xem giai thich trong pickMatmulQ4WgVariant()).
+  if not enqueued:
+    let (wgKernelName, wg) = pickMatmulQ4WgVariant()
+    if wgKernelName != "matmul_q4_naive":
+      let kernelWg = getKernel(wgKernelName)
+      var bA2 = bufA; var bWq2 = bufWq; var bSc2 = bufScales; var bZp2 = bufZeros; var bC2 = bufC
+      var mArg2 = int32(m); var kArg2 = int32(k); var nArg2 = int32(n)
+      var gsArg2 = int32(groupSize); var ngArg2 = int32(nGroupsPerRow)
+      if lib.clSetKernelArg(kernelWg, 0, csize_t(sizeof(cl_mem)), addr bA2) == 0 and
+         lib.clSetKernelArg(kernelWg, 1, csize_t(sizeof(cl_mem)), addr bWq2) == 0 and
+         lib.clSetKernelArg(kernelWg, 2, csize_t(sizeof(cl_mem)), addr bSc2) == 0 and
+         lib.clSetKernelArg(kernelWg, 3, csize_t(sizeof(cl_mem)), addr bZp2) == 0 and
+         lib.clSetKernelArg(kernelWg, 4, csize_t(sizeof(cl_mem)), addr bC2) == 0 and
+         lib.clSetKernelArg(kernelWg, 5, csize_t(sizeof(int32)), addr mArg2) == 0 and
+         lib.clSetKernelArg(kernelWg, 6, csize_t(sizeof(int32)), addr kArg2) == 0 and
+         lib.clSetKernelArg(kernelWg, 7, csize_t(sizeof(int32)), addr nArg2) == 0 and
+         lib.clSetKernelArg(kernelWg, 8, csize_t(sizeof(int32)), addr gsArg2) == 0 and
+         lib.clSetKernelArg(kernelWg, 9, csize_t(sizeof(int32)), addr ngArg2) == 0:
+        let rowBlocksWg = csize_t((n + MMQ4_NDST - 1) div MMQ4_NDST)
+        var globalSizeWg = [rowBlocksWg * wg, csize_t(m)]
+        var localSizeWg = [wg, csize_t(1)]
+        if lib.clEnqueueNDRangeKernel(gQueue, kernelWg, 2, nil, addr globalSizeWg[0], addr localSizeWg[0], 0, nil, nil) == 0:
+          enqueued = true
+  if not enqueued:
+    let kernel = getKernel("matmul_q4_naive")
+    var bA = bufA; var bWq = bufWq; var bSc = bufScales; var bZp = bufZeros; var bC = bufC
+    var mArg = int32(m); var kArg = int32(k); var nArg = int32(n)
+    var gsArg = int32(groupSize); var ngArg = int32(nGroupsPerRow)
+    gpuCheck(lib.clSetKernelArg(kernel, 0, csize_t(sizeof(cl_mem)), addr bA) == 0, "setArg failed")
+    gpuCheck(lib.clSetKernelArg(kernel, 1, csize_t(sizeof(cl_mem)), addr bWq) == 0, "setArg failed")
+    gpuCheck(lib.clSetKernelArg(kernel, 2, csize_t(sizeof(cl_mem)), addr bSc) == 0, "setArg failed")
+    gpuCheck(lib.clSetKernelArg(kernel, 3, csize_t(sizeof(cl_mem)), addr bZp) == 0, "setArg failed")
+    gpuCheck(lib.clSetKernelArg(kernel, 4, csize_t(sizeof(cl_mem)), addr bC) == 0, "setArg failed")
+    gpuCheck(lib.clSetKernelArg(kernel, 5, csize_t(sizeof(int32)), addr mArg) == 0, "setArg failed")
+    gpuCheck(lib.clSetKernelArg(kernel, 6, csize_t(sizeof(int32)), addr kArg) == 0, "setArg failed")
+    gpuCheck(lib.clSetKernelArg(kernel, 7, csize_t(sizeof(int32)), addr nArg) == 0, "setArg failed")
+    gpuCheck(lib.clSetKernelArg(kernel, 8, csize_t(sizeof(int32)), addr gsArg) == 0, "setArg failed")
+    gpuCheck(lib.clSetKernelArg(kernel, 9, csize_t(sizeof(int32)), addr ngArg) == 0, "setArg failed")
+    # Khong tile (khac matmul_naive dung threadgroup mem) nen khong ep bo global
+    # size chia het cho local size - dung nil cho local_work_size, de driver tu
+    # chon, tranh phai roundUp/pad nhu ban tiled.
+    var globalSize2D = [csize_t(n), csize_t(m)]
+    gpuCheck(lib.clEnqueueNDRangeKernel(gQueue, kernel, 2, nil, addr globalSize2D[0], nil, 0, nil, nil) == 0, "clEnqueueNDRangeKernel failed")
   gpuCheck(lib.clEnqueueReadBuffer(gQueue, bufC, CL_TRUE, 0, bytesC, addr result[0], 0, nil, nil) == 0, "read failed")
 
 proc openclActivation*(op: string, x: seq[float32]): seq[float32] =

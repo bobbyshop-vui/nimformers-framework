@@ -23,7 +23,7 @@ nim c -d:release -o:bybylang bybylang.nim
 - `#` at the start of a line is a comment.
 - `import name` or `import "path/name.bybylang"` — recursive import, `.bybylang` extension auto-appended, cycle-protected via absolute path.
 - `print <expr>` → generates `echo <expr>`.
-- `function NAME` ... a line containing only `NAME` closes the definition; call it with `call NAME`.
+- `function NAME` opens a definition; the body is whatever's indented deeper than the `function` line (same dedent rule as `if/while/for`), no closing marker needed. Invoke it with `call NAME` or just a line containing only `NAME`.
 - `if cond:` / `elif cond:` / `else:` / `while cond:` / `for x in range(a, b):` — translated directly to the equivalent Nim construct, arbitrarily nestable.
 - `mode is N` (N = 1..4) → prints "Mode 1: Low-level" / "Mode 2: Mid-level" / "Mode 3: High-level" / "Mode 4: Web-level" (any other N → "Unknown mode").
 
@@ -64,10 +64,7 @@ gpu matmul A, B -> C m M k K n N
 ```
 A: [M×K], B: [K×N] → C: [M×N].
 
-```
-gpu matmul2 A1, B1, A2, B2 -> C1, C2 m1 M k1 K n1 N m2 M k2 K n2 N
-```
-Two independent matmuls fused into a single call.
+`gpuMatmul2` (two independent matmuls fused into one call) exists in `gpubackend.nim` but, like `apflu_backward`/`fused_add_act` above, has **no `.bybylang` syntax** — `genGpuLine` doesn't recognize `matmul2` as an op name, so it silently drops the 3rd/4th operands and mis-parses the `->` side. Call `gpuMatmul2(...)` directly from Nim.
 
 ### Activations
 
@@ -75,15 +72,10 @@ Two independent matmuls fused into a single call.
 gpu relu X -> Y
 gpu sigmoid X -> Y
 gpu tanh X -> Y
-gpu apflu X -> Y alpha A beta B      # defaults: alpha=0.1, beta=1.0 if omitted
-gpu apflu_backward X, DY -> DX alpha A beta B   # alpha/beta optional, same defaults
+gpu apflu X -> Y alpha A beta B      # alpha/beta optional; defaults to alpha=0.1, beta=1.0 if omitted
 ```
 
-### Fused add + activation
-
-```
-gpu fused_add_act A, B -> C act "relu"    # "relu" | "sigmoid" | "tanh" | "none"
-```
+`apflu_backward` and fused add+activation have real Nim procs (`gpuApfluBackward`, `gpuFusedAddAct` in `gpubackend.nim`) but **no working `.bybylang` syntax** — `genGpuLine` has no branch for either op name, so writing `gpu apflu_backward ...` or `gpu fused_add_act ...` generates invalid Nim (the codegen falls through to the generic 2-operand path and mis-parses everything after `->` as a single variable name). Call `gpuApfluBackward(...)` / `gpuFusedAddAct(...)` directly from Nim instead — see §4.
 
 ### Softmax / LayerNorm
 
@@ -108,6 +100,13 @@ gpu attention_backward Q, K, V, S_MATRIX, DY -> DQ, DK, DV B H S D scale SCALE
 ```
 B=batch, H=heads, S=seq_len, D=head_dim.
 
+### RoPE
+
+```
+gpu rope X, COS, SIN -> Y seqlen T heads H dim D
+```
+Rotates `X` in place using `COS`/`SIN` tables. **Only valid inside a `session:` block** (§3) — `gpubackend.nim` only implements `sessionRope`, there's no immediate/standalone version. Written outside a session it isn't recognized as a `gpu` sub-command by `genGpuLine` and falls through to the generic op fallback below (which won't do what you want).
+
 ### Generic op (fallback)
 
 ```
@@ -117,7 +116,26 @@ Generates `gpuOp("<other_op>", backend, A, B)` — requires a matching branch in
 
 ---
 
-## 3. GPU Resident Tensor API (CUDA) — called directly from Nim
+## 3. `session:` blocks — batching multiple `gpu ...` calls
+
+```
+session:
+  gpu add A, B -> C size 4
+  gpu mul C, A -> D size 4
+  gpu relu D -> E
+  gpu rope Q, COS, SIN -> Q2 seqlen 4 heads 1 dim 4
+```
+
+Wraps the enclosed `gpu ...` lines with the Session API (`sessionBegin` / `sessionUpload` / `session<Op>` / `sessionEnd` / `sessionRead` / `sessionFree` in `gpubackend.nim`) so intermediate results stay on the GPU across ops instead of round-tripping through `seq[float32]` after every single call.
+
+- Ops with a session-encoded path: `add`/`sub`/`mul`/`div`, `relu`/`sigmoid`/`tanh`, `softmax`, `matmul`, `layernorm`, `rope`. Anything else inside the block (including `apflu`, `embedding`, `attention`, `attention_backward`, `layernorm_backward`) is left as a normal immediate `gpu ...` call — it still runs correctly, just not batched.
+- Unlike outside a session, a trailing `size N` **does** affect codegen here — it's used as the element-count argument passed to the session op, not just descriptive.
+- If `sessionBegin()` fails (backend doesn't support sessions), the whole block automatically falls back to calling each line immediately — except `gpu rope`, which has no immediate equivalent; on fallback it prints a warning and leaves its output equal to its first input (RoPE is skipped, not approximated).
+- Non-`gpu` lines inside a `session:` block (assignments, `print`, etc.) run normally, outside the session's GPU batching.
+
+---
+
+## 4. GPU Resident Tensor API (CUDA) — called directly from Nim
 
 Defined at the end of `gpubackend.nim`. **Not** exposed through `.bybylang` syntax — call it from plain Nim code to avoid a CPU↔GPU round trip on every op:
 
@@ -129,13 +147,15 @@ let out = cuDownload(tc)          # only download when you actually need the res
 cuFree(ta); cuFree(tb); cuFree(tc)
 ```
 
-Available: `cuUpload`, `cuUploadIndices`, `cuDownload`, `cuFree`, `cuMatmulR`, `cuAddR`, `cuSubR`, `cuMulR`, `cuDivR`, `cuReluR`, `cuSigmoidR`, `cuTanhR`, `cuSoftmaxR`, `cuLayernormR`, `cuEmbeddingLookupR`.
+Available: `cuUpload`, `cuUploadIndices`, `cuDownload`, `cuFree`, `cuMatmulR`, `cuAddR`, `cuSubR`, `cuMulR`, `cuDivR`, `cuReluR`, `cuSigmoidR`, `cuTanhR`, `cuSoftmaxR`, `cuLayernormR`, `cuAttentionFusedR`, `cuCopyIntoR`, `cuRopeR`, `cuEmbeddingLookupR`, `cuAllocScratch`.
 
 > ⚠️ **Note:** these resident-tensor calls exist but the forward pass generated from `.bybylang` (`genGpuLine`) does not call them — every `gpu ...` DSL command still uploads/downloads through `seq[float32]` on each call (per-op round trip), not the resident chain.
 
+Also Nim-only, for the same reason (no `.bybylang` syntax wired up, see §2): `gpuMatmul2`, `gpuFusedAddAct`, `gpuApfluBackward`.
+
 ---
 
-## 4. Low-level hardware-simulation commands
+## 5. Low-level hardware-simulation commands
 
 These **do** have real DSL syntax, parsed in `genBlock` (`bybylang.nim` ~line 668–714) and lowered to calls that operate on a simulated RAM (1024 ints) / BUS (seq[string]) / 32 Pins:
 
@@ -162,7 +182,7 @@ Parser quirks worth knowing:
 
 ---
 
-## 5. Backends
+## 6. Backends
 
 | Backend | File | Notes |
 |---|---|---|
@@ -172,7 +192,7 @@ Parser quirks worth knowing:
 | TSIC-IR | `tsic_ir.nim` | intermediate IR, lowerable to PTX / MSL / OpenCL C / GLSL |
 | CPU | inside `gpubackend.nim` (`cpuRelu`, `cpuMatmul`, ...) | pure-Nim fallback, always correct but slow |
 
-## 6. Minimal example
+## 7. Minimal example
 
 ```
 gpu backend is "tsic"
