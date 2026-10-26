@@ -173,6 +173,94 @@ proc forwardMambaMixerInfer(mamba: Mamba2Real; x: Tensor; ctx: Backend):
   result.conv = terminal.conv
   result.ssm = terminal.ssm
 
+type
+  LoraGradSpec* = object
+    ## Adapter LoRA cua 1 Linear: A [r, inF], B [outF, r] (row-major, nhu LoraAdapter).
+    A*, B*: seq[float32]
+    r*: int
+    scale*: float32
+
+## Backward LoRA-aware (train LoRA): trainStep dang ky adapter theo TEN tham so
+## (vd "block7.mambaReal.inProj.weight") truoc backwardBlock va xoa sau do. Voi
+## Linear co dang ky, backward KHONG tinh dW day du [outF, inF] (19.5 GMAC + doc/ghi
+## ~300MB cho inProj) roi rut gon qua gradToAB, ma tinh thang:
+##   dB = s * dY^T (X A^T)      [outF, r]
+##   dA = s * (dY B)^T X        [r, inF]
+## - dung bang toan hoc voi gradToAB(dW = dY^T X). Grad ghi vao grads[key & "::loraA"]
+## va grads[key & "::loraB"]; dX van = dY @ W_eff (weight da merge LoRA) nhu cu.
+## Bang rong (mac dinh, moi duong infer/khac) -> giu nguyen duong backward cu.
+var gLoraGradRequest* = initTable[string, LoraGradSpec]()
+
+proc linearBackwardLoraAware*(l: Linear; x, dOut: Tensor; spec: LoraGradSpec;
+                              ctx: Backend): tuple[dX, dA, dB, dBias: Tensor] =
+  let (rows, cols) = flatten2D(x.shape)
+  let inF = l.inF
+  let outF = l.outF
+  let r = spec.r
+  doAssert cols == inF and dOut.shape[^1] == outF and dOut.data.len == rows * outF,
+    &"LoRA-aware backward: x.shape={x.shape} dOut.shape={dOut.shape} khong khop Linear {inF}->{outF}"
+  doAssert l.weight.data.len == outF * inF,
+    "LoRA-aware backward can weight fp32 da merge LoRA trong l.weight.data"
+  doAssert r > 0 and spec.A.len == r * inF and spec.B.len == outF * r,
+    "LoRA-aware backward: A/B sai kich thuoc"
+  # dX = dOut @ W_eff  ([rows,outF] @ [outF,inF]) - giong nhanh dX cua Linear.backward.
+  result.dX = Tensor(shape: x.shape,
+                     data: beMatmul(ctx, dOut.data, rows, outF, l.weight.data, outF, inF))
+  # XAt[t,k] = sum_i x[t,i] * A[k,i]
+  var xat = newSeq[float64](rows * r)
+  for t in 0 ..< rows:
+    let xr = t * inF
+    for k in 0 ..< r:
+      let ar = k * inF
+      var acc = 0.0
+      for i in 0 ..< inF: acc += float64(x.data[xr + i]) * float64(spec.A[ar + i])
+      xat[t * r + k] = acc
+  # dB[o,k] = s * sum_t dOut[t,o] * XAt[t,k];  dYB[t,k] = sum_o dOut[t,o] * B[o,k]
+  var dB64 = newSeq[float64](outF * r)
+  var dyb = newSeq[float64](rows * r)
+  var dBias64 = newSeq[float64](outF)
+  for t in 0 ..< rows:
+    let dr = t * outF
+    for o in 0 ..< outF:
+      let d = float64(dOut.data[dr + o])
+      if d == 0.0: continue
+      dBias64[o] += d
+      for k in 0 ..< r:
+        dB64[o * r + k] += d * xat[t * r + k]
+        dyb[t * r + k] += d * float64(spec.B[o * r + k])
+  # dA[k,i] = s * sum_t dYB[t,k] * x[t,i]
+  var dA64 = newSeq[float64](r * inF)
+  for t in 0 ..< rows:
+    let xr = t * inF
+    for k in 0 ..< r:
+      let c = dyb[t * r + k]
+      if c == 0.0: continue
+      let ar = k * inF
+      for i in 0 ..< inF: dA64[ar + i] += c * float64(x.data[xr + i])
+  let s = float64(spec.scale)
+  result.dA = newTensor(@[r, inF])
+  for j in 0 ..< dA64.len: result.dA.data[j] = float32(dA64[j] * s)
+  result.dB = newTensor(@[outF, r])
+  for j in 0 ..< dB64.len: result.dB.data[j] = float32(dB64[j] * s)
+  result.dBias = newTensor(@[outF])
+  for j in 0 ..< outF: result.dBias.data[j] = float32(dBias64[j])
+
+proc linearBackwardMaybeLora(l: Linear; key: string; x, dOut: Tensor; ctx: Backend;
+                             grads: var Table[string, Tensor]; biasKey: string): Tensor =
+  ## Linear co adapter dang ky -> LoRA-aware (grads[key::loraA/::loraB]); khong thi
+  ## Linear.backward day du nhu cu (grads[key] = dW).
+  if key in gLoraGradRequest:
+    let g = linearBackwardLoraAware(l, x, dOut, gLoraGradRequest[key], ctx)
+    grads[key & "::loraA"] = g.dA
+    grads[key & "::loraB"] = g.dB
+    grads[biasKey] = g.dBias
+    result = g.dX
+  else:
+    let (dX, dW, dB) = l.backward(x, dOut, ctx)
+    grads[key] = dW
+    grads[biasKey] = dB
+    result = dX
+
 proc backwardMambaMixerKernel(mamba: Mamba2Real; x: Tensor;
     cache: Mamba2RealCache; dOut: Tensor; ctx: Backend; prefix: string;
     grads: var Table[string, Tensor]): Tensor =
@@ -190,16 +278,17 @@ proc backwardMambaMixerKernel(mamba: Mamba2Real; x: Tensor;
     "Mamba2Real backward: cached input / dOut shape mismatch"
 
   let normed = sliceTensor(cache.buf, L.normedOut, L.BT * C, @[B, T, C])
-  let (dNormed, dOutW, dOutB) = mamba.outProj.backward(normed, dOut, ctx)
-  grads[prefix & ".outProj.weight"] = dOutW
-  grads[prefix & ".outProj.bias"] = dOutB
+  let dNormed = linearBackwardMaybeLora(mamba.outProj, prefix & ".outProj.weight", normed, dOut,
+                                        ctx, grads, prefix & ".outProj.bias")
 
   var buf = cache.buf
   buf.blit(L.dNormedOut, dNormed.data, 0, L.BT * C)
   let tgR = rmsTg(L)
-  discard runMicroVmChain(ctx, [
-    (buildM2RmsBwdProgram(L), L.BT * L.normGroups * tgR, tgR * 4, tgR,
-      "@m2_rms_bwd_" & m2Tag(L))], buf)
+  # Moi nhom = 1 command buffer nhu truoc, nhung buf chi upload/doc lai 1 lan cho ca
+  # rms_bwd + 16 chunk scan_bwd + dt/conv (truoc: 18 lan upload + 18 lan doc ca scratch).
+  var groups: seq[seq[MvmStep]]
+  groups.add @[(buildM2RmsBwdProgram(L), L.BT * L.normGroups * tgR, tgR * 4, tgR,
+      "@m2_rms_bwd_" & m2Tag(L))]
 
   var nChunk = 16
   let envChunk = getEnv("BYBY_SCAN_NCHUNK")
@@ -211,13 +300,13 @@ proc backwardMambaMixerKernel(mamba: Mamba2Real; x: Tensor;
   var nBeg = 0
   while nBeg < mamba.dState:
     let nCount = min(perChunk, mamba.dState - nBeg)
-    discard runMicroVmChain(ctx, [
-      (buildM2ScanBwdProgram(L, nBeg, nCount), B * L.HD, 4, 0,
-        "@m2_scan_bwd_" & m2Tag(L) & "_n" & $nBeg & "_" & $nCount)], buf)
+    groups.add @[(buildM2ScanBwdProgram(L, nBeg, nCount), B * L.HD, 4, 0,
+        "@m2_scan_bwd_" & m2Tag(L) & "_n" & $nBeg & "_" & $nCount)]
     nBeg += nCount
-  discard runMicroVmChain(ctx, [
+  groups.add @[
     (buildM2DtBwdProgram(L), L.BT * M2Tg, 4, M2Tg, "@m2_dt_bwd_" & m2Tag(L)),
-    (buildM2ConvBwdProgram(L), L.BT * M2Tg, 4, M2Tg, "@m2_conv_bwd_" & m2Tag(L))], buf)
+    (buildM2ConvBwdProgram(L), L.BT * M2Tg, 4, M2Tg, "@m2_conv_bwd_" & m2Tag(L))]
+  discard runMicroVmChainGroups(ctx, groups, buf)
 
   grads[prefix & ".normWeight"] = sliceTensor(buf, L.dNormW, C, @[C])
   grads[prefix & ".dSkip"] = sliceTensor(buf, L.dDSkip, H, @[H])
@@ -226,10 +315,8 @@ proc backwardMambaMixerKernel(mamba: Mamba2Real; x: Tensor;
   grads[prefix & ".convWeight"] = sliceTensor(buf, L.dConvW, cDim * K, @[cDim, K])
   grads[prefix & ".convBias"] = sliceTensor(buf, L.dConvB, cDim, @[cDim])
   let dProj = sliceTensor(buf, L.dProj, L.BT * L.P, cache.proj.shape)
-  let (dX, dInW, dInB) = mamba.inProj.backward(x, dProj, ctx)
-  grads[prefix & ".inProj.weight"] = dInW
-  grads[prefix & ".inProj.bias"] = dInB
-  result = dX
+  result = linearBackwardMaybeLora(mamba.inProj, prefix & ".inProj.weight", x, dProj,
+                                   ctx, grads, prefix & ".inProj.bias")
 
 proc blockRmsForward(x, gamma: Tensor; eps: float32; ctx: Backend): Tensor =
   doAssert x.shape.len >= 2 and x.shape[^1] > 0,

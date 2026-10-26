@@ -18,12 +18,13 @@
 ##   - QUAN TRỌNG: checkpoint base vẫn .bin (rawbin.nim qua jamba_hybrid.
 ##     saveCheckpoint/loadCheckpoint) - KHÔNG dùng .nimq ở đây.
 
-import std/[math, random, strformat, os, strutils, json, tables, sequtils, parsejson, streams, times]
+import std/[math, random, strformat, os, strutils, json, tables, sequtils, parsejson, streams, times, monotimes]
 import nimformer
 import backend
 import quant
 import rawbin
 import jamba_hybrid
+import hybrid_block_kernel   # gLoraGradRequest/LoraGradSpec - backward LoRA-aware
 import mamba2_real              # Mamba2Real - can cho block 'R'
 import load_codestral_into_jamba # loadCodestralIntoJamba - nap weight HF that vao block 'R'
 import hf_tokenizer               # tokenizer THAT (tekken/HF) - bat buoc cho CFG_INIT_MODE=="codestral"
@@ -34,6 +35,7 @@ import test_nimformer   # tái dùng BPETokenizer: getOrTrainBPE/encodeBPE/decod
 import quantize_lora_bin_4bit
 import mamba2_ssm_gpu   # softmaxCrossEntropyGpu, apfAdamStepFused
 import checkpoint
+import prefill_profile   # pfTime/pfReport - dung lai cho BYBY_TRAIN_PROFILE
 
 proc cRename(oldPath, newPath: cstring): cint {.importc: "rename", header: "<stdio.h>".}
 proc cLink(oldPath, newPath: cstring): cint {.importc: "link", header: "<unistd.h>".}
@@ -604,11 +606,19 @@ proc saveW*(store: AttnWeightDiskStore, name: string, data: seq[float32]) =
     raise newException(IOError, "Khong mo duoc attn weight temp: " & tmp)
   var magic = AttnWeightMagic
   var n = int64(data.len)
-  discard f.writeBuffer(addr magic, sizeof(magic))
-  discard f.writeBuffer(addr n, sizeof(n))
-  if data.len > 0:
-    discard f.writeBuffer(unsafeAddr data[0], data.len * sizeof(float32))
-  f.close()
+  var ok = true
+  try:
+    ok = f.writeBuffer(addr magic, sizeof(magic)) == sizeof(magic) and
+         f.writeBuffer(addr n, sizeof(n)) == sizeof(n)
+    if ok and data.len > 0:
+      let nBytes = data.len * sizeof(float32)
+      ok = f.writeBuffer(unsafeAddr data[0], nBytes) == nBytes
+  finally:
+    f.close()
+  if not ok:
+    # Dia day: KHONG commit file cat cut (hasW chi doc header se tuong la hop le).
+    try: removeFile(tmp) except OSError: discard
+    raise newException(IOError, "Ghi attn weight thieu byte (dia day?): " & tmp)
   if cRename(tmp.cstring, path.cstring) != 0:
     raise newException(IOError, "Khong the commit attn weight atomic: " & tmp)
 
@@ -640,6 +650,13 @@ proc cleanupAttn*(store: var AttnWeightDiskStore) =
       removeFile(f)
   except OSError: discard
 
+# Kiem update step 0 (auditStep0LoraBlocks): meta[Step0AuditMetaKey] = "ok" trong .bin
+# step 1 = moi block LoRA da duoc xac nhan co update step 0 tinh tu gradient THAT
+# (lm_head that, dung batch step 0). Thieu co -> lan chay sau tu kiem + sua.
+const Step0AuditMetaKey* = "step0Audit"
+var gLoadedCkptMeta*: Table[string, string]   # meta .bin vua nap (loadCheckpointLoraBin)
+var gStep0Verified* = false                    # process nay da xac nhan step 0 -> ghi co
+
 proc saveCheckpointLoraBin*(m: var NimformerModelJamba, lora: JambaLora, path: string,
                             epoch: int, newBlockParamNames: seq[string],
                             attnStore: AttnWeightDiskStore) =
@@ -660,6 +677,9 @@ proc saveCheckpointLoraBin*(m: var NimformerModelJamba, lora: JambaLora, path: s
   meta["quantKind"] = "mixed:qkFp4KM-or-fp32-raw"
   meta["quantGroupSize"] = "mixed:fp4-km-group32-or-fp32-raw"
   meta["trainStepSemantics"] = "step-not-epoch"
+  if epoch == 1 and (gStep0Verified or
+                     gLoadedCkptMeta.getOrDefault(Step0AuditMetaKey) == "ok"):
+    meta[Step0AuditMetaKey] = "ok"
   meta["trainSeqLen"] = $CFG_SEQ_LEN
   meta["trainBatchSize"] = $CFG_BATCH_SIZE
   # Preset norm cua forward luc TRAIN -> infer_lora doc lai va dung CHINH preset nay
@@ -723,13 +743,19 @@ proc saveCheckpointLoraBin*(m: var NimformerModelJamba, lora: JambaLora, path: s
       raise newException(IOError, "Checkpoint thieu newBlock parameter trong model: " & name)
     let p = byName[name]
     meta["newBlock." & name & ".shape"] = $p[].shape
-    var values = p[].data
-    if values.len == 0:
-      let expected = numelShape(p[].shape)
-      if not attnStore.hasW(name, expected):
-        raise newException(IOError, "Thieu weight block moi trong RAM/SSD: " & name)
-      values = attnStore.loadW(name, expected)
     let expected = numelShape(p[].shape)
+    var values: seq[float32]
+    if lora.quantBase.len > 0 and attnStore.hasW(name, expected):
+      # Train streaming: sidecar SSD la ban CHINH (trainStep nap tu day va ghi lai sau
+      # update). p[].data co the con gia tri .bin CU (resume backward bo qua block nay
+      # trong process nay; [resume-layer]/COMMIT_ONLY khong chay step) -> KHONG dung no.
+      values = attnStore.loadW(name, expected)
+    else:
+      values = p[].data
+      if values.len == 0:
+        if not attnStore.hasW(name, expected):
+          raise newException(IOError, "Thieu weight block moi trong RAM/SSD: " & name)
+        values = attnStore.loadW(name, expected)
     if expected <= 0 or values.len != expected:
       raise newException(IOError,
         &"Khong export newBlock '{name}': shape={p[].shape}, expected={expected}, data={values.len}")
@@ -844,6 +870,7 @@ proc loadCheckpointLoraBin*(path: string): tuple[model: NimformerModelJamba, lor
   let fmt = meta.getOrDefault("format")
   if fmt != "nimformers-lora-v1" and fmt != "nimformers-lora-v1-qlora4":
     raise newException(ValueError, "Khong phai LoRA-only checkpoint: " & path)
+  gLoadedCkptMeta = meta
   let savedNormPreset = meta.getOrDefault("normPreset")
   let savedMambaNormImpl = meta.getOrDefault("mambaNormImpl")
   if savedNormPreset != TRAIN_NORM_PRESET or savedMambaNormImpl != TRAIN_MAMBA_NORM_IMPL:
@@ -2001,7 +2028,7 @@ proc saveResumeState(step, nextLayer: int, phase: string, dX: Tensor,
   var f = open(tmp, fmWrite)
   template mustWrite(buf: pointer, n: int) =
     if f.writeBuffer(buf, n) != n:
-      f.close()
+      # f.close() do finally ben duoi lo (truoc day close 2 lan).
       raise newException(IOError, "saveResumeState: ghi that bai (dia day?)")
   try:
     var magic = ResumeStateMagic
@@ -2211,6 +2238,57 @@ proc progressEnd*(p: var ProgressMeter) =
 
 var gLastStepForwardRan*: bool = false
 
+# ── Do thoi gian train ──────────────────────────────────────────────────────
+# Moi block in 1 dong "[time] ..." (rat re). BYBY_TRAIN_PROFILE=1: them bang chi
+# tiet theo stage (lin.gemm, blk.inProj, ...) tu prefill_profile cho tung block.
+let gTrainProfile = getEnv("BYBY_TRAIN_PROFILE", "0") != "0"
+# Backward LoRA-aware (mac dinh BAT): kernel tinh thang dA/dB, khong tinh dW day du
+# [outF,inF] roi gradToAB. BYBY_LORA_AWARE_BWD=0 -> duong cu (de doi chieu).
+let gLoraAwareBwd = getEnv("BYBY_LORA_AWARE_BWD", "1") != "0"
+
+proc dsec(a, b: MonoTime): float = float((b - a).inMilliseconds) / 1000.0
+
+template trainProfBegin() =
+  if gTrainProfile:
+    gPfEnabled = true
+    pfReset()
+    gPfActive = true
+
+template trainProfEnd(label: string; t0: MonoTime) =
+  if gTrainProfile:
+    gPfActive = false
+    stderr.writeLine "[train-profile] " & label
+    pfReport(float((getMonoTime() - t0).inMilliseconds))
+
+const
+  AuditGoodAgree = 0.90   # >= : dau B da luu khop gradient step 0 that -> block dung
+  AuditBadAgree = 0.70    # < AuditGoodAgree van tinh lai; > AuditBadAgree (khong phai ~50%) thi canh bao
+var gAuditStopBlock* = -1 # audit: block dung dau tien (backward dung tai day), -1 = khong co
+
+proc graftInitForStep0(name: string; cur: seq[float32]): seq[float32] =
+  ## Gia tri tham so block G TRUOC step 0 (luc graft, xem jamba_hybrid.newJambaBlock):
+  ## attn.outProj = 0, fuseGate.weight = 0, fuseGate.bias = 4. attn.qkvProj co grad
+  ## step 0 = 0 (outProj = 0) nen khong doi -> giu nguyen. Gia tri hien tai chi duoc
+  ## cach init toi da 1 buoc Adam (LR G * 1/warmup ~ 2.5e-7); xa hon = khong phai
+  ## checkpoint step 1 cua graft nay -> raise, khong doan.
+  if ".attn.qkvProj." in name:
+    return cur
+  var init: float32
+  if name.endsWith(".attn.outProj.weight") or name.endsWith(".attn.outProj.bias") or
+     name.endsWith(".fuseGate.weight"):
+    init = 0'f32
+  elif name.endsWith(".fuseGate.bias"):
+    init = 4'f32
+  else:
+    raise newException(ValueError, &"[audit] Khong biet gia tri graft truoc step 0 cua '{name}'")
+  for v in cur:
+    if not (abs(v - init) <= 1e-5'f32):
+      raise newException(ValueError,
+        &"[audit] '{name}' lech gia tri graft {init} toi {abs(v - init):.3e} (> 1 buoc Adam step 0) - " &
+        "khong tai tao duoc dieu kien step 0. Dung.")
+  result = newSeq[float32](cur.len)
+  for k in 0 ..< result.len: result[k] = init
+
 proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
                                loState: var LoraTrainState,
                                adamStore: var AdamDiskStore,
@@ -2219,7 +2297,9 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
                                idsBatch, targetsBatch: seq[seq[int]], ctx: Backend;
                                gLrScale: float32 = 1.0;
                                stepIndex: int = -1;
-                               updateMaxBlock: int = high(int)): float32 =
+                               updateMaxBlock: int = high(int);
+                               auditRefB: Table[string, seq[float32]] =
+                                 initTable[string, seq[float32]]()): float32 =
   ## gLrScale (mac dinh 1.0) nhan vao LR cua MOI tham so block G (ca sidecar
   ## lan fuseGate) - caller (vong train that) truyen warmup factor de tranh
   ## buoc update lon ngay dau. Cac tham so block 'A'/'S' khac van dung
@@ -2227,6 +2307,11 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
   ## updateMaxBlock: block i > updateMaxBlock chi backward de lay dX, KHONG
   ## Adam/rescue/layer-progress (dung boi fillUntrainedLoraBlocks de chay
   ## noi phan backward con thieu cua 1 step dang do).
+  ## auditRefB (khong rong = che do kiem step 0, auditStep0LoraBlocks): moi B dang = 0
+  ## va block G tinh bang gia tri graft (dieu kien step 0). Tung block tu tren xuong:
+  ## dau B da luu (auditRefB) khop -gradient -> block dung, DUNG backward tai day
+  ## (gAuditStopBlock); khong khop -> reset Adam roi update lai nhu step 0.
+  let auditMode = auditRefB.len > 0
   doAssert isGpuCtx(ctx),
     "trainStepGraftStreaming requires a GPU backend; refusing CPU execution"
   # Allow automatic CPU fallback when GPU runs out of memory, with GPU retry
@@ -2430,6 +2515,8 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
   if not canResumeBackward:
     gLastStepForwardRan = true
     for i in max(0, resumeForwardFrom) ..< m.blocks.len:
+      let tf0 = getMonoTime()
+      trainProfBegin()
       if i in namesByBlock:
         dlog &"block {i}: mergeInOne x{namesByBlock[i].len} tham so"
         for name in namesByBlock[i]: mergeInOne(m, lo, ctx, name)
@@ -2441,7 +2528,10 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
             linearsByName[name][].residentReady = false
             linearsByName[name][].residentFp32Ready = false
           p[].data = attnStore.loadW(name, numelShape(p[].shape))
+          if auditMode: p[].data = graftInitForStep0(name, p[].data)
+      let tfMerge = getMonoTime()
       x = forwardBlock(m.blocks[i], x, ctx, blockIndex = i)
+      let tfFwd = getMonoTime()
       # Bug4: phát hiện NaN/Inf ngay sau mỗi block thay vì chờ đến loss
       for v in x.data:
         if v.classify in {fcNan, fcInf, fcNegInf}:
@@ -2456,6 +2546,10 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
             quantFlags[name][] = fullPrecWasQuantized[name]
       xstore.pushActivation(x)
       saveForwardState(i + 1)
+      let tfEnd = getMonoTime()
+      stderr.writeLine &"[time] fwd block {i}: merge+load={dsec(tf0, tfMerge):.1f}s " &
+        &"forward={dsec(tfMerge, tfFwd):.1f}s spill={dsec(tfFwd, tfEnd):.1f}s total={dsec(tf0, tfEnd):.1f}s"
+      trainProfEnd(&"fwd block {i}", tf0)
       GC_fullCollect()
       dlog &"block {i}: forward xong"
       if gStopRequested and stepIndex >= 0:
@@ -2522,7 +2616,13 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
   # ---- BACKWARD: tung block NGUOC - merge lai, backward, trich LoRA/Adam
   # NGAY vao 1 bang grads RIENG (chi 1 block), roi xoa ----
   let firstBackwardLayer = if canResumeBackward: resumeNextLayer else: m.blocks.len - 1
+  # Theo doi block da backward trong step nay (ke ca block xong o lan chay truoc,
+  # da duoc xac nhan qua layer-progress khi resume) - cuoi step phai du TAT CA.
+  var blockDone = newSeq[bool](m.blocks.len)
+  for j in firstBackwardLayer + 1 ..< m.blocks.len: blockDone[j] = true
   for i in countdown(firstBackwardLayer, 0):
+    let tb0 = getMonoTime()
+    trainProfBegin()
     if i in namesByBlock:
       dlog &"backward block {i}: mergeInOne"
       for name in namesByBlock[i]: mergeInOne(m, lo, ctx, name)
@@ -2537,13 +2637,24 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
           linearsByName[name][].residentReady = false
           linearsByName[name][].residentFp32Ready = false
         p[].data = attnStore.loadW(name, numelShape(p[].shape))
+        if auditMode: p[].data = graftInitForStep0(name, p[].data)
 
+    let tbMerge = getMonoTime()
     let xi = xstore.readActivation(i)   # doc DUNG 1 activation tu SSD, dung xong (backwardBlock) la het scope
     let dXBeforeBlock = dX  # gradient vao block i; can cho rescue resume
     var blockGrads = initTable[string, Tensor]()   # rieng cho block nay, KHONG tich luy
-    dX = backwardBlock(m.blocks[i], xi, dX, ctx, &"block{i}", blockGrads,
-               blockIndex = i)
+    gLoraGradRequest.clear()
+    if gLoraAwareBwd:
+      for name in namesByBlock.getOrDefault(i, @[]):
+        let ad = lo.adapters[name]
+        gLoraGradRequest[name] = LoraGradSpec(A: ad.A.data, B: ad.B.data, r: ad.r, scale: ad.scale)
+    try:
+      dX = backwardBlock(m.blocks[i], xi, dX, ctx, &"block{i}", blockGrads,
+                 blockIndex = i)
+    finally:
+      gLoraGradRequest.clear()
     dlog &"backward block {i}: backwardBlock xong"
+    let tbBwd = getMonoTime()
     if i > updateMaxBlock:
       # Chi truyen dX xuong; weight/Adam cua block nay giu nguyen.
       for name in namesByBlock.getOrDefault(i, @[]): restoreBaseOne(m, lo, name)
@@ -2553,6 +2664,10 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
       if stepIndex >= 0:
         # Resume tiep tu block i-1 voi dX nay (khong co layer-progress cho block nay).
         saveResumeState(stepIndex, i - 1, "backward", dX, loss)
+      blockDone[i] = true   # co y chi truyen dX (block > updateMaxBlock)
+      stderr.writeLine &"[time] bwd block {i} (chi truyen dX): merge+load={dsec(tb0, tbMerge):.1f}s " &
+        &"backwardBlock={dsec(tbMerge, tbBwd):.1f}s total={dsec(tb0, getMonoTime()):.1f}s"
+      trainProfEnd(&"bwd block {i} (chi truyen dX)", tb0)
       GC_fullCollect()
       if gStopRequested and stepIndex >= 0:
         gTrainStepFullyDone = false
@@ -2564,17 +2679,94 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
     # CAM thieu: moi tham so LoRA va moi tham so block moi (G attn/fuseGate) cua
     # block nay PHAI co gradient - kiem TRUOC khi update bat ky thu gi cua block.
     # (Truoc day tham so block moi thieu grad bi bo qua im lang.)
+    # dA/dB tinh TRUOC cho ca block va kiem: huu han; dB khong duoc toan 0 (dB = 0 =
+    # block khong nhan duoc gradient -> khong hoc, dung loai loi "layer trong").
+    var abGrads = initTable[string, tuple[dA, dB: Tensor]]()
     for name in namesByBlock.getOrDefault(i, @[]):
-      if name notin blockGrads:
+      var dA, dB: Tensor
+      if (name & "::loraA") in blockGrads and (name & "::loraB") in blockGrads:
+        # Kernel LoRA-aware da tinh thang dA/dB (khong co dW day du).
+        dA = blockGrads[name & "::loraA"]
+        dB = blockGrads[name & "::loraB"]
+      elif name in blockGrads:
+        (dA, dB) = gradToAB(blockGrads[name], lo.adapters[name], ctx)
+      else:
         raise newException(ValueError,
           &"LoRA adapter '{name}' khong co gradient trong backward block {i}. " &
            "Dung train se khong duoc phep tiep tuc am tham.")
+      let ad0 = lo.adapters[name]
+      if dA.shape != ad0.A.shape or dB.shape != ad0.B.shape:
+        raise newException(ValueError,
+          &"LoRA '{name}' block {i}: grad shape dA={dA.shape} dB={dB.shape} khac A={ad0.A.shape} B={ad0.B.shape}")
+      for v in dA.data:
+        if v.classify in {fcNan, fcInf, fcNegInf}:
+          raise newException(ValueError, &"LoRA '{name}' block {i}: grad A co NaN/Inf - dung, khong update.")
+      var dBNonZero = false
+      for v in dB.data:
+        if v.classify in {fcNan, fcInf, fcNegInf}:
+          raise newException(ValueError, &"LoRA '{name}' block {i}: grad B co NaN/Inf - dung, khong update.")
+        if v != 0'f32: dBNonZero = true
+      if not dBNonZero:
+        raise newException(ValueError,
+          &"LoRA '{name}' block {i}: grad B TOAN 0 - block khong nhan gradient (dX xuong block = 0?). " &
+           "Dung, khong update (se thanh layer trong).")
+      abGrads[name] = (dA, dB)
     for name in fullPrecNamesByBlock.getOrDefault(i, @[]):
       if name notin blockGrads:
         raise newException(ValueError,
           &"Tham so block moi '{name}' khong co gradient trong backward block {i} - " &
            "se KHONG duoc update. Dung train.")
+      for v in blockGrads[name].data:
+        if v.classify in {fcNan, fcInf, fcNegInf}:
+          raise newException(ValueError, &"Tham so block moi '{name}' block {i}: grad co NaN/Inf - dung.")
 
+    if auditMode:
+      # Adam buoc 1 tu B = 0: B = -lr * g/(|g|+eps) -> dau B da luu phai NGUOC dau
+      # gradient step 0 that. So tung phan tu (bo phan tu = 0), lay ty le thap nhat.
+      var agree = 1.0
+      for name in namesByBlock.getOrDefault(i, @[]):
+        if name notin auditRefB:
+          raise newException(ValueError, &"[audit] Thieu B da luu cua '{name}'")
+        let refB = auditRefB[name]
+        let g = abGrads[name].dB.data
+        if refB.len != g.len:
+          raise newException(ValueError, &"[audit] '{name}': B da luu {refB.len} phan tu, grad {g.len}")
+        var nCmp, nSame = 0
+        for k in 0 ..< g.len:
+          if refB[k] != 0'f32 and g[k] != 0'f32:
+            inc nCmp
+            if (refB[k] < 0'f32) == (g[k] > 0'f32): inc nSame
+        if nCmp == 0:
+          raise newException(ValueError, &"[audit] '{name}' block {i}: khong co phan tu nao de so dau")
+        agree = min(agree, float(nSame) / float(nCmp))
+      stderr.writeLine &"[audit] block {i}: dau B da luu khop gradient step 0 that {agree * 100:.2f}%"
+      if agree >= AuditGoodAgree:
+        # Block dung: block <= i den tu cung lan tinh dung (lap/train tu tren xuong lien
+        # mach) -> giu nguyen, DUNG backward. Khong ghi state: resume se kiem lai block nay.
+        for name in namesByBlock.getOrDefault(i, @[]): restoreBaseOne(m, lo, name)
+        for name in fullPrecNamesByBlock.getOrDefault(i, @[]):
+          paramByName[name][].data = @[]
+          if name in fullPrecWasQuantized: quantFlags[name][] = fullPrecWasQuantized[name]
+        for j in 0 .. i: blockDone[j] = true
+        gAuditStopBlock = i
+        stderr.writeLine &"[audit] block {i} DUNG -> giu nguyen block 0..{i}, dung backward."
+        trainProfEnd(&"bwd block {i} (audit dung)", tb0)
+        GC_fullCollect()
+        break
+      if agree > AuditBadAgree:
+        # Update step 0 DUNG cua block la duy nhat (-lr*sign(g) tren dung batch step 0):
+        # khop < nguong = khong phai update do -> van tinh lai (khong raise roi ket mai).
+        stderr.writeLine &"[audit] CANH BAO block {i}: khop {agree * 100:.2f}% (khong phai ~50% cua " &
+          &"gradient rac, cung khong >= {AuditGoodAgree * 100:.0f}%) - van tinh lai theo gradient that."
+      # Block sai: tinh lai update step 0 tu dau (B dang = 0, G dang = gia tri graft).
+      for name in namesByBlock.getOrDefault(i, @[]):
+        loState.adamA[name] = newApfAdamState(lo.adapters[name].A.data.len)
+        loState.adamB[name] = newApfAdamState(lo.adapters[name].B.data.len)
+      for name in fullPrecNamesByBlock.getOrDefault(i, @[]):
+        adamStore.init(name, numelShape(paramByName[name][].shape))
+      stderr.writeLine &"[audit] block {i} SAI -> tinh lai update step 0 (Adam ve 0)."
+
+    let tbGrad = getMonoTime()
     # Snapshot pre-update weights for G (gated) and R (pure Mamba2Real) so a
     # failed post-update safety / layer-probe check can be rolled back in-place
     # instead of aborting the whole run. One block at a time -> peak RAM grows
@@ -2614,12 +2806,12 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
     var layerTensors: seq[checkpoint.LayerTensor] = @[]
     if i in namesByBlock:
       for name in namesByBlock[i]:
-        if name notin blockGrads:
+        if name notin abGrads:
           raise newException(ValueError,
             &"LoRA adapter '{name}' khong co gradient trong backward block {i}. " &
              "Dung train se khong duoc phep tiep tuc am tham.")
         var ad = lo.adapters[name]
-        let (dA, dB) = gradToAB(blockGrads[name], ad, ctx)
+        let (dA, dB) = abGrads[name]   # da tinh + kiem o tren
         var stA = loState.adamA[name]
         var stB = loState.adamB[name]
         let loraLr = loState.lr * blockLrScale
@@ -2687,6 +2879,7 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
           quantFlags[name][] = fullPrecWasQuantized[name]
       GC_fullCollect()
 
+    let tbUpd = getMonoTime()
     # Post-update safety check + rescue for G (gated) and R (pure Mamba) blocks.
     # Runs once per block AFTER the whole Adam loop has written params to SSD.
     # LAYER_PROBE (mặc định bật; tắt bằng BYBY_LAYER_PROBE=0) chạy short probe
@@ -2705,6 +2898,10 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
       for name in rescueLoraNames:
         if name in lo.adapters: mergeInOne(m, lo, ctx, name)
       var gCheckError = ""
+      # Output forward (weight SAU update) dung chung cho check resid/mixer va
+      # LAYER_PROBE: 2 cho truoc day goi forwardBlock 2 lan cung input + cung
+      # weight -> ket qua y het, ton them 1 lan forward ca block.
+      var yCheck: Tensor
       try:
         if m.blocks[i].kind == bkMambaRealGated:
           let biasName = &"block{i}.fuseGate.bias"
@@ -2738,6 +2935,7 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
           # Bug1: kiểm tra output G block thay vì discard
           if gCheckError.len == 0:
             let yG = forwardBlock(m.blocks[i], xi, ctx, blockIndex = i)
+            yCheck = yG
             var inSqG, outSqG = 0.0
             var inMaxG, outMaxG = 0.0
             for k in 0 ..< xi.data.len:
@@ -2767,6 +2965,7 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
           # vào residual). Residual 16× gần như không bắt hub-hub; mixer 1.5× mới
           # siết nhánh Mamba (gần G sidecar 0.5×, không phải 4×).
           let y = forwardBlock(m.blocks[i], xi, ctx, blockIndex = i)
+          yCheck = y
           var inSq, outSq, mixSq = 0.0
           var inMax, outMax, mixMax = 0.0
           for k in 0 ..< xi.data.len:
@@ -2816,7 +3015,9 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
           gPerBlockProbeOk[i] = okCount
           if CFG_LAYER_PROBE_EVERY <= 0 or (okCount mod max(1, CFG_LAYER_PROBE_EVERY)) == 0:
             let xOrig = xstore.readActivation(i + 1)
-            let yProbe = forwardBlock(m.blocks[i], xi, ctx, blockIndex = i)
+            let yProbe =
+              if yCheck.data.len == xOrig.data.len and yCheck.shape == xOrig.shape: yCheck
+              else: forwardBlock(m.blocks[i], xi, ctx, blockIndex = i)
             var driftSq, origSq = 0.0
             for k in 0 ..< xOrig.data.len:
               let orig = float64(xOrig.data[k])
@@ -2906,6 +3107,7 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
           &"{newScale:.3f} (attempt {fails}/{maxAttempts})."
         rescueTriggered = true
       GC_fullCollect()
+    let tbCheck = getMonoTime()
     dlog &"backward block {i}: adam update + SSD spill xong"
     if stepIndex >= 0:
       # Commit order: state FIRST (so a crash right after never replays this
@@ -2930,6 +3132,13 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
         saveResumeState(stepIndex, -1, "backward_done", dX, loss)
       if getEnv("BYBY_TEST_CRASH_AFTER_BACKWARD_LAYER", "") == $i:
         raise newException(CatchableError, "SIMULATED_CRASH_AFTER_BACKWARD_LAYER_" & $i)
+    blockDone[i] = true
+    let tbEnd = getMonoTime()
+    stderr.writeLine &"[time] bwd block {i}: merge+load={dsec(tb0, tbMerge):.1f}s " &
+      &"backwardBlock={dsec(tbMerge, tbBwd):.1f}s grad+check={dsec(tbBwd, tbGrad):.1f}s " &
+      &"adam+SSD={dsec(tbGrad, tbUpd):.1f}s safety+probe={dsec(tbUpd, tbCheck):.1f}s " &
+      &"spill={dsec(tbCheck, tbEnd):.1f}s total={dsec(tb0, tbEnd):.1f}s"
+    trainProfEnd(&"bwd block {i}", tb0)
     # blockGrads het scope ngay day -> GC thu hoi, KHONG lan sang block ke
     GC_fullCollect()   # SUA: chay cho MOI block, giong nhu forward o tren
     # Ctrl+C: chi break SAU khi layer nay da spill SSD + ghi resume/layer progress
@@ -2940,6 +3149,15 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
         "(resume state + layer progress da tren SSD). Chay lai de tiep tuc."
       break
 
+  if gTrainStepFullyDone:
+    # CAM thieu: step chi duoc coi la xong khi MOI block da backward.
+    var missing: seq[int] = @[]
+    for j in 0 ..< m.blocks.len:
+      if not blockDone[j]: missing.add j
+    if missing.len > 0:
+      raise newException(ValueError,
+        &"[check] step {stepIndex}: {missing.len} block CHUA backward ({missing}) - KHONG coi step la xong.")
+    stderr.writeLine &"[check] step {stepIndex}: du {m.blocks.len}/{m.blocks.len} block da backward."
   # defer closeAndDelete() o dau ham da don scratch SSD ca khi return binh thuong
   # lan khi co exception.
   result = loss
@@ -2949,6 +3167,15 @@ const FillStepIndex* = 0   # lan lap tinh lai step 0
 proc fillMarkerPath*(ckptPath: string): string =
   ## Co trong <ckpt>.inprogress/ = dang lap do (noi dung: K).
   checkpoint.progressDir(ckptPath) / "fill-step0.k"
+
+proc auditMarkerPath*(ckptPath: string): string =
+  ## Co trong <ckpt>.inprogress/ = dang kiem/sua update step 0 do (auditStep0LoraBlocks).
+  checkpoint.progressDir(ckptPath) / "audit-step0"
+
+proc step0RepairInProgress*(ckptPath: string): bool =
+  ## Tien do trong <ckpt>.inprogress thuoc lan lap/kiem step 0 (stepIndex = FillStepIndex),
+  ## KHONG phai 1 step train thuong.
+  fileExists(fillMarkerPath(ckptPath)) or fileExists(auditMarkerPath(ckptPath))
 
 proc fillUntrainedLoraBlocks*(m: var NimformerModelJamba, lo: var JambaLora,
                               loState: var LoraTrainState, adamStore: var AdamDiskStore,
@@ -3016,7 +3243,10 @@ proc fillUntrainedLoraBlocks*(m: var NimformerModelJamba, lo: var JambaLora,
     checkpoint.clearLayerProgress(ckpt)
     removeActivationResume(FillStepIndex)
     createDir(checkpoint.progressDir(ckpt))
-    writeFile(marker, $k)
+    # Atomic: crash giua chung khong de lai marker rong (lan sau K="" -> raise).
+    writeFile(marker & ".tmp", $k)
+    if cRename((marker & ".tmp").cstring, marker.cstring) != 0:
+      raise newException(IOError, "[fill] Khong ghi duoc marker " & marker)
   var curStep, curLayer: int
   let hasCursor = resuming and checkpoint.readProgressCursor(ckpt, curStep, curLayer) and
     curStep == FillStepIndex
@@ -3087,6 +3317,213 @@ proc fillUntrainedLoraBlocks*(m: var NimformerModelJamba, lo: var JambaLora,
       &"KHONG commit. Xem log RESCUE; xoa {checkpoint.progressDir(ckpt)} de lap lai tu dau.")
   echo &"[fill] Lap xong: step 0 loss={loss:.4f}, {lo.adapters.len}/{lo.adapters.len} adapter co B != 0"
   result = true
+
+proc auditStep0Core*(m: var NimformerModelJamba, lo: var JambaLora,
+                     loState: var LoraTrainState, adamStore: var AdamDiskStore,
+                     attnStore: var AttnWeightDiskStore,
+                     idsB, tgtMaskB: seq[seq[int]], ctx: Backend, ckptStep: int): bool =
+  ## TU DONG kiem + sua update step 0 cua checkpoint step 1 chua co co
+  ## meta[Step0AuditMetaKey] (vd block 51..63 cua lan train 21/10: step 0 tinh qua
+  ## lm_head random). Tinh lai DUNG step 0 (moi B = 0, block G = gia tri graft, batch
+  ## step 0, lm_head that), backward tu block tren cung xuong: block nao dau B da luu
+  ## khong khop gradient that -> reset Adam + update lai; gap block khop dau tien ->
+  ## dung (block duoi do giu nguyen). Resume duoc (marker audit + layer progress).
+  ## Tra ve true -> caller commit (.bin co co + Adam + commit marker).
+  if ckptStep != 1: return false
+  if getEnv("BYBY_STEP0_AUDIT", "1") == "0":
+    echo "[audit] BYBY_STEP0_AUDIT=0 -> bo qua kiem update step 0."
+    return false
+  let ckpt = getCheckpointPath()
+  let marker = auditMarkerPath(ckpt)
+  let resuming = fileExists(marker)
+  if gLoadedCkptMeta.getOrDefault(Step0AuditMetaKey) == "ok":
+    if resuming:
+      # Lan truoc da ghi .bin CO co (crash sau saveCheckpointLoraBin, truoc khi don):
+      # kiem da xong. Lam tiep se so B MOI voi chinh no -> raise mai. Chi don tien do.
+      echo "[audit] .bin da co co xac nhan step 0 - don tien do kiem con sot lai."
+      checkpoint.clearLayerProgress(ckpt)
+      removeActivationResume(FillStepIndex)
+    return false
+  for name, ad in lo.adapters:
+    var nz = false
+    for v in ad.B.data:
+      if v != 0'f32:
+        nz = true
+        break
+    if not nz:
+      raise newException(ValueError,
+        &"[audit] '{name}' con B = 0 - phai lap (fillUntrainedLoraBlocks) truoc khi kiem step 0.")
+  if resuming:
+    echo "[audit] TIEP TUC kiem/sua update step 0 do (" & marker & ")."
+  else:
+    echo "[audit] Checkpoint step 1 chua duoc xac nhan update step 0 -> tinh lai step 0 " &
+         "(forward 64 block + backward tu block tren cung toi block dung dau tien)."
+    checkpoint.clearLayerProgress(ckpt)
+    removeActivationResume(FillStepIndex)
+    createDir(checkpoint.progressDir(ckpt))
+    writeFile(marker & ".tmp", "1")
+    if cRename((marker & ".tmp").cstring, marker.cstring) != 0:
+      raise newException(IOError, "[audit] Khong ghi duoc marker " & marker)
+  var curStep, curLayer: int
+  let hasCursor = resuming and checkpoint.readProgressCursor(ckpt, curStep, curLayer) and
+    curStep == FillStepIndex
+  if hasCursor and (curLayer < 0 or curLayer >= m.blocks.len):
+    raise newException(IOError,
+      &"[audit] Cursor {curLayer} ngoai 0..{m.blocks.len - 1}. Xoa {checkpoint.progressDir(ckpt)} de kiem lai.")
+
+  # B da luu (.bin) de so dau; roi MOI B = 0 = dieu kien truoc step 0. A khong doi
+  # qua step 0 (dA = 0 khi B = 0) nen dung nguyen.
+  var refB = initTable[string, seq[float32]]()
+  for name in toSeq(lo.adapters.keys):
+    refB[name] = lo.adapters[name].B.data
+    lo.adapters[name].B.data = newSeq[float32](refB[name].len)
+  proc blockOf(name: string): int =
+    let rest = name["block".len .. ^1]
+    parseInt(rest[0 ..< rest.find('.')])
+
+  gAuditStopBlock = -1
+  var loss = 0'f32
+  var stopBlock = -1
+  if hasCursor and curLayer == 0:
+    # Lan truoc da sua toi block 0 (moi block deu sai), chua kip commit: chi nap ket qua.
+    discard restoreLayerProgressForStep(lo, ckpt, FillStepIndex, m.blocks.len)
+  else:
+    let gLrScale = min(1.0'f32, 1.0'f32 / float32(CFG_G_LR_WARMUP_STEPS))
+    loss = trainStepGraftStreaming(m, lo, loState, adamStore, attnStore, CFG_NEWBLOCK_LR,
+      idsB, tgtMaskB, ctx, gLrScale, stepIndex = FillStepIndex,
+      updateMaxBlock = m.blocks.len - 1, auditRefB = refB)
+    if gStopRequested and not gTrainStepFullyDone:
+      stderr.writeLine "[audit] Dung an toan - tien do tren SSD (" & checkpoint.progressDir(ckpt) &
+        "). Chay lai de tiep tuc, KHONG mat phan da lam."
+      quit(130)
+    stopBlock = gAuditStopBlock
+  # Block <= stopBlock: dung -> tra B da luu. Block > stopBlock: vua sua (B moi).
+  var nFixed = 0
+  for name, b in refB:
+    let bi = blockOf(name)
+    if bi <= stopBlock:
+      lo.adapters[name].B.data = b
+    else:
+      let nb = lo.adapters[name].B.data
+      var nz = false
+      for v in nb:
+        if v != 0'f32:
+          nz = true
+          break
+      if not nz:
+        raise newException(ValueError,
+          &"[audit] '{name}' (block {bi}) van B = 0 sau khi sua (RESCUE rollback?) - KHONG commit. " &
+          &"Chay lai de sua tiep block nay.")
+      if nb == b:
+        raise newException(ValueError,
+          &"[audit] '{name}' (block {bi}) bi danh dau sai nhung B moi giong het B cu - KHONG commit.")
+      inc nFixed
+  if stopBlock == m.blocks.len - 1:
+    echo &"[audit] Moi block deu co update step 0 dung (loss step 0={loss:.4f}) - chi ghi co xac nhan."
+  else:
+    echo &"[audit] Xong: sua block {stopBlock + 1}..{m.blocks.len - 1} ({nFixed} adapter), " &
+         (if stopBlock >= 0: &"block 0..{stopBlock} dung (giu nguyen)" else: "khong co block nao dung tu truoc") &
+         &", loss step 0={loss:.4f}"
+  gStep0Verified = true
+  result = true
+
+proc auditStep0LoraBlocks*(m: var NimformerModelJamba, lo: var JambaLora,
+                           loState: var LoraTrainState, adamStore: var AdamDiskStore,
+                           attnStore: var AttnWeightDiskStore,
+                           bpeTok: BPETokenizer, hfTok: HfTokenizer, usingHfTok: bool,
+                           ctx: Backend, ckptStep: int): bool =
+  ## Nhu auditStep0Core voi DUNG batch step 0 (batcher moi tu dau dataset, nhu lap).
+  if ckptStep != 1 or getEnv("BYBY_STEP0_AUDIT", "1") == "0" or
+     gLoadedCkptMeta.getOrDefault(Step0AuditMetaKey) == "ok":
+    return auditStep0Core(m, lo, loState, adamStore, attnStore, @[], @[], ctx, ckptStep)
+  var auditBatcher = newStreamingBatcher(CFG_DATASETS, CFG_SEQ_LEN, CFG_BATCH_SIZE,
+                                         bpeTok, hfTok, usingHfTok)
+  let (idsB, _, tgtMaskB) = auditBatcher.nextBatch()
+  auditStep0Core(m, lo, loState, adamStore, attnStore, idsB, tgtMaskB, ctx, ckptStep)
+
+proc checkLoraCheckpointIntegrity*(m: var NimformerModelJamba, lo: JambaLora, step: int,
+                                   newBlockNames: seq[string]): seq[int] =
+  ## Kiem tra KY trang thai LoRA + block G vua nap (resume) / vua tao (run moi) TRUOC
+  ## khi train/lap. Raise neu co loi lam hong train: thieu adapter, sai kich thuoc,
+  ## alpha/scale sai, NaN/Inf, A toan 0 (grad B = g.(A x)^T = 0 -> adapter KHONG BAO
+  ## GIO hoc duoc), thieu weight block G. Tra ve cac block co B = 0 o MOI adapter
+  ## (block TRONG) - co che bu fillUntrainedLoraBlocks se lap chung.
+  var problems: seq[string] = @[]
+  var byName = initTable[string, ptr Tensor]()
+  for (name, t) in paramList(m): byName[name] = t
+  var nAdapters = 0
+  for i, c in m.pattern:
+    var names: seq[string] = @[]
+    if c in {'R', 'r', 'P', 'p', 'G', 'g'}:
+      names = @[&"block{i}.mambaReal.inProj.weight", &"block{i}.mambaReal.outProj.weight"]
+    elif c in {'M', 'm'}:
+      names = @[&"block{i}.mamba.inProj.weight", &"block{i}.mamba.outProj.weight"]
+    var blockEmpty = names.len > 0
+    var zeroBNames: seq[string] = @[]
+    for name in names:
+      if name notin lo.adapters:
+        problems.add "thieu adapter " & name
+        blockEmpty = false
+        continue
+      inc nAdapters
+      let ad = lo.adapters[name]
+      if ad.r <= 0 or ad.A.data.len != ad.r * ad.inF or ad.B.data.len != ad.outF * ad.r:
+        problems.add &"{name}: A/B sai kich thuoc"
+        blockEmpty = false
+        continue
+      if ad.scale.classify in {fcNan, fcInf, fcNegInf} or ad.scale != ad.alpha / float32(ad.r):
+        problems.add &"{name}: alpha/scale khong hop le"
+      var aNonZero, bNonZero, aBad, bBad = false
+      for v in ad.A.data:
+        if v.classify in {fcNan, fcInf, fcNegInf}: aBad = true
+        elif v != 0'f32: aNonZero = true
+      for v in ad.B.data:
+        if v.classify in {fcNan, fcInf, fcNegInf}: bBad = true
+        elif v != 0'f32: bNonZero = true
+      if aBad: problems.add &"{name}: A co NaN/Inf"
+      if bBad: problems.add &"{name}: B co NaN/Inf"
+      if not aNonZero:
+        problems.add &"{name}: A toan 0 - adapter KHONG BAO GIO hoc duoc"
+      if bNonZero or bBad: blockEmpty = false
+      if not bNonZero and not bBad: zeroBNames.add name
+    if blockEmpty: result.add i
+    elif step >= 1 and zeroBNames.len > 0:
+      # Nua block trong: co che bu chi lap block trong CA 2 adapter -> se ket o luc luu.
+      problems.add &"block {i}: adapter {zeroBNames} co B = 0 nhung adapter con lai da train " &
+        "(nua block trong - co che bu khong lap duoc)"
+  var nNew = 0
+  for name in newBlockNames:
+    if name notin byName:
+      problems.add "thieu tham so block moi " & name
+      continue
+    let p = byName[name]
+    if p[].data.len == numelShape(p[].shape):
+      var bad = false
+      for v in p[].data:
+        if v.classify in {fcNan, fcInf, fcNegInf}: bad = true
+      if bad: problems.add name & ": NaN/Inf"
+      inc nNew
+    elif name in lo.quantBase:
+      inc nNew
+    else:
+      problems.add name & ": khong co weight (RAM lan quantBase)"
+  var emptyDesc = "khong co block trong"
+  if result.len > 0:
+    var contiguous = true
+    for j in 1 ..< result.len:
+      if result[j] != result[j - 1] + 1: contiguous = false
+    emptyDesc = &"{result.len} block TRONG (B = 0): " &
+      (if contiguous: &"{result[0]}..{result[^1]}" else: $result)
+  echo &"[check] step={step}: {nAdapters} adapter LoRA, {nNew}/{newBlockNames.len} tham so block moi, " &
+       &"{emptyDesc}, {problems.len} loi"
+  if problems.len > 0:
+    for p in problems[0 ..< min(10, problems.len)]: stderr.writeLine "[check]   " & p
+    raise newException(ValueError,
+      &"[check] Checkpoint/LoRA hong ({problems.len} loi, vd: {problems[0]}) - KHONG train.")
+  if step == 0 and result.len == m.blocks.len:
+    echo "[check] Run moi: moi B = 0 la binh thuong o step 0."
+  elif result.len > 0:
+    echo "[check] -> co che bu (fillUntrainedLoraBlocks) se lap cac block trong truoc khi train tiep."
 
 when isMainModule:
   setControlCHook(onTrainCtrlC)
@@ -3350,10 +3787,24 @@ when isMainModule:
   # (giu nguyen, dung tinh than "dong bang toi da, chi hoc phan can hoc").
   var adamStore = initAdamDiskStore(CFG_ADAM_DIR)
   let commitOnlyMode = getEnv("BYBY_COMMIT_ONLY", "0") != "0"
+  if not resumed and step0RepairInProgress(getCheckpointPath()):
+    # Tien do LAP/KIEM step 0 (tinh tren .bin cu) nhung .bin khong con. Con .prev ->
+    # rat co the .bin bi xoa nham: KHONG tu xoa tien do (mat nhieu gio), dung + huong dan.
+    if fileExists(getCheckpointPath() & ".prev"):
+      raise newException(IOError,
+        &"[fill] Con tien do lap/kiem step 0 do ({checkpoint.progressDir(getCheckpointPath())}) nhung " &
+        &"khong con {getCheckpointPath()}. Khoi phuc roi chay lai de lam tiep:\n" &
+        &"  cp -p {getCheckpointPath()}.prev {getCheckpointPath()}\n" &
+        &"Neu that su muon train moi tu dau: xoa {checkpoint.progressDir(getCheckpointPath())} truoc.")
+    # Khong con ca .bin lan .prev -> run moi: tien do do KHONG thuoc run nay, de lai thi
+    # trainStep step 0 se resume nham vao no. Bo di truoc khi bat cu thu gi doc .inprogress.
+    echo "[fill] Khong con checkpoint .bin/.prev nhung con tien do lap do -> bo tien do lap, train moi tu dau."
+    checkpoint.clearLayerProgress(getCheckpointPath())
+    removeActivationResume(FillStepIndex)
   let hasInprogress = dirExists(checkpoint.progressDir(getCheckpointPath()))
-  # Dang lap do (fillUntrainedLoraBlocks bi ngat): tien do lap nam trong
-  # <ckpt>.inprogress voi stepIndex = FillStepIndex, KHONG phai 1 step train thuong.
-  var fillInProgress = resumed and fileExists(fillMarkerPath(getCheckpointPath()))
+  # Dang lap/kiem step 0 do (fillUntrainedLoraBlocks / auditStep0LoraBlocks bi ngat): tien
+  # do nam trong <ckpt>.inprogress voi stepIndex = FillStepIndex, KHONG phai 1 step train thuong.
+  var fillInProgress = resumed and step0RepairInProgress(getCheckpointPath())
   if oldStep == 0 and not commitOnlyMode and not hasInprogress:
     # Chi cleanup Adam khi that su run moi (khong con inprogress de recover).
     adamStore.cleanup()
@@ -3380,6 +3831,9 @@ when isMainModule:
           adamStore.init(name, plen)
         newBlockNames.add(name)
         break
+
+  # Kiem tra KY LoRA + block G truoc moi thu khac (raise neu hong; bao block trong).
+  discard checkLoraCheckpointIntegrity(m, lo, oldStep, newBlockNames)
 
   # RESUME INTEGRITY: checkpoint co weight chua du; phai kiem tra Adam + cursor.
   let currentDatasetSig = datasetSignature(CFG_DATASETS)
@@ -3727,8 +4181,16 @@ when isMainModule:
       if newBlockNames.len > 0 and not adamStoreAllAtStep(adamStore, m, newBlockNames, epoch):
         forceAdamStoreToStep(adamStore, m, newBlockNames, epoch)
       let ckpt = getCheckpointPath()
+      # Backup chi la phu: file co the da bi xoa/doi ten trong luc lap (nhieu gio) -
+      # KHONG duoc de loi backup lam mat ket qua lap (bug: copyFile .bin da bi xoa ->
+      # OSError -> chet truoc khi ghi .bin).
       for suffix in ["", ".resume.commit"]:
-        copyFile(ckpt & suffix, ckpt & suffix & ".before_fill")
+        if fileExists(ckpt & suffix):
+          try: copyFile(ckpt & suffix, ckpt & suffix & ".before_fill")
+          except OSError as e:
+            stderr.writeLine &"[fill] CANH BAO: khong backup duoc {ckpt}{suffix}: {e.msg} - van ghi ket qua lap."
+        else:
+          stderr.writeLine &"[fill] CANH BAO: {ckpt}{suffix} khong con tren dia - bo qua backup, van ghi ket qua lap."
       saveCheckpointLoraBin(m, lo, ckpt, epoch, newBlockNames, attnStore)
       saveLoraAdamStates(adamStore, loState)
       writeResumeCommit(ckpt, epoch, CFG_SEQ_LEN, CFG_BATCH_SIZE, m.pattern, currentDatasetSig,
@@ -3738,6 +4200,40 @@ when isMainModule:
       removeActivationResume(FillStepIndex)
       fillInProgress = false
       echo &"[fill] Da ghi {ckpt} step={epoch} (backup: {ckpt}.before_fill)"
+
+  # TU DONG kiem update step 0 (sau khi lap): block co update step 0 sai (vd tinh qua
+  # lm_head random) -> tinh lai; ghi co vao .bin de lan sau khong kiem lai.
+  block step0Audit:
+    var cs, cl: int
+    if not resumed or epoch != oldStep:
+      break step0Audit
+    if not step0RepairInProgress(getCheckpointPath()) and
+       checkpoint.readProgressCursor(getCheckpointPath(), cs, cl):
+      break step0Audit   # dang co 1 step train thuong do dang
+    if auditStep0LoraBlocks(m, lo, loState, adamStore, attnStore,
+                            bpeTok, hfTok, usingHfTok, ctx, epoch):
+      if not loraAdamStateAllAtStep(loState, lo, epoch):
+        forceLoraAdamToStep(loState, lo, epoch)
+      if newBlockNames.len > 0 and not adamStoreAllAtStep(adamStore, m, newBlockNames, epoch):
+        forceAdamStoreToStep(adamStore, m, newBlockNames, epoch)
+      let ckpt = getCheckpointPath()
+      # Giu .bin truoc khi sua (hard link, O(1)): .prev KHONG giu duoc vi final save ngay
+      # sau se ghi de no. Loi backup khong duoc lam mat ket qua kiem.
+      let backup = ckpt & ".before_audit"
+      try:
+        if fileExists(backup): removeFile(backup)
+        if fileExists(ckpt) and cLink(ckpt.cstring, backup.cstring) != 0:
+          copyFile(ckpt, backup)
+      except OSError as e:
+        stderr.writeLine &"[audit] CANH BAO: khong backup duoc {ckpt}: {e.msg} - van ghi ket qua."
+      saveCheckpointLoraBin(m, lo, ckpt, epoch, newBlockNames, attnStore)
+      saveLoraAdamStates(adamStore, loState)
+      writeResumeCommit(ckpt, epoch, CFG_SEQ_LEN, CFG_BATCH_SIZE, m.pattern, currentDatasetSig,
+        (if CFG_INIT_MODE == "codestral": CFG_HF_DIR else: ""))
+      checkpoint.clearLayerProgress(ckpt)
+      removeActivationResume(FillStepIndex)
+      fillInProgress = false
+      echo &"[audit] Da ghi {ckpt} step={epoch} ({Step0AuditMetaKey}=ok; ban truoc: {backup})"
 
   var runningLoss = 0'f32
   var prevStepLoss = -1'f32
@@ -3774,6 +4270,10 @@ when isMainModule:
       # Step dang do: resume/layer progress da tren SSD — KHONG inc epoch, KHONG commit full ckpt.
       stderr.writeLine "[finetune_lora] Thoat an toan (step chua xong). Chay lai make finetune-mamba de resume layer."
       quit(130)
+    if epoch == 0 and gTrainStepFullyDone and gLastStepForwardRan:
+      # Step 0: loss + gradient tinh tron trong process nay (lm_head da bind, preflight)
+      # -> .bin step 1 ghi co xac nhan, lan sau khong can kiem step 0 lai.
+      gStep0Verified = true
     inc epoch
     if gStopRequested:
       # Step da xong (backward den layer 0 hoac break sau layer 0). Thu commit roi thoat.
