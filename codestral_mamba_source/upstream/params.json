@@ -1,0 +1,12 @@
+{
+  "dim": 4096,
+  "n_layers": 64,
+  "vocab_size": 32768,
+  "n_groups": 8,
+  "rms_norm": true,
+  "residual_in_fp32": true,
+  "fused_add_norm": true,
+  "pad_vocab_size_multiple": 1,
+  "tie_embeddings": false,
+  "model_type": "mamba"
+}

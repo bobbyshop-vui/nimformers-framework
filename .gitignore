@@ -1,8 +1,39 @@
-.DS_Store
-test_nimformer.exe
-test_nimformer
-Lưu trữ.zip
-check_groupsize
+# ===== loai tru du lieu / model / nen  (2026-10-26) =====
+*.nimq
+*.bin
+*.zip
+jamba_parallel*
+python_code_dataset_*.jsonl
+
+# ===== binary da bien dich (Mach-O), liet ke dich danh vi khong co duoi =====
+bench_dispatch_overhead
+bench_ffn_fused_full
+bench_ffn_matmul
+bench_fp4_gemv
+bench_gemv_variants
+finetune_lora_bin
+graft_attention_bin
+infer_lora_bin
+migrate_lora_json_to_bin
 nim_inference
+print_manifest_bin
+pytorch_bin_loader_bin
+quantize_codestral_bin
+quantize_lora_bin_4bit
+repair_lora_json
+rmsg_groups_test
+sharded_hf_loader
+t_grid_barrier
+test_inferencespectron
+test_nimformer
+test_streaming_matches
+testops
+vm_ref_test
+
+# ===== entry co tu truoc =====
+Archive.zip
+codestral_mamba_7b_fp4.nimq
+llama_cpp_metal_inference_kernels.zip
 model.nimq
-Lưu trữ 2.zip
+vendor/.DS_Store
+vendor/bybylang

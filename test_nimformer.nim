@@ -10,12 +10,24 @@
 ## sigmoid...) đi qua backend.nim (beMatmul/beAdd/beSigmoid...) để chạy đúng
 ## trên backend đã chọn (cpu/metal/cuda/opencl/tsic), KHÔNG lặng lẽ rơi về
 ## vòng lặp Nim thuần cho những phép toán lớn.
+##
+## GPU-ONLY: khi ctx là GPU (isGpuCtx: Metal/Vulkan) MỌI phép tính của
+## Linear++, Mamba2SSD, khối Spectron, loss và Adam chạy trên GPU; lỗi GPU thì
+## RAISE (gpuFail), KHÔNG BAO GIỜ âm thầm tính lại trên CPU. Các hàm cpu*
+## bên dưới chỉ còn là bản tham chiếu cho backend không phải GPU (tsic) và
+## cho test đối chiếu. Phần còn lại trên host là sắp xếp dữ liệu (tách/ghép
+## slice theo head, vì Tensor.data nằm trên host) và lượng tử hoá APF
+## (customfloat chưa có kernel GPU), không phải phép tính model.
 
 import std/[math, random, strformat, os, strutils, json, tables]
 import customfloat
 import backend
 import quant
-import nimformer  # Tensor, Linear, LayerNorm, FeedForward, Embedding, addT,
+import nimformer
+import mamba2_ssm_gpu   # kernel GPU Linear++ train (forward+backward), runMicroVm, CE/Adam GPU
+from fp4_gemv_vm import buildLinearPlusStepProgram   # kernel GPU Linear++ 1 token (cung kernel infer)
+import fp4_gemv_vm as lpvm                            # lpvm.lpLayout(C, H): layout [proj|y|z|S]
+import gpu_layers  # encodeEluPlus1 / encodeEluPlus1Backward for GPU-only Linear++  # Tensor, Linear, LayerNorm, FeedForward, Embedding, addT,
                    # transpose, flatten2D, newTensor, randnTensor,
                    # ApfAdamState, apfAdamStep, newLinear, newLayerNorm,
                    # newFeedForward, newEmbedding
@@ -31,7 +43,7 @@ const
   CFG_SEQ_LEN* = 128
   CFG_BATCH_SIZE* = 32
   CFG_NUM_MERGES* = 500        # vocab cuoi = 256 + merges (dung som neu het cap lap)
-  CFG_N_STEPS* = 100_000        # so buoc train demo
+  CFG_N_STEPS* = 6_000        # so buoc train demo
   CFG_LR* = 3e-4'f32
   CFG_REQUANTIZE_EVERY* = 50   # xem giai thich trong trainStep ben duoi
   CFG_LOG_EVERY* = 100         # log loss moi bao nhieu buoc
@@ -39,23 +51,19 @@ const
   CFG_CORPUS_PATH* = "databricks-dolly-15k.jsonl"
   CFG_GEN_MAX_NEW_TOKENS* = 40
   CFG_GEN_TEMPERATURE* = 0'f32
-  CFG_GEN_PROMPT* = "Cau lenh if-else"
+  CFG_GEN_PROMPT* = "When did Virgin Australia start operating?"
   CFG_CHECKPOINT_PATH* = "finetune.nimq"
   CFG_CHECKPOINT_EVERY* = 5    # luu checkpoint moi bao nhieu buoc train
 
 # ═══════════════════════════════════════════════════════════════
-# CANH BAO FALLBACK CPU - in ra 1 LAN DUY NHAT khi Mamba2SSD phai roi ve
-# CPU thay vi chay session GPU (tranh spam log qua 10.000 buoc train).
+# GPU-ONLY: loi GPU -> raise, KHONG tinh lai tren CPU (truoc day
+# warnFallbackOnce roi ve cpuMamba2Forward/cpuLinearPlusForward).
 # ═══════════════════════════════════════════════════════════════
-var
-  warnedNoSession = false
-  warnedSessionBeginFail = false
-  warnedSessionMidFail = false
-
-proc warnFallbackOnce(flag: var bool, reason: string) =
-  if not flag:
-    stderr.writeLine(&"[CANH BAO] Mamba2SSD roi ve CPU fallback: {reason} (chi in 1 lan, cac buoc sau van fallback tuong tu neu cung ly do)")
-    flag = true
+proc gpuFail(what: string; backend: GpuBackend) {.noreturn.} =
+  let detail = sessionGetLastError(backend)
+  raise newException(CatchableError,
+    "[test_nimformer] GPU " & what & " that bai tren " & $backend &
+    (if detail.len > 0: ": " & detail else: "") & " (GPU-only: khong roi ve CPU)")
 
 # ═══════════════════════════════════════════════════════════════
 # BPE TOKENIZER RIÊNG CHO SPECTRON (byte-level BPE, tự train trên corpus
@@ -400,14 +408,23 @@ proc applyFeatureMap(x: seq[float32]): seq[float32] =
   result = newSeq[float32](x.len)
   for i in 0 ..< x.len: result[i] = eluPlus1(x[i])
 
-proc cpuLinearPlusForward(qData, kData, vData: seq[float32], B, H, T, D: int):
+proc applyFeatureMapGpu(ctx: Backend; x: seq[float32]): seq[float32] =
+  ## GPU JIT feature map for Linear++ training (no CPU loop).
+  let n = x.len
+  var hIn = sessionUpload(ctx.kind.toByby(), x)
+  var hOut = sessionAllocScratch(ctx.kind.toByby(), n)
+  encodeEluPlus1(ctx, hIn, hOut, n)
+  result = sessionRead(ctx.kind.toByby(), hOut, n)
+  sessionFree(ctx.kind.toByby(), hIn)
+  sessionFree(ctx.kind.toByby(), hOut)
+
+proc cpuLinearPlusForward*(qData, kData, vData: seq[float32], B, H, T, D: int):
     tuple[outData, qf, kf, den: seq[float32]] =
-  ## qf/kf: feature-mapped Q/K (cùng layout [B,T,H*D]) - trả về để backward
-  ## khỏi phải tính lại. den: mẫu số [B,T,H] (1 số/head/token).
-  let C = H * D
+  ## CPU reference (used by existing callers without ctx).
   result.qf = applyFeatureMap(qData)
   result.kf = applyFeatureMap(kData)
   result.den = newSeq[float32](B * T * H)
+  let C = H * D
   result.outData = newSeq[float32](B * T * C)
   template idx(b, t, h, d: int): int = b * T * C + t * C + h * D + d
   template dIdx(b, t, h: int): int = b * T * H + t * H + h
@@ -428,7 +445,7 @@ proc cpuLinearPlusForward(qData, kData, vData: seq[float32], B, H, T, D: int):
         for d in 0 ..< D:
           result.outData[idx(b, i, h, d)] = num[d] * invDen
 
-proc cpuLinearPlusBackward(qData, kData, vData, qf, kf, den, dOutData: seq[float32],
+proc cpuLinearPlusBackward*(qData, kData, vData, qf, kf, den, dOutData: seq[float32],
                             B, H, T, D: int): tuple[dQ, dK, dV: seq[float32]] =
   let C = H * D
   result.dQ = newSeq[float32](B * T * C)
@@ -485,10 +502,8 @@ type
     nHeads*, headDim*, embedDim*: int
     qkvProj*: Linear   # x -> [Q|K|V], mỗi phần embedDim
     outProj*: Linear
-    useSession*: bool  # giữ cờ cho tương thích API (bản CPU-tham chiếu ở
-                        # trên đã correctness-first; đường GPU-session có
-                        # thể thêm sau theo đúng khuôn Mamba2SSD nếu cần
-                        # tăng tốc, không đổi kết quả).
+    useSession*: bool  # giữ cờ cho tương thích API; ctx GPU LUÔN chạy GPU
+                        # (không còn đường CPU khi useSession=false).
 
 proc newLinearPlusAttention*(embedDim, nHeads: int, useSession: bool = true): LinearPlusAttention =
   assert embedDim mod nHeads == 0
@@ -499,7 +514,104 @@ proc newLinearPlusAttention*(embedDim, nHeads: int, useSession: bool = true): Li
   result.outProj = newLinear(embedDim, embedDim)
   result.useSession = useSession
 
-proc splitQKV(proj: Tensor, B, T, C: int): tuple[q, k, v: seq[float32]] =
+# Incremental state for causal Linear++ attention.
+# This is the exact associative form of:
+#   S_t = sum_{j<=t} phi(K_j) outer V_j
+#   z_t = sum_{j<=t} phi(K_j)
+#   y_t = phi(Q_t) S_t / (phi(Q_t) dot z_t + eps)
+# It is mathematically equivalent to the causal quadratic reference above,
+# but O(H*D*D) work and O(H*D*D + H*D) state per token instead of O(T^2).
+type
+  LinearPlusAttentionState* = object
+    ## S[h,dq,dv], row-major, then z[h,dq].
+    kv*: seq[float32]
+    z*: seq[float32]
+    nHeads*: int
+    headDim*: int
+
+proc newLinearPlusAttentionState*(m: LinearPlusAttention): LinearPlusAttentionState =
+  result.nHeads = m.nHeads
+  result.headDim = m.headDim
+  result.kv = newSeq[float32](m.nHeads * m.headDim * m.headDim)
+  result.z = newSeq[float32](m.nHeads * m.headDim)
+
+proc reset*(s: var LinearPlusAttentionState) =
+  for i in 0 ..< s.kv.len: s.kv[i] = 0'f32
+  for i in 0 ..< s.z.len: s.z[i] = 0'f32
+
+proc forwardLinearPlusStep*(m: LinearPlusAttention,
+                            x: Tensor,
+                            state: var LinearPlusAttentionState,
+                            ctx: Backend): Tensor =
+  ## One-token causal Linear++ step. No T*T score/mask is constructed.
+  ## x must be [1,1,C]. Q/K/V projection still uses the normal GPU-resident
+  ## Linear path; only the small recurrent attention state is updated here.
+  doAssert x.data.len == m.embedDim, "Linear++ step requires exactly one token"
+  doAssert state.nHeads == m.nHeads and state.headDim == m.headDim,
+    "Linear++ attention state does not match model"
+
+  let proj = m.qkvProj.forward(x, ctx)
+  let C = m.embedDim
+  let D = m.headDim
+  let H = m.nHeads
+
+  var y = newTensor(@[1, 1, C])
+  if isGpuCtx(ctx):
+    # GPU: dung CHINH kernel Linear++ step cua infer (buildLinearPlusStepProgram, 1 TG/head,
+    # D lane) tren buffer [proj | y | z | S]; state host <-> GPU moi buoc.
+    let lay = lpvm.lpLayout(C, H)
+    var buf = newSeq[float32](lay.total)
+    buf.blit(lay.offProj, proj.data, 0, 3 * C)
+    buf.blit(lay.offZ, state.z, 0, H * D)
+    buf.blit(lay.offS, state.kv, 0, H * D * D)
+    if not runMicroVm(ctx, buildLinearPlusStepProgram(lay, LP_EPS), buf, H * D, 16,
+                      "lp_step_host_" & $H & "_" & $C, tgSize = D):
+      gpuFail("Linear++ step", ctx.kind.toByby())
+    y.data = buf[lay.offY ..< lay.offY + C]
+    state.z = buf[lay.offZ ..< lay.offZ + H * D]
+    state.kv = buf[lay.offS ..< lay.offS + H * D * D]
+    return m.outProj.forward(y, ctx)
+  let qBase = 0
+  let kBase = C
+  let vBase = 2 * C
+  # Reuse these buffers across heads: no per-head heap allocation in decode.
+  var qf = newSeq[float32](C)
+  var kf = newSeq[float32](C)
+
+  for h in 0 ..< H:
+    let qOff = h * D
+    let kvBase = h * D * D
+    let zBase = h * D
+
+    # phi(Q), phi(K) = ELU(x)+1. Update the causal sufficient statistics
+    # before reading them, so the current token can attend to itself.
+    for d in 0 ..< D:
+      qf[qOff + d] = eluPlus1(proj.data[qBase + qOff + d])
+      kf[qOff + d] = eluPlus1(proj.data[kBase + qOff + d])
+      state.z[zBase + d] += kf[qOff + d]
+
+    # S += phi(K)^T outer V.
+    for dq in 0 ..< D:
+      let kval = kf[qOff + dq]
+      let row = kvBase + dq * D
+      for dv in 0 ..< D:
+        state.kv[row + dv] += kval * proj.data[vBase + qOff + dv]
+
+    # O = Q S / (Q z + eps).
+    var den = 0'f32
+    for dq in 0 ..< D:
+      den += qf[qOff + dq] * state.z[zBase + dq]
+    let invDen = 1'f32 / (den + LP_EPS)
+
+    for dv in 0 ..< D:
+      var num = 0'f32
+      for dq in 0 ..< D:
+        num += qf[qOff + dq] * state.kv[kvBase + dq * D + dv]
+      y.data[qOff + dv] = num * invDen
+
+  result = m.outProj.forward(y, ctx)
+
+proc splitQKV*(proj: Tensor, B, T, C: int): tuple[q, k, v: seq[float32]] =
   result.q = newSeq[float32](B * T * C)
   result.k = newSeq[float32](B * T * C)
   result.v = newSeq[float32](B * T * C)
@@ -516,35 +628,62 @@ proc forwardLinearPlus*(m: LinearPlusAttention, x: Tensor, ctx: Backend): Tensor
   let B = x.shape[0]; let T = x.shape[1]; let C = x.shape[2]
   assert C == m.embedDim
   let proj = m.qkvProj.forward(x, ctx)
-  let (qData, kData, vData) = splitQKV(proj, B, T, C)
-  let (outData, _, _, _) = cpuLinearPlusForward(qData, kData, vData, B, m.nHeads, T, m.headDim)
   var y = newTensor(@[B, T, C])
-  y.data = outData
+  if isGpuCtx(ctx):
+    # GPU micro-kernel (train_gpu_vm): phi + causal Linear++ trong 1 session.
+    y.data = linearPlusForwardGpu(ctx, proj.data, B, T, m.nHeads, m.headDim)
+  else:
+    let (qData, kData, vData) = splitQKV(proj, B, T, C)
+    let (outData, _, _, _) = cpuLinearPlusForward(qData, kData, vData, B, m.nHeads, T, m.headDim)
+    y.data = outData
+  result = m.outProj.forward(y, ctx)
+
+proc forwardLinearPlusSession*(m: LinearPlusAttention, x: Tensor, ctx: Backend): Tensor =
+  ## Linear++ forward cho INFERENCE (jamba_hybrid/lora). GPU: CUNG micro-kernel
+  ## voi forwardLinearPlus (linearPlusForwardGpu: phi(x)=elu+1, scan nhan qua,
+  ## chia chuan hoa - tat ca trong 1 session GPU). Truoc day ban nay tinh phi va
+  ## phep chia tren CPU, tach slice tung head, va roi ve cpuLinearPlusForward
+  ## khi session loi; gio loi GPU -> raise. Backend khong phai GPU: ban tham chieu.
+  let B = x.shape[0]; let T = x.shape[1]; let C = x.shape[2]
+  assert C == m.embedDim
+  let proj = m.qkvProj.forward(x, ctx)
+  var y = newTensor(@[B, T, C])
+  if isGpuCtx(ctx):
+    y.data = linearPlusForwardGpu(ctx, proj.data, B, T, m.nHeads, m.headDim)
+  else:
+    let (qData, kData, vData) = splitQKV(proj, B, T, C)
+    y.data = cpuLinearPlusForward(qData, kData, vData, B, m.nHeads, T, m.headDim).outData
   result = m.outProj.forward(y, ctx)
 
 proc backwardLinearPlus*(m: LinearPlusAttention, x: Tensor, dOut: Tensor, ctx: Backend): tuple[
     dX, dQkvW, dQkvB, dOutW, dOutB: Tensor] =
   let B = x.shape[0]; let T = x.shape[1]; let C = x.shape[2]
   let proj = m.qkvProj.forward(x, ctx)
-  let (qData, kData, vData) = splitQKV(proj, B, T, C)
-  let (outData, qf, kf, den) = cpuLinearPlusForward(qData, kData, vData, B, m.nHeads, T, m.headDim)
-
-  var y = newTensor(@[B, T, C]); y.data = outData
-  let dOutP = m.outProj.backward(y, dOut, ctx)
-  let dY = dOutP.dX.data
-
-  let (dQ, dK, dV) = cpuLinearPlusBackward(qData, kData, vData, qf, kf, den, dY,
-                                            B, m.nHeads, T, m.headDim)
-
+  var y = newTensor(@[B, T, C])
   var dProj = newTensor(proj.shape)
-  for b in 0 ..< B:
-    let baseIn = b * T * 3 * C
-    let baseOut = b * T * C
-    for t in 0 ..< T:
-      for c in 0 ..< C:
-        dProj.data[baseIn + t * 3 * C + c]         = dQ[baseOut + t * C + c]
-        dProj.data[baseIn + t * 3 * C + C + c]     = dK[baseOut + t * C + c]
-        dProj.data[baseIn + t * 3 * C + 2 * C + c] = dV[baseOut + t * C + c]
+  var dOutP: tuple[dX, dW, dB: Tensor]
+  if isGpuCtx(ctx):
+    # GPU: forward dựng lại + backward 2 pass trong 1 session. Cần y cho outProj.backward
+    # nên chạy forward trước (1 session), rồi backward (1 session, tự dựng lại phi/y).
+    y.data = linearPlusForwardGpu(ctx, proj.data, B, T, m.nHeads, m.headDim)
+    dOutP = m.outProj.backward(y, dOut, ctx)
+    dProj.data = linearPlusBackwardGpu(ctx, proj.data, dOutP.dX.data, B, T, m.nHeads, m.headDim)
+  else:
+    let (qData, kData, vData) = splitQKV(proj, B, T, C)
+    let (outData, qf, kf, den) = cpuLinearPlusForward(qData, kData, vData, B, m.nHeads, T, m.headDim)
+    y.data = outData
+    dOutP = m.outProj.backward(y, dOut, ctx)
+    let dY = dOutP.dX.data
+    let (dQ, dK, dV) = cpuLinearPlusBackward(qData, kData, vData, qf, kf, den, dY,
+                                              B, m.nHeads, T, m.headDim)
+    for b in 0 ..< B:
+      let baseIn = b * T * 3 * C
+      let baseOut = b * T * C
+      for t in 0 ..< T:
+        for c in 0 ..< C:
+          dProj.data[baseIn + t * 3 * C + c]         = dQ[baseOut + t * C + c]
+          dProj.data[baseIn + t * 3 * C + C + c]     = dK[baseOut + t * C + c]
+          dProj.data[baseIn + t * 3 * C + 2 * C + c] = dV[baseOut + t * C + c]
 
   let dQkvP = m.qkvProj.backward(x, dProj, ctx)
   result = (dQkvP.dX, dQkvP.dW, dQkvP.dB, dOutP.dW, dOutP.dB)
@@ -582,17 +721,12 @@ proc backward*(blk: TransformerBlockLinearPP, x: Tensor, dOut: Tensor, ctx: Back
   let x3 = blk.ln2.forward(x2, ctx)
 
   let dFF = blk.ff.backward(x3, dOut, ctx)
-  var dX2 = dFF.dX
-  let dLN2 = blk.ln2.backward(x2, dX2, ctx)
-  var dX2Total = dLN2.dX
-  for i in 0 ..< dX2Total.data.len:
-    dX2Total.data[i] += dOut.data[i]   # residual x2 = x + attnOut
+  let dLN2 = blk.ln2.backward(x2, dFF.dX, ctx)
+  let dX2Total = addT(ctx, dLN2.dX, dOut)     # residual x2 = x + attnOut
 
   let dAttn = backwardLinearPlus(blk.attn, x1, dX2Total, ctx)
   let dLN1 = blk.ln1.backward(x, dAttn.dX, ctx)
-  var dX0 = dLN1.dX
-  for i in 0 ..< dX0.data.len:
-    dX0.data[i] += dX2Total.data[i]    # residual gốc
+  let dX0 = addT(ctx, dLN1.dX, dX2Total)      # residual gốc
 
   result = (
     dX0,
@@ -614,7 +748,7 @@ proc buildDecayMask(T: int, a: float32): seq[float32] =
       result[i * T + j] = v
       v *= a
 
-proc cpuMamba2Forward(xgData, bData, cData: seq[float32], B, H, T, D: int,
+proc cpuMamba2Forward*(xgData, bData, cData: seq[float32], B, H, T, D: int,
                        aVals: seq[float32]): seq[float32] =
   let C = H * D
   result = newSeq[float32](B * T * C)
@@ -633,7 +767,7 @@ proc cpuMamba2Forward(xgData, bData, cData: seq[float32], B, H, T, D: int,
           for d in 0 ..< D:
             result[idx(b, i, h, d)] += score * xgData[idx(b, j, h, d)]
 
-proc cpuMamba2Backward(xgData, bData, cData, dOutData: seq[float32], B, H, T, D: int,
+proc cpuMamba2Backward*(xgData, bData, cData, dOutData: seq[float32], B, H, T, D: int,
                         aVals: seq[float32]): tuple[dXg, dB, dC: seq[float32]] =
   let C = H * D
   result.dXg = newSeq[float32](B * T * C)
@@ -694,6 +828,90 @@ proc splitXgBC(proj: Tensor, B, T, C: int): tuple[xg, b, c, gate: seq[float32]] 
         result.c[baseOut + t * C + cc]    = proj.data[baseIn + t * 4 * C + 2 * C + cc]
         result.gate[baseOut + t * C + cc] = proj.data[baseIn + t * 4 * C + 3 * C + cc]
 
+proc mamba2SsdGpu*(ctx: Backend; xgData, bData, cData, dYData: seq[float32];
+                  B, H, T, D: int; aVals: seq[float32]):
+    tuple[y, dXg, dB, dC: seq[float32]] =
+  ## SSD dang "quadratic" tren GPU, 1 session cho moi (b, h):
+  ##   S  = M o (C B^T)          (M = mask suy giam a^(i-j), j <= i)
+  ##   Y  = S Xg
+  ## Neu dYData khac rong (backward), them:
+  ##   dXg = S^T dY,  S^T = M^T o (B C^T)
+  ##   dS  = M o (dY Xg^T)  -> dC = dS B
+  ##   dS^T = M^T o (Xg dY^T) -> dB = dS^T C
+  ## Moi tich A B^T dung sessionMatmulNT (khong transpose tren host). Tach slice
+  ## [T,D] theo head chi la sap xep du lieu. Loi GPU -> raise.
+  let backend = ctx.kind.toByby()
+  let C = H * D
+  let bwd = dYData.len > 0
+  result.y = newSeq[float32](B * T * C)
+  if bwd:
+    result.dXg = newSeq[float32](B * T * C)
+    result.dB = newSeq[float32](B * T * C)
+    result.dC = newSeq[float32](B * T * C)
+  proc slice(src: seq[float32]; b, h: int): seq[float32] =
+    result = newSeq[float32](T * D)
+    for t in 0 ..< T:
+      let off = b * T * C + t * C + h * D
+      for d in 0 ..< D: result[t * D + d] = src[off + d]
+  proc scatter(dst: var seq[float32]; raw: seq[float32]; b, h: int) =
+    for t in 0 ..< T:
+      let off = b * T * C + t * C + h * D
+      for d in 0 ..< D: dst[off + d] = raw[t * D + d]
+  for h in 0 ..< H:
+    let mask = buildDecayMask(T, aVals[h])
+    var maskT = newSeq[float32](T * T)
+    if bwd:
+      for i in 0 ..< T:
+        for j in 0 ..< T: maskT[j * T + i] = mask[i * T + j]
+    for b in 0 ..< B:
+      if not sessionBegin(backend): gpuFail("sessionBegin (Mamba2SSD)", backend)
+      var owned: seq[SessionHandle]
+      proc up(v: seq[float32]): SessionHandle =
+        result = sessionUpload(backend, v); owned.add result
+      proc scratch(n: int): SessionHandle =
+        result = sessionAllocScratch(backend, n); owned.add result
+      var ok = true
+      let hM = up(mask)
+      let hC = up(slice(cData, b, h))
+      let hB = up(slice(bData, b, h))
+      let hXg = up(slice(xgData, b, h))
+      var hRaw = scratch(T * T)
+      var hS = scratch(T * T)
+      var hY = scratch(T * D)
+      ok = ok and sessionMatmulNT(backend, hC, hB, hRaw, T, D, T)        # C B^T
+      ok = ok and sessionVecOp(backend, "mul", hRaw, hM, hS, T * T)       # S
+      ok = ok and sessionMatmul(backend, hS, hXg, hY, T, T, D)            # Y
+      var hDXg, hDC, hDB: SessionHandle
+      if bwd:
+        let hMT = up(maskT)
+        let hDY = up(slice(dYData, b, h))
+        var hRawT = scratch(T * T)
+        var hST = scratch(T * T)
+        var hDSraw = scratch(T * T)
+        var hDS = scratch(T * T)
+        var hDSTraw = scratch(T * T)
+        var hDST = scratch(T * T)
+        hDXg = scratch(T * D); hDC = scratch(T * D); hDB = scratch(T * D)
+        ok = ok and sessionMatmulNT(backend, hB, hC, hRawT, T, D, T)       # B C^T
+        ok = ok and sessionVecOp(backend, "mul", hRawT, hMT, hST, T * T)   # S^T
+        ok = ok and sessionMatmul(backend, hST, hDY, hDXg, T, T, D)        # dXg
+        ok = ok and sessionMatmulNT(backend, hDY, hXg, hDSraw, T, D, T)    # dY Xg^T
+        ok = ok and sessionVecOp(backend, "mul", hDSraw, hM, hDS, T * T)   # dS
+        ok = ok and sessionMatmul(backend, hDS, hB, hDC, T, T, D)          # dC
+        ok = ok and sessionMatmulNT(backend, hXg, hDY, hDSTraw, T, D, T)   # Xg dY^T
+        ok = ok and sessionVecOp(backend, "mul", hDSTraw, hMT, hDST, T * T) # dS^T
+        ok = ok and sessionMatmul(backend, hDST, hC, hDB, T, T, D)         # dB
+      let ended = sessionEnd(backend)
+      if not ok or not ended:
+        for hd in owned.mitems: sessionFree(backend, hd)
+        gpuFail("encode/sessionEnd (Mamba2SSD)", backend)
+      scatter(result.y, sessionRead(backend, hY, T * D), b, h)
+      if bwd:
+        scatter(result.dXg, sessionRead(backend, hDXg, T * D), b, h)
+        scatter(result.dC, sessionRead(backend, hDC, T * D), b, h)
+        scatter(result.dB, sessionRead(backend, hDB, T * D), b, h)
+      for hd in owned.mitems: sessionFree(backend, hd)
+
 proc forwardMamba2*(m: Mamba2SSD, x: Tensor, ctx: Backend): Tensor =
   let B = x.shape[0]; let T = x.shape[1]; let C = x.shape[2]
   assert C == m.embedDim
@@ -702,79 +920,8 @@ proc forwardMamba2*(m: Mamba2SSD, x: Tensor, ctx: Backend): Tensor =
   let proj = m.inProj.forward(x, ctx)
   let (xgData, bData, cData, gateData) = splitXgBC(proj, B, T, C)
 
-  var yData: seq[float32]
-
-  if m.useSession and ctx.kind in {bkMetal, bkCuda, bkOpenCL}:
-    let backend = ctx.kind.toByby()
-    yData = newSeq[float32](B * T * C)
-    var sessionOk = sessionBegin(backend)
-
-    if sessionOk:
-      var scoreHandles: seq[SessionHandle] = @[]
-      var maskHandles: seq[SessionHandle] = @[]
-      var oHandles: seq[SessionHandle] = @[]
-
-      block encodeLoop:
-        for h in 0 ..< H:
-          var hMask = sessionUpload(backend, buildDecayMask(T, m.aVals[h]))
-          for b in 0 ..< B:
-            var cSlice = newSeq[float32](T * D)
-            var bSliceT = newSeq[float32](D * T)
-            var xgSlice = newSeq[float32](T * D)
-            for t in 0 ..< T:
-              let off = b * T * C + t * C + h * D
-              for d in 0 ..< D:
-                cSlice[t * D + d] = cData[off + d]
-                bSliceT[d * T + t] = bData[off + d]
-                xgSlice[t * D + d] = xgData[off + d]
-
-            var hC = sessionUpload(backend, cSlice)
-            var hBT = sessionUpload(backend, bSliceT)
-            var hXg = sessionUpload(backend, xgSlice)
-            var hScore = sessionAllocScratch(backend, T * T)
-            var hScoreMasked = sessionAllocScratch(backend, T * T)
-            var hO = sessionAllocScratch(backend, T * D)
-
-            if not sessionMatmul(backend, hC, hBT, hScore, T, D, T):
-              sessionOk = false
-            elif not sessionVecOp(backend, "mul", hScore, hMask, hScoreMasked, T * T):
-              sessionOk = false
-            elif not sessionMatmul(backend, hScoreMasked, hXg, hO, T, T, D):
-              sessionOk = false
-
-            sessionFree(backend, hC); sessionFree(backend, hBT); sessionFree(backend, hXg)
-            sessionFree(backend, hScore)
-            scoreHandles.add(hScoreMasked)
-            oHandles.add(hO)
-            if not sessionOk: break encodeLoop
-          maskHandles.add(hMask)
-
-      if sessionOk and sessionEnd(backend):
-        var hi = 0
-        for h in 0 ..< H:
-          for b in 0 ..< B:
-            let raw = sessionRead(backend, oHandles[hi], T * D)
-            for t in 0 ..< T:
-              let dstOff = b * T * C + t * C + h * D
-              for d in 0 ..< D:
-                yData[dstOff + d] = raw[t * D + d]
-            inc hi
-      else:
-        warnFallbackOnce(warnedSessionMidFail, "sessionMatmul/sessionVecOp/sessionEnd that bai giua chung tren backend " & $ctx.kind)
-        yData = cpuMamba2Forward(xgData, bData, cData, B, H, T, D, m.aVals)
-
-      for hd in scoreHandles.mitems: sessionFree(backend, hd)
-      for hd in oHandles.mitems: sessionFree(backend, hd)
-      for hd in maskHandles.mitems: sessionFree(backend, hd)
-    else:
-      warnFallbackOnce(warnedSessionBeginFail, "sessionBegin() that bai tren backend " & $ctx.kind)
-      yData = cpuMamba2Forward(xgData, bData, cData, B, H, T, D, m.aVals)
-  else:
-    if m.useSession and ctx.kind in {bkMetal, bkCuda, bkOpenCL}:
-      discard
-    else:
-      warnFallbackOnce(warnedNoSession, "khong dung session (useSession=false hoac backend " & $ctx.kind & " khong ho tro session)")
-    yData = cpuMamba2Forward(xgData, bData, cData, B, H, T, D, m.aVals)
+  let yData = if isGpuCtx(ctx): mamba2SsdGpu(ctx, xgData, bData, cData, @[], B, H, T, D, m.aVals).y
+              else: cpuMamba2Forward(xgData, bData, cData, B, H, T, D, m.aVals)
 
   let gateAct = beSigmoid(ctx, gateData)
   let gated = beMul(ctx, yData, gateAct)
@@ -791,7 +938,9 @@ proc backwardMamba2*(m: Mamba2SSD, x: Tensor, dOut: Tensor, ctx: Backend): tuple
   let proj = m.inProj.forward(x, ctx)
   let (xgData, bData, cData, gateData) = splitXgBC(proj, B, T, C)
 
-  let yData = cpuMamba2Forward(xgData, bData, cData, B, H, T, D, m.aVals)
+  let gpu = isGpuCtx(ctx)
+  let yData = if gpu: mamba2SsdGpu(ctx, xgData, bData, cData, @[], B, H, T, D, m.aVals).y
+              else: cpuMamba2Forward(xgData, bData, cData, B, H, T, D, m.aVals)
   let gateAct = beSigmoid(ctx, gateData)
   let gated = beMul(ctx, yData, gateAct)
   var y = newTensor(@[B, T, C]); y.data = gated
@@ -799,16 +948,16 @@ proc backwardMamba2*(m: Mamba2SSD, x: Tensor, dOut: Tensor, ctx: Backend): tuple
   let dOutP = m.outProj.backward(y, dOut, ctx)
   let dGated = dOutP.dX.data
 
-  var dGateAct = newSeq[float32](dGated.len)
-  var dY = newSeq[float32](dGated.len)
-  for i in 0 ..< dGated.len:
-    dGateAct[i] = dGated[i] * yData[i]
-    dY[i] = dGated[i] * gateAct[i]
-  var dGateRaw = newSeq[float32](dGateAct.len)
-  for i in 0 ..< dGateAct.len:
-    dGateRaw[i] = dGateAct[i] * gateAct[i] * (1'f32 - gateAct[i])
+  # gated = y * sigmoid(g):  dY = dGated*s,  dg = dGated*y*s*(1-s)
+  let dY = beMul(ctx, dGated, gateAct)
+  let sPrime = beSub(ctx, gateAct, beMul(ctx, gateAct, gateAct))
+  let dGateRaw = beMul(ctx, beMul(ctx, dGated, yData), sPrime)
 
-  let (dXg, dB, dC) = cpuMamba2Backward(xgData, bData, cData, dY, B, H, T, D, m.aVals)
+  let (dXg, dB, dC) =
+    if gpu:
+      let r = mamba2SsdGpu(ctx, xgData, bData, cData, dY, B, H, T, D, m.aVals)
+      (r.dXg, r.dB, r.dC)
+    else: cpuMamba2Backward(xgData, bData, cData, dY, B, H, T, D, m.aVals)
 
   var dProj = newTensor(proj.shape)
   for b in 0 ..< B:
@@ -844,36 +993,46 @@ proc newTransformerBlockSpectron*(embedDim, nHeads, ffMult: int, useSession: boo
   result.ln1 = newLayerNorm(embedDim)
   result.ln2 = newLayerNorm(embedDim)
 
-proc concatLastDim(a, b: Tensor): Tensor =
+proc concatLastDim*(a, b: Tensor; ctx: Backend): Tensor =
   let B = a.shape[0]; let T = a.shape[1]; let C = a.shape[2]
   result = newTensor(@[B, T, 2 * C])
+  if isGpuCtx(ctx):
+    result.data = beConcatGpu(ctx, a.data & b.data, @[0'i32, int32(B * T * C)],
+                              @[int32(C), int32(C)], @[0'i32, int32(C)], 2 * C, 1, B * T * 2 * C)
+    return
   for i in 0 ..< B * T:
     for c in 0 ..< C:
       result.data[i * 2 * C + c] = a.data[i * C + c]
       result.data[i * 2 * C + C + c] = b.data[i * C + c]
 
-proc splitLastDim(x: Tensor, C: int): tuple[a, b: Tensor] =
+proc splitLastDim*(x: Tensor, C: int; ctx: Backend): tuple[a, b: Tensor] =
   ## Ngược lại concatLastDim: [B,T,2C] -> 2 x [B,T,C].
   let B = x.shape[0]; let T = x.shape[1]
   result.a = newTensor(@[B, T, C])
   result.b = newTensor(@[B, T, C])
+  if isGpuCtx(ctx):
+    result.a.data = beSplitSliceGpu(ctx, x.data, 2 * C, C, 0, 1, B * T * C)
+    result.b.data = beSplitSliceGpu(ctx, x.data, 2 * C, C, C, 1, B * T * C)
+    return
   for i in 0 ..< B * T:
     for c in 0 ..< C:
       result.a.data[i * C + c] = x.data[i * 2 * C + c]
       result.b.data[i * C + c] = x.data[i * 2 * C + C + c]
+
+proc gateMix(ctx: Backend; gate: seq[float32]; a, b: Tensor): Tensor =
+  ## gate*a + (1-gate)*b = b + gate*(a-b), GPU elementwise.
+  result = newTensor(a.shape)
+  result.data = beAdd(ctx, b.data, beMul(ctx, gate, beSub(ctx, a.data, b.data)))
 
 proc forward*(blk: TransformerBlockSpectron, x: Tensor, ctx: Backend): Tensor =
   let x1 = blk.ln1.forward(x, ctx)
   let attnOut = forwardLinearPlus(blk.attn, x1, ctx)
   let mambaOut = forwardMamba2(blk.mamba, x1, ctx)
 
-  let fuseIn = concatLastDim(attnOut, mambaOut)
+  let fuseIn = concatLastDim(attnOut, mambaOut, ctx)
   let gateLogit = blk.fuseGate.forward(fuseIn, ctx)
   let gate = beSigmoid(ctx, gateLogit.data)
-
-  var combined = newTensor(attnOut.shape)
-  for i in 0 ..< combined.data.len:
-    combined.data[i] = gate[i] * attnOut.data[i] + (1'f32 - gate[i]) * mambaOut.data[i]
+  let combined = gateMix(ctx, gate, attnOut, mambaOut)
 
   let x2 = addT(ctx, x, combined)
   let x3 = blk.ln2.forward(x2, ctx)
@@ -893,56 +1052,42 @@ proc backward*(blk: TransformerBlockSpectron, x: Tensor, dOut: Tensor, ctx: Back
   let x1 = blk.ln1.forward(x, ctx)
   let attnOut = forwardLinearPlus(blk.attn, x1, ctx)
   let mambaOut = forwardMamba2(blk.mamba, x1, ctx)
-  let fuseIn = concatLastDim(attnOut, mambaOut)
+  let fuseIn = concatLastDim(attnOut, mambaOut, ctx)
   let gateLogit = blk.fuseGate.forward(fuseIn, ctx)
   let gate = beSigmoid(ctx, gateLogit.data)
-  var combined = newTensor(attnOut.shape)
-  for i in 0 ..< combined.data.len:
-    combined.data[i] = gate[i] * attnOut.data[i] + (1'f32 - gate[i]) * mambaOut.data[i]
+  let combined = gateMix(ctx, gate, attnOut, mambaOut)
   let x2 = addT(ctx, x, combined)
   let x3 = blk.ln2.forward(x2, ctx)
 
   # ---- backward FF + LN2 ----
   let dFF = blk.ff.backward(x3, dOut, ctx)
   let dLN2 = blk.ln2.backward(x2, dFF.dX, ctx)
-  var dX2 = dLN2.dX
-  for i in 0 ..< dX2.data.len:
-    dX2.data[i] += dOut.data[i]   # residual x2 = x + combined
+  let dX2 = addT(ctx, dLN2.dX, dOut)   # residual x2 = x + combined
 
-  # ---- backward gated fusion ----
-  var dGate = newSeq[float32](dX2.data.len)
-  var dAttnOutPartial = newSeq[float32](dX2.data.len)
-  var dMambaOutPartial = newSeq[float32](dX2.data.len)
-  for i in 0 ..< dX2.data.len:
-    dGate[i] = dX2.data[i] * (attnOut.data[i] - mambaOut.data[i])
-    dAttnOutPartial[i] = dX2.data[i] * gate[i]
-    dMambaOutPartial[i] = dX2.data[i] * (1'f32 - gate[i])
+  # ---- backward gated fusion (GPU elementwise) ----
+  let dGate = beMul(ctx, dX2.data, beSub(ctx, attnOut.data, mambaOut.data))
+  let dAttnOutPartial = beMul(ctx, dX2.data, gate)
+  let dMambaOutPartial = beSub(ctx, dX2.data, dAttnOutPartial)          # dX2*(1-gate)
 
   var dGateLogit = newTensor(gateLogit.shape)
-  for i in 0 ..< dGateLogit.data.len:
-    dGateLogit.data[i] = dGate[i] * gate[i] * (1'f32 - gate[i])   # sigmoid'
+  dGateLogit.data = beMul(ctx, dGate, beSub(ctx, gate, beMul(ctx, gate, gate)))   # sigmoid'
 
   let dFuse = blk.fuseGate.backward(fuseIn, dGateLogit, ctx)
-  let (dAttnOutFuse, dMambaOutFuse) = splitLastDim(dFuse.dX, C)
+  let (dAttnOutFuse, dMambaOutFuse) = splitLastDim(dFuse.dX, C, ctx)
 
   var dAttnOutTotal = newTensor(attnOut.shape)
   var dMambaOutTotal = newTensor(mambaOut.shape)
-  for i in 0 ..< dAttnOutTotal.data.len:
-    dAttnOutTotal.data[i] = dAttnOutPartial[i] + dAttnOutFuse.data[i]
-    dMambaOutTotal.data[i] = dMambaOutPartial[i] + dMambaOutFuse.data[i]
+  dAttnOutTotal.data = beAdd(ctx, dAttnOutPartial, dAttnOutFuse.data)
+  dMambaOutTotal.data = beAdd(ctx, dMambaOutPartial, dMambaOutFuse.data)
 
   # ---- backward 2 nhánh (attn Linear++ và Mamba2) ----
   let dAttn = backwardLinearPlus(blk.attn, x1, dAttnOutTotal, ctx)
   let dMamba = backwardMamba2(blk.mamba, x1, dMambaOutTotal, ctx)
 
-  var dX1Total = newTensor(x1.shape)
-  for i in 0 ..< dX1Total.data.len:
-    dX1Total.data[i] = dAttn.dX.data[i] + dMamba.dX.data[i]
+  let dX1Total = addT(ctx, dAttn.dX, dMamba.dX)
 
   let dLN1 = blk.ln1.backward(x, dX1Total, ctx)
-  var dX0 = dLN1.dX
-  for i in 0 ..< dX0.data.len:
-    dX0.data[i] += dX2.data[i]   # residual gốc x2 = x + combined
+  let dX0 = addT(ctx, dLN1.dX, dX2)    # residual gốc x2 = x + combined
 
   result = (
     dX0,
@@ -1037,6 +1182,15 @@ proc softmaxCrossEntropy*(logits: Tensor, targets: seq[seq[int]], ctx: Backend):
     tuple[loss: float32, dLogits: Tensor] =
   ## logits: [B,T,V]. targets: [B][T] token id kế tiếp (next-token).
   let B = logits.shape[0]; let T = logits.shape[1]; let V = logits.shape[2]
+  if isGpuCtx(ctx):
+    # GPU: softmax + loss + dLogits trong 1 micro-kernel chain (chia trung binh B*T).
+    var tgt = newSeq[float32](B * T)
+    for b in 0 ..< B:
+      for t in 0 ..< T: tgt[b * T + t] = float32(targets[b][t])
+    let r = softmaxCrossEntropyGpu(ctx, logits.data, tgt, B * T, V, B * T)
+    var dLogits = newTensor(logits.shape)
+    dLogits.data = r.dLogits
+    return (r.loss, dLogits)
   let probs = beSoftmax(ctx, logits.data, B * T, V)
   var dLogits = newTensor(logits.shape)
   var totalLoss = 0'f32
@@ -1220,6 +1374,21 @@ proc trainStep*(m: var NimformerModelSpectron, adam: var ModelAdamState,
   let (loss, dLogits) = softmaxCrossEntropy(logits, targetsBatch, ctx)
   let grads = m.backwardBatch(idsBatch, dLogits, ctx)
 
+  # GPU: Adam 1 micro-kernel / tham so (adamStepFusedGpu). Chi buoc requantize APF
+  # dinh ky (moi `requantizeEvery` step) con chay tren host - customfloat chua co
+  # kernel GPU. Backend khong phai GPU: apfAdamStep goc.
+  let gpu = isGpuCtx(ctx)
+  proc apfAdamStep(param: var Tensor, grad: Tensor, state: var ApfAdamState,
+                   lr: float32, requantizeEvery: int): CustomFloat {.used.} =
+    if not gpu:
+      return nimformer.apfAdamStep(param, grad, state, lr, requantizeEvery = requantizeEvery)
+    inc state.step
+    adamStepFusedGpu(ctx, param.data, grad.data, state.m, state.v, state.step, lr)
+    if requantizeEvery > 0 and state.step mod requantizeEvery == 0:
+      let cf = buildCustomDtypeForTensor(param.data, grad.data)
+      param.data = decodeArray(encodeArray(param.data, cf), cf)
+      result = cf
+
   discard apfAdamStep(m.outProj.weight, grads.dOutProjW, adam.outProjW, lr, requantizeEvery = requantizeEvery)
   discard apfAdamStep(m.outProj.bias, grads.dOutProjB, adam.outProjB, lr, requantizeEvery = requantizeEvery)
   discard apfAdamStep(m.embed.weight, grads.dEmbed, adam.embed, lr, requantizeEvery = requantizeEvery)
@@ -1288,7 +1457,10 @@ proc generate*(m: NimformerModelSpectron, promptIds: seq[int], maxNewTokens: int
     let T = logits.shape[0]
     let V = logits.shape[1]
     let lastLogits = logits.data[(T - 1) * V ..< T * V]
-    let nextId = sampleFromLogits(lastLogits, temperature, rng)
+    let nextId =
+      if isGpuCtx(ctx) and temperature <= 0'f32:
+        int(beArgmaxIndexGpu(ctx, lastLogits, 1, V, 1).idx[0])   # greedy tren GPU
+      else: sampleFromLogits(lastLogits, temperature, rng)
     result.add(nextId)
 
 # ═══════════════════════════════════════════════════════════════
@@ -1346,35 +1518,23 @@ when isMainModule:
       result.targets[b] = tgt
 
   var rng = initRand(42)
-  # SỬA (bug thật, đúng ý bạn chỉ ra): TRƯỚC ĐÂY vòng lặp chạy THÊM
-  # CFG_N_STEPS bước MỖI LẦN chạy lại script, bất kể checkpoint đã có bao
-  # nhiêu step rồi - "startStep + CFG_N_STEPS" luôn cộng dồn, nghĩa là chạy
-  # `nim c -r test_nimformer.nim` 3 lần với CFG_N_STEPS=10200 sẽ train tới
-  # step ~30600, VƯỢT HẲN con số CFG_N_STEPS bạn đặt ra (đọc tên biến/comment
-  # cũ "so buoc train demo" thì đây rõ ràng phải là TỔNG số step mong muốn,
-  # không phải "số step cộng thêm mỗi lần chạy"). Giờ CFG_N_STEPS là TỔNG
-  # THẬT: nếu checkpoint đã có startStep >= CFG_N_STEPS, KHÔNG train thêm
-  # bước nào nữa (dừng ngay, không vượt quá). Nếu startStep < CFG_N_STEPS,
-  # chỉ chạy đúng phần còn thiếu (CFG_N_STEPS - startStep bước), dừng đúng
-  # tại step = CFG_N_STEPS, không hơn.
-  if startStep >= CFG_N_STEPS:
-    echo &"== Checkpoint da o step {startStep} >= CFG_N_STEPS={CFG_N_STEPS} -> KHONG train them, bo qua vong lap =="
-  else:
-    echo &"== Bat dau train demo: muc tieu TONG {CFG_N_STEPS} buoc (dang o step {startStep}, con {CFG_N_STEPS - startStep} buoc), batch={CFG_BATCH_SIZE}, seq={CFG_SEQ_LEN} =="
-    for step in (startStep + 1) .. CFG_N_STEPS:
-      let (ids, targets) = sampleBatch(corpusIds, CFG_BATCH_SIZE, CFG_SEQ_LEN, rng)
-      let loss = trainStep(model, adam, ids, targets, ctx, lr = CFG_LR,
-                            requantizeEvery = CFG_REQUANTIZE_EVERY)
-      if step mod CFG_LOG_EVERY == 0 or step == startStep + 1:
-        echo &"step {step:>5} | loss = {loss:.4f}"
+  echo &"== Bat dau train demo: {CFG_N_STEPS} buoc (tu step {startStep + 1}), batch={CFG_BATCH_SIZE}, seq={CFG_SEQ_LEN} =="
+  # SUA: vong lap chay CFG_N_STEPS buoc TIEP THEO ke tu startStep (khong phai
+  # luon quay lai step 1) - resume dung so step da luu trong checkpoint.
+  for step in (startStep + 1) .. (startStep + CFG_N_STEPS):
+    let (ids, targets) = sampleBatch(corpusIds, CFG_BATCH_SIZE, CFG_SEQ_LEN, rng)
+    let loss = trainStep(model, adam, ids, targets, ctx, lr = CFG_LR,
+                          requantizeEvery = CFG_REQUANTIZE_EVERY)
+    if step mod CFG_LOG_EVERY == 0 or step == startStep + 1:
+      echo &"step {step:>5} | loss = {loss:.4f}"
 
-      if step mod CFG_CHECKPOINT_EVERY == 0:
-        saveCheckpoint(model, CFG_CHECKPOINT_PATH, step)
-        if step mod CFG_LOG_EVERY == 0 or step == startStep + CFG_CHECKPOINT_EVERY:
-          echo &"  [checkpoint] da luu {CFG_CHECKPOINT_PATH} (step {step})"
+    if step mod CFG_CHECKPOINT_EVERY == 0:
+      saveCheckpoint(model, CFG_CHECKPOINT_PATH, step)
+      if step mod CFG_LOG_EVERY == 0 or step == startStep + CFG_CHECKPOINT_EVERY:
+        echo &"  [checkpoint] da luu {CFG_CHECKPOINT_PATH} (step {step})"
 
-    saveCheckpoint(model, CFG_CHECKPOINT_PATH, CFG_N_STEPS)
-    echo &"== Da luu checkpoint cuoi cung: {CFG_CHECKPOINT_PATH} (step {CFG_N_STEPS}) =="
+  saveCheckpoint(model, CFG_CHECKPOINT_PATH, startStep + CFG_N_STEPS)
+  echo &"== Da luu checkpoint cuoi cung: {CFG_CHECKPOINT_PATH} =="
 
   echo "== Sinh thu (greedy) tu 1 cau moi =="
   let promptIds = encodeBPE(tok, CFG_GEN_PROMPT)
