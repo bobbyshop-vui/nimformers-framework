@@ -526,6 +526,71 @@ proc runMicroVmChain*(ctx: Backend; steps: openArray[MvmStep]; memF32: var seq[f
       raise
   raise newException(CatchableError, "runMicroVmChain: unreachable retry state")
 
+proc runMicroVmChainGroups*(ctx: Backend; groups: openArray[seq[MvmStep]];
+                            memF32: var seq[float32]): bool =
+  ## Bang goi runMicroVmChain lan luot cho tung nhom, nhung buffer chi upload 1 lan
+  ## va doc lai 1 lan. Moi nhom van la 1 command buffer rieng (thoi gian GPU moi
+  ## command buffer giu nguyen nhu cu -> khong tang nguy co watchdog timeout).
+  ## Loi/timeout o bat ky nhom nao -> bo ket qua GPU, chay lai TU DAU tung nhom bang
+  ## runMicroVmChain tu ban host goc (kernel co atomic cong don, khong replay giua chung).
+  ## BYBY_VM_GROUPS=0 -> duong cu (moi nhom 1 lan upload/doc).
+  if getEnv("BYBY_VM_GROUPS", "1") == "0" or groups.len <= 1:
+    for g in groups:
+      discard runMicroVmChain(ctx, g, memF32)
+    return true
+  let be = ctx.kind.toByby()
+  checkVmScratchCapacity(ctx, memF32.len, "stage chain groups")
+  var names: seq[seq[string]]
+  for g in groups:
+    names.add g.mapIt(kernelNameFor(ctx, it.prog, it.tag))   # truoc sessionBegin
+  var h: byby.SessionHandle
+  var uploaded = false
+  var ended = true
+  var ok = false
+  var output: seq[float32]
+  try:
+    var pfT0 = getMonoTimeIfPf()
+    h = sessionUpload(be, memF32)
+    if not vmUploadSucceeded(be, h):
+      raise newException(CatchableError,
+        &"runMicroVmChainGroups: Metal upload failed for {memF32.len} float32")
+    uploaded = true
+    pfAddIf("vm.upload", pfT0)
+    pfT0 = getMonoTimeIfPf()
+    for gi in 0 ..< groups.len:
+      beginVmSession(be, "runMicroVmChainGroups")
+      ended = false
+      encodeSteps(ctx, groups[gi], names[gi], h)
+      finishVmSession(be, "runMicroVmChainGroups", ended)
+    pfAddIf("vm.encode+gpu", pfT0)
+    pfT0 = getMonoTimeIfPf()
+    output = sessionRead(be, h, memF32.len)
+    pfAddIf("vm.read", pfT0)
+    ok = output.len == memF32.len
+  except CatchableError as e:
+    var timeoutDetail = ""
+    if not ended:
+      if not sessionEnd(be):
+        timeoutDetail = sessionGetLastError(be)
+        discard sessionRecoverQueue(be)
+      ended = true
+    if uploaded:
+      sessionFree(be, h)
+      uploaded = false
+    # Giong runMicroVmChain: CHI timeout GPU moi chay lai; loi khac raise ngay.
+    if not (e.msg.startsWith(VmTimeoutRetryMarker) or
+            (timeoutDetail.len > 0 and isVmGpuTimeout(timeoutDetail))):
+      raise
+    stderr.writeLine("[microvm] chain groups timeout (" & e.msg &
+      "); chay lai tung nhom tu ban host goc")
+  if uploaded: sessionFree(be, h)
+  if ok:
+    memF32 = output
+    return true
+  for g in groups:
+    discard runMicroVmChain(ctx, g, memF32)
+  true
+
 proc runMicroVmChainSparse*(ctx: Backend; steps: openArray[MvmStep]; totalLen: int;
                             head: seq[float32];
                             reads: openArray[tuple[off, len: int]]): seq[seq[float32]] =
