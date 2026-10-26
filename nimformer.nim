@@ -1,10 +1,13 @@
 ## nimformer.nim
 ## Transformer đầy đủ với backward cho attention + custom transformer blocks
 
-import std/[math, random, strformat]
+import std/[math, random, strformat, algorithm, tables]
 import customfloat
-import backend, vendor/bybylang/gpubackend as byby  # Import Backend và các helper (byby.session* để tự gộp session GPU)
+import backend  # Import Backend và các helper
 import quant     # QuantTensor, dequantizeTensor - giữ weight nén int4 trong RAM
+import vendor/bybylang/gpubackend as byby
+import fp4_gemv_gpu  # gFp4CacheGpu, fp4GemmGpuRows (prefill FP4-KM)
+import prefill_profile  # BYBY_PREFILL_PROFILE: pfTime
 
 # ===================================================================
 # Tensor utilities (giữ nguyên)
@@ -17,6 +20,10 @@ type
 proc numel(shape: seq[int]): int =
   result = 1
   for s in shape: result *= s
+
+var gLoraSizeMismatchWarned = 0  ## THÊM: đếm số lần đã cảnh báo kích thước LoRA
+                                  ## không khớp (xem forward() dưới) - giới hạn để
+                                  ## không spam log nếu nhiều Linear cùng bị.
 
 proc newTensor*(shape: seq[int], fill: float32 = 0'f32): Tensor =
   result.shape = shape
@@ -88,6 +95,16 @@ type
                                         ## int4-asymmetric (int8/int4-symmetric/tied-embedding) -
                                         ## dequant 1 lần lúc load thay vì mỗi token (xem backend.nim)
     residentFp32Ready*: bool           ## true sau khi residentFp32 đã upload xong
+    loraA*, loraB*: seq[float32]  ## THÊM (xem forward() dưới + mergeInUploadStreamingJamba
+                                   ## trong lora.nim): adapter LoRA gắn rời, KHÔNG merge vật
+                                   ## lý vào weight - giữ base (weightQ/useQuant) NGUYÊN VẸN
+                                   ## dạng nén suốt đời process, đúng đúng bất biến cốt lõi
+                                   ## của type này (xem comment weightQ ở trên: "KHÔNG bao giờ
+                                   ## expand hết ra fp32 một lần rồi giữ mãi"). loraA:[r,inF]
+                                   ## phẳng, loraB:[outF,r] phẳng, rỗng (@[]) nếu không gắn.
+    loraR*: int                   ## rank r; 0 = KHÔNG có LoRA gắn (mặc định, code cũ không đổi)
+    loraScale*: float32           ## alpha / r
+    gpuCacheName*: string         ## ten trong gFp4CacheGpu sau prepareGpuLinForLinear (FP4-KM)
 
 proc newLinear*(inF, outF: int): Linear =
   let scale = sqrt(2'f32 / float32(inF))
@@ -104,7 +121,12 @@ proc setQuantWeight*(l: var Linear, qt: QuantTensor) =
   l.weightQ = qt
   l.useQuant = true
   l.weight.data = @[]
-proc uploadResident*(l: var Linear, ctx: Backend) =
+  # A Linear may already have a resident FP32/Q4 copy from an earlier binding.
+  # It must not silently keep serving that stale copy after its quant source
+  # changes; force the next forward to use the newly bound weightQ.
+  l.residentReady = false
+  l.residentFp32Ready = false
+proc uploadResident*(l: var Linear, ctx: Backend, sparsityPct: float32 = 0.0'f32) =
   ## Upload weight lên GPU MỘT LẦN (gọi từ loadLlamaWeightsL sau khi load
   ## xong, KHÔNG gọi trong vòng lặp decode).
   ## - int4-per-group (Q4_K_M style, đường llama.cpp-style): dùng thẳng
@@ -117,7 +139,33 @@ proc uploadResident*(l: var Linear, ctx: Backend) =
   ##   MỖI TOKEN (nguyên nhân chính gây ~4s/token). Giờ dequant/transpose
   ##   MỘT LẦN duy nhất ở đây rồi giữ resident dạng fp32 trên GPU
   ##   (beResidentUploadFp32), mỗi token chỉ upload activation nhỏ.
+  ##
+  ## THÊM MỚI: sparsityPct > 0 -> BLOCK-LEVEL SPARSITY áp dụng NGAY TRONG
+  ## NIM, TRƯỚC khi upload GPU - KHÔNG đụng file .nimq/export_to_nimq.py
+  ## (theo đúng yêu cầu). Với mỗi khối group_size giá trị liên tiếp, tính độ
+  ## quan trọng bằng biên độ trung bình quy đổi xấp xỉ (0.5*scale, vì giá trị
+  ## int4 giải nén nằm quanh [0,15] canh giữa quanh 7.5, biên độ dao động
+  ## thực ~ 0.5*range = 0.5*scale*15 -> gần đúng dùng "scale" làm proxy độ
+  ## quan trọng, KHÔNG cần giải nén đầy đủ 128 giá trị mỗi khối - rẻ, nhanh,
+  ## chạy 1 lần lúc load model). Khối bị cắt: ép scale=0 -> công thức giải
+  ## nén (nibble-zp)*scale LUÔN = 0 - ĐÚNG TOÁN HỌC, không phải xấp xỉ. Chỉ
+  ## sửa MẢNG scale ĐÃ Ở TRONG RAM (l.weightQ.scale), không đổi packed data,
+  ## không đổi format, không ghi lại file nào.
   if l.useQuant and l.weightQ.kind == qkInt4Asymmetric and l.weightQ.groupSize > 0:
+    if sparsityPct > 0.0'f32 and l.weightQ.scale.len > 0:
+      var scaleCopy = l.weightQ.scale  # copy để tính percentile không ảnh hưởng thứ tự gốc
+      scaleCopy.sort()
+      var idx = int(float32(scaleCopy.len - 1) * sparsityPct / 100.0'f32)
+      idx = max(0, min(idx, scaleCopy.len - 1))
+      let threshold = scaleCopy[idx]
+      var nPruned = 0
+      for i in 0 ..< l.weightQ.scale.len:
+        if l.weightQ.scale[i] <= threshold:
+          l.weightQ.scale[i] = 0.0'f32
+          l.weightQ.zero_point[i] = 0.0'f32
+          inc nPruned
+      stderr.writeLine "[SPARSITY] cat " & $nPruned & "/" & $l.weightQ.scale.len &
+        " khoi (nguong scale <= " & $threshold & ")"
     let nGroupsPerRow = (l.inF + l.weightQ.groupSize - 1) div l.weightQ.groupSize
     l.residentW = beResidentUploadQ4(ctx, l.weightQ.data, l.weightQ.scale, l.weightQ.zero_point,
                                       l.inF, l.outF, l.weightQ.groupSize, nGroupsPerRow)
@@ -128,6 +176,14 @@ proc uploadResident*(l: var Linear, ctx: Backend) =
     let wT = dequantizeTensorTransposed(l.weightQ)
     l.residentFp32 = beResidentUploadFp32(ctx, wT)
     l.residentFp32Ready = true
+    # TOI UU RAM: sau khi upload xong, forward() CHI dung duong residentFp32Ready
+    # (xem forward() duoi day) - l.weight.data (neu co, vd sau mergeIn() ghi
+    # merged.data vao day) khong con can nua nhung truoc gio KHONG duoc xoa =>
+    # ton tai SONG SONG 1 ban fp32 tren CPU RAM + 1 ban tren GPU (tren may GPU
+    # tich hop/unified memory nhu Intel Iris, ca 2 ban DEU an chung RAM he
+    # thong = gap doi RAM thuc te dung so voi can thiet). Giai phong ngay,
+    # giong het pattern setQuantWeight() da lam o tren.
+    l.weight.data = @[]
   elif l.weight.data.len > 0:
     # Linear fp32 thường (vd. tied-embedding lm_head dùng thẳng embW) -
     # transpose 1 LẦN thay vì mỗi token.
@@ -143,28 +199,34 @@ proc forward*(l: Linear, x: Tensor, ctx: Backend): Tensor =
   result = newTensor(outShape)
 
   var y: seq[float32]
-  if l.residentReady:
-    y = beResidentLinearQ4(ctx, x.data, l.residentW, rows)  # chỉ upload activation, weight resident sẵn
-  elif l.residentFp32Ready:
-    # FIX: weight int8/int4-symmetric/fp32-thường ĐÃ resident (xem
-    # uploadResident) - chỉ upload activation nhỏ mỗi token, KHÔNG dequant
-    # lại toàn bộ weight nữa.
-    y = beResidentLinearFp32(ctx, x.data, l.residentFp32, rows, l.inF, l.outF)
+  pfTime("lin.gemm"):
+    if l.residentReady:
+      y = beResidentLinearQ4(ctx, x.data, l.residentW, rows)  # chỉ upload activation, weight resident sẵn
+    elif l.residentFp32Ready:
+      # FIX: weight int8/int4-symmetric/fp32-thường ĐÃ resident (xem
+      # uploadResident) - chỉ upload activation nhỏ mỗi token, KHÔNG dequant
+      # lại toàn bộ weight nữa.
+      y = beResidentLinearFp32(ctx, x.data, l.residentFp32, rows, l.inF, l.outF)
 
-  if y.len == 0:
-    # Chưa resident, hoặc backend hiện tại không hỗ trợ đường resident (vd
-    # CPU/tsic) -> rơi về đường cũ (vẫn đúng, chỉ mất phần tăng tốc resident).
-    if l.useQuant and l.weightQ.kind == qkInt4Asymmetric and l.weightQ.groupSize > 0:
-      let nGroupsPerRow = (l.inF + l.weightQ.groupSize - 1) div l.weightQ.groupSize
-      y = beMatmulQ4(ctx, x.data, l.weightQ.data, l.weightQ.scale, l.weightQ.zero_point,
-                      rows, l.inF, l.outF, l.weightQ.groupSize, nGroupsPerRow)
-    else:
-      var wT: seq[float32]
-      if l.useQuant:
-        wT = dequantizeTensorTransposed(l.weightQ)
+    if y.len == 0:
+      # Chưa resident, hoặc backend hiện tại không hỗ trợ đường resident (vd
+      # CPU/tsic) -> rơi về đường cũ (vẫn đúng, chỉ mất phần tăng tốc resident).
+      if l.useQuant and l.weightQ.kind == qkFp4KM and l.gpuCacheName.len > 0 and
+         l.gpuCacheName in gFp4CacheGpu and gFp4CacheGpu[l.gpuCacheName].residentReady and
+         ctx.kind.toByby() in {byby.gbMetal, byby.gbVulkan}:
+        # Prefill song song: GPU resident FP4-KM + MBLOCK=4 (khong dequant CPU).
+        y = fp4GemmGpuRows(ctx, l.gpuCacheName, x.data, rows)
+      elif l.useQuant and l.weightQ.kind == qkInt4Asymmetric and l.weightQ.groupSize > 0:
+        let nGroupsPerRow = (l.inF + l.weightQ.groupSize - 1) div l.weightQ.groupSize
+        y = beMatmulQ4(ctx, x.data, l.weightQ.data, l.weightQ.scale, l.weightQ.zero_point,
+                        rows, l.inF, l.outF, l.weightQ.groupSize, nGroupsPerRow)
       else:
-        wT = transpose(l.weight).data
-      y = beMatmul(ctx, x.data, rows, l.inF, wT, l.inF, l.outF)
+        var wT: seq[float32]
+        if l.useQuant:
+          wT = dequantizeTensorTransposed(l.weightQ)
+        else:
+          wT = transpose(l.weight).data
+        y = beMatmul(ctx, x.data, rows, l.inF, wT, l.inF, l.outF)
 
   # === FIX: LUÔN ĐẢM BẢO KÍCH THƯỚC ĐÚNG ===
   let expectedSize = rows * l.outF
@@ -179,6 +241,38 @@ proc forward*(l: Linear, x: Tensor, ctx: Backend): Tensor =
   # Cộng bias (l.bias.data có độ dài l.outF)
   for i in 0 ..< y.len:
     result.data[i] = y[i] + l.bias.data[i mod l.outF]
+
+  # THÊM: LoRA CỘNG THÊM (additive), KHÔNG merge vật lý vào weight. y/result ở
+  # trên luôn đi qua đường resident/quant Q4 NÉN như base gốc (weightQ/useQuant
+  # KHÔNG hề bị đụng tới bởi LoRA nữa - xem mergeInUploadStreamingJamba trong
+  # lora.nim) - CHỈ cộng thêm 1 delta hạng thấp [rows,outF] = scale * (x @ A^T)
+  # @ B^T, đúng tinh thần QLoRA lúc suy luận chuẩn (base lượng tử hoá giữ
+  # nguyên, adapter nhỏ cộng thêm ngoài). r nhỏ (thường 4-64) nên 2 phép nhân
+  # nhỏ này RẺ hơn rất nhiều so với matmul chính [rows,inF]x[inF,outF]. TRÁNH
+  # đúng lỗi bloat ~27GB (merge vật lý ra fp32 cho cả 105 tham số lớn) từng
+  # gây OOM/Killed - xem comment ở định nghĩa Linear/loraA phía trên.
+  if l.loraR > 0 and l.loraA.len == l.loraR * l.inF and l.loraB.len == l.outF * l.loraR:
+    pfTime("lin.lora"):
+      let At = transpose(Tensor(shape: @[l.loraR, l.inF], data: l.loraA))   # [inF, r]
+      let Bt = transpose(Tensor(shape: @[l.outF, l.loraR], data: l.loraB))  # [r, outF]
+      let xA = beMatmul(ctx, x.data, rows, l.inF, At.data, l.inF, l.loraR)       # [rows, r]
+      let delta = beMatmul(ctx, xA, rows, l.loraR, Bt.data, l.loraR, l.outF)     # [rows, outF]
+      for i in 0 ..< result.data.len:
+        result.data[i] += delta[i] * l.loraScale
+  elif l.loraR > 0:
+    # CHOT CHAN (khong crash ca tien trinh): l.loraR > 0 nhung loraA/loraB
+    # KHONG dung kich thuoc mong doi (r*inF va outF*r) - rat co the do 1
+    # adapter bi thieu phan A hoac B trong chinh file .bin, hoac kich thuoc
+    # r trong meta khong khop voi tensor da luu (xem loadBinaryLoraForInfer
+    # trong infer_lora.nim). BO QUA delta LoRA cho DUNG tham so nay (dung
+    # weight goc, khong co dieu chinh LoRA cho no) thay vi index vao seq sai
+    # kich thuoc/rong -> IndexDefect crash toan bo qua trinh sinh.
+    if gLoraSizeMismatchWarned < 10:
+      inc gLoraSizeMismatchWarned
+      stderr.writeLine("[canh bao] LoRA adapter kich thuoc khong khop cho 1 Linear " &
+        "(r=" & $l.loraR & ", loraA.len=" & $l.loraA.len & " (can " & $(l.loraR * l.inF) &
+        "), loraB.len=" & $l.loraB.len & " (can " & $(l.outF * l.loraR) &
+        ")) - bo qua delta LoRA cho tham so nay, dung weight goc.")
 proc backward*(l: Linear, x: Tensor, dOut: Tensor, ctx: Backend): tuple[dX, dW, dB: Tensor] =
   ## Backward Linear: 
   ## dW = x^T @ dOut  (cộng dồn qua batch)
@@ -217,6 +311,27 @@ proc backward*(l: Linear, x: Tensor, dOut: Tensor, ctx: Backend): tuple[dX, dW, 
       dB.data[j] += dOutFlat[i * l.outF + j]
 
   result = (dX, dW, dB)
+
+proc backwardInputOnly*(l: Linear, x: Tensor, dOut: Tensor, ctx: Backend): Tensor =
+  ## Backward chi tinh dX khi Linear.weight/bias dang frozen. Tranh tinh va
+  ## cap phat dW=[outF,inF] khong duoc dung (dac biet lm_head vocab x hidden).
+  let (rows, cols) = flatten2D(x.shape)
+  doAssert cols == l.inF,
+    &"Linear.backwardInputOnly: x.shape={x.shape} (cols={cols}) nhung l.inF={l.inF}"
+  doAssert dOut.shape[^1] == l.outF,
+    &"Linear.backwardInputOnly: dOut.shape={dOut.shape} (last={dOut.shape[^1]}) nhung l.outF={l.outF}"
+  var weightData = l.weight.data
+  if weightData.len != l.outF * l.inF:
+    if not l.useQuant:
+      raise newException(ValueError,
+        &"Linear.backwardInputOnly: weight data len={weightData.len}, expected={l.outF * l.inF}")
+    weightData = dequantizeTensor(l.weightQ)
+  if weightData.len != l.outF * l.inF:
+    raise newException(ValueError,
+      &"Linear.backwardInputOnly: dequantized weight len={weightData.len}, expected={l.outF * l.inF}")
+  result.shape = x.shape
+  result.data = beMatmul(ctx, dOut.data, rows, l.outF,
+                         weightData, l.inF, l.inF)
 
 # ===================================================================
 # LayerNorm (forward/backward dùng Metal matmul)
@@ -361,19 +476,6 @@ proc newFeedForward*(embedDim, mult: int): FeedForward =
   result.fc2 = newLinear(embedDim * mult, embedDim)
 
 proc forward*(ff: FeedForward, x: Tensor, ctx: Backend): Tensor =
-  # FIX HIỆU NĂNG: nếu cả fc1 và fc2 đã resident Q4 (đường phổ biến nhất khi
-  # load model .nimq int4-asymmetric), gộp fc1+apflu+fc2 vào 1 session GPU
-  # (beFeedForwardFusedQ4) thay vì 3 round-trip riêng - xem giải thích ở
-  # backend.nim. Nếu chưa resident hoặc fused thất bại (seq rỗng) -> rơi về
-  # đúng đường cũ, không đổi hành vi/độ chính xác.
-  if ff.fc1.residentReady and ff.fc2.residentReady:
-    let (rows, _) = flatten2D(x.shape)
-    let fused = beFeedForwardFusedQ4(ctx, x.data, ff.fc1.residentW, ff.fc2.residentW, rows)
-    if fused.len == rows * ff.fc2.outF:
-      result = newTensor(@[x.shape[0], x.shape[1], ff.fc2.outF])
-      for i in 0 ..< fused.len:
-        result.data[i] = fused[i] + ff.fc2.bias.data[i mod ff.fc2.outF]
-      return
   var h = ff.fc1.forward(x, ctx)
   h.data = beApflu(ctx, h.data, 0.1'f32, 1.0'f32)
   result = ff.fc2.forward(h, ctx)
@@ -579,6 +681,10 @@ proc newApfAdamState*(paramLen: int): ApfAdamState =
 proc apfAdamStep*(param: var Tensor, grad: Tensor, state: var ApfAdamState,
                    lr: float32 = 1e-3'f32, b1: float32 = 0.9'f32, b2: float32 = 0.999'f32,
                    eps: float32 = 1e-8'f32, requantizeEvery: int = 1): CustomFloat =
+  ## Bản CPU thuần (GIỮ NGUYÊN - vẫn được test_nimformer.nim/nơi khác dùng).
+  ## Cho pipeline fine-tune LoRA (lora.nim/finetune_lora.nim), dùng
+  ## apfAdamStepGpu bên dưới thay vào đó (chạy trên ctx/GPU, xem lý do trong
+  ## comment của nó).
   inc state.step
   let bc1 = 1'f32 - pow(b1, float32(state.step))
   let bc2 = 1'f32 - pow(b2, float32(state.step))
@@ -589,6 +695,64 @@ proc apfAdamStep*(param: var Tensor, grad: Tensor, state: var ApfAdamState,
     let mHat = state.m[i] / bc1
     let vHat = state.v[i] / bc2
     param.data[i] -= lr * mHat / (sqrt(vHat) + eps)
+  if state.step mod requantizeEvery == 0:
+    let cf = buildCustomDtypeForTensor(param.data, grad.data)
+    param.data = decodeArray(encodeArray(param.data, cf), cf)
+    result = cf
+  else:
+    result = buildCustomDtypeForTensor(param.data)
+
+proc constArrNf*(v: float32, n: int): seq[float32] =
+  result = newSeq[float32](n)
+  for i in 0 ..< n: result[i] = v
+
+proc apfAdamStepGpu*(ctx: Backend, param: var Tensor, grad: Tensor, state: var ApfAdamState,
+                      lr: float32 = 1e-3'f32, b1: float32 = 0.9'f32, b2: float32 = 0.999'f32,
+                      eps: float32 = 1e-8'f32, requantizeEvery: int = 1): CustomFloat =
+  ## Bản GPU của apfAdamStep, dùng beMul/beAdd/beDiv (backend.nim) cho toàn
+  ## bộ phần nhân/cộng/chia của Adam (m,v accumulate, mHat/vHat, param
+  ## update) thay vì vòng for CPU.
+  ##
+  ## Toàn bộ Adam (m,v accumulate, mHat/vHat, sqrt, param update) giờ đi qua
+  ## beMul/beAdd/beDiv/beSub/beSqrt (backend.nim) - kể cả sqrt(vHat) đã có
+  ## kernel GPU thật cho cả 3 backend (Metal/OpenCL/CUDA - xem gpuSqrt trong
+  ## vendor/bybylang/gpubackend.nim). CUDA cần 1 bước build tay bằng nvcc rồi
+  ## nối PTX (xem vendor/bybylang/backends/cuda/kernels/vecop_sqrt_kernel.cu)
+  ## trước khi kernel thật sự chạy được trên máy CUDA - CHƯA build/test được
+  ## trong sandbox này (không có nvcc/GPU thật).
+  inc state.step
+  let n = param.data.len
+  let bc1 = 1'f32 - pow(b1, float32(state.step))
+  let bc2 = 1'f32 - pow(b2, float32(state.step))
+
+  # m = b1*m + (1-b1)*g   (GPU: mul + mul + add)
+  let mDecay = beMul(ctx, state.m, constArrNf(b1, n))
+  let mNew = beMul(ctx, grad.data, constArrNf(1'f32 - b1, n))
+  state.m = beAdd(ctx, mDecay, mNew)
+
+  # v = b2*v + (1-b2)*g*g   (GPU: mul + mul + mul + add)
+  let gg = beMul(ctx, grad.data, grad.data)
+  let vDecay = beMul(ctx, state.v, constArrNf(b2, n))
+  let vNew = beMul(ctx, gg, constArrNf(1'f32 - b2, n))
+  state.v = beAdd(ctx, vDecay, vNew)
+
+  # mHat = m/bc1, vHat = v/bc2   (GPU: div)
+  let mHat = beDiv(ctx, state.m, constArrNf(bc1, n))
+  let vHat = beDiv(ctx, state.v, constArrNf(bc2, n))
+
+  # sqrt(vHat) — GIO DA CHAY GPU THAT qua beSqrt (Metal/OpenCL co kernel that,
+  # CUDA fallback CPU dung - xem ghi chu chi tiet trong beSqrt/gpuSqrt).
+  # (KHONG import tensor_ops.nim o day de dung sqrtT - tensor_ops.nim tu no
+  # da `import nimformer`, import nguoc lai se circular. beSqrt goi thang tu
+  # `backend` - da import san o dau file - la du, cung dung dung 1 kernel.)
+  let sqrtVHat = beSqrt(ctx, vHat)
+
+  # denom = sqrt(vHat) + eps ; update = lr * mHat / denom ; param -= update  (GPU: add, div, mul, sub)
+  let denom = beAdd(ctx, sqrtVHat, constArrNf(eps, n))
+  let step = beDiv(ctx, mHat, denom)
+  let scaledStep = beMul(ctx, step, constArrNf(lr, n))
+  param.data = beSub(ctx, param.data, scaledStep)
+
   if state.step mod requantizeEvery == 0:
     let cf = buildCustomDtypeForTensor(param.data, grad.data)
     param.data = decodeArray(encodeArray(param.data, cf), cf)

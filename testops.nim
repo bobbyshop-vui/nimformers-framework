@@ -8,22 +8,10 @@
 ## Mỗi test in PASS/FAIL kèm tên; cuối cùng in tổng kết + thoát code != 0
 ## nếu có FAIL (để dùng trong CI/script tự động).
 
-import std/[math, strformat, random, os]
+import std/[math, strformat, random]
 import backend
 import nimformer   # Tensor
 import tensor_ops
-
-## Tham số dòng lệnh (KHÔNG dùng cờ kiểu "--backend", chỉ 1 tham số thường):
-##   nim c -r testops.nim cpu
-##   nim c -r testops.nim opencl
-##   nim c -r testops.nim metal
-##   nim c -r testops.nim cuda
-##   nim c -r testops.nim tsic
-## Không truyền gì -> mặc định "cpu" (an toàn, chạy được trên mọi máy kể cả
-## máy build không có driver GPU). Mục đích: mỗi backend phải tự chạy được
-## bộ test NÀY (không riêng CPU) để bắt lỗi sớm thay vì chỉ phát hiện khi
-## chạy inference thật.
-let backendArg = if paramCount() >= 1: paramStr(1) else: "cpu"
 
 var nPass = 0
 var nFail = 0
@@ -39,41 +27,25 @@ proc check(name: string, cond: bool) =
     inc nFail
     echo &"[FAIL] {name}"
 
-proc check[T](name: string, got, want: T) =
-  ## Overload: khi test so sánh 2 giá trị cụ thể (int, bool, seq[int], ...),
-  ## luôn in ra got/want dù PASS hay FAIL, thay vì chỉ in mỗi tên + PASS.
-  let cond = (got == want)
-  if cond:
-    inc nPass
-    echo &"[PASS] {name}  got={got} want={want}"
-  else:
-    inc nFail
-    echo &"[FAIL] {name}  got={got} want={want}"
-
 proc checkSeq(name: string, got, want: openArray[float32], tol: float32 = 1e-4'f32) =
   if got.len != want.len:
     inc nFail
     echo &"[FAIL] {name}  (do dai khac: got={got.len} want={want.len})"
-    echo &"        got={got}"
-    echo &"        want={want}"
     return
   var ok = true
-  var firstMismatch = -1
   for i in 0 ..< got.len:
     if not closeEnough(got[i], want[i], tol):
       ok = false
-      if firstMismatch < 0: firstMismatch = i
+      echo &"        mismatch tai i={i}: got={got[i]} want={want[i]}"
+      break
   if ok:
     inc nPass
-    echo &"[PASS] {name}  got={got}"
+    echo &"[PASS] {name}"
   else:
     inc nFail
-    echo &"[FAIL] {name}  mismatch dau tien tai i={firstMismatch}"
-    echo &"        got ={got}"
-    echo &"        want={want}"
+    echo &"[FAIL] {name}"
 
-echo &"===== TESTOPS: chạy trên backend \"{backendArg}\" ====="
-let ctx = newBackend(backendArg)
+let ctx = newBackend("vulkan")
 
 # ─────────────────────────────────────────────────────────────
 # 1. exp/log/sqrt/pow
@@ -107,7 +79,7 @@ block:
   var t: Tensor
   t.shape = @[2, 3]  # [[1,2,3],[4,5,6]]
   t.data = @[1'f32, 2, 3, 4, 5, 6]
-  let p = permute(t, @[1, 0])  # transpose -> [[1,4],[2,5],[3,6]]
+  let p = permute(ctx, t, @[1, 0])  # transpose -> [[1,4],[2,5],[3,6]]
   check("permute shape", p.shape == @[3, 2])
   checkSeq("permute data (transpose 2x3)", p.data, @[1'f32, 4, 2, 5, 3, 6])
 
@@ -133,15 +105,15 @@ block:
   var a, b: Tensor
   a.shape = @[2, 2]; a.data = @[1'f32, 2, 3, 4]
   b.shape = @[2, 2]; b.data = @[5'f32, 6, 7, 8]
-  let c = concat([a, b], dim = 1)
+  let c = concat(ctx, [a, b], dim = 1)
   check("concat shape", c.shape == @[2, 4])
   checkSeq("concat data", c.data, @[1'f32, 2, 5, 6, 3, 4, 7, 8])
 
-  let s = stack([a, b], dim = 0)
+  let s = stack(ctx, [a, b], dim = 0)
   check("stack shape", s.shape == @[2, 2, 2])
   checkSeq("stack data", s.data, @[1'f32, 2, 3, 4, 5, 6, 7, 8])
 
-  let parts = split(c, splitSize = 2, dim = 1)
+  let parts = split(ctx, c, splitSize = 2, dim = 1)
   check("split so luong phan", parts.len == 2)
   checkSeq("split phan 1 == a", parts[0].data, a.data)
   checkSeq("split phan 2 == b", parts[1].data, b.data)
@@ -150,10 +122,10 @@ block:
 # 6. dropout - eval phải trả nguyên x; train (p=1) phải ra toàn 0
 # ─────────────────────────────────────────────────────────────
 block:
-  var rng = initRand(42)
+  let seed = 42'u32
   let x = @[1'f32, 2, 3, 4]
-  checkSeq("dropout eval = identity", beDropout(ctx, x, 0.5'f32, false, rng), x)
-  let allZero = beDropout(ctx, x, 1.0'f32 - 1e-6'f32, true, rng)
+  checkSeq("dropout eval = identity", beDropout(ctx, x, 0.5'f32, false, seed), x)
+  let allZero = beDropout(ctx, x, 1.0'f32 - 1e-6'f32, true, seed)
   # p ~ 1 -> gan nhu chac chan moi phan tu bi zero (xac suat con lai ~0)
   # (chi kiem tra scale dung: gia tri con lai phai = x[i] * 1/(1-p))
   discard allZero
@@ -227,6 +199,6 @@ block:
            beAffineScan(ctx, aRand, bRand, @[37], 0), sequentialAffine(aRand, bRand), tol = 1e-3'f32)
 
 echo ""
-echo &"===== KET QUA [{backendArg}]: {nPass} PASS / {nFail} FAIL (tong {nPass + nFail}) ====="
+echo &"===== KET QUA: {nPass} PASS / {nFail} FAIL (tong {nPass + nFail}) ====="
 if nFail > 0:
   quit(1)

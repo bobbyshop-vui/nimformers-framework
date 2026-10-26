@@ -1,6 +1,6 @@
 # Nimformer Framework
 
-Nimformer is a **pure Nim** transformer framework supporting multiple compute backends (CPU, Metal, CUDA, OpenCL, TSIC) through `vendor/bybylang`, adaptive quantization (int8/int4/int4-asymmetric/fp8/APF-auto), compressed `.nimq` checkpoints, and a full LLaMA/GQA inference pipeline (RoPE, RMSNorm, SwiGLU, KV-cache).
+Nimformer is a **pure Nim** transformer framework supporting Metal, Vulkan, and TSIC GPU execution through `vendor/bybylang`, adaptive quantization (int8/int4/int4-asymmetric/fp8/APF-auto), compressed `.nimq` checkpoints, and a full LLaMA/GQA inference pipeline (RoPE, RMSNorm, SwiGLU, KV-cache). CUDA is disabled; the legacy `cuda` backend spelling redirects to Vulkan.
 
 ## 1. Project Structure
 
@@ -61,8 +61,8 @@ nimformers-framework/
 ```nim
 proc newBackend*(force: string = backend): Backend
 ```
-Creates a new backend. `force` = `"cpu"` | `"metal"` | `"cuda"` | `"opencl"` | `"tsic"` | `"auto"`.
-- `"auto"`: auto-detects an available GPU (CUDA → Metal → OpenCL → TSIC). If **no** GPU is found, it **raises** an error by default instead of silently falling back to CPU (see `gForbidCpuFallback` below).
+Creates a new backend. `force` = `"metal"` | `"vulkan"` | `"cuda"` (legacy alias for Vulkan) | `"tsic"` | `"auto"`.
+- `"auto"`: auto-detects Metal, then Vulkan. If **no** GPU is found, it **raises** an error by default instead of silently falling back to CPU (see `gForbidCpuFallback` below).
 - An explicit choice (`"cpu"`, `"metal"`, ...) is always accepted, including `"cpu"` (for deliberate demo/debug use).
 
 ```nim
@@ -78,7 +78,7 @@ Defaults to `true`: if the explicitly chosen GPU backend fails at runtime, the p
 ```nim
 proc toByby*(bk: BackendKind): byby.GpuBackend
 ```
-Converts a `BackendKind` (`bkCpu`/`bkMetal`/`bkCuda`/`bkOpenCL`/`bkTsic`) into `bybylang`'s internal `GpuBackend` type.
+Converts a `BackendKind` into BybyLang's internal `GpuBackend`. `newBackend("cuda")` is retained as a compatibility alias and selects Vulkan; it does not invoke CUDA.
 
 ### 2.2. Matrix operations
 
@@ -94,7 +94,7 @@ proc beMatmul2*(ctx: Backend,
                 a2: openArray[float32], M2, K2: int, b2: openArray[float32], K2b, N2: int):
                 tuple[y1, y2: seq[float32]]
 ```
-Two independent matrix multiplications inside a single command buffer (Metal/CUDA), reducing overhead compared to calling `beMatmul` twice.
+Two independent matrix multiplications inside a single command buffer where supported, reducing overhead compared to calling `beMatmul` twice.
 
 ```nim
 proc beMatmulQ4*(ctx: Backend, a: openArray[float32], wq: openArray[uint8],
@@ -498,7 +498,7 @@ This is the main CLI script for training/finetuning the `NimformerModelLinearPP`
 --layers=4             Number of transformer layers
 --ff-mult=4            FFN multiplier
 --quant=auto           Quantization type: int8|int4|fp8|auto|none
---backend=metal        Backend: cpu|metal|cuda|opencl|auto
+--backend=metal        Backend: metal|vulkan|cuda(alias)|auto
 --no-session           Disable session API
 --save=finetune.nimq   Output checkpoint path
 --tokenizer=tokenizer.json  Path to a tokenizer.json (BPE) file, OR a HF model name/path
@@ -607,14 +607,14 @@ let (model, states, stepNo) = loadCheckpointFull("ckpt.nimq.ckpt")
 ```nim
 import backend
 
-# Automatically select: first available GPU (CUDA -> Metal -> OpenCL -> TSIC)
+# Automatically select: Metal, then Vulkan
 newBackend("auto")
 
 # Explicit selection
 newBackend("cpu")
 newBackend("metal")
-newBackend("cuda")
-newBackend("opencl")
+newBackend("vulkan")
+newBackend("cuda") # legacy alias; redirects to Vulkan
 newBackend("tsic")
 ```
 
@@ -623,7 +623,7 @@ Or via build flags (Makefile):
 ```
 make run-metal   # use Metal
 make run-cpu     # use CPU
-make run-cuda    # use CUDA (requires building cuda_kernels.cu first)
+make run-cuda    # compatibility target; backend selection redirects to Vulkan
 ```
 
 ---

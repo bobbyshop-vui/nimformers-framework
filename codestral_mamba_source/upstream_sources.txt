@@ -1,0 +1,15 @@
+Codestral Mamba model card / files:
+https://huggingface.co/mistralai/Mamba-Codestral-7B-v0.1
+https://huggingface.co/mistralai/Mamba-Codestral-7B-v0.1/blob/main/config.json
+https://huggingface.co/mistralai/Mamba-Codestral-7B-v0.1/blob/main/params.json
+
+Hugging Face Mamba-2 implementation:
+https://github.com/huggingface/transformers/blob/main/src/transformers/models/mamba2/modeling_mamba2.py
+https://raw.githubusercontent.com/huggingface/transformers/main/src/transformers/models/mamba2/modeling_mamba2.py
+
+Original Mamba-2 implementation used by the public Mamba package:
+https://github.com/state-spaces/mamba/blob/main/mamba_ssm/modules/mamba2.py
+https://raw.githubusercontent.com/state-spaces/mamba/main/mamba_ssm/modules/mamba2.py
+
+Official Mistral inference repository:
+https://github.com/mistralai/mistral-inference

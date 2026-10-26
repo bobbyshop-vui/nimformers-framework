@@ -105,6 +105,26 @@ proc packedU64ToFp32*(packed: uint64, cf: CustomFloat): float32 =
 # API Điểm Vào Cho Framework (Hỗ Trợ GPU OpenCL & CPU Fallback)
 # ─────────────────────────────────────────────────────────────
 
+proc buildDecodeLUT*(cf: CustomFloat): array[256, float32] =
+  ## LUT giai ma nhanh - CHI dung duoc khi cf.itemSize == 1 (1 byte/phan tu:
+  ## dung cho ca fp4 VA fp8 trong codebase nay, vi itemSize = ceil(totalBits/8)
+  ## nen fp4 (4 bit) van chiem tron 1 byte, khong nen 2 gia tri/byte). Build
+  ## 1 LAN cho moi CustomFloat spec (khong doi trong suot qua trinh train),
+  ## sau do decode chi la 1 phep tra bang O(1) thay vi tinh lai exponent/
+  ## mantissa tung phan tu (packedU64ToFp32) - nhanh hon dang ke khi decode
+  ## lap lai nhieu lan (vd on-demand dequant weight moi buoc train).
+  assert cf.itemSize == 1, &"buildDecodeLUT chi ho tro itemSize==1 (fp4/fp8), cf nay itemSize={cf.itemSize}"
+  for b in 0 ..< 256:
+    result[b] = packedU64ToFp32(uint64(b), cf)
+
+proc decodeArrayLUT*(buf: openArray[uint8], lut: array[256, float32]): seq[float32] =
+  ## Ban nhanh cua decodeArray, dung LUT da build san (buildDecodeLUT). Ket
+  ## qua GIONG HET decodeArray(buf, cf) (da verify - xem test_lut_correctness
+  ## trong smoke test) nhung nhanh hon vi khong tinh lai bit-arithmetic.
+  result = newSeq[float32](buf.len)
+  for i in 0 ..< buf.len:
+    result[i] = lut[int(buf[i])]
+
 proc cpuEncodeArray*(arr: openArray[float32], cf: CustomFloat): seq[uint8] =
   result = newSeq[uint8](arr.len * cf.itemSize)
   for i, v in arr:
