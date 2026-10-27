@@ -63,7 +63,7 @@ proc checkMambaParallelScan(ctx: Backend; mamba: Mamba2Real; x: Tensor) =
   discard runMicroVmChain(ctx, [
     (buildM2ConvSiluProgram(L), L.BT * M2Tg, 4, M2Tg, "scan_new_conv"),
     (buildM2DtProgram(L), L.BT * M2Tg, 4, M2Tg, "scan_new_dt"),
-    mamba2ScanStep(L)], parallel)
+    mamba2ScanStep(L, ctx, forceParallel = true)], parallel)
   var yErr = 0'f32
   for i in 0 ..< L.BT * L.C:
     yErr = max(yErr, abs(sequential[L.yPre + i] - parallel[L.yPre + i]))

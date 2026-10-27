@@ -505,13 +505,14 @@ type
     useSession*: bool  # giữ cờ cho tương thích API; ctx GPU LUÔN chạy GPU
                         # (không còn đường CPU khi useSession=false).
 
-proc newLinearPlusAttention*(embedDim, nHeads: int, useSession: bool = true): LinearPlusAttention =
+proc newLinearPlusAttention*(embedDim, nHeads: int, useSession: bool = true;
+                            initializeWeights = true): LinearPlusAttention =
   assert embedDim mod nHeads == 0
   result.embedDim = embedDim
   result.nHeads = nHeads
   result.headDim = embedDim div nHeads
-  result.qkvProj = newLinear(embedDim, 3 * embedDim)
-  result.outProj = newLinear(embedDim, embedDim)
+  result.qkvProj = newLinear(embedDim, 3 * embedDim, initializeWeights)
+  result.outProj = newLinear(embedDim, embedDim, initializeWeights)
   result.useSession = useSession
 
 # Incremental state for causal Linear++ attention.

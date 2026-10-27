@@ -14,10 +14,9 @@ import mamba2_vm_kernels
 import prefill_profile   # BYBY_PREFILL_PROFILE: vm.upload / vm.gpu / vm.read
 import mamba2_full_vm
 import fp4_gemv_gpu
+import vendor/bybylang/backends/vulkan/vulkan_driver as vkDrv
 import nimformer     # Tensor, ApfAdamState, apfAdamStepGpu (cho apfAdamStepFused)
 import customfloat
-when not defined(macosx):
-  import vendor/bybylang/backends/cuda/cuda_driver as cudaDrv
 
 type
   LayerOff* = object
@@ -121,20 +120,13 @@ proc encodeMicroVm*(ctx: Backend; program: VmProgram; hMem: byby.SessionHandle;
               else: jit_vm.dispatchProgramNoSession(gJitCache, program, tag)
 
   if be == byby.gbVulkan:
-    if tg <= 0 or tg > 256:
+    if tg <= 0 or tg > vkDrv.vulkanMaxTgThreads():
       raise newException(CatchableError,
-        "encodeMicroVm[" & tag & "]: Vulkan workgroup size must be in 1..256; got " & $tg)
+        "encodeMicroVm[" & tag & "]: unsupported Vulkan workgroup size " & $tg)
     let glsl = jit_vm.lowerBytecodeToGlsl(program, kname)
-    if not byby.sessionJitMicroVmEnc(be, kname, glsl, hMem, nThreads, tg):
+    if not byby.sessionJitMicroVmEnc(be, kname, glsl, hMem, nThreads, tg, tgFloats):
       raise newException(CatchableError, "encodeMicroVm[" & tag & "]: Vulkan JIT dispatch failed")
     return
-
-  when not defined(macosx):
-    if be == byby.gbCuda and hMem.cudaHandle.dptr != 0:
-      if cudaDrv.cudaLaunchMicroVmInplace(program.words, hMem.cudaHandle.dptr,
-          hMem.cudaHandle.numel, nThreads, tgFloats):
-        return
-      raise newException(CatchableError, "encodeMicroVm CUDA inplace failed")
 
   # preKname: ten kernel da tinh TRUOC khi mo session. Ham nay chay TRONG session dang mo nen KHONG
   # duoc mo session rieng de hash GPU (metal_session_begin tu choi session long nhau) ->
@@ -197,13 +189,14 @@ proc encodeMicroVm*(ctx: Backend; program: VmProgram; hMem: byby.SessionHandle;
 
 type MvmStep* = tuple[prog: VmProgram, nThreads, tgBytes, tgSize: int, tag: string]
 
-proc mamba2ScanStep*(L: M2Lay): MvmStep =
-  ## The parallel affine scan is the default on macOS (Metal), where it matches
-  ## the serial recurrence. It has shown a real Vulkan-vs-serial state mismatch,
-  ## so other platforms keep the serial scan until the Vulkan shared-memory/
-  ## barrier path passes differential tests. BYBY_MAMBA_SCAN_PARALLEL=0/1 overrides.
-  const scanParDefault = when defined(macosx): "1" else: "0"
-  let tg = if getEnv("BYBY_MAMBA_SCAN_PARALLEL", scanParDefault) == "1": m2ScanTgSize(L.T)
+proc mamba2ScanStep*(L: M2Lay; ctx: Backend; forceParallel = false): MvmStep =
+  ## Parallel affine scan is verified/default on Metal. Vulkan uses the serial
+  ## recurrence until its shared-memory/barrier path passes differential tests.
+  ## The selection follows the active backend (not merely the host OS).
+  ## BYBY_MAMBA_SCAN_PARALLEL=0/1 overrides; forceParallel is for parity tests.
+  let scanParDefault = if ctx.kind.toByby() == byby.gbMetal: "1" else: "0"
+  let parallel = forceParallel or getEnv("BYBY_MAMBA_SCAN_PARALLEL", scanParDefault) == "1"
+  let tg = if parallel: m2ScanTgSize(L.T)
            else: 0
   if tg > 0:
     doAssert L.B * L.HD <= high(int) div tg,
@@ -315,16 +308,17 @@ proc finishVmSession(be: byby.GpuBackend; label: string; ended: var bool) =
   raise newException(CatchableError, msg)
 
 var gTgCapReady = false
+var gTgCapBackend: BackendKind
 
 proc ensureTgCap*(ctx: Backend) =
   ## Đặt gTgCap (mamba2_full_vm) = pow2 lớn nhất <= maxTotalThreadsPerThreadgroup THẬT của GPU.
   ## Gọi trước khi build bất kỳ program reduction nào (rmsTg / rmsRowTg / lpPhiTg).
   ## BYBY_RMS_TG=<n> ép tay. Backend không phải Metal: giữ 1024.
-  if gTgCapReady: return
+  if gTgCapReady and gTgCapBackend == ctx.kind: return
   var cap = 1024
   var queried = true
   if ctx.kind == bkVulkan:
-    cap = 256 # conservative Vulkan/MoltenVK workgroup width for this VM shader
+    cap = min(1024, vkDrv.vulkanMaxTgThreads())
   else:
     when defined(macosx):
       queried = false
@@ -346,7 +340,11 @@ proc ensureTgCap*(ctx: Backend) =
   # Pipeline JIT dùng nhiều thanh ghi hơn micro_vm_kernel nên giới hạn thật THẤP hơn
   # (Iris 640: micro_vm_kernel 512, kernel JIT chỉ 448). Không biết trước khi biên dịch,
   # nên chặn ở 256 (đủ cho reduction, mọi GPU Mac đều chạy được). BYBY_RMS_TG ép tay.
-  if getEnv("BYBY_RMS_TG").len == 0: cap = min(cap, 256)
+  if ctx.kind != bkVulkan and getEnv("BYBY_RMS_TG").len == 0: cap = min(cap, 256)
+  let requested = getEnv("BYBY_RMS_TG")
+  if requested.len > 0:
+    try: cap = min(cap, max(1, parseInt(requested)))
+    except ValueError: discard
   cap = 1 shl fastLog2(max(cap, 32))
   gTgCap = cap
   if not queried:
@@ -354,9 +352,10 @@ proc ensureTgCap*(ctx: Backend) =
     gTgCap = min(cap, 256)
     return
   gTgCapReady = true
+  gTgCapBackend = ctx.kind
   stderr.writeLine "[tgcap] gioi han threadgroup cho kernel reduction = " & $cap
 
-var gRmsTgSize = initTable[int, int]()
+var gRmsTgSize = initTable[string, int]()
 
 proc rmsTgSizeFor*(ctx: Backend; C: int): int =
   ## FIX token rac (bug #9). Chon so thread/threadgroup cho kernel rmsGate
@@ -373,15 +372,15 @@ proc rmsTgSizeFor*(ctx: Backend; C: int): int =
   ## moi block, moi token (nhat quan, lap lai y het moi lan chay).
   ##
   ## Ep buoc tay: BYBY_RMS_TG=<n>.
-  if C in gRmsTgSize: return gRmsTgSize[C]
+  let cacheKey = $ctx.kind & "_" & $C
+  if cacheKey in gRmsTgSize: return gRmsTgSize[cacheKey]
   # Chọn tgSize = luỹ thừa 2 lớn nhất <= min(1024, C, giới hạn GPU) VÀ chia hết C.
   # Công thức đóng (bit trick) thay cho 2 vòng `while t > ...: t = t div 2`.
   let t0 = 1 shl fastLog2(min(1024, C))
   var bound = 1024
+  if ctx.kind == bkVulkan: bound = vkDrv.vulkanMaxTgThreads()
   when defined(macosx):
-    if ctx.kind == bkVulkan:
-      bound = 256
-    elif sessionPipeline("micro_vm_kernel"):
+    if ctx.kind != bkVulkan and sessionPipeline("micro_vm_kernel"):
       let m = sessionMaxTgThreads()
       if m > 0: bound = m
     let envTg = getEnv("BYBY_RMS_TG")
@@ -399,7 +398,7 @@ proc rmsTgSizeFor*(ctx: Backend; C: int): int =
         " voi gioi han " & $bound & " thread/threadgroup")
     stderr.writeLine "[rmsgate] tgSize=" & $t & " cho C=" & $C &
       " (GPU cho toi da " & $bound & " thread/threadgroup) - FIX bug #9"
-  gRmsTgSize[C] = t
+  gRmsTgSize[cacheKey] = t
   result = t
 
 proc runMicroVm*(ctx: Backend; program: VmProgram; memF32: var seq[float32];

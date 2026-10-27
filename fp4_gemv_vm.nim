@@ -437,6 +437,161 @@ proc buildFp4KmGemv4RowProgram*(K, N: int): VmProgram =
   p.emitHalt()
   result = p
 
+proc buildFp4KmGemmM8Program*(K, N: int): VmProgram =
+  ## Eight input rows share one decoded weight. Save all eight accumulators
+  ## before reducing them together, using just one barrier per tree level.
+  doAssert K > 0 and K mod 32 == 0 and N > 0
+  const accum = [4'u32, 6'u32, 10'u32, 11'u32, 12'u32, 13'u32, 14'u32, 15'u32]
+  var p: VmProgram
+  p.emitUTgid(0); p.emitULid(1)
+  p.emitKmLutCopy()
+  p.emitUMulK(2, 0, uint32(K div 2))
+  p.emitUAndK(6, 1, 15); p.emitUAdd(2, 2, 6)
+  p.emitUMulK(3, 0, uint32(K div 32))
+  p.emitUAddK(3, 3, uint32(N * (K div 2)))
+  p.emitUShrK(4, 1, 4); p.emitUShlK(4, 4, 2)
+  p.emitUAddK(5, 1, 0)
+  for r in accum: p.emitLoadConstF32(r, 0)
+  p.emitLoadConstF32(5, float32(K div 32))
+  sessionVmForGpu(p, 5):
+    p.emitULoadU8(6, 2); p.emitUShr(6, 6, 4); p.emitUAndK(6, 6, 15)
+    p.emitUToR(1, 6); p.emitTgLoadF32(1, 1, 0)
+    p.emitULoadU8(7, 3); p.emitUToR(2, 7); p.emitTgLoadF32(2, 2, 16)
+    p.emitMul(1, 1, 2)
+    for m in 0 ..< 8:
+      p.emitULoadIn(3, 5, uint32(m * K))
+      p.emitFma(accum[m], 1, 3, accum[m])
+    p.emitUAddK(2, 2, 16); p.emitUAddK(3, 3, 1); p.emitUAddK(5, 5, 32)
+  p.emitUToR(7, 1)
+  for m in 0 ..< 8: p.emitTgStoreF32(accum[m], 7, uint32(Fp4KmLutLen + m * GemvTg))
+  p.emitBarrierTg()
+  p.emitLoadConstF32(5, 5); p.emitLoadConstF32(8, 16)
+  sessionVmForGpu(p, 5):
+    p.emitCmpLt(9, 7, 8)
+    sessionVmIfGpu(p, 9):
+      p.emitAdd(10, 7, 8)
+      for m in 0 ..< 8:
+        p.emitTgLoadF32(1, 7, uint32(Fp4KmLutLen + m * GemvTg))
+        p.emitTgLoadF32(2, 10, uint32(Fp4KmLutLen + m * GemvTg))
+        p.emitAdd(1, 1, 2); p.emitTgStoreF32(1, 7, uint32(Fp4KmLutLen + m * GemvTg))
+    p.emitBarrierTg()
+    p.emitMulConst(8, 8, 0.5'f32)
+  p.emitLoadConstF32(8, 1); p.emitCmpLt(9, 7, 8)
+  sessionVmIfGpu(p, 9):
+    for m in 0 ..< 8:
+      p.emitTgLoadF32(1, 7, uint32(Fp4KmLutLen + m * GemvTg))
+      p.emitUStoreF32(1, 0, uint32(m * N))
+  p.emitHalt()
+  p
+
+proc emitKmLutCopyDynamic(p: var VmProgram; tg: int) =
+  p.emitUAddK(8, 1, 0)
+  p.emitLoadConstF32(10, float32((Fp4KmLutLen + tg - 1) div tg))
+  p.emitLoadConstF32(12, float32(Fp4KmLutLen))
+  sessionVmForGpu(p, 10):
+    p.emitUToR(11, 8); p.emitCmpLt(13, 11, 12)
+    sessionVmIfGpu(p, 13):
+      p.emitULoadConstF(9, 8); p.emitTgStoreF32(9, 11, 0)
+    p.emitUAddK(8, 8, uint32(tg))
+  p.emitBarrierTg()
+
+proc emitKmReduceDynamic(p: var VmProgram; accum: openArray[uint32]; tg: int;
+                         batched: bool; N: int) =
+  ## All rows share the barrier at each tree level. Every lane participates,
+  ## including Intel GPUs whose SIMD width is smaller than the workgroup.
+  p.emitUToR(7, 1)
+  for r, reg in accum: p.emitTgStoreF32(reg, 7, uint32(Fp4KmLutLen + r * tg))
+  p.emitBarrierTg()
+  p.emitLoadConstF32(5, float32(fastLog2(tg)))
+  p.emitLoadConstF32(8, float32(tg div 2))
+  sessionVmForGpu(p, 5):
+    p.emitCmpLt(9, 7, 8)
+    sessionVmIfGpu(p, 9):
+      p.emitAdd(10, 7, 8)
+      for r in 0 ..< accum.len:
+        p.emitTgLoadF32(1, 7, uint32(Fp4KmLutLen + r * tg))
+        p.emitTgLoadF32(2, 10, uint32(Fp4KmLutLen + r * tg))
+        p.emitAdd(1, 1, 2); p.emitTgStoreF32(1, 7, uint32(Fp4KmLutLen + r * tg))
+    p.emitBarrierTg(); p.emitMulConst(8, 8, 0.5'f32)
+  p.emitLoadConstF32(8, 1); p.emitCmpLt(9, 7, 8)
+  sessionVmIfGpu(p, 9):
+    for r in 0 ..< accum.len:
+      p.emitTgLoadF32(1, 7, uint32(Fp4KmLutLen + r * tg))
+      if batched: p.emitUStoreF32(1, 0, uint32(r * N))
+      else: p.emitUStoreF32(1, 2, uint32(r))
+  p.emitHalt()
+
+proc buildFp4KmGemvTunedProgram*(K, N, tg, rows: int): VmProgram =
+  ## Four-byte packed loads cover eight weights/lane. Wider groups split K
+  ## over more lanes; rows reuse the activation. No weight repacking required.
+  doAssert tg in [32, 64, 128, 256] and rows in [2, 4]
+  doAssert K > 0 and K mod (tg * 8) == 0 and N > 0 and N mod rows == 0
+  const acc = [4'u32, 12'u32, 13'u32, 14'u32]
+  const partial = [8'u32, 9'u32, 10'u32, 11'u32]
+  var p: VmProgram
+  p.emitUTgid(0); p.emitULid(1); p.emitKmLutCopyDynamic(tg)
+  p.emitUMulK(2, 0, uint32(rows))
+  p.emitUShrK(3, 1, 2); p.emitUAndK(4, 1, 3)
+  p.emitUMulK(5, 2, uint32(K div 2))
+  p.emitUShlK(10, 3, 4); p.emitUAdd(5, 5, 10)
+  p.emitUShlK(10, 4, 2); p.emitUAdd(5, 5, 10)
+  p.emitUMulK(6, 2, uint32(K div 32))
+  p.emitUAddK(6, 6, uint32(N * (K div 2))); p.emitUAdd(6, 6, 3)
+  p.emitUShlK(7, 3, 5); p.emitUAdd(7, 7, 10)
+  for r in 0 ..< rows: p.emitLoadConstF32(acc[r], 0)
+  p.emitLoadConstF32(5, float32(K div (tg * 8)))
+  sessionVmForGpu(p, 5):
+    for r in 0 ..< rows:
+      p.emitULoadU32(uint32(8 + r), 5, uint32(r * (K div 2)))
+      p.emitULoadU8(uint32(12 + r), 6, uint32(r * (K div 32)))
+      p.emitLoadConstF32(partial[r], 0)
+    for t in 0 ..< 4:
+      for hi in 0 ..< 2:
+        p.emitULoadIn(3, 7, uint32(t + 16 * hi))
+        for r in 0 ..< rows:
+          p.emitUShrK(3, uint32(8 + r), uint32(8 * t + 4 * hi)); p.emitUAndK(3, 3, 15)
+          p.emitUToR(1, 3); p.emitTgLoadF32(1, 1, 0)
+          p.emitFma(partial[r], 1, 3, partial[r])
+    for r in 0 ..< rows:
+      p.emitUToR(2, uint32(12 + r)); p.emitTgLoadF32(2, 2, 16)
+      p.emitFma(acc[r], 2, partial[r], acc[r])
+    p.emitUAddK(5, 5, uint32(tg * 4)); p.emitUAddK(6, 6, uint32(tg div 4))
+    p.emitUAddK(7, 7, uint32(tg * 8))
+  p.emitKmReduceDynamic(acc.toOpenArray(0, rows - 1), tg, false, N)
+  p
+
+proc buildFp4KmGemmTunedProgram*(K, N, tg, batchRows: int): VmProgram =
+  ## Batched variant: decode one packed word/scale for all input rows.
+  doAssert tg in [32, 64, 128, 256] and batchRows in [4, 8]
+  doAssert K > 0 and K mod (tg * 8) == 0 and N > 0
+  const acc = [4'u32, 6'u32, 10'u32, 11'u32, 12'u32, 13'u32, 14'u32, 15'u32]
+  var p: VmProgram
+  p.emitUTgid(0); p.emitULid(1); p.emitKmLutCopyDynamic(tg)
+  p.emitUShrK(3, 1, 2); p.emitUAndK(4, 1, 3)
+  p.emitUMulK(2, 0, uint32(K div 2))
+  p.emitUShlK(6, 3, 4); p.emitUAdd(2, 2, 6)
+  p.emitUShlK(6, 4, 2); p.emitUAdd(2, 2, 6)
+  p.emitUShlK(5, 3, 5); p.emitUAdd(5, 5, 6)
+  p.emitUMulK(3, 0, uint32(K div 32))
+  p.emitUAddK(3, 3, uint32(N * (K div 2)))
+  p.emitUShrK(6, 1, 2); p.emitUAdd(3, 3, 6)
+  for r in 0 ..< batchRows: p.emitLoadConstF32(acc[r], 0)
+  p.emitLoadConstF32(5, float32(K div (tg * 8)))
+  sessionVmForGpu(p, 5):
+    p.emitULoadU32(8, 2); p.emitULoadU8(9, 3)
+    p.emitUToR(2, 9); p.emitTgLoadF32(2, 2, 16)
+    for t in 0 ..< 4:
+      for hi in 0 ..< 2:
+        p.emitUShrK(6, 8, uint32(8 * t + 4 * hi)); p.emitUAndK(6, 6, 15)
+        p.emitUToR(1, 6); p.emitTgLoadF32(1, 1, 0); p.emitMul(1, 1, 2)
+        for r in 0 ..< batchRows:
+          p.emitULoadIn(3, 5, uint32(r * K + t + 16 * hi))
+          p.emitFma(acc[r], 1, 3, acc[r])
+    p.emitUAddK(2, 2, uint32(tg * 4)); p.emitUAddK(3, 3, uint32(tg div 4))
+    p.emitUAddK(5, 5, uint32(tg * 8))
+  p.emitKmReduceDynamic(acc.toOpenArray(0, batchRows - 1), tg, true, N)
+  p
+
 proc buildFp4KmGemmM4Program*(K, N: int): VmProgram =
   ## FP4-KM group-32 GEMM tile MBLOCK=4: 1 cột output / threadgroup, 4 hàng input.
   ## Weight đọc 1 lần / phần tử cột, tái dùng cho 4 token (ý tưởng matmul_q4_batched

@@ -36,8 +36,11 @@ type
     lutBuf*: byby.SessionHandle
     rows*, cols*: int
     rowsPerTg*: int       ## 2 for FP4-KM group32 tiled GEMV, otherwise 1
+    tgSize*: int          ## exact group width used by the selected decode kernel
     jitName*: string
     m4JitName*: string    ## FP4-KM MBLOCK=4 prefill GEMM (empty if not built)
+    m8JitName*: string    ## FP4-KM MBLOCK=8, shared reduction for short prefixes
+    m8TgSize*: int
     glslSrc*: string       ## cached GLSL for Vulkan multi-buf path
     m4GlslSrc*: string
     tgBytes*: int          ## threadgroup memory (LUT + vung reduce) - xem fp4GemvTgBytes
@@ -78,6 +81,7 @@ proc uploadFp4WeightOnce*(ctx: Backend, name: string; wq: seq[uint8];
   if rowsPerTg notin [1, 2, 4] or (rowsPerTg > 1 and (lut.len != Fp4KmLutLen or rows mod rowsPerTg != 0)):
     raise newException(ValueError, "uploadFp4WeightOnce: rowsPerTg khong hop le cho " & name)
   c.rowsPerTg = rowsPerTg
+  c.tgSize = GemvTg
   c.tgBytes = (lut.len + rowsPerTg * GemvTg) * 4  # LUT + one 32-lane reduction per output row
   # Weight lớn: Shared (không wired). LUT nhỏ: Private OK.
   c.wBuf = sessionUploadBytesShared(be, wq)
@@ -113,6 +117,7 @@ proc encodeFp4Gemv*(c: Fp4LinCacheGpu; hIn: byby.SessionHandle; inOffElems: int;
   ## GLSL:  0=MemF32, 1=MemU8(WeightU8 uint), 2=Lut, 3=Input, 4=MemU32
   ## Dispatch: N/rowsPerTg threadgroup x 32 thread.
   let isVk = hOut.kind == byby.gbVulkan
+  let tg = if c.tgSize > 0: c.tgSize else: GemvTg
   let glsl = if isVk: c.glslSrc else: ""
   if isVk and glsl.len == 0:
     return false
@@ -131,10 +136,10 @@ proc encodeFp4Gemv*(c: Fp4LinCacheGpu; hIn: byby.SessionHandle; inOffElems: int;
       discard sessionBindBuffer(4, hIn.metalHandle, inOffElems * 4)
   discard sessionEncTgBytes(isVk, 0, max(c.tgBytes, 16))
   let maxTG = sessionEncMaxTg(isVk)
-  if maxTG > 0 and maxTG < GemvTg:
+  if maxTG > 0 and maxTG < tg:
     raise newException(CatchableError,
-      "encodeFp4Gemv: pipeline chi cho " & $maxTG & " thread/threadgroup < " & $GemvTg)
-  result = sessionEncDispatch(isVk, (c.rows div c.rowsPerTg) * GemvTg, GemvTg, c.tgBytes)
+      "encodeFp4Gemv: pipeline chi cho " & $maxTG & " thread/threadgroup < " & $tg)
+  result = sessionEncDispatch(isVk, (c.rows div c.rowsPerTg) * tg, tg, c.tgBytes)
 
 proc encodeFp4GemmM4*(c: Fp4LinCacheGpu; hIn: byby.SessionHandle; inOffElems: int;
                       hOut: byby.SessionHandle; outOffElems: int): bool =

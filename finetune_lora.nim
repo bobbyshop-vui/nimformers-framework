@@ -1594,6 +1594,17 @@ proc syncLoraAdamFromStore*(store: AdamDiskStore, state: var LoraTrainState, lor
       if disk.step >= ramStep:
         state.adamB[name] = disk
 
+proc cloneFloat32Data(src: seq[float32]): seq[float32] =
+  ## Dedicated allocation, even under ARC/ORC or shared seq assignment.
+  result = newSeq[float32](src.len)
+  for j in 0 ..< src.len:
+    result[j] = src[j]
+
+proc cloneAdamSnapshot(st: ApfAdamState): ApfAdamState =
+  result.step = st.step
+  result.m = cloneFloat32Data(st.m)
+  result.v = cloneFloat32Data(st.v)
+
 proc adamNeverUpdated(st: ApfAdamState): bool =
   ## m = v = 0 tuyet doi: chua tung nhan gradient nao (moi init / reset).
   for x in st.m:
@@ -1776,7 +1787,10 @@ proc applyLayerProgressToLora*(lo: var JambaLora, tensors: seq[checkpoint.LayerT
       if t.shape.len > 0: lo.adapters[adapterName].B.shape = t.shape
       inc result
 
-proc restoreLayerProgressForStep*(lo: var JambaLora, ckptPath: string, step, nBlocks: int): int =
+proc requireCompleteLayerSnapshot(lo: JambaLora, ckptPath: string, step, li: int)
+
+proc restoreLayerProgressForStep*(lo: var JambaLora, ckptPath: string, step, nBlocks: int,
+                                  updateMaxBlock = high(int)): int =
   ## Tra ve lastCompletedLayer (-1 = khong co). Nap LoRA block nBlocks-1 .. cLayer.
   result = -1
   var cStep, cLayer: int
@@ -1785,8 +1799,10 @@ proc restoreLayerProgressForStep*(lo: var JambaLora, ckptPath: string, step, nBl
   if cLayer < 0 or cLayer >= nBlocks: return
   var nTen = 0
   for li in countdown(nBlocks - 1, cLayer):
+    # Fill deliberately only propagates dX through blocks > updateMaxBlock.
+    if li > updateMaxBlock: continue
+    requireCompleteLayerSnapshot(lo, ckptPath, step, li)
     let tensors = checkpoint.loadLayerProgress(ckptPath, step, li)
-    if tensors.len == 0: continue
     nTen += applyLayerProgressToLora(lo, tensors)
   result = cLayer
   stderr.writeLine("[resume-layer] step=" & $step & " cursor layer=" & $cLayer &
@@ -2020,9 +2036,16 @@ proc finalizeActivationStore(s: var DiskActivationStore) =
 proc resumeStatePath(step: int): string =
   getCheckpointPath() & ".inprogress" / ("step-" & $step & ".state")
 
+proc preparedResumeStatePath(step: int): string =
+  resumeStatePath(step) & ".prepared"
+
+proc discardPreparedResumeState(step: int) =
+  try: removeFile(preparedResumeStatePath(step))
+  except OSError: discard
+
 proc saveResumeState(step, nextLayer: int, phase: string, dX: Tensor,
-                     loss: float32) =
-  let path = resumeStatePath(step)
+                     loss: float32, prepared = false) =
+  let path = if prepared: preparedResumeStatePath(step) else: resumeStatePath(step)
   createDir(getCheckpointPath() & ".inprogress")
   let tmp = path & ".tmp"
   var f = open(tmp, fmWrite)
@@ -2056,8 +2079,8 @@ proc saveResumeState(step, nextLayer: int, phase: string, dX: Tensor,
     moveFile(tmp, path)
 
 proc loadResumeState(step: int, nextLayer: var int, phase: var string,
-                     dX: var Tensor, lossOut: var float32): bool =
-  let path = resumeStatePath(step)
+                     dX: var Tensor, lossOut: var float32, prepared = false): bool =
+  let path = if prepared: preparedResumeStatePath(step) else: resumeStatePath(step)
   if not fileExists(path): return false
   var f = open(path, fmRead)
   try:
@@ -2100,6 +2123,68 @@ proc loadResumeState(step: int, nextLayer: var int, phase: var string,
   finally:
     f.close()
 
+proc promotePreparedResumeState(step: int) =
+  let src = preparedResumeStatePath(step)
+  if not fileExists(src):
+    raise newException(IOError, "[resume] Missing prepared per-layer resume state: " & src)
+  if cRename(src.cstring, resumeStatePath(step).cstring) != 0:
+    raise newException(IOError, "[resume] Cannot atomically promote " & src)
+
+proc requireCompleteLayerSnapshot(lo: JambaLora, ckptPath: string, step, li: int) =
+  ## Verify every A/B pair before trusting a progress cursor. A G-only block
+  ## legitimately has zero LoRA tensors but still has a nonempty layer manifest.
+  if not checkpoint.layerProgressReadable(ckptPath, step, li):
+    raise newException(IOError,
+      &"[resume] Missing/corrupt layer snapshot for step {step}, block {li}. " &
+      "DO NOT delete .inprogress or restart from the previous checkpoint.")
+  let tensors = checkpoint.loadLayerProgress(ckptPath, step, li)
+  var expected = 0
+  for name, ad in lo.adapters:
+    if not name.startsWith("block" & $li & "."): continue
+    for which in ["A", "B"]:
+      inc expected
+      let key = name & "::" & which
+      var found = false
+      for t in tensors:
+        let orig = if which == "A": ad.A else: ad.B
+        if t.name == key and t.shape == orig.shape and t.data.len == orig.data.len:
+          found = true
+          break
+      if not found:
+        raise newException(IOError, &"[resume] Incomplete LoRA snapshot: {key} step={step} layer={li}")
+  if tensors.len != expected:
+    raise newException(IOError,
+      &"[resume] Unexpected layer tensor count at block {li}: {tensors.len}, expected {expected}")
+
+proc recoverPreparedResumeState(step, nBlocks: int, lo: JambaLora) =
+  ## 2-phase layer commit: prepared dX is written BEFORE optimizer updates;
+  ## layer weights+cursor are committed after updates; then prepared is promoted.
+  ## If killed while optimizer writes were incomplete, refuse to replay the block
+  ## (this requires an external rollback; silently replaying doubles Adam steps).
+  if not fileExists(preparedResumeStatePath(step)): return
+  var nextLayer = -2
+  var phase = ""
+  var dx: Tensor
+  var loss = 0'f32
+  if not loadResumeState(step, nextLayer, phase, dx, loss, prepared = true):
+    raise newException(IOError, "[resume] Corrupt prepared state; refusing unsafe optimizer replay")
+  let finished = if phase == "backward_done": 0 else: nextLayer + 1
+  if finished < 0 or finished >= nBlocks or
+     (phase != "backward" and phase != "backward_done") or
+     (phase == "backward_done" and nextLayer != -1):
+    raise newException(IOError, "[resume] Invalid prepared cursor; refusing replay")
+  var curStep, curLayer: int
+  let hasCursor = checkpoint.readProgressCursor(getCheckpointPath(), curStep, curLayer)
+  if hasCursor and (curStep != step or (curLayer != finished and curLayer != finished + 1)):
+    raise newException(IOError, "[resume] Prepared state and cursor disagree; refusing replay")
+  # Layer files are the authoritative evidence that the post-update LoRA
+  # weights were fully written. With none, Adam may already be partly changed.
+  requireCompleteLayerSnapshot(lo, getCheckpointPath(), step, finished)
+  if not hasCursor or curLayer != finished:
+    checkpoint.commitLayerProgressCursor(getCheckpointPath(), step, finished)
+  promotePreparedResumeState(step)
+  stderr.writeLine &"[resume] Recovered staged block {finished}: LoRA snapshot + cursor + dX consistent."
+
 proc activationResumePath(step: int): string =
   getScratchDir() / (".xs_resume_step_" & $step & ".bin")
 
@@ -2108,6 +2193,7 @@ proc removeActivationResume*(step: int) =
   except OSError: discard
   try: removeFile(resumeStatePath(step))
   except OSError: discard
+  discardPreparedResumeState(step)
 
 proc layerProgressStepState*(step, cursorLayer, nBlocks: int,
                              backwardDone, canResume: var bool): string =
@@ -2123,6 +2209,12 @@ proc layerProgressStepState*(step, cursorLayer, nBlocks: int,
   # cursor == 0: layer-progress block 0 da ghi = backward xong. KHONG doi phase
   # "backward_done": o block 0 progress duoc ghi TRUOC resume state, crash giua
   # 2 lan ghi de lai phase="backward" next=0 -> replay block 0 se update 2 lan.
+  if cursorLayer == 0 and hasRs and rsPhase == "backward" and rsNext == 0:
+    # Legacy code recorded rollback of layer 0 using the same cursor as a
+    # committed layer 0. Cannot know whether layer 0 was really updated.
+    raise newException(IOError,
+      "[resume] Ambiguous legacy layer-0 cursor (backward next=0). " &
+      "Refusing to commit an incompletely trained step; KEEP .inprogress.")
   backwardDone = cursorLayer == 0
   canResume = hasRs and rsPhase == "backward" and rsNext >= 0 and rsNext < nBlocks and
     fileExists(activationResumePath(step))
@@ -2331,6 +2423,7 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
   let actPath = if stepIndex >= 0: activationResumePath(stepIndex)
                 else: CFG_SCRATCH_DIR / (".xs_scratch_" & $cast[int](addr m) & ".bin")
   if stepIndex >= 0:
+    recoverPreparedResumeState(stepIndex, m.blocks.len, lo)
     let hasState = loadResumeState(stepIndex, resumeNextLayer, resumePhase, resumedDX, resumedLoss)
     var curStep, curLayer: int
     let hasCursor = checkpoint.readProgressCursor(getCheckpointPath(), curStep, curLayer) and
@@ -2347,7 +2440,8 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
       # Load the LoRA A/B deltas already applied to the upper blocks before the
       # crash. Their Adam m/v were persisted per layer in adamStore, so
       # restoreLoraAdamStates() at startup already recovered them.
-      let restoredLayer = restoreLayerProgressForStep(lo, getCheckpointPath(), stepIndex, m.blocks.len)
+      let restoredLayer = restoreLayerProgressForStep(lo, getCheckpointPath(), stepIndex,
+        m.blocks.len, updateMaxBlock)
       # Block > updateMaxBlock chi truyen dX, khong ghi layer-progress: chua toi
       # block updateMaxBlock thi chua co cursor nao (-1).
       let expectedLayer = if resumeNextLayer + 1 > updateMaxBlock: -1 else: resumeNextLayer + 1
@@ -2357,7 +2451,7 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
          restoredLayer != resumeNextLayer:
         raise newException(IOError,
           &"[resume] Per-layer progress layer {restoredLayer} khong khop voi resumeNextLayer {resumeNextLayer} " &
-          &"(ky vong layer {expectedLayer}). Xoa .inprogress de train lai.")
+          &"(ky vong layer {expectedLayer}). GIU .inprogress; kiem tra snapshot truoc khi can thiep.")
       dlog &"resume state: backward layer {resumeNextLayer}, khong chay lai forward"
     elif hasCursor:
       # Da co block update trong step nay nhung khong resume backward duoc: chay
@@ -2620,7 +2714,8 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
   # da duoc xac nhan qua layer-progress khi resume) - cuoi step phai du TAT CA.
   var blockDone = newSeq[bool](m.blocks.len)
   for j in firstBackwardLayer + 1 ..< m.blocks.len: blockDone[j] = true
-  for i in countdown(firstBackwardLayer, 0):
+  var i = firstBackwardLayer
+  while i >= 0:
     let tb0 = getMonoTime()
     trainProfBegin()
     if i in namesByBlock:
@@ -2641,7 +2736,8 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
 
     let tbMerge = getMonoTime()
     let xi = xstore.readActivation(i)   # doc DUNG 1 activation tu SSD, dung xong (backwardBlock) la het scope
-    let dXBeforeBlock = dX  # gradient vao block i; can cho rescue resume
+    var dXBeforeBlock = dX  # gradient entering i, needed unchanged on retry
+    dXBeforeBlock.data = cloneFloat32Data(dX.data)
     var blockGrads = initTable[string, Tensor]()   # rieng cho block nay, KHONG tich luy
     gLoraGradRequest.clear()
     if gLoraAwareBwd:
@@ -2674,6 +2770,7 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
         stderr.writeLine &"[finetune_lora] Dung an toan sau backward block {i} (chi truyen dX). " &
           "Chay lai de tiep tuc."
         break
+      dec i
       continue
 
     # CAM thieu: moi tham so LoRA va moi tham so block moi (G attn/fuseGate) cua
@@ -2766,6 +2863,13 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
         adamStore.init(name, numelShape(paramByName[name][].shape))
       stderr.writeLine &"[audit] block {i} SAI -> tinh lai update step 0 (Adam ve 0)."
 
+    # Prepare next dX BEFORE any optimizer write. If the process dies before the
+    # layer's .bin/.idx files are complete, startup must stop (not update twice).
+    if stepIndex >= 0:
+      let preparedPhase = if i == 0: "backward_done" else: "backward"
+      saveResumeState(stepIndex, i - 1, preparedPhase, dX, loss, prepared = true)
+      if getEnv("BYBY_TEST_CRASH_AFTER_PREPARED_LAYER", "") == $i:
+        raise newException(IOError, "SIMULATED_CRASH_AFTER_PREPARED_LAYER_" & $i)
     let tbGrad = getMonoTime()
     # Snapshot pre-update weights for G (gated) and R (pure Mamba2Real) so a
     # failed post-update safety / layer-probe check can be rolled back in-place
@@ -2779,7 +2883,7 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
     var loraPreAdamA = initTable[string, ApfAdamState]()
     var loraPreAdamB = initTable[string, ApfAdamState]()
     let needsRescue = m.blocks[i].kind in {bkMambaRealGated, bkMambaReal, bkMambaRealPlusAttn}
-    var rescueTriggered = false  # set true when rescue rollback fires for this block
+    var rescueTriggered = false  # rollback triggers a same-block retry, never a commit
     let blockLrScale =
       if needsRescue:
         gPerBlockLrScale.getOrDefault(i, 1.0'f32)
@@ -2790,10 +2894,12 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
       for name in namesByBlock.getOrDefault(i, @[]):
         if name in lo.adapters:
           let ad = lo.adapters[name]
-          loraPreUpdateA[name] = ad.A.data
-          loraPreUpdateB[name] = ad.B.data
-          loraPreAdamA[name] = loState.adamA[name]
-          loraPreAdamB[name] = loState.adamB[name]
+          # Nim seq assignment may share storage. Adam GPU updates m/v in place.
+          # A rollback MUST own independent buffers, not aliases to live tensors.
+          loraPreUpdateA[name] = cloneFloat32Data(ad.A.data)
+          loraPreUpdateB[name] = cloneFloat32Data(ad.B.data)
+          loraPreAdamA[name] = cloneAdamSnapshot(loState.adamA[name])
+          loraPreAdamB[name] = cloneAdamSnapshot(loState.adamB[name])
       for name in fullPrecNamesByBlock.getOrDefault(i, @[]):
         if name in paramByName:
           let p = paramByName[name]
@@ -3088,16 +3194,9 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
             loState.adamB[name] = stB
             adamStore.save(loraAdamKey(name, "A"), stA)
             adamStore.save(loraAdamKey(name, "B"), stB)
-        # Update layerTensors to reflect the rolled-back weights so checkpoint progress is consistent
-        layerTensors.setLen(0)
-        for name in rescueLoraNames:
-          if name in lo.adapters:
-            let ad = lo.adapters[name]
-            layerTensors.add(checkpoint.LayerTensor(name: name & "::A",
-              shape: ad.A.shape, data: ad.A.data))
-            layerTensors.add(checkpoint.LayerTensor(name: name & "::B",
-              shape: ad.B.shape, data: ad.B.data))
+        # Rolled-back block is NOT completed: no layer-progress record is written.
         if fails > maxAttempts:
+          if stepIndex >= 0: discardPreparedResumeState(stepIndex)
           raise newException(CatchableError,
             &"{kindTag} block {i}: {fails} consecutive post-update safety failures " &
             &"(last: {gCheckError}); LR scale={newScale:.3f}. Rescue failed - " &
@@ -3109,27 +3208,32 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
       GC_fullCollect()
     let tbCheck = getMonoTime()
     dlog &"backward block {i}: adam update + SSD spill xong"
+    if rescueTriggered:
+      # The update was rolled back. Never write layer i as completed or move
+      # the progress cursor to i: that would skip i, especially for i == 0.
+      # Retry exactly the same block with its original incoming dX and a
+      # reduced LR; the inner fails counter bounds repeated rescue attempts.
+      if stepIndex >= 0: discardPreparedResumeState(stepIndex)
+      dX = dXBeforeBlock
+      trainProfEnd(&"bwd block {i} (rescue retry)", tb0)
+      GC_fullCollect()
+      if gStopRequested:
+        gTrainStepFullyDone = false
+        stderr.writeLine &"[finetune_lora] RESCUE block {i}: stop before retry; resume at SAME block."
+        break
+      stderr.writeLine &"[finetune_lora] RESCUE block {i}: retry SAME block (not {i - 1})."
+      continue
     if stepIndex >= 0:
-      # Commit order: state FIRST (so a crash right after never replays this
-      # layer), then the per-layer LoRA weights. New-block weights and Adam
-      # moments were already flushed inside the loop above.
-      # After rescue rollback the weight at block i was NOT advanced, so
-      # nextLayer must be i (not i-1) to force a replay of this block on
-      # resume. After a clean update nextLayer = i-1 as usual.
-      let nextLayerAfterThis =
-        if needsRescue and rescueTriggered: i
-        else: i - 1
-      if nextLayerAfterThis >= 0:
-        # Khi rescue: luu dXBeforeBlock (gradient vao block i) de resume replay
-        # dung block i tu dau; khi clean: luu dX (gradient vao block i-1).
-        let dXToSave = if needsRescue and rescueTriggered: dXBeforeBlock else: dX
-        saveResumeState(stepIndex, nextLayerAfterThis, "backward", dXToSave, loss)
-        checkpoint.saveLayerProgress(getCheckpointPath(), stepIndex, i, layerTensors)
-      else:
-        # Layer 0 xong: van ghi layer progress block 0 len SSD, KHONG xoa inprogress
-        # cho den khi commit .bin thanh cong (tranh mat weight neu Adam check fail).
-        checkpoint.saveLayerProgress(getCheckpointPath(), stepIndex, i, layerTensors)
-        saveResumeState(stepIndex, -1, "backward_done", dX, loss)
+      # Two-phase commit: LoRA layer snapshot+cursor is authoritative; prepared
+      # dX is promoted to active .state only after the snapshot commits.
+      # On restart a leftover .prepared is rolled forward ONLY when that
+      # layer snapshot is intact; otherwise training stops without replay.
+      if getEnv("BYBY_TEST_CRASH_BEFORE_LAYER_CURSOR", "") == $i:
+        raise newException(IOError, "SIMULATED_CRASH_BEFORE_LAYER_CURSOR_" & $i)
+      checkpoint.saveLayerProgress(getCheckpointPath(), stepIndex, i, layerTensors)
+      if getEnv("BYBY_TEST_CRASH_AFTER_LAYER_CURSOR", "") == $i:
+        raise newException(IOError, "SIMULATED_CRASH_AFTER_LAYER_CURSOR_" & $i)
+      promotePreparedResumeState(stepIndex)
       if getEnv("BYBY_TEST_CRASH_AFTER_BACKWARD_LAYER", "") == $i:
         raise newException(CatchableError, "SIMULATED_CRASH_AFTER_BACKWARD_LAYER_" & $i)
     blockDone[i] = true
@@ -3141,13 +3245,14 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
     trainProfEnd(&"bwd block {i}", tb0)
     # blockGrads het scope ngay day -> GC thu hoi, KHONG lan sang block ke
     GC_fullCollect()   # SUA: chay cho MOI block, giong nhu forward o tren
-    # Ctrl+C: chi break SAU khi layer nay da spill SSD + ghi resume/layer progress
-    # (doan tren). Resume se tiep tu nextLayerAfterThis, khong mat Adam da ghi.
+    # Ctrl+C: break only after the accepted layer has committed both progress
+    # and the next dX; rescue retries never mark a layer completed.
     if gStopRequested:
       gTrainStepFullyDone = false
       stderr.writeLine &"[finetune_lora] Dung an toan sau backward layer {i} " &
         "(resume state + layer progress da tren SSD). Chay lai de tiep tuc."
       break
+    dec i
 
   if gTrainStepFullyDone:
     # CAM thieu: step chi duoc coi la xong khi MOI block da backward.
@@ -3247,6 +3352,7 @@ proc fillUntrainedLoraBlocks*(m: var NimformerModelJamba, lo: var JambaLora,
     writeFile(marker & ".tmp", $k)
     if cRename((marker & ".tmp").cstring, marker.cstring) != 0:
       raise newException(IOError, "[fill] Khong ghi duoc marker " & marker)
+  if resuming: recoverPreparedResumeState(FillStepIndex, m.blocks.len, lo)
   var curStep, curLayer: int
   let hasCursor = resuming and checkpoint.readProgressCursor(ckpt, curStep, curLayer) and
     curStep == FillStepIndex
@@ -3292,9 +3398,15 @@ proc fillUntrainedLoraBlocks*(m: var NimformerModelJamba, lo: var JambaLora,
 
   var loss = 0'f32
   if hasCursor and curLayer == 0:
+    # Old binaries could write cursor=0 on a RESCUE rollback. Detect the
+    # ambiguous legacy state before treating this as a completed backward.
+    var backwardDone, canResume: bool
+    discard layerProgressStepState(FillStepIndex, curLayer, m.blocks.len,
+      backwardDone, canResume)
     # Backward da toi block 0 o lan truoc (chua kip commit): KHONG chay lai,
     # chi nap weight da lap tu layer-progress.
-    discard restoreLayerProgressForStep(lo, ckpt, FillStepIndex, m.blocks.len)
+    discard restoreLayerProgressForStep(lo, ckpt, FillStepIndex, m.blocks.len,
+      updateMaxBlock = k)
   else:
     var fillBatcher = newStreamingBatcher(CFG_DATASETS, CFG_SEQ_LEN, CFG_BATCH_SIZE,
                                           bpeTok, hfTok, usingHfTok)
@@ -3336,6 +3448,7 @@ proc auditStep0Core*(m: var NimformerModelJamba, lo: var JambaLora,
   let ckpt = getCheckpointPath()
   let marker = auditMarkerPath(ckpt)
   let resuming = fileExists(marker)
+  if resuming: recoverPreparedResumeState(FillStepIndex, m.blocks.len, lo)
   if gLoadedCkptMeta.getOrDefault(Step0AuditMetaKey) == "ok":
     if resuming:
       # Lan truoc da ghi .bin CO co (crash sau saveCheckpointLoraBin, truoc khi don):
@@ -3385,6 +3498,9 @@ proc auditStep0Core*(m: var NimformerModelJamba, lo: var JambaLora,
   var loss = 0'f32
   var stopBlock = -1
   if hasCursor and curLayer == 0:
+    var backwardDone, canResume: bool
+    discard layerProgressStepState(FillStepIndex, curLayer, m.blocks.len,
+      backwardDone, canResume)
     # Lan truoc da sua toi block 0 (moi block deu sai), chua kip commit: chi nap ket qua.
     discard restoreLayerProgressForStep(lo, ckpt, FillStepIndex, m.blocks.len)
   else:
@@ -3834,6 +3950,12 @@ when isMainModule:
 
   # Kiem tra KY LoRA + block G truoc moi thu khac (raise neu hong; bao block trong).
   discard checkLoraCheckpointIntegrity(m, lo, oldStep, newBlockNames)
+  # Recover a crash between per-layer cursor commit and resume-state commit.
+  # An unfinished optimizer write without a complete layer snapshot FAILS CLOSED.
+  if hasInprogress:
+    recoverPreparedResumeState(oldStep, m.blocks.len, lo)
+    if oldStep != FillStepIndex and step0RepairInProgress(getCheckpointPath()):
+      recoverPreparedResumeState(FillStepIndex, m.blocks.len, lo)
 
   # RESUME INTEGRITY: checkpoint co weight chua du; phai kiem tra Adam + cursor.
   let currentDatasetSig = datasetSignature(CFG_DATASETS)

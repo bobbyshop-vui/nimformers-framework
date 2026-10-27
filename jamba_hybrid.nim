@@ -194,7 +194,7 @@ proc charToKind(c: char): BlockKind =
 proc newJambaBlock(kind: BlockKind, embedDim, nHeads, ffMult: int, useSession: bool,
                     mambaRealDState: int = 64, mambaRealNGroups: int = 1,
                     mambaRealConvKernel: int = 4, mambaRealExpand: int = 2,
-                    quantResident: bool = false): JambaBlock =
+                    quantResident: bool = false; initializeWeights = true): JambaBlock =
   result.kind = kind
   result.ln1 = newLayerNorm(embedDim)
   result.ln2 = newLayerNorm(embedDim)
@@ -223,7 +223,8 @@ proc newJambaBlock(kind: BlockKind, embedDim, nHeads, ffMult: int, useSession: b
     # backwardBlock ben duoi) - vi Mamba2 that cua HF KHONG co FFN xen giua
     # moi layer (chi norm->mixer->residual), khac Transformer block thuong.
     result.mambaReal = newMamba2Real(embedDim, embedDim * mambaRealExpand, nHeads,
-                                      mambaRealDState, mambaRealNGroups, mambaRealConvKernel)
+                                      mambaRealDState, mambaRealNGroups, mambaRealConvKernel,
+                                      initializeWeights = initializeWeights)
     if quantResident:
       # SUA (fix OOM ~29GB luc DUNG MODEL, truoc ca khi load .nimq): inProj/
       # outProj la 2 ma tran to nhat moi block (~90% tong tham so 1 block
@@ -244,8 +245,9 @@ proc newJambaBlock(kind: BlockKind, embedDim, nHeads, ffMult: int, useSession: b
       result.mambaReal.outProj.weight.data = @[]
   of bkMambaRealPlusAttn, bkMambaRealGated:
     result.mambaReal = newMamba2Real(embedDim, embedDim * mambaRealExpand, nHeads,
-                                      mambaRealDState, mambaRealNGroups, mambaRealConvKernel)
-    result.attn = newLinearPlusAttention(embedDim, nHeads, useSession)
+                                      mambaRealDState, mambaRealNGroups, mambaRealConvKernel,
+                                      initializeWeights = initializeWeights)
+    result.attn = newLinearPlusAttention(embedDim, nHeads, useSession, initializeWeights)
     # FIX: DÙNG CHUNG ln1 CHO CẢ MAMBA VÀ ATTENTION (giống Jamba gốc).
     # attnLn1 ĐÃ BỎ - 2 nhánh cùng thấy input đã chuẩn hóa y hệt → tránh lệch scale khi cộng residual.
     # P remains exact Mamba identity at initialization. G adds a near-identity
@@ -253,7 +255,7 @@ proc newJambaBlock(kind: BlockKind, embedDim, nHeads, ffMult: int, useSession: b
     for i in 0 ..< result.attn.outProj.weight.data.len: result.attn.outProj.weight.data[i] = 0'f32
     for i in 0 ..< result.attn.outProj.bias.data.len: result.attn.outProj.bias.data[i] = 0'f32
     if kind == bkMambaRealGated:
-      result.fuseGate = newLinear(embedDim * 2, embedDim)
+      result.fuseGate = newLinear(embedDim * 2, embedDim, initializeWeights)
       for i in 0 ..< result.fuseGate.weight.data.len: result.fuseGate.weight.data[i] = 0'f32
       for i in 0 ..< result.fuseGate.bias.data.len: result.fuseGate.bias.data[i] = 4'f32
     if quantResident:
@@ -263,22 +265,23 @@ proc newJambaBlock(kind: BlockKind, embedDim, nHeads, ffMult: int, useSession: b
 proc newNimformerModelJamba*(vocab, embedDim, nHeads, ffMult: int, pattern: string,
                               useSession: bool = true, mambaRealDState: int = 64,
                               mambaRealNGroups: int = 1, mambaRealConvKernel: int = 4,
-                              mambaRealExpand: int = 2, quantResident: bool = false): NimformerModelJamba =
+                              mambaRealExpand: int = 2, quantResident: bool = false;
+                              initializeWeights = true): NimformerModelJamba =
   assert pattern.len > 0, "pattern rong - can it nhat 1 layer"
   result.vocab = vocab
   result.embedDim = embedDim
   result.nHeads = nHeads
   result.ffMult = ffMult
   result.pattern = pattern
-  result.embed = newEmbedding(vocab, embedDim)
-  result.outProj = newLinear(embedDim, vocab)
+  result.embed = newEmbedding(vocab, embedDim, initializeWeights)
+  result.outProj = newLinear(embedDim, vocab, initializeWeights)
   result.normF = newLayerNorm(embedDim)   # LEGACY - không còn dùng (xem struct)
   result.rmsF = newRmsNorm(embedDim)      # MOI (rms-fin): norm_f THẬT trước lm_head
   result.blocks = newSeq[JambaBlock](pattern.len)
   for i, c in pattern:
     result.blocks[i] = newJambaBlock(charToKind(c), embedDim, nHeads, ffMult, useSession,
                                       mambaRealDState, mambaRealNGroups, mambaRealConvKernel,
-                                      mambaRealExpand, quantResident)
+                                      mambaRealExpand, quantResident, initializeWeights)
 
 # ═══════════════════════════════════════════════════════════════
 # FORWARD / BACKWARD theo block. R/P được xử lý bởi block-kernel entrypoints

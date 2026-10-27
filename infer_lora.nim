@@ -19,6 +19,7 @@ import session_vm
 import jit_vm
 import hybrid_block_kernel
 import prefill_profile   # BYBY_PREFILL_PROFILE
+import prefill_gpu
 import mamba2_real
 import mamba2_full_vm
 import mamba2_fused_step
@@ -30,42 +31,25 @@ import test_nimformer   # BPETokenizer: loadBPE/encodeBPE/decodeBPEStr
 import load_codestral_into_jamba   # loadCodestralQuantResidentFromNimq - tai tao base tu .nimq
 import quantize_lora_bin_4bit
 when defined(macosx):
-  # MOI: ha QoS cua tien trinh xuong UTILITY - macOS MAC DINH gan thread
-  # chinh cua 1 chuong trinh CLI o QOS_CLASS_USER_INTERACTIVE (muc CAO
-  # NHAT, ngang hang voi chinh UI!) - nghia la infer_lora_bin dang tranh
-  # CPU/GPU ngang hang voi WindowServer/UI, KHONG he bi he thong tu dong
-  # nhuong cho UI khi can. Day rat co the la nguyen nhan chinh gay lag/
-  # giat may (rieng cho GPU tich hop dung chung man hinh nhu Iris 640).
-  # QOS_CLASS_UTILITY = viec chay nen dai hoi, nguoi dung biet co no chay
-  # nhung khong doi truc tiep tung giay - dung y het tinh chat infer nay.
-  # Da xac nhan thuc te (Apple docs + issue clangd#1119): doi tu muc cao
-  # sang UTILITY giu may "responsive" cho cong viec nen nang tuong tu.
+  # QOS_CLASS_USER_INITIATED (0x19): CLI inference đang trực tiếp phục vụ
+  # yêu cầu của người dùng. Đây là ưu tiên thread CPU; Metal không có API
+  # công khai tương đương để cưỡng ép GPU scheduler ưu tiên command buffer.
   type QosClassT = cint
-  const QOS_CLASS_UTILITY: QosClassT = 0x11
+  const QOS_CLASS_USER_INITIATED: QosClassT = 0x19
   proc pthread_set_qos_class_self_np(qos_class: QosClassT, relative_priority: cint): cint
     {.importc: "pthread_set_qos_class_self_np", header: "<pthread/qos.h>".}
 
-  proc lowerProcessPriorityForBackgroundInfer*() =
-    ## Goi 1 LAN, CANG SOM CANG TOT (dau chuong trinh) - anh huong toan bo
-    ## viec CPU submit lenh GPU sau do.
-    ## SUA (sau nhieu lan bi Killed:9 khong on dinh - luc thi luc khong,
-    ## cung 1 dong code): MAC DINH TAT (truoc day mac dinh BAT). QoS thap
-    ## hon khien tien trinh de bi macOS chon giet TRUOC TIEN khi he thong
-    ## can giai phong RAM gap (jetsam) - dung tinh nang, nhung danh doi
-    ## that: tien trinh nang RAM (~model 7B) + QoS thap la cong thuc de bi
-    ## kill hon, ke ca luc Memory Pressure hien XANH (khong the hien ro
-    ## tren Activity Monitor tuc thoi). Vi da xay ra kill khong on dinh
-    ## nhieu lan sau khi bat tinh nang nay, chuyen thanh phai tu bat
-    ## (BYBY_LOW_PRIORITY=1) thay vi mac dinh bat - uu tien AN TOAN/ON DINH
-    ## hon la do lag, tru khi nguoi dung chu dong chon danh doi nguoc lai.
-    if getEnv("BYBY_LOW_PRIORITY", "0") == "1":
-      let rc = pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0)
+  proc setInferenceThreadPriority*() =
+    ## Default ON for an interactive inference run. Set
+    ## BYBY_MACOS_HIGH_PRIORITY=0 to leave inherited QoS unchanged.
+    if getEnv("BYBY_MACOS_HIGH_PRIORITY", "1") != "0":
+      let rc = pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0)
       if rc == 0:
-        stderr.writeLine "[infer] Da ha QoS tien trinh xuong UTILITY (may nen it lag hon nhung DE BI HE THONG KILL HON khi can RAM gap - tat bang BYBY_LOW_PRIORITY=0)"
+        stderr.writeLine "[infer] macOS thread QoS = USER_INITIATED"
       else:
-        stderr.writeLine "[infer] CANH BAO: ha QoS that bai (rc=" & $rc & ") - bo qua, chay binh thuong"
+        stderr.writeLine "[infer] macOS QoS update failed (rc=" & $rc & "); using inherited priority"
 else:
-  proc lowerProcessPriorityForBackgroundInfer*() = discard
+  proc setInferenceThreadPriority*() = discard
 
 # MOI: doc peak-RSS THAT cua chinh tien trinh (khong fork process con -
 # xem giai thich day du trong finetune_lora.nim, ban dau tung dung
@@ -179,24 +163,23 @@ proc decodeAny(t: AnyTokenizer, ids: seq[int]): string =
   of atkHf: decodeHf(t.hf, ids)
 
 proc bannedMask(t: AnyTokenizer, vocab: int): seq[bool] =
-  ## banned[id]=true -> KHONG duoc sample.
-  ## HfTokenizer.banned da bao gom special + standalone-space token duoc
-  ## xac dinh tu vocabulary/encode(" "), KHONG hard-code token ID.
+  ## Chi chan token DIEU KHIEN cua tokenizer, cho phep tat ca token van ban
+  ## va khoang trang (ke ca \n / indent). Khong dung bang garbageSpace:
+  ## whitespace token hop le co the decode rieng thanh chuoi rong.
   result = newSeq[bool](vocab)
   case t.kind
   of atkHf:
-    if t.hf.banned.len != vocab:
-      # Truoc day chi CANH BAO roi tra ve mang toan false -> KHONG chan duoc
-      # special/whitespace token -> sampler co the boc vao token dieu khien
-      # => token rac. Vocab da duoc kiem tra khop luc load checkpoint, nen
-      # lech o day la bat thuong: dung ngay thay vi sinh rac am tham.
+    if t.hf.special.len != vocab:
       raise newException(ValueError,
-        "[infer] bang banned cua tokenizer (" & $t.hf.banned.len &
-        ") khac vocab model (" & $vocab &
-        "). KHONG the chan special token dang tin - dung ngay, khong sinh tiep.")
-    for i in 0 ..< vocab: result[i] = t.hf.banned[i]
+        "[infer] bang special cua tokenizer (" & $t.hf.special.len &
+        ") khac vocab model (" & $vocab & ")")
+    for i in 0 ..< vocab:
+      result[i] = t.hf.special[i]
+    # EOS / stop tokens phai duoc sample de generation ket thuc.
+    for id in t.hf.stopIds:
+      if id >= 0 and id < vocab: result[id] = false
   of atkBpe:
-    discard   # BPE tu che khong co special token
+    discard
 
 proc isStopAny(t: AnyTokenizer, id: int): bool =
   case t.kind
@@ -208,38 +191,6 @@ proc pieceAny(t: AnyTokenizer, id: int): string =
   case t.kind
   of atkHf: pieceOfHf(t.hf, id)
   of atkBpe: ""
-
-proc buildWsOnly(t: AnyTokenizer, vocab: int): seq[bool] =
-  ## Token CHI gom khoang trang/xuong dong (vd "▁" id=29473, "▁▁", "\n").
-  ## SUA BUG THAT: hf_tokenizer chi chan id lay tu encode(" ") = [1027] = "▁▁"
-  ## (dau cach kep, do dummy-prefix cua SentencePiece), con token "▁" DON
-  ## (id=29473) KHONG bi chan => model sinh "▁" 60 lan, decode ra toan khoang
-  ## trang. Quet tu decode([id,id]): khong rong va toan khoang trang.
-  result = newSeq[bool](vocab)
-  var n = 0
-  var shown: seq[string] = @[]
-  for id in 0 ..< vocab:
-    var txt = ""
-    try:
-      txt = decodeAny(t, @[id, id])
-    except CatchableError:
-      continue
-    if txt.len > 0 and txt.strip().len == 0:
-      result[id] = true
-      inc n
-      if shown.len < 6: shown.add &"{id}={pieceAny(t, id).escape}"
-  stderr.writeLine &"[infer] token chi gom khoang trang: {n} id (vd {shown.join(\" \")})"
-
-proc stepBanned(banned, wsOnly: seq[bool], gen: seq[int]): seq[bool] =
-  ## Chan token khoang-trang-thuan khi: (a) buoc sinh dau tien, hoac (b) 2 token
-  ## truoc deu la khoang trang -> khong cho cau tra loi mo dau bang khoang trang
-  ## va khong cho vong lap khoang trang; thut dong code (\n + "▁▁▁▁") van duoc.
-  result = banned
-  var blockWs = gen.len == 0
-  if gen.len >= 2 and wsOnly[gen[^1]] and wsOnly[gen[^2]]: blockWs = true
-  if blockWs:
-    for i in 0 ..< result.len:
-      if wsOnly[i]: result[i] = true
 
 proc buildNoPenalty(t: AnyTokenizer, vocab: int): seq[bool] =
   ## Token dinh dang thuan (\n, space, tab, thut dong) KHONG duoc coi la
@@ -397,7 +348,7 @@ var gCkptNormPreset = ""
   ## Rong = checkpoint CU (truoc ban co khoa nay) -> generate() tu do preset bang bisect.
 var gCkptMambaNormImpl = ""
 
-proc loadBinaryLoraForInfer(path: string): tuple[model: NimformerModelJamba, lora: JambaLora, tok: AnyTokenizer] =
+proc loadBinaryLoraForInfer*(path: string): tuple[model: NimformerModelJamba, lora: JambaLora, tok: AnyTokenizer] =
   ## Hỗ trợ NIMBIN1 (fp32) và NIMBIN4 (QLoRA 4-bit).
   ## SUA (bug RAM): newBlock KHONG con dequant fp32 ngay luc load nua (truoc
   ## day song resident suot doi chuong trinh, dung y het van de m 8GB fp32
@@ -465,7 +416,8 @@ proc loadBinaryLoraForInfer(path: string): tuple[model: NimformerModelJamba, lor
                                   mambaRealDState = CFG_CODESTRAL_DSTATE,
                                   mambaRealNGroups = CFG_CODESTRAL_NGROUPS,
                                   mambaRealConvKernel = CFG_CODESTRAL_CONVKERNEL,
-                                  mambaRealExpand = CFG_CODESTRAL_EXPAND, quantResident = true)
+                                  mambaRealExpand = CFG_CODESTRAL_EXPAND, quantResident = true,
+                                  initializeWeights = false)
   var quantResident = loadCodestralQuantResidentFromNimq(m, nimqPath)
   for name, qt in newBlockQuant:
     quantResident[name] = qt
@@ -592,12 +544,15 @@ proc loadBinaryLoraForInfer(path: string): tuple[model: NimformerModelJamba, lor
     if dropped.len > 0:
       echo &"[infer] Bo {dropped.len} LoRA adapter co A/B toan 0 (delta = 0, khong doi ket qua); " &
            &"con {lo.adapters.len} adapter co tac dung."
-  # BYBY_MERGE_LORA=1: gop LoRA vao weight fp4 ngay luc nap (tung tensor), bo han lenh LoRA tren GPU.
+  # BYBY_MERGE_LORA=1: chi merge neu sai so roundtrip duoc chung minh
+  # rat nho SO VOI delta LoRA. FP4-KM mac dinh duoc skip (giu LoRA fused),
+  # khong bao gio requant ngoai y muon va lam model sinh token sai.
   if getEnv("BYBY_MERGE_LORA", "0") == "1":
-    echo "[infer] BYBY_MERGE_LORA=1: CANH BAO - requantize FP4 lam MAT gan het delta LoRA va them " &
-         "nhieu luong tu vao ca tensor (xem mergeLoraIntoQuantBase) -> de ra token rac. Chi de thi nghiem."
+    echo "[infer] Safe LoRA merge: quantized weights khong duoc merge neu mat delta; " &
+         "loi thi giu adapter, tiep tuc fused one-dispatch."
     let nMerged = mergeLoraIntoQuantBase(lo)
-    echo "[infer] Da gop " & $nMerged & " adapter; con lai " & $lo.adapters.len & " adapter chay rieng."
+    echo "[infer] Ket qua safe merge: " & $nMerged & " adapter qua guard; " &
+         $lo.adapters.len & " adapter van duoc gan nguyen ven."
   # FIX IndexDefect: bind quantBase → Linear.weightQ/useQuant TRƯỚC generate.
   # (NIMBIN4 + quantResident: weight.data đã @[], phải nối weightQ trước
   # mergeInUploadStreamingJamba / uploadResident, kể cả block A linear.)
@@ -1033,9 +988,11 @@ proc parallelPrefillFallbackReason(m: NimformerModelJamba; lora: JambaLora;
     return "parallel prefill disabled by BYBY_PREFILL_PARALLEL=0"
   if not isGpuCtx(ctx): return "GPU backend is required"
   if tokenIds.len < 2: return "fewer than two prefix tokens"
-  # Prompt ngan hon BYBY_PREFILL_PAR_MIN_T thi di tung token. Mac dinh 2 = LUON prefill
-  # song song (khi du dieu kien). Dat 16 neu muon tranh JIT kernel theo T cho prompt ngan.
-  let parMinT = (try: parseInt(getEnv("BYBY_PREFILL_PAR_MIN_T", "2")) except ValueError: 2)
+  # The resident prefix avoids the host-transfer cost of the legacy scan and
+  # can batch even short prompts. Keep the old threshold for the old path.
+  let defaultMin = if getEnv("BYBY_PREFILL_RESIDENT", "1") != "0" and
+                      residentPrefillReason(m, ctx).len == 0: 2 else: 32
+  let parMinT = (try: parseInt(getEnv("BYBY_PREFILL_PAR_MIN_T", $defaultMin)) except ValueError: defaultMin)
   if tokenIds.len < parMinT:
     return "prompt " & $tokenIds.len & " token < BYBY_PREFILL_PAR_MIN_T=" & $parMinT
   if tokenIds.len > 64: return "sequence scan threadgroup limit is 64 tokens"
@@ -1069,6 +1026,10 @@ proc forwardParallelPrefill(m: var NimformerModelJamba; lora: JambaLora;
     gPfActive = false
     if gPfEnabled:
       pfReport(float((getMonoTime() - pfWall0).inNanoseconds) / 1e6)
+  if getEnv("BYBY_PREFILL_RESIDENT", "1") != "0" and residentPrefillReason(m, ctx).len == 0:
+    forwardResidentPrefill(m, tokenIds, ctx)
+    markGpuPrefillReady()
+    return
   pfTime("warmup+reset"):
     warmupGpuForParallelPrefill(m, ctx)
   var x = pfExpr("embed", m.embed.lookupBatch(@[tokenIds], ctx))
@@ -1112,11 +1073,15 @@ proc forwardPrefillBatch*(m: var NimformerModelJamba; lora: JambaLora;
         "falling back to tokenwise prefill: " & e.msg)
   else:
     echo "[infer] Parallel prefill unavailable (" & fallbackReason & "); using tokenwise prefill."
+  var prefixPath = "independent kernels, one session/token"
+  when not defined(noOneDispatch):
+    if gOdActive: prefixPath = "R one-dispatch segments + gated blocks"
+  echo "[infer] recurrent prefill: " & prefixPath & "; no intermediate logits."
   for i, tid in tokenIds:
-    if (i mod 1 == 0) or i == tokenIds.high:
+    if i == 0 or i == tokenIds.high or (i + 1) mod 16 == 0:
       echo "[infer] prefill token " & $(i + 1) & "/" & $tokenIds.len &
-        " id=" & $tid & ""
-    discard forwardStepJambaGpuRetry(m, tid, tokenIds, i, ctx)
+        " id=" & $tid
+    discard forwardStepJambaGpuRetry(m, tid, tokenIds, i, ctx, produceLogits = false)
   echo "[infer] Prefill xong " & $tokenIds.len & " token -> bat dau sinh."
 
 proc forwardPrefillBatch*(m: var NimformerModelJamba; tokenIds: seq[int];
@@ -1124,7 +1089,7 @@ proc forwardPrefillBatch*(m: var NimformerModelJamba; tokenIds: seq[int];
   ## Norm-sweep diagnostics intentionally do not receive the checkpoint's
   ## quantBase table, so keep their prior recurrent reference path.
   for i, tid in tokenIds:
-    discard forwardStepJambaGpuRetry(m, tid, tokenIds, i, ctx)
+    discard forwardStepJambaGpuRetry(m, tid, tokenIds, i, ctx, produceLogits = false)
 
 # ═══════════════════════════════════════════════════════════════════
 # Decode STREAM dung dau cach + chan doan token / norm preset
@@ -1273,7 +1238,7 @@ type SweepMode = object
   preset: string
 
 proc runBisect(m: var NimformerModelJamba, tok: AnyTokenizer, vocab: int,
-               banned, wsOnly, noPenalty: seq[bool], cfgBase: SamplerCfg, ctx: Backend): string =
+               banned, noPenalty: seq[bool], cfgBase: SamplerCfg, ctx: Backend): string =
   ## BYBY_NORM_SWEEP (opt-in): chia doi de tim cho hong, NGAY TRONG 1 lan
   ## chay (load model rat lau). Moi che do: (1) NLL teacher-forcing tren cau mau
   ## dung dinh dang train, (2) greedy sinh chu tu cau hoi ro rang, (3) residual.
@@ -1379,9 +1344,8 @@ proc runBisect(m: var NimformerModelJamba, tok: AnyTokenizer, vocab: int,
           lg0 = logits.data
         else:
           logits = forwardStepJambaGpuRetry(m, ids[^1], ids, ids.len - 1, ctx)
-        let bs = stepBanned(banned, wsOnly, gen)
         let winStart = max(0, ids.len - cfgG.repeatWindow)
-        let nid = sampleToken(logits.data, vocab, cfgG, bs, noPenalty,
+        let nid = sampleToken(logits.data, vocab, cfgG, banned, noPenalty,
                               toOpenArray(ids, winStart, ids.len - 1), rng)
         if isStopAny(tok, nid): break
         ids.add(nid)
@@ -1432,6 +1396,19 @@ proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenize
   echo "[infer] 100% GPU (R=Mamba2Real fp4/int4 O(1), A=LinearPlusAttention fp4/int4 O(1))."
   mergeInUploadStreamingJamba(m, lora, ctx)
   prepareGpuModel(m, lora, ctx)
+  # Inference now owns packed GPU buffers. Keeping the loader's second host
+  # copy costs ~3.5 GiB on Codestral and competes with the same iGPU RAM.
+  # Legacy sequence forward also uses gpuCacheName, so it needs only metadata.
+  var freedPackedBytes = 0
+  for name, qt in lora.quantBase.mpairs:
+    if name in gFp4CacheGpu and gFp4CacheGpu[name].residentReady and
+       ((ctx.kind.toByby() == gbMetal and gFp4CacheGpu[name].wBuf.metalHandle != nil) or
+        (ctx.kind.toByby() == gbVulkan and gFp4CacheGpu[name].wBuf.vulkanHandle.buf != nil)):
+      freedPackedBytes += qt.data.len
+      qt.data = @[]
+  if freedPackedBytes > 0:
+    echo "[infer] Packed GPU cache ready; released " &
+      $(freedPackedBytes div (1024 * 1024)) & " MiB duplicate host weights."
   GC_fullCollect()
   echo &"[infer] GPU san sang. RSS: {rssMB()}"
 
@@ -1447,14 +1424,13 @@ proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenize
   var rng = initRand(seed)
   let banned = bannedMask(tok, vocabModel)
   let noPenalty = buildNoPenalty(tok, vocabModel)
-  let wsOnly = buildWsOnly(tok, vocabModel)
   let cfg = defaultSamplerCfg(temperature)
   var nBanned = 0
   for b in banned:
     if b: inc nBanned
   echo &"[infer] sampler: T={cfg.temperature} top_p={cfg.topP} min_p={cfg.minP} " &
        &"repeat_penalty={cfg.repeatPenalty}/win={cfg.repeatWindow}, " &
-       &"chan {nBanned} special token."
+       &"chan {nBanned} control token (khong chan whitespace)."
 
   # ── (1) kiem tra kernel Linear++ step ngay tren GPU (dang thuc giai tich, vai giay) ──
   if getEnv("BYBY_LPCHECK", "0") != "0":
@@ -1473,7 +1449,7 @@ proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenize
   var sweepPreset = ""        # preset bisect de xuat (chi khi hybrid khop ro ret 1 kieu norm khac mac dinh)
   if getEnv("BYBY_NORM_SWEEP", "0") != "0":
     try:
-      sweepPreset = runBisect(m, tok, vocabModel, banned, wsOnly, noPenalty, cfg, ctx)
+      sweepPreset = runBisect(m, tok, vocabModel, banned, noPenalty, cfg, ctx)
     except Exception as e:
       stderr.writeLine "[bisect] LOI: " & e.msg & " - bo qua, chay binh thuong."
     setGpuDisableLora(false)
@@ -1561,7 +1537,7 @@ proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenize
       lastLogits = logits.data
 
     let winStart = max(0, ids.len - cfg.repeatWindow)
-    let bannedNow = stepBanned(banned, wsOnly, genIds)
+    # Mask chi danh cho control token, KHONG chan / phan loai whitespace.
     
     # DEBUG: Log sampling diagnostics. BYBY_DEBUG_SAMPLING=1 in N buoc dau
     # (N = BYBY_DEBUG_SAMPLING_STEPS, mac dinh 5). BYBY_DEBUG_SAMPLING_ALL=1
@@ -1572,9 +1548,9 @@ proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenize
     let dbgSamplingSteps = envInt("BYBY_DEBUG_SAMPLING_STEPS", 5)
     if dbgSampling and (dbgSamplingAll or step < dbgSamplingSteps):
       stderr.writeLine &"[DEBUG sample] step={step} vocab={vocabModel} temp={cfg.temperature} topP={cfg.topP} minP={cfg.minP} repPen={cfg.repeatPenalty} win={cfg.repeatWindow}"
-      stderr.writeLine &"[DEBUG sample] bannedNow.count={bannedNow.filterIt(it).len} wsOnly.count={wsOnly.filterIt(it).len} noPenalty.count={noPenalty.filterIt(it).len}"
+      stderr.writeLine &"[DEBUG sample] controlBanned.count={nBanned} noPenalty.count={noPenalty.filterIt(it).len}"
       stderr.writeLine &"[DEBUG sample] recentIds={ids[winStart ..< ids.len]}"
-      var logitStats = logitSummary(lastLogits, vocabModel, bannedNow)
+      let logitStats = logitSummary(lastLogits, vocabModel, banned)
       stderr.writeLine &"[DEBUG sample] logits: " & logitStats
       # Also print top 10 logits
       var idx = toSeq(0 ..< vocabModel)
@@ -1582,24 +1558,10 @@ proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenize
       for r in 0 ..< min(10, idx.len):
         let tid = idx[r]
         let txt = decodeAny(tok, @[tid])
-        stderr.writeLine &"      top#{r}: id={tid} logit={lastLogits[tid]:.3f} banned={bannedNow[tid]} text={txt.escape}"
+        stderr.writeLine &"      top#{r}: id={tid} logit={lastLogits[tid]:.3f} banned={banned[tid]} text={txt.escape}"
     
-    let nextId = sampleToken(lastLogits, vocabModel, cfg, bannedNow, noPenalty,
+    let nextId = sampleToken(lastLogits, vocabModel, cfg, banned, noPenalty,
                              toOpenArray(ids, winStart, ids.len - 1), rng)
-
-    # BYBY_DEBUG_RAC=1: log NGAY token vua sample o MOI buoc, danh dau token rac
-    # (decode ra U+FFFD/rong, hoac piece chi gom khoang trang). BYBY_DEBUG_SAMPLING
-    # chi in TOP logits chu KHONG in token THUC SU duoc chon - day moi la thu
-    # can de khoanh vung "token rac" xuat hien o buoc nao.
-    if getEnv("BYBY_DEBUG_RAC", "0") != "0":
-      let pieceTxt = decodeAny(tok, @[nextId])
-      let pieceRaw = pieceAny(tok, nextId)
-      let badUtf8 = pieceTxt.contains("\xEF\xBF\xBD") or pieceTxt.len == 0
-      let spaceOnly = pieceRaw.len > 0 and pieceRaw.strip().len == 0
-      stderr.writeLine &"[rac] #{step+1} id={nextId} logit={lastLogits[nextId]:.3f} " &
-        &"banned={bannedNow[nextId]} piece={pieceRaw.escape} text={pieceTxt.escape}" &
-        (if badUtf8: " <-- GARBAGE(U+FFFD/empty)" else: "") &
-        (if spaceOnly: " <-- SPACE-ONLY" else: "")
 
     if step == 0 and getEnv("BYBY_DEBUG_TOP5", "0") != "0":
       stderr.writeLine "==== [top5 logits, buoc 0] vocab=" & $vocabModel & " " &
@@ -1669,10 +1631,6 @@ proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenize
     if profSummary.len > 0: stderr.writeLine profSummary
   let splitSummary = decodeSplitSummary()
   if splitSummary.len > 0: stderr.writeLine splitSummary
-  if genIds.len >= 8 and (sd.emitted.strip().len == 0 or distinctGen.len <= 2):
-    stderr.writeLine "[infer] CANH BAO: dau ra rong/lap -> hidden state nhieu kha nang SAI. " &
-      "Chay lai voi BYBY_NORM_SWEEP=1 (thu nhieu cau hinh norm) va BYBY_TRACE_BLOCKS=1 " &
-      "(do residual tung khoi) de tim khoi/cau hinh gay lech."
 
   stdout.write("\n")
   result = printedText
@@ -1680,7 +1638,7 @@ proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenize
 
 
 when isMainModule:
-  lowerProcessPriorityForBackgroundInfer()
+  setInferenceThreadPriority()
   let args = commandLineParams()
   let ckptPath = if args.len >= 1: args[0] else: CFG_CHECKPOINT_PATH
   # ═══ SUA: BO KHOANG TRANG CUOI PROMPT ═══
@@ -1750,6 +1708,6 @@ when isMainModule:
     echo &"[infer] R-only block indices: {rBlocks}; no Linear++ sidecars loaded."
   echo &"[infer] RSS ngay sau khi load xong model (truoc khi suy luan): {rssMB()}"
   echo &"[infer] prompt: {prompt}"
-  discard generate(m, lo, tok, prompt, CFG_MAX_NEW_TOKENS, ctx,
+  discard generate(m, lo, tok, prompt, max(1, envInt("BYBY_MAX_NEW_TOKENS", CFG_MAX_NEW_TOKENS)), ctx,
                     temperature = temperature, seed = CFG_SEED)
   echo "─────────────────────────────"

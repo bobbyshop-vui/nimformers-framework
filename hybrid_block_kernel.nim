@@ -78,7 +78,7 @@ proc forwardMambaMixerKernel(mamba: Mamba2Real; x: Tensor; ctx: Backend):
   let tgR = rmsTg(L)
   discard runMicroVmChain(ctx, [
     (buildM2ConvDtProgram(L), L.BT * M2Tg, 4, M2Tg, "@m2_conv_dt_" & m2Tag(L)),
-    mamba2ScanStep(L),
+    mamba2ScanStep(L, ctx),
     (buildM2RmsFwdProgram(L), L.BT * L.normGroups * tgR, tgR * 4, tgR,
       "@m2_rms_" & m2Tag(L))], buf)
   pfAddIf("blk.mamba2Vm", pfVm0)
@@ -145,7 +145,7 @@ proc forwardMambaMixerInfer(mamba: Mamba2Real; x: Tensor; ctx: Backend):
     try:
       outs = runMicroVmChainSparse(ctx, [
         (buildM2ConvDtProgram(L), L.BT * M2Tg, 4, M2Tg, "@m2_conv_dt_" & m2Tag(L)),
-        mamba2ScanStep(L),
+        mamba2ScanStep(L, ctx),
         (buildM2RmsFwdProgram(L), L.BT * L.normGroups * tgR, tgR * 4, tgR,
           "@m2_rms_" & m2Tag(L))], L.fwdEnd, head,
         [(off: L.normedOut, len: L.BT * C), (off: L.states + T * L.HD * L.N, len: L.HD * L.N)])
@@ -450,7 +450,7 @@ proc forwardPBlockKernel*(mamba: Mamba2Real; attn: LinearPlusAttention;
     var blockSteps: seq[MvmStep] = @[
       (buildM2ConvDtProgram(mLay), mLay.BT * M2Tg, 4, M2Tg,
         "@m2_conv_dt_" & m2Tag(mLay)),
-      mamba2ScanStep(mLay),
+      mamba2ScanStep(mLay, ctx),
       (buildM2RmsFwdProgram(mLay), mLay.BT * mLay.normGroups * tgR,
         tgR * 4, tgR, "@m2_rms_" & m2Tag(mLay))]
     for lpStep in linearPlusForwardSteps(lpLay):

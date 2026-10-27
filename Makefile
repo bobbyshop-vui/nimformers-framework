@@ -2,6 +2,8 @@
 
 NIM      := nim
 NIMFLAGS := -d:release --hints:off --mm:arc --opt:speed
+INFER_LORA_NIMCACHE := nimcache/infer-lora
+NIM_INFER_NIMCACHE := nimcache/nim-inference
 
 TEST_SRC  := test_nimformer.nim
 
@@ -145,23 +147,49 @@ build-graft:
 build-finetune:
 	$(NIM) c $(NIMFLAGS) -o:$(FINETUNE_BIN) $(FINETUNE_SRC)
 
-# Cac path toi uu cua infer-lora (one-dispatch, GEMV 4 hang, prefill song song,
-# Mamba2/Linear++ parallel scan, pad M fp4) da BAT MAC DINH trong code - khong can
-# export o day. Tat tung cai de A/B: make infer-lora BYBY_ONE_DISPATCH=0 /
+# Infer defaults: independent decode kernels in one session + resident GPU
+# prefill (R/P/G). One-dispatch is opt-in after the Iris 640 end-to-end A/B.
+# Compare paths with: make infer-lora BYBY_ONE_DISPATCH=1 /
+# BYBY_PREFILL_RESIDENT=0 /
 # BYBY_GEMV_VARIANT=0 / BYBY_PREFILL_PARALLEL=0 / BYBY_MAMBA_SCAN_PARALLEL=0 /
 # BYBY_LP_SCAN_SERIAL=1 / BYBY_FP4_PAD_M=0.
 # Gop LoRA vao fp4 lam token rac -> TAT. LoRA chay rieng.
 export BYBY_MERGE_LORA ?= 0
+export BYBY_ONE_DISPATCH ?= 0
+export BYBY_PREFILL_RESIDENT ?= 1
+export BYBY_GEMV_VARIANT ?= auto
+export BYBY_PREFILL_FP4_KERNEL ?= auto
+export BYBY_GPU_AUTOTUNE ?= 1
+export BYBY_VULKAN_TENSOR_CORES ?= 1
+export BYBY_MERGE_ALL_LAYERS_SESSION ?= 1
+export BYBY_MERGE_QKV_ATTN_SESSION ?= 1
+export BYBY_DISABLE_KV_RESIDENT ?= 0
 export BYBY_DECODE_PROFILE ?= 1
+export BYBY_PREFILL_PROFILE ?= 1
 export BYBY_INFER_VERBOSE ?= 1
 export BYBY_DEBUG_SAMPLING ?= 1
 export BYBY_G_DIAGNOSTICS ?= 0
 export BYBY_TRACE_BLOCKS ?= 0
-export BYBY_LOW_PRIORITY ?= 0
+export BYBY_MACOS_HIGH_PRIORITY ?= 1
 
 # One-dispatch duoc build mac dinh; -d:noOneDispatch de bo han khoi binary.
-build-infer-lora:
-	$(NIM) c $(NIMFLAGS) -o:$(INFER_LORA_BIN) $(INFER_LORA_SRC)
+# Keep the Metal extension reproducible even when bybylang is a fresh submodule.
+.PHONY: prepare-resident-metal
+prepare-resident-metal:
+	@if ! grep -q 'proc metalSessionMatmulMpsNTEnc' vendor/bybylang/backends/metal/metal_backend.nim; then \
+		patch --dry-run -d vendor/bybylang -p1 < patches/bybylang-resident-mps.patch >/dev/null && \
+		patch -d vendor/bybylang -p1 < patches/bybylang-resident-mps.patch; \
+	fi
+
+.PHONY: prepare-vulkan-inference
+prepare-vulkan-inference: prepare-resident-metal
+	@if ! grep -q 'proc vulkanTensorCoreAvailable' vendor/bybylang/backends/vulkan/vulkan_driver.nim; then \
+		patch --dry-run -d vendor/bybylang -p1 < patches/bybylang-inference-gpu.patch >/dev/null && \
+		patch -d vendor/bybylang -p1 < patches/bybylang-inference-gpu.patch; \
+	fi
+
+build-infer-lora: prepare-vulkan-inference
+	$(NIM) c $(NIMFLAGS) --nimcache:$(INFER_LORA_NIMCACHE) -o:$(INFER_LORA_BIN) $(INFER_LORA_SRC)
 
 build-compact-lora:
 	$(NIM) c $(NIMFLAGS) -o:$(COMPACT_LORA_BIN) compact_lora_checkpoint.nim
@@ -169,8 +197,8 @@ build-compact-lora:
 build-migrate-lora:
 	$(NIM) c $(NIMFLAGS) -o:$(MIGRATE_LORA_BIN) migrate_lora_json_to_bin.nim
 
-build-nim-inference:
-	$(NIM) c $(NIMFLAGS) -o:$(NIM_INFER_BIN) $(NIM_INFER_SRC)
+build-nim-inference: prepare-vulkan-inference
+	$(NIM) c $(NIMFLAGS) --nimcache:$(NIM_INFER_NIMCACHE) -o:$(NIM_INFER_BIN) $(NIM_INFER_SRC)
 
 build-spectron:
 	$(NIM) c $(NIMFLAGS) -o:$(SPECTRON_BIN) $(SPECTRON_SRC)

@@ -90,7 +90,7 @@ proc clearLayerProgress*(ckptPath: string) =
 proc hasLayerProgress*(ckptPath: string, step: int): bool =
   result = dirExists(stepDir(ckptPath, step))
 
-proc writeCursor(ckptPath: string, step, layer: int) =
+proc commitLayerProgressCursor*(ckptPath: string, step, layer: int) =
   createDir(progressDir(ckptPath))
   let p = cursorPath(ckptPath)
   let tmp = p & ".tmp"
@@ -156,7 +156,7 @@ proc saveLayerProgress*(ckptPath: string, step, layer: int,
       f.close()
     atomicReplace(tmpPath, finalPath)
 
-  writeCursor(ckptPath, step, layer)
+  commitLayerProgressCursor(ckptPath, step, layer)
 
 proc loadLayerProgress*(ckptPath: string, step, layer: int): seq[LayerTensor] =
   ## Read back exactly what `saveLayerProgress` wrote, or an empty seq when
@@ -212,3 +212,25 @@ proc loadLayerProgress*(ckptPath: string, step, layer: int): seq[LayerTensor] =
           return newSeq[LayerTensor]()
   finally:
     f.close()
+
+proc layerProgressReadable*(ckptPath: string, step, layer: int): bool =
+  ## True only when both files exist and the complete tensor manifest/payload
+  ## can be read. An empty *legitimate* layer has a 4-byte manifest count=0
+  ## and just the magic bytes in .bin; do not confuse it with a missing layer.
+  let binPath = layerBinPath(ckptPath, step, layer)
+  let idxPath = layerIdxPath(ckptPath, step, layer)
+  if not fileExists(binPath) or not fileExists(idxPath): return false
+  let tensors = loadLayerProgress(ckptPath, step, layer)
+  if tensors.len > 0: return true
+  if getFileSize(idxPath) != int64(sizeof(int32)) or
+     getFileSize(binPath) != int64(ProgressMagicLen): return false
+  var f: File
+  if not open(f, idxPath, fmRead): return false
+  var n: int32
+  let ok = f.readBuffer(addr n, sizeof(n)) == sizeof(n) and n == 0
+  f.close()
+  if not ok: return false
+  if not open(f, binPath, fmRead): return false
+  var magic = newString(ProgressMagicLen)
+  result = f.readBuffer(addr magic[0], magic.len) == magic.len and magic == ProgressMagic
+  f.close()
