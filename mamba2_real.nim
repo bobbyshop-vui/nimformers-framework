@@ -46,7 +46,8 @@ type
 proc convDim*(m: Mamba2Real): int = m.intermediateSize + 2 * m.nGroups * m.dState
 
 proc newMamba2Real*(hiddenSize, intermediateSize, numHeads, dState, nGroups: int,
-                     convKernel: int = 4, normEps: float32 = 1e-5'f32): Mamba2Real =
+                     convKernel: int = 4, normEps: float32 = 1e-5'f32;
+                     initializeWeights = true): Mamba2Real =
   assert intermediateSize mod numHeads == 0, "intermediateSize phai chia het numHeads"
   assert numHeads mod nGroups == 0, "numHeads phai chia het nGroups"
   result.hiddenSize = hiddenSize
@@ -58,7 +59,8 @@ proc newMamba2Real*(hiddenSize, intermediateSize, numHeads, dState, nGroups: int
   result.convKernel = convKernel
   result.normEps = normEps
   let cDim = intermediateSize + 2 * nGroups * dState
-  result.inProj = newLinear(hiddenSize, 2 * intermediateSize + 2 * nGroups * dState + numHeads)
+  result.inProj = newLinear(hiddenSize, 2 * intermediateSize + 2 * nGroups * dState + numHeads,
+    initializeWeights)
   result.convWeight = randnTensor(@[cDim, convKernel], 1'f32 / sqrt(float32(convKernel)))
   result.convBias = newTensor(@[cDim])
   result.aLog = newTensor(@[numHeads])
@@ -67,7 +69,7 @@ proc newMamba2Real*(hiddenSize, intermediateSize, numHeads, dState, nGroups: int
   result.dSkip = newTensor(@[numHeads], 1'f32)
   result.dtBias = newTensor(@[numHeads])
   result.normWeight = newTensor(@[intermediateSize], 1'f32)
-  result.outProj = newLinear(intermediateSize, hiddenSize)
+  result.outProj = newLinear(intermediateSize, hiddenSize, initializeWeights)
 
 proc inProjSsmRowRange*(intermediateSize, nGroups, dState, numHeads: int): (int, int) =
   ## Hàng [lo, hi) của inProj.weight thuộc nhánh SSM (xBC + dt), không gồm z-gate.
@@ -123,7 +125,7 @@ proc forwardMamba2Real*(m: Mamba2Real, x: Tensor, ctx: Backend):
   let tgR = rmsTg(L)
   discard runMicroVmChain(ctx, [
     (buildM2ConvDtProgram(L), L.BT * M2Tg, 4, M2Tg, "@m2_conv_dt_" & m2Tag(L)),
-    mamba2ScanStep(L),
+    mamba2ScanStep(L, ctx),
     (buildM2RmsFwdProgram(L), L.BT * L.normGroups * tgR, tgR * 4, tgR, "@m2_rms_" & m2Tag(L))], buf)
   let normedOut = sliceTensor(buf, L.normedOut, L.BT * C, @[B, T, C])
   let y = m.outProj.forward(normedOut, ctx)

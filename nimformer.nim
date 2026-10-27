@@ -95,6 +95,7 @@ type
                                         ## int4-asymmetric (int8/int4-symmetric/tied-embedding) -
                                         ## dequant 1 lần lúc load thay vì mỗi token (xem backend.nim)
     residentFp32Ready*: bool           ## true sau khi residentFp32 đã upload xong
+    residentFp32NT*: bool              ## residentFp32 stores original [outF,inF] rows
     loraA*, loraB*: seq[float32]  ## THÊM (xem forward() dưới + mergeInUploadStreamingJamba
                                    ## trong lora.nim): adapter LoRA gắn rời, KHÔNG merge vật
                                    ## lý vào weight - giữ base (weightQ/useQuant) NGUYÊN VẸN
@@ -106,11 +107,12 @@ type
     loraScale*: float32           ## alpha / r
     gpuCacheName*: string         ## ten trong gFp4CacheGpu sau prepareGpuLinForLinear (FP4-KM)
 
-proc newLinear*(inF, outF: int): Linear =
+proc newLinear*(inF, outF: int; initializeWeights = true): Linear =
   let scale = sqrt(2'f32 / float32(inF))
   result.inF = inF
   result.outF = outF
-  result.weight = randnTensor(@[outF, inF], scale)
+  result.weight = if initializeWeights: randnTensor(@[outF, inF], scale)
+                  else: Tensor(shape: @[outF, inF], data: @[])
   result.useQuant = false
   result.bias = newTensor(@[outF])
 
@@ -126,6 +128,7 @@ proc setQuantWeight*(l: var Linear, qt: QuantTensor) =
   # changes; force the next forward to use the newly bound weightQ.
   l.residentReady = false
   l.residentFp32Ready = false
+  l.residentFp32NT = false
 proc uploadResident*(l: var Linear, ctx: Backend, sparsityPct: float32 = 0.0'f32) =
   ## Upload weight lên GPU MỘT LẦN (gọi từ loadLlamaWeightsL sau khi load
   ## xong, KHÔNG gọi trong vòng lặp decode).
@@ -175,6 +178,7 @@ proc uploadResident*(l: var Linear, ctx: Backend, sparsityPct: float32 = 0.0'f32
     # LẦN, upload resident fp32.
     let wT = dequantizeTensorTransposed(l.weightQ)
     l.residentFp32 = beResidentUploadFp32(ctx, wT)
+    l.residentFp32NT = false
     l.residentFp32Ready = true
     # TOI UU RAM: sau khi upload xong, forward() CHI dung duong residentFp32Ready
     # (xem forward() duoi day) - l.weight.data (neu co, vd sau mergeIn() ghi
@@ -189,7 +193,32 @@ proc uploadResident*(l: var Linear, ctx: Backend, sparsityPct: float32 = 0.0'f32
     # transpose 1 LẦN thay vì mỗi token.
     let wT = transpose(l.weight).data
     l.residentFp32 = beResidentUploadFp32(ctx, wT)
+    l.residentFp32NT = false
     l.residentFp32Ready = true
+
+proc residentLinearNt(l: Linear; x: seq[float32]; rows: int; ctx: Backend): seq[float32] =
+  ## Share inference's original row-major GPU weight with sequence forward.
+  let be = ctx.kind.toByby()
+  var hx = byby.sessionUpload(be, x)
+  var hy = byby.sessionAllocScratch(be, rows * l.outF)
+  var opened = false
+  try:
+    if not byby.sessionBegin(be): raise newException(CatchableError, "resident NT sessionBegin failed")
+    opened = true
+    if not byby.sessionMatmulNT(be, hx, l.residentFp32, hy, rows, l.inF, l.outF):
+      raise newException(CatchableError, "resident NT GEMM failed")
+    let ended = byby.sessionEnd(be)
+    opened = false
+    if not ended:
+      discard byby.sessionRecoverQueue(be)
+      raise newException(CatchableError, "resident NT sessionEnd failed")
+    result = byby.sessionRead(be, hy, rows * l.outF)
+  finally:
+    if opened:
+      discard byby.sessionEnd(be)
+      discard byby.sessionRecoverQueue(be)
+    byby.sessionFree(be, hx)
+    byby.sessionFree(be, hy)
 
 proc forward*(l: Linear, x: Tensor, ctx: Backend): Tensor =
   let (rows, cols) = flatten2D(x.shape)
@@ -206,7 +235,8 @@ proc forward*(l: Linear, x: Tensor, ctx: Backend): Tensor =
       # FIX: weight int8/int4-symmetric/fp32-thường ĐÃ resident (xem
       # uploadResident) - chỉ upload activation nhỏ mỗi token, KHÔNG dequant
       # lại toàn bộ weight nữa.
-      y = beResidentLinearFp32(ctx, x.data, l.residentFp32, rows, l.inF, l.outF)
+      y = if l.residentFp32NT: residentLinearNt(l, x.data, rows, ctx)
+          else: beResidentLinearFp32(ctx, x.data, l.residentFp32, rows, l.inF, l.outF)
 
     if y.len == 0:
       # Chưa resident, hoặc backend hiện tại không hỗ trợ đường resident (vd
@@ -567,10 +597,11 @@ type
     weight*: Tensor
     dim*, vocab*: int
 
-proc newEmbedding*(vocab, dim: int): Embedding =
+proc newEmbedding*(vocab, dim: int; initializeWeights = true): Embedding =
   result.vocab = vocab
   result.dim = dim
-  result.weight = randnTensor(@[vocab, dim], sqrt(2'f32 / float32(vocab)))
+  result.weight = if initializeWeights: randnTensor(@[vocab, dim], sqrt(2'f32 / float32(vocab)))
+                  else: Tensor(shape: @[vocab, dim], data: @[])
 
 proc lookupBatch*(e: Embedding, idsBatch: seq[seq[int]], ctx: Backend): Tensor =
   let B = idsBatch.len

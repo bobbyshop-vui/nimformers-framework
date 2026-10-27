@@ -57,12 +57,31 @@ proc isPrecisionSensitive(name: string): bool =
 
 when isMainModule:
   if paramCount() < 2:
-    echo "usage: merge_lora_to_nimq <tien_to_checkpoint (co <tien_to>.lora.json canh ben)> <out.nimq> [--graft-quant int8|int4|fp4|fp8]"
+    echo "usage (LEGACY/UNSAFE): merge_lora_to_nimq <tien_to_checkpoint (co <tien_to>.lora.json canh ben)> <out.nimq> [--graft-quant int8|int4|fp4|fp8] [--unsafe-legacy-requant]"
     echo "       CAM .bin: tham so dau CHI dung de tim <tien_to>.lora.json, KHONG doc file .bin nao."
     quit(1)
 
   let ckptPrefix = paramStr(1)
   let outPath = paramStr(2)
+  # Tool nay CHI doc JSON legacy; khong the merge checkpoint NIMBIN4
+  # cua `finetune_lora.nim` hien tai. Mac dinh fail-closed de tranh tao .nimq
+  # bi requant Mamba toan bo -> token sai va mat LoRA delta.
+  var unsafeLegacy = false
+  for k in 3 .. paramCount():
+    if paramStr(k) == "--unsafe-legacy-requant": unsafeLegacy = true
+  if not unsafeLegacy:
+    stderr.writeLine "[merge] SAFE STOP: tool nay chi ho tro .lora.json legacy, " &
+      "khong doc checkpoint NIMBIN4 .bin hien tai; no con requant Mamba ve FP4."
+    stderr.writeLine "[merge] KHONG tao merged .nimq vi co nguy co mat delta LoRA " &
+      "va lam model sinh token sai. BYBY_MERGE_LORA=1 trong infer_lora.nim " &
+      "co quality guard va fallback ve fused adapter."
+    stderr.writeLine "[merge] Neu buoc phai chay tool JSON cu, " &
+      "dung --unsafe-legacy-requant (KHONG dung voi .bin hien tai)."
+    quit(1)
+  if ckptPrefix.toLowerAscii.endsWith(".bin") and fileExists(ckptPrefix):
+    stderr.writeLine "[merge] STOP: input la checkpoint .bin, " &
+      "nhung tool nay KHONG biet doc .bin. Khong duoc merge JSON thay the."
+    quit(1)
   var graftQuantStr = "int8"
   var i = 3
   while i <= paramCount():

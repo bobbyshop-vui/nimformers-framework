@@ -417,21 +417,31 @@ proc dropZeroLoraAdapters*(lo: var JambaLora): seq[string] =
   for name in result: lo.adapters.del(name)
 
 proc mergeLoraIntoQuantBase*(lo: var JambaLora, verbose = true): int =
-  ## GOP VINH VIEN LoRA vao weight fp4 (QuantTensor) - TUNG TENSOR MOT:
-  ##   dequant(base) -> + scale * B@A -> quantize LAI cung kind/format -> thay vao quantBase,
-  ## roi XOA adapter do khoi lo.adapters. Sau do KHONG con lenh LoRA nao tren GPU
-  ## (bo ~4 dispatch/block R). Bo nho dinh ~3 ban cua 1 tensor (~1GB), khong dequant ca model.
-  ## Tra ve so adapter da gop.
-  ## CANH BAO CHAT LUONG (da do tren checkpoint that, block 0/51/58): delta LoRA ~0.1% norm
-  ## weight, nho hon buoc luong tu FP4 hang chuc lan -> requantize chi giu ~0-1% delta, trong
-  ## khi quantizeFp4KM tinh lai globalScale/scale nhom nen lam tron lai ca tensor (in_proj:
-  ## 88% phan tu doi, nhieu ~2.9% |W| - gap ~3 lan chinh delta). Ket qua = mat LoRA + them
-  ## nhieu o ca 128 ma tran -> token rac. Chi dung de thi nghiem.
-  var names: seq[string]
-  for name in lo.adapters.keys: names.add name
+  ## MERGE AN TOAN: khong bao gio xoa adapter truoc khi xac minh tensor da merge.
+  ## W_ref = dequant(base) + scale*B@A, W_test = dequant(requant(W_ref)).
+  ## Kiem tra error tuong doi voi CHINH delta LoRA (khong so voi |W_base|:
+  ## LoRA nho ~0.1% |W|, so voi |W| se che giau mat het delta).
+  ##
+  ## Mac dinh KHONG thu requant FP4 / INT4 (khoang luong tu lon hon LoRA,
+  ## ton nhieu phut+RAM de thu). Set BYBY_MERGE_LORA_TRY_FP4=1 neu muon
+  ## KIEM THU CO GUARD. Neu khong qua thi GIU base + adapter nguyen ven,
+  ## forward van fuse LoRA trong one-dispatch; khong lam hu checkpoint .bin.
+  ##
+  ## NOTE: Khong co cach "merge lossless vao 4-bit" noi chung voi LoRA
+  ## fp32 bat ky. Dense fp16/fp32 can backend khac va RAM cao hon.
+  const maxRelativeDeltaError = 0.001'f64  # 0.1% RMS error cua delta
+  const maxRelativePeakError = 0.01'f64    # 1% cua peak delta
+  let tryLowBit = getEnv("BYBY_MERGE_LORA_TRY_FP4", "0") == "1"
+  var names: seq[string] = @[]
+  for name in lo.adapters.keys: names.add(name)
   var merged = 0
+  var skippedLowBit = 0
+  var rejected = 0
+  var withoutBase = 0
   for name in names:
-    if name notin lo.quantBase: continue
+    if name notin lo.quantBase:
+      inc withoutBase
+      continue
     let base = lo.quantBase[name]
     if base.shape.len != 2: continue
     let ad = lo.adapters[name]
@@ -440,26 +450,93 @@ proc mergeLoraIntoQuantBase*(lo: var JambaLora, verbose = true): int =
     if ad.inF != inF or ad.outF != outF or ad.r <= 0 or
        ad.A.data.len != ad.r * inF or ad.B.data.len != outF * ad.r:
       raise newException(ValueError, "mergeLoraIntoQuantBase: shape adapter khong khop base: " & name)
+    # Chi preflight tren tensor co precision thap, KHONG cap phat dequant
+    # full-size ~128MB va khong requant hang tram trieu phan tu vo ich.
+    if base.kind in {qkFp4KM, qkInt4, qkInt4Asymmetric, qkCustom} and not tryLowBit:
+      inc skippedLowBit
+      continue
+    # INT8/FP8 cung co the lam mat delta; bat buoc qua guard nhu FP4.
     var w = dequantViaLUT(base)
     if w.len != outF * inF:
       raise newException(ValueError, "mergeLoraIntoQuantBase: dequant sai kich thuoc: " & name)
-    let sc = ad.scale
+    var deltaRow = newSeq[float32](inF)
+    var deltaNormSq = 0.0
+    var maxDelta = 0.0
+    # Track FP32 weight-add rounding too: a tiny LoRA delta can disappear
+    # when added to W even BEFORE requantizing to FP4.
+    var addRoundSq = 0.0
+    var maxAddRound = 0.0
     for o in 0 ..< outF:
-      let row = o * inF
+      for i in 0 ..< inF: deltaRow[i] = 0'f32
       for r in 0 ..< ad.r:
-        let b = ad.B.data[o * ad.r + r] * sc
+        let b = ad.B.data[o * ad.r + r] * ad.scale
         if b == 0'f32: continue
-        let aRow = r * inF
+        let ar = r * inF
         for i in 0 ..< inF:
-          w[row + i] += b * ad.A.data[aRow + i]
-    lo.quantBase[name] = quantizeTensor(w, base.shape, base.kind, customCf = base.cf)
-    lo.adapters.del(name)
-    inc merged
-    if verbose and merged mod 16 == 0:
-      echo "[lora-merge] da gop " & $merged & "/" & $names.len & " (" & name & ")"
+          deltaRow[i] += b * ad.A.data[ar + i]
+      let row = o * inF
+      for i in 0 ..< inF:
+        let d = deltaRow[i]
+        deltaNormSq += float64(d) * float64(d)
+        if abs(float64(d)) > maxDelta: maxDelta = abs(float64(d))
+        let oldW = w[row + i]
+        let afterAdd = oldW + d
+        let addErr = abs(float64(afterAdd) - (float64(oldW) + float64(d)))
+        addRoundSq += addErr * addErr
+        if addErr > maxAddRound: maxAddRound = addErr
+        w[row + i] = afterAdd
+    # Neu delta tong hop = 0, GIU adapter: B@A co the cancellation,
+    # chi drop-zero A/B duoc chung minh an toan o proc rieng.
+    if deltaNormSq == 0.0:
+      inc rejected
+      continue
+    # Bao toan groupSize; quantizeTensor() voi qkFp4KM mac dinh 32,
+    # khong duoc am tham doi layout neu base co groupSize khac.
+    let candidate =
+      if base.kind == qkFp4KM:
+        quantizeFp4KM(w, base.shape, groupSize =
+          (if base.groupSize > 0: base.groupSize else: 32))
+      else:
+        quantizeTensor(w, base.shape, base.kind, customCf = base.cf)
+    # Kiem tra ket qua THUC sau luong tu, khong check truoc requant.
+    let roundtrip = dequantViaLUT(candidate)
+    if roundtrip.len != w.len:
+      raise newException(ValueError, "mergeLoraIntoQuantBase: roundtrip shape khong khop: " & name)
+    var errSq = 0.0
+    var maxErr = 0.0
+    var valid = true
+    for i in 0 ..< w.len:
+      let got = roundtrip[i]
+      let expected = w[i]
+      if got != got or expected != expected or
+         abs(got) > float32.high or abs(expected) > float32.high:
+        valid = false
+        break
+      let e = abs(float64(got) - float64(expected))
+      errSq += e * e
+      if e > maxErr: maxErr = e
+    # Triangle-inequality upper bound vs EXACT real-valued W_base + delta.
+    # Khong duoc chi so voi float32 w: d nho co the bi mat vi FP32 add.
+    let rel = if valid: (sqrt(errSq) + sqrt(addRoundSq)) / sqrt(deltaNormSq) else: Inf
+    if valid and rel <= maxRelativeDeltaError and
+       maxErr + maxAddRound <= maxRelativePeakError * maxDelta:
+      # COMMIT ONLY AFTER THE VALIDATION; on failure both base and adapter
+      # are bitwise unchanged, so lossless fused LoRA remains available.
+      lo.quantBase[name] = candidate
+      lo.adapters.del(name)
+      inc merged
+      if verbose: echo &"[lora-merge] ACCEPT {name}: relErr/delta={rel:.6f}"
+    else:
+      inc rejected
+      if verbose: echo &"[lora-merge] REJECT {name}: relErr/delta={rel:.6f} " &
+        "(base + LoRA GIU NGUYEN; khong xoa adapter)"
   if verbose:
-    echo "[lora-merge] XONG: " & $merged & " adapter da gop vinh vien vao weight fp4 (quantBase)."
-  merged
+    echo &"[lora-merge] SAFE: {merged} adapter merged, {skippedLowBit} low-bit skip, " &
+      &"{rejected} rejected, {withoutBase} without base; {lo.adapters.len} adapter con lai."
+    if skippedLowBit + rejected > 0:
+      echo "[lora-merge] FP4-km khong the merge LoRA fp32 chinh xac o 4-bit: " &
+           "giu base packed + LoRA fused trong GPU de tranh token sai."
+  result = merged
 
 proc mergeInOne*(m: var NimformerModelJamba, lora: var JambaLora, ctx: Backend, name: string) =
   ## Ban SCOPED cua mergeIn - chi xu ly 1 THAM SO duy nhat (name). Dung cho
@@ -1221,7 +1298,9 @@ proc prepareGpuModel*(m: var NimformerModelJamba, lora: var JambaLora, ctx: Back
   let be = ctx.kind.toByby()
   let hidden = m.embedDim
   when not defined(noOneDispatch):
-    if getEnv("BYBY_ONE_DISPATCH", "1") != "0" and not gOdActive:
+    # Iris 640 end-to-end A/B: independent kernels in one session are faster.
+    # Keep the persistent mega-kernel available as an explicit experiment.
+    if getEnv("BYBY_ONE_DISPATCH", "0") != "0" and not gOdActive:
       let odWhy = odTryPrepare(m, ctx)
       if odWhy.len == 0:
         gOdActive = true
@@ -1374,7 +1453,8 @@ proc encodeBlockOld(m: var NimformerModelJamba, ctx: Backend, i: int) =
   of bkMamba, bkSpectron:
     raise newException(ValueError, "encodeOneToken: block M/S chua ho tro")
 
-proc encodeOneToken(m: var NimformerModelJamba, ctx: Backend) =
+proc encodeOneToken(m: var NimformerModelJamba, ctx: Backend;
+                    produceLogits: bool = true) =
   ## Encode toan bo 1 buoc forward (R+A theo dung pattern -> normF -> lm_head)
   ## vao session dang mo. Khong sessionRead giua chung.
   let be = ctx.kind.toByby()
@@ -1395,8 +1475,9 @@ proc encodeOneToken(m: var NimformerModelJamba, ctx: Backend) =
           encodeBlockOld(m, ctx, i)
           decSplitMark(be, "G.block" & $i, tSplit)
           inc i
-      encodeHeadGpu(m, ctx)
-      if gDecSplitOn and gDecSplitActive:
+      if produceLogits:
+        encodeHeadGpu(m, ctx)
+      if produceLogits and gDecSplitOn and gDecSplitActive:
         # lm_head: ket thuc o sessionEnd cua caller; do bang buffer rieng cho dong nhat.
         decSplitMark(be, "normF+lm_head", tSplit)
         inc gDecSplitTokens
@@ -1406,7 +1487,8 @@ proc encodeOneToken(m: var NimformerModelJamba, ctx: Backend) =
   # normF == backbone.norm_f cua HF Mamba2 = RMSNorm chi co gamma (khop ban infer
   # cu da chay dung, PATCH_MARKER_V4). KHONG con "copy thang neu norm loi": bo qua
   # normF im lang se ra logit sai ma khong ai biet.
-  encodeHeadGpu(m, ctx)
+  if produceLogits:
+    encodeHeadGpu(m, ctx)
 
 proc warmupGpuKernelsOnce(m: var NimformerModelJamba, ctx: Backend) =
   ## Ep JIT-compile + bind PSO lan dau cho MOI loai kernel, trong 1 session
@@ -1456,7 +1538,8 @@ proc warmupGpuKernelsOnce(m: var NimformerModelJamba, ctx: Backend) =
       stderr.writeLine "[warmup] session reset state loi: " & sessionGetLastError(be)
       if not sessionRecoverQueue(be): discard
 
-proc forwardStepJambaGpu*(m: var NimformerModelJamba, tokenId: int, ctx: Backend): Tensor =
+proc forwardStepJambaGpu*(m: var NimformerModelJamba, tokenId: int, ctx: Backend;
+                          produceLogits: bool = true): Tensor =
   ## MOT session / token cho TOAN BO model (R + A xen ke theo dung pattern),
   ## dung 1 command buffer duy nhat - dung yeu cau "gop thanh 1 kernel tuc 1
   ## session moi token". Khong sessionRead giua layer; chi doc logits 1 lan.
@@ -1469,7 +1552,7 @@ proc forwardStepJambaGpu*(m: var NimformerModelJamba, tokenId: int, ctx: Backend
       "forwardStepJambaGpu: recurrent GPU state khong con dang tin (buoc truoc gap loi/timeout). " &
       "Goi resetGpuGenState() thanh cong truoc khi tiep tuc; khong duoc replay token tren state co the da cap nhat mot phan.")
 
-  let profDecode = getEnv("BYBY_DECODE_PROFILE", "0") != "0"
+  let profDecode = produceLogits and getEnv("BYBY_DECODE_PROFILE", "0") != "0"
   let tProfEntry = (if profDecode: monoSecs() else: 0.0)
   if not gGpuWarmedUp:
     warmupGpuKernelsOnce(m, ctx)
@@ -1500,7 +1583,7 @@ proc forwardStepJambaGpu*(m: var NimformerModelJamba, tokenId: int, ctx: Backend
       statefulDispatchStarted = true
       gDecSplitActive = gInferStepCount > 0   # bo token dau + warmup
       try:
-        encodeOneToken(m, ctx)
+        encodeOneToken(m, ctx, produceLogits = produceLogits)
       finally:
         gDecSplitActive = false
     except CatchableError as e:
@@ -1586,9 +1669,14 @@ proc forwardStepJambaGpu*(m: var NimformerModelJamba, tokenId: int, ctx: Backend
         if bi in gLayersV2:
           vecStats("mix(after)", bi, sessionRead(be, gLayersV2[bi].hMix, n))
         vecStats("residual x", bi, sessionRead(be, gHXPersist, n))
-    let logits = sessionRead(be, gHLogitsPersist, m.outProj.outF)
+    # Prefill token truoc token cuoi prompt: chi can update recurrent state.
+    # Khong chay normF/lm_head va khong read logits (head khong co dependency
+    # nao voi state, nen ket qua sau khi prefill hoan toan giong path cu).
+    let logits: seq[float32] =
+      if produceLogits: sessionRead(be, gHLogitsPersist, m.outProj.outF)
+      else: @[]
     block:
-      let dumpPath = getEnv("BYBY_DUMP_LOGITS")   # so sanh path cu vs 1-dispatch: od_compare_logits.py
+      let dumpPath = if produceLogits: getEnv("BYBY_DUMP_LOGITS") else: ""   # so sanh path cu vs 1-dispatch: od_compare_logits.py
       if dumpPath.len > 0:
         var df: File
         if open(df, dumpPath, fmAppend):
@@ -1609,8 +1697,11 @@ proc forwardStepJambaGpu*(m: var NimformerModelJamba, tokenId: int, ctx: Backend
         gProfEnd += tProf3 - tProf2
         gProfRead += tProf4 - tProf3
       inc gProfTokens
-    result = newTensor(@[1, 1, m.outProj.outF])
-    result.data = logits
+    if produceLogits:
+      result = newTensor(@[1, 1, m.outProj.outF])
+      result.data = logits
+    else:
+      result = Tensor(shape: @[1, 1, 0], data: @[])
     inc gInferStepCount
     stepComplete = true
   except CatchableError:
@@ -1797,19 +1888,25 @@ proc warmupGpuForParallelPrefill*(m: var NimformerModelJamba; ctx: Backend) =
     gGpuWarmedUp = true
   resetGpuGenState(m, ctx)
 
+proc markGpuPrefillReady*() =
+  ## A successful resident prefill has already installed every recurrent
+  ## state. A first-token warmup would erase those states; compile any cold
+  ## decode kernels normally when encoding that token instead.
+  gGpuWarmedUp = true
+
 proc isGpuTimeoutFailure(msg: string): bool =
   let lower = msg.toLowerAscii()
   result = "timeout" in lower or "timed out" in lower
 
 proc forwardStepJambaGpuRetry*(m: var NimformerModelJamba; tokenId: int;
                                replayTokens: openArray[int]; replayCount: int;
-                               ctx: Backend): Tensor =
+                               ctx: Backend; produceLogits: bool = true): Tensor =
   ## A recurrent token cannot be blindly replayed after a failed command buffer:
   ## Mamba2/Linear++ may already have advanced some persistent states. On timeout,
   ## reset all states, rebuild the known-good prefix, and only then retry tokenId.
   doAssert replayCount >= 0 and replayCount <= replayTokens.len
   try:
-    return forwardStepJambaGpu(m, tokenId, ctx)
+    return forwardStepJambaGpu(m, tokenId, ctx, produceLogits = produceLogits)
   except CatchableError as firstErr:
     if not isGpuTimeoutFailure(firstErr.msg): raise
     stderr.writeLine("[infer] recurrent GPU timeout; reset state, replaying " &
@@ -1817,8 +1914,8 @@ proc forwardStepJambaGpuRetry*(m: var NimformerModelJamba; tokenId: int;
     try:
       resetGpuGenState(m, ctx)
       for i in 0 ..< replayCount:
-        discard forwardStepJambaGpu(m, replayTokens[i], ctx)
-      return forwardStepJambaGpu(m, tokenId, ctx)
+        discard forwardStepJambaGpu(m, replayTokens[i], ctx, produceLogits = false)
+      return forwardStepJambaGpu(m, tokenId, ctx, produceLogits = produceLogits)
     except CatchableError as retryErr:
       raise newException(CatchableError,
         "forwardStepJambaGpuRetry: timeout recovery/replay failed; original=" &

@@ -19,7 +19,7 @@ import nimpy
 # đang false (xem uploadResident() trong nimformer.nim) hoặc sessionBegin/
 # sessionMatmulQ4/sessionMatmul đang fail ngay từ lệnh gọi đầu tiên.
 # ─────────────────────────────────────────────────────────────
-var gDebugPathOn = existsEnv("BYBY_DEBUG_PATH")
+var gDebugPathOn = getEnv("BYBY_DEBUG_PATH", "0") != "0"
 var gDebugPathSeen = initHashSet[string]()
 proc debugPathOnce(tag: string, usedFast: bool, extra: string = "") =
   if not gDebugPathOn: return
@@ -1889,7 +1889,7 @@ proc fusedResidualNormFFNContinue(norm: RMSNormL, ff: SwiGLUL, x: Tensor, be: Gp
   pending.setLen(0)
 
 ## ===================================================================
-## MODE 2 (opt-in, MẶC ĐỊNH TẮT): gộp Session #1 (QKV+RoPE) + Session #2
+## MODE 2 (default ON): gộp Session #1 (QKV+RoPE) + Session #2
 ## (attention+oProj+FFN) thành ĐÚNG 1 command buffer/layer thay vì 2.
 ## Bật bằng BYBY_MERGE_QKV_ATTN_SESSION=1. KHÔNG set gì (mặc định) = hành
 ## vi CŨ 100%, không đổi 1 dòng nào trong forward(blk...) hiện tại.
@@ -2681,6 +2681,9 @@ proc sampleTopP(ctx: Backend, logits: seq[float32], temperature: float32 = 0.7'f
 
 proc generate*(m: LlamaModelL, tok: HFTokenizer, ctx: Backend, promptIds: seq[int],
                maxNewTokens: int = 128, temperature: float32 = 0.7'f32, topP: float32 = 0.9'f32): string =
+  echo "[inference] optimized paths: all-layers-session=" & $gMergeAllLayersSession &
+    ", merged-QKV-attention=" & $gMergeQkvAttnSession &
+    ", resident-KV=" & $(getEnv("BYBY_DISABLE_KV_RESIDENT", "0") != "1")
   # SỬA: nhận thẳng promptIds (đã tokenize qua applyChatTemplate) thay vì
   # nhận chuỗi prompt rồi tự encode() lại - encode() dùng add_special_tokens
   # (BOS thô), KHÔNG áp dụng chat template thật của model -> model instruct
@@ -2865,7 +2868,7 @@ when isMainModule:
 
   let modelPath = argOr(0, "TheBloke/deepseek-coder-6.7B-instruct-GPTQ")
   let nimqPath = argOr(1, "/Volumes/Data/Laptrinh/App/nimformers-framework/model.nimq")
-  let backendName = argOr(2, "vulkan")
+  let backendName = argOr(2, "auto")
   let promptText = argOr(3, "Write a Python function to return the n-th Fibonacci number.")
   let maxNewTokens = parseInt(argOr(4, "100"))
   let temperature = parseFloat(argOr(5, "0.7")).float32

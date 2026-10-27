@@ -10,7 +10,7 @@
 ##
 ## Tất cả encode vào session đang mở; không sessionRead giữa chừng.
 
-import std/[tables, os, strutils]
+import std/[tables, os, strutils, math, monotimes, times, algorithm, strformat]
 import backend
 import vendor/bybylang/gpubackend as byby
 import session_vm
@@ -170,6 +170,7 @@ type
     aBuf*, bBuf*: byby.SessionHandle
     hT*: byby.SessionHandle          ## scratch [r]
     r*, inF*, outF*: int
+    scale*: float32
     knA*, knB*: string
     bSmallK*: bool                   ## knB dùng kernel 1-thread/hàng (r <= 32)
     ready*: bool
@@ -185,6 +186,7 @@ proc prepareLoraGpu*(ctx: Backend; name: string; loraA, loraB: seq[float32];
   ensureDummy(be)
   var g: GpuLora
   g.r = r; g.inF = inF; g.outF = outF
+  g.scale = scale
   g.aBuf = byby.sessionUploadPrivate(be, loraA)
   g.bBuf = byby.sessionUploadPrivate(be, loraB)
   g.hT = byby.sessionUploadPrivate(be, newSeq[float32](max(r, 64)))   # ghi được: kernel ghi vào memF32
@@ -280,6 +282,92 @@ proc uploadBiasOrRaise(name: string; bias: seq[float32]; N: int): seq[float32]
 
 var gLinCache* = initTable[string, GpuLin]()   ## 1 nguon su that duy nhat: MOI Linear (R lan A, moi kind) tra qua day.
 
+type Fp4Plan = object
+  kn, label: string
+  tg, rows, bytes: int
+
+var gFp4Plans = initTable[string, Fp4Plan]()
+
+proc tuneFp4Plan(ctx: Backend; c: Fp4LinCacheGpu; batch: int): Fp4Plan =
+  ## Tune once per backend/shape using real packed weights. Candidate outputs
+  ## must match the existing kernel before their timings are considered.
+  let be = ctx.kind.toByby()
+  let key = $be & "_" & $c.cols & "_" & $c.rows & "_" & $batch
+  if key in gFp4Plans: return gFp4Plans[key]
+  let baseline = if batch == 1:
+    Fp4Plan(kn: c.jitName, label: "legacy", tg: GemvTg,
+      rows: c.rowsPerTg, bytes: c.tgBytes)
+    else: Fp4Plan(kn: c.m8JitName, label: "legacy-M8", tg: GemvTg,
+      rows: 8, bytes: (Fp4KmLutLen + 8 * GemvTg) * 4)
+  var candidates = @[baseline]
+  let forcedTg = (try: parseInt(getEnv("BYBY_GEMV_TG", "0")) except ValueError: 0)
+  for tg in [32, 64, 128]:
+    if c.cols mod (tg * 8) != 0 or (forcedTg != 0 and forcedTg != tg): continue
+    let rows = if batch == 1: 4 else: 8
+    if batch == 1 and c.rows mod rows != 0: continue
+    let prog = if batch == 1: buildFp4KmGemvTunedProgram(c.cols, c.rows, tg, rows)
+               else: buildFp4KmGemmTunedProgram(c.cols, c.rows, tg, rows)
+    let label = "wide" & $rows & "-tg" & $tg
+    let kn = vmKernelForBe(prog, "fp4_" & label & "_" & key, be)
+    candidates.add Fp4Plan(kn: kn, label: label, tg: tg, rows: rows,
+      bytes: (Fp4KmLutLen + rows * tg) * 4)
+  if candidates.len == 1: return baseline
+  if getEnv("BYBY_GPU_AUTOTUNE", "1") == "0":
+    result = candidates[1]
+    gFp4Plans[key] = result
+    return
+  var data = newSeq[float32](batch * c.cols)
+  for i in 0 ..< data.len: data[i] = float32((i * 17 mod 101) - 50) / 64
+  var hX = byby.sessionUpload(be, data)
+  var hY = byby.sessionAllocScratch(be, batch * c.rows)
+  defer:
+    byby.sessionFree(be, hX); byby.sessionFree(be, hY)
+  proc dispatch(plan: Fp4Plan): float =
+    let start = getMonoTime()
+    if not byby.sessionBegin(be): raise newException(CatchableError, "FP4 tuning sessionBegin failed")
+    try:
+      let groups = if batch == 1: c.rows div plan.rows else: c.rows
+      encodeVmKernel(plan.kn, groups * plan.tg, plan.tg, plan.bytes,
+        hY, 0, c.wBuf, c.lutBuf, hX, 0)
+      if not byby.sessionEnd(be):
+        raise newException(CatchableError, "FP4 tuning GPU failed: " & byby.sessionGetLastError(be))
+    except CatchableError:
+      discard byby.sessionEnd(be)
+      discard byby.sessionRecoverQueue(be)
+      raise
+    float((getMonoTime() - start).inNanoseconds) / 1e6
+  var reference: seq[float32]
+  var valid = newSeq[bool](candidates.len)
+  var timings = newSeq[seq[float]](candidates.len)
+  for i, plan in candidates:
+    discard dispatch(plan)
+    let values = byby.sessionRead(be, hY, batch * c.rows)
+    if i == 0:
+      reference = values
+      valid[i] = true
+    else:
+      var err, mag: float32
+      valid[i] = true
+      for j, v in values:
+        if classify(v) in {fcNan, fcInf, fcNegInf}: valid[i] = false
+        err = max(err, abs(v - reference[j])); mag = max(mag, abs(reference[j]))
+      valid[i] = valid[i] and err <= max(1e-5'f32, mag * 1e-4'f32)
+  # Interleave candidates to reduce bias from GPU clock/thermal changes.
+  for round in 0 ..< 3:
+    for j in 0 ..< candidates.len:
+      let i = if round mod 2 == 0: j else: candidates.high - j
+      if valid[i]: timings[i].add dispatch(candidates[i])
+  var best = 0
+  var bestMs = high(float)
+  for i in 0 ..< candidates.len:
+    if not valid[i]: continue
+    timings[i].sort()
+    if timings[i][1] < bestMs:
+      best = i; bestMs = timings[i][1]
+  result = candidates[best]
+  gFp4Plans[key] = result
+  echo &"[gpu-tune] FP4 {c.cols}x{c.rows} M={batch}: {result.label}, {bestMs:.3f}ms (GPU parity checked)"
+
 proc prepareGpuLinForLinear*(ctx: Backend; name: string; lin: var Linear): GpuLin =
   ## Chuẩn bị GPU Linear cho MỌI dạng weight (R lẫn A: fp4-KM resident,
   ## int4-asymmetric resident, hoặc fp32 fallback random-init lúc chưa load).
@@ -306,7 +394,8 @@ proc prepareGpuLinForLinear*(ctx: Backend; name: string; lin: var Linear): GpuLi
       let pairRows = gsz == 32 and K mod 32 == 0 and N mod 2 == 0
       # BYBY_GEMV_VARIANT: 0 = 2 hang, 1 = nap rong 32-bit, 2 = 4 hang/threadgroup (mac dinh).
       # Bien the khong ap dung duoc cho shape nay -> tu ve kernel 2 hang. Do bang bench_gemv_variants.nim.
-      let variant = (try: parseInt(getEnv("BYBY_GEMV_VARIANT", "2")) except ValueError: 2)
+      let variantSetting = getEnv("BYBY_GEMV_VARIANT", "auto")
+      let variant = (try: parseInt(variantSetting) except ValueError: 2)
       let useWide = variant == 1 and pairRows and fp4KmGemvWideSupported(K, N)
       let use4Row = variant == 2 and gsz == 32 and K mod 32 == 0 and N mod 4 == 0
       let gemvRows = if use4Row: 4 elif pairRows: 2 else: 1
@@ -331,8 +420,19 @@ proc prepareGpuLinForLinear*(ctx: Backend; name: string; lin: var Linear): GpuLi
         let m4kn = vmKernelForBe(m4prog, m4tag, be)
         var c = gFp4CacheGpu[name]
         c.m4JitName = m4kn
+        c.m8JitName = vmKernelForBe(buildFp4KmGemmM8Program(K, N),
+          "fp4km_m8_" & $K & "x" & $N, be)
+        c.m8TgSize = GemvTg
         if be == byby.gbVulkan:
           c.m4GlslSrc = jit_vm.glslSourceFor(gJitV2, m4prog, m4tag)
+        if variantSetting == "auto" and K mod 256 == 0 and N mod 4 == 0:
+          let plan = tuneFp4Plan(ctx, c, 1)
+          c.jitName = plan.kn; c.rowsPerTg = plan.rows
+          c.tgSize = plan.tg; c.tgBytes = plan.bytes
+          if be == byby.gbVulkan: c.glslSrc = jit_vm.cachedGlslSource(gJitV2, plan.kn)
+        if getEnv("BYBY_PREFILL_FP4_KERNEL", "auto") == "auto" and K mod 256 == 0:
+          let plan = tuneFp4Plan(ctx, c, 8)
+          c.m8JitName = plan.kn; c.m8TgSize = plan.tg
         gFp4CacheGpu[name] = c
     lin.weightQ.data = @[]   # host trung -> giai phong, GPU da giu ban Shared
     lin.gpuCacheName = name
@@ -366,7 +466,17 @@ proc prepareGpuLinForLinear*(ctx: Backend; name: string; lin: var Linear): GpuLi
     let kn = vmKernelForBe(prog, "f32_gemv_" & $K & "x" & $N, be)
     result.name = name; result.K = K; result.N = N
     result.knF32 = kn
-    result.wF32 = byby.sessionUpload(be, lin.weight.data)
+    result.wF32 = if be == byby.gbVulkan: byby.sessionUploadPrivate(be, lin.weight.data)
+                  else: byby.sessionUpload(be, lin.weight.data)
+    if (be == byby.gbMetal and result.wF32.metalHandle == nil) or
+       (be == byby.gbVulkan and result.wF32.vulkanHandle.buf == nil):
+      raise newException(CatchableError, "prepareGpuLinForLinear: FP32 GPU upload failed: " & name)
+    # This [out,in] allocation also serves sequence forward. Release the
+    # duplicate host copy (~1.5 GiB for four Codestral sidecars).
+    lin.residentFp32 = result.wF32
+    lin.residentFp32Ready = true
+    lin.residentFp32NT = true
+    lin.weight.data = @[]
     result.biasH = byby.sessionUploadPrivate(be, uploadBiasOrRaise(name, lin.bias.data, N))
     result.hasBias = true
     result.ready = true
