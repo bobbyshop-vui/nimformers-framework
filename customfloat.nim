@@ -1,6 +1,6 @@
 ## customfloat.nim
 ## Port của CustomFloat + APF (Adaptive Precision Float) từ metal_ai.py
-## Không phụ thuộc trực tiếp vào GPU driver nào - ủy quyền hoàn toàn qua BybyLang (CUDA/Metal/OpenCL/TSIC).
+## Không phụ thuộc trực tiếp vào GPU driver nào - ủy quyền hoàn toàn qua BybyLang (CUDA/Metal/OpenCL/Vulkan).
 ## Tự động tăng tốc GPU, hỗ trợ CPU Fallback tự động kèm theo log cảnh báo rõ ràng.
 
 import std/[math, strformat, algorithm]

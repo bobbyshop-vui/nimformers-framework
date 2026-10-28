@@ -1,7 +1,7 @@
 ## backend.nim
 ## Lớp chọn backend tính toán cho Nimformer dựa hoàn toàn vào BybyLang trong vendor.
-## Loại bỏ toàn bộ các kernel tự viết ngoài, thống nhất mọi backend (CPU, Metal, CUDA, OpenCL, TSIC)
-## qua duy nhất BybyLang để tối ưu hoá hiệu năng, tránh trùng lặp mã nguồn và hỗ trợ hoàn hảo TSIC.
+## Loại bỏ toàn bộ các kernel tự viết ngoài, thống nhất mọi backend (CPU, Metal, CUDA, OpenCL)
+## qua duy nhất BybyLang để tối ưu hoá hiệu năng, tránh trùng lặp mã nguồn.
 
 import vendor/bybylang/gpubackend as byby
 import customfloat
@@ -11,13 +11,14 @@ export byby.GpuBackend, byby.SessionHandle, byby.sessionBegin, byby.sessionUploa
        byby.sessionAllocHeap, byby.sessionAllocFromHeap, byby.sessionFreeHeap,
        byby.sessionRead, byby.sessionFree, byby.sessionCopyInto, byby.sessionScale,
        byby.ResidentWeightHandle, byby.residentUploadQ4, byby.sessionMatmulQ4, byby.residentFreeQ4,
+       byby.residentPrepareQ4,
        byby.sessionLayernormEnc, byby.sessionRmsnormEnc, byby.sessionAttentionFusedEnc,
        byby.sessionAttentionDecodeGqaEnc, byby.cpuAttentionDecodeGqa,
        byby.gpuGather, byby.gpuArgmaxIndex, byby.gpuCompare, byby.gpuDropoutMask,
        byby.gpuPermute, byby.gpuSplitSlice, byby.gpuConcat, byby.sessionGetLastError,
        byby.sessionAttentionDecodeAllHeadsEnc, byby.sessionRecoverQueue, byby.sessionCommitContinue
 
-# -d:backend=cpu|metal|cuda|opencl|tsic|auto — mặc định "auto" (tự dò lúc runtime).
+# -d:backend=cpu|metal|cuda|opencl|vulkan|auto — mặc định "auto" (tự dò lúc runtime).
 const backend* {.strdefine.} = "auto"
 
 type
@@ -25,7 +26,6 @@ type
     bkMetal = "metal"
     bkCuda = "cuda"
     bkVulkan = "vulkan"
-    bkTsic = "tsic"
 
   Backend* = object
     kind*: BackendKind
@@ -37,7 +37,6 @@ proc toByby*(bk: BackendKind): byby.GpuBackend =
   # CUDA execution path from Nimformer. All CUDA selections use Vulkan.
   of bkCuda: byby.gbVulkan
   of bkVulkan: byby.gbVulkan
-  of bkTsic: byby.gbTsic
 
 proc resolveBackendKind(want: string): BackendKind =
   case want
@@ -45,7 +44,7 @@ proc resolveBackendKind(want: string): BackendKind =
     raise newException(ValueError,
       "resolveBackendKind(\"cpu\"): backend CPU da bi GO BO khoi framework " &
       "nay theo yeu cau - khong con lua chon CPU nao, tuong minh hay khong " &
-      "cung khong duoc. Chon 1 trong: metal/cuda/opencl(vulkan)/tsic/auto.")
+      "cung khong duoc. Chon 1 trong: metal/cuda/opencl(vulkan)/auto.")
   of "metal": bkMetal
   of "cuda":
     stderr.writeLine "[Framework] backend 'cuda' is deprecated/disabled; redirecting to Vulkan"
@@ -54,10 +53,9 @@ proc resolveBackendKind(want: string): BackendKind =
   of "vulkan": bkVulkan   # "opencl" da duoc thay bang Vulkan lam backend GPU
                           # da nen tang fallback (xem toByby: bkVulkan -> gbVulkan)
                           # - chap nhan ca 2 ten string de tuong thich nguoc.
-  of "tsic": bkTsic
-  else:
+  of "auto":
     # "auto" -> Tự động dò backend qua BybyLang. Khong tim thay GPU nao (CUDA/
-    # Metal/Vulkan/TSIC) -> RAISE luon, khong con nhanh bkCpu nao de roi vao nua
+    # Metal/Vulkan) -> RAISE luon, khong con nhanh bkCpu nao de roi vao nua
     # (truoc day con "fallback bkCpu neu gForbidCpuFallback=false" - gio bo
     # HAN, backend CPU khong ton tai trong enum nay nua nen khong co gi de tra ve).
     let chosen = byby.detectBackend()
@@ -65,12 +63,13 @@ proc resolveBackendKind(want: string): BackendKind =
     of byby.gbCuda: bkCuda
     of byby.gbMetal: bkMetal
     of byby.gbVulkan: bkVulkan
-    of byby.gbTsic: bkTsic
     of byby.gbCpu, byby.gbAuto:
       raise newException(CatchableError,
-        "resolveBackendKind(\"auto\"): KHÔNG tìm thấy GPU nào (CUDA/Metal/Vulkan/TSIC) " &
+        "resolveBackendKind(\"auto\"): KHÔNG tìm thấy GPU nào (CUDA/Metal/Vulkan) " &
         "trên máy này. Backend CPU đã bị GỠ BỎ khỏi framework - không có gì để " &
         "fallback về. Cắm GPU / cài driver rồi thử lại.")
+  else:
+    raise newException(ValueError, "backend khong duoc ho tro: " & want)
 
 proc newBackend*(force: string = backend): Backend =
   ## Khởi tạo backend mới. Tự động liên kết và chọn thiết bị phù hợp nhất.
@@ -82,7 +81,7 @@ proc closeBackend*(b: Backend) =
   discard
 
 proc setForbidCpuFallback*(forbid: bool) =
-  ## Mặc định TRUE: nếu backend GPU đã chọn (cuda/metal/opencl/tsic) lỗi lúc
+  ## Mặc định TRUE: nếu backend GPU đã chọn (cuda/metal/opencl) lỗi lúc
   ## chạy, chương trình sẽ raise lỗi thay vì âm thầm rơi về CPU và tiếp tục
   ## train (CPU chậm hơn GPU rất nhiều lần và người dùng thường không để ý vì
   ## chỉ có 1 dòng log stderr). Chỉ set false nếu bạn CHỦ ĐỘNG muốn cho phép
@@ -294,7 +293,7 @@ proc beAddLayernormFused*(ctx: Backend, a, b: openArray[float32], gamma, beta: o
   ## CẢ HAI: `summed` (a+b thô, dùng làm residual cho lần cộng cuối block)
   ## VÀ `normed` (đã qua layernorm) - để caller không phải cộng lại lần 2.
   ## CHỈ có lợi thật trên backend đã có sessionLayernormEnc (hiện tại:
-  ## Metal). Nếu backend không hỗ trợ (CUDA/OpenCL/CPU/TSIC hiện tại, hoặc
+  ## Metal). Nếu backend không hỗ trợ (CUDA/OpenCL/CPU hiện tại, hoặc
   ## encode lỗi lúc chạy) -> rơi về ĐÚNG đường cũ (beAdd rồi beLayernorm),
   ## không đổi hành vi/độ chính xác, chỉ mất phần tăng tốc.
   let be = ctx.kind.toByby()

@@ -240,7 +240,7 @@ proc forward*(l: Linear, x: Tensor, ctx: Backend): Tensor =
 
     if y.len == 0:
       # Chưa resident, hoặc backend hiện tại không hỗ trợ đường resident (vd
-      # CPU/tsic) -> rơi về đường cũ (vẫn đúng, chỉ mất phần tăng tốc resident).
+      # CPU) -> rơi về đường cũ (vẫn đúng, chỉ mất phần tăng tốc resident).
       if l.useQuant and l.weightQ.kind == qkFp4KM and l.gpuCacheName.len > 0 and
          l.gpuCacheName in gFp4CacheGpu and gFp4CacheGpu[l.gpuCacheName].residentReady and
          ctx.kind.toByby() in {byby.gbMetal, byby.gbVulkan}:
