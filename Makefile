@@ -1,11 +1,11 @@
 # Makefile — build project Nimformer
 
 NIM      := nim
-NIMFLAGS := -d:release --hints:off --mm:arc --opt:speed
+NIMFLAGS := -d:release --hints:off --mm:arc --opt:speed --path:. --path:test/codestral --path:test/deepseek-inference --path:test/spectron --path:kernelfortest
 INFER_LORA_NIMCACHE := nimcache/infer-lora
 NIM_INFER_NIMCACHE := nimcache/nim-inference
 
-TEST_SRC  := test_nimformer.nim
+TEST_SRC  := test/spectron/test_nimformer.nim
 
 # ── Nhận diện OS ──
 ifeq ($(OS),Windows_NT)
@@ -36,11 +36,13 @@ endif
 TEST_BIN  := test_nimformer$(EXE_EXT)
 
 # ── Cac binary lien quan Mamba: graft / finetune (LoRA) / inference ──
-GRAFT_SRC       := graft_attention.nim
-FINETUNE_SRC    := finetune_lora.nim
-INFER_LORA_SRC  := infer_lora.nim
-NIM_INFER_SRC   := nim_inference.nim
-SPECTRON_SRC    := test_inferencespectron.nim
+GRAFT_SRC       := test/codestral/graft_attention.nim
+FINETUNE_SRC    := test/codestral/finetune_lora.nim
+INFER_LORA_SRC  := test/codestral/infer_lora.nim
+NIM_INFER_SRC   := test/deepseek-inference/nim_inference.nim
+SPECTRON_SRC    := test/spectron/test_inferencespectron.nim
+COMPACT_LORA_SRC := test/codestral/compact_lora_checkpoint.nim
+MIGRATE_LORA_SRC := test/codestral/migrate_lora_json_to_bin.nim
 
 GRAFT_BIN       := graft_attention_bin$(EXE_EXT)
 FINETUNE_BIN    := finetune_lora_bin$(EXE_EXT)
@@ -49,9 +51,13 @@ COMPACT_LORA_BIN := compact_lora_checkpoint$(EXE_EXT)
 MIGRATE_LORA_BIN := migrate_lora_json_to_bin$(EXE_EXT)
 NIM_INFER_BIN   := nim_inference$(EXE_EXT)
 SPECTRON_BIN    := test_inferencespectron$(EXE_EXT)
+CLEAN_BINS      := $(TEST_BIN) $(GRAFT_BIN) $(FINETUNE_BIN) $(INFER_LORA_BIN) \
+                   $(COMPACT_LORA_BIN) $(MIGRATE_LORA_BIN) $(NIM_INFER_BIN) $(SPECTRON_BIN)
 
-.PHONY: shaders all build run run-cpu run-metal run-opencl run-tsic clean \
-        build-graft build-finetune build-infer-lora build-nim-inference build-spectron \
+.PHONY: shaders all build run run-cpu run-metal run-opencl run-cuda clean \
+        download-models download-datasets \
+        build-graft build-finetune build-infer-lora build-compact-lora \
+        build-migrate-lora build-nim-inference build-spectron \
         graft finetune-mamba infer-lora infer-mamba infer-deepseek run-spectron mamba-pipeline
 
 all: build run
@@ -79,24 +85,42 @@ run-opencl:
 	$(NIM) c $(NIMFLAGS) -d:backend=opencl $(TEST_SRC)
 	$(RUN_PREFIX)$(TEST_BIN)
 
-run-tsic:
-	$(NIM) c $(NIMFLAGS) -d:backend=tsic $(TEST_SRC)
-	$(RUN_PREFIX)$(TEST_BIN)
-
 clean:
 ifeq ($(IS_WINDOWS),yes)
-	-if exist test_nimformer.exe $(RM_F) test_nimformer.exe
+	-$(RM_F) $(CLEAN_BINS) $(addsuffix .exe,$(CLEAN_BINS))
 	-if exist nimcache $(RM_RF) nimcache
 	-del /Q /F model_*.nimq 2>nul
 else
-	$(RM_F) test_nimformer
-	$(RM_F) test_nimformer.exe
+	$(RM_F) $(CLEAN_BINS) $(addsuffix .exe,$(CLEAN_BINS))
 	$(RM_RF) nimcache
 	$(RM_F) model_*.nimq
 endif
 run-cuda:
-	nim c -d:release --hints:off -d:backend=cuda test_nimformer.nim
-	./test_nimformer$(EXE_EXT)
+	$(NIM) c $(NIMFLAGS) -d:backend=cuda $(TEST_SRC)
+	$(RUN_PREFIX)$(TEST_BIN)
+
+# Download public Hugging Face assets into the paths used by inference/training.
+download-models:
+	@set -eu; \
+	mkdir -p test/deepseek-inference/models test/codestral/models/hf; \
+	for file in model.nimq config.json tokenizer.json tokenizer_config.json; do \
+	  curl -fL --retry 3 -C - "https://huggingface.co/bobbydeveloper2014/deepseek-coder-6.7b-nimq/resolve/main/$$file" -o "test/deepseek-inference/models/$$file"; \
+	done; \
+	for file in config.json params.json generation_config.json special_tokens_map.json tokenizer.json tokenizer_config.json tokenizer.model tokenizer.model.v3; do \
+	  curl -fL --retry 3 -C - "https://huggingface.co/bobbydeveloper2014/codestral-v0.1-7b-nimq/resolve/main/$$file" -o "test/codestral/models/hf/$$file"; \
+	done; \
+	curl -fL --retry 3 -C - https://huggingface.co/bobbydeveloper2014/codestral-v0.1-7b-nimq/resolve/main/codestral_mamba_only.nimq -o test/codestral/models/codestral_mamba_only.nimq; \
+	curl -fL --retry 3 -C - https://huggingface.co/bobbydeveloper2014/codestral-v0.1-nimq-qlora-linearattention/resolve/main/jamba_parallel_lora.bin -o test/codestral/models/jamba_parallel_lora.bin; \
+	echo 'test/codestral/models/hf' > test/codestral/models/jamba_parallel_lora.bin.hf_tokenizer_dir
+
+download-datasets:
+	@set -eu; \
+	mkdir -p test/spectron; \
+	for shard in 1 2 3 4 5; do \
+	  file="python_code_dataset_$${shard}.jsonl"; \
+	  curl -fL --retry 3 -C - "https://huggingface.co/datasets/bobbydeveloper2014/python-code/resolve/main/$$file" -o "test/spectron/$$file"; \
+	done; \
+	curl -fL --retry 3 -C - https://huggingface.co/datasets/bobbydeveloper2014/mega-nim-python-code/resolve/main/nim_python_code_dataset_mega.jsonl -o test/spectron/nim_python_code_dataset_mega.jsonl
 
 # ══════════════════════════════════════════════════════════════════
 # Mamba: graft (cay Attention vao checkpoint Mamba-only) / finetune LoRA /
@@ -106,7 +130,7 @@ run-cuda:
 # ══════════════════════════════════════════════════════════════════
 
 # Mac dinh cho tung target (ghi de qua bien moi truong hoac make graft ARGS="...")
-# GRAFT_DEFAULT_OLD = GRAFT_DEFAULT_OUT = codestral_mamba_7b_fp4.nimq: day la
+# GRAFT_DEFAULT_OLD = GRAFT_DEFAULT_OUT = test/codestral/models/codestral_mamba_only.nimq:
 # CHU DINH - file .nimq nay la output cua quantize_codestral.nim (xem usage
 # doc trong file do) VA DONG THOI la CFG_NIMQ_PATH_DEFAULT ma finetune_lora.nim
 # doc lai (finetune-mamba mac dinh khong argv). Graft ghi DE LEN CHINH file
@@ -114,11 +138,11 @@ run-cuda:
 # loadCheckpoint/saveCheckpoint hien tai) de finetune-mamba luon thay dung
 # file "da cay" ma khong can doi ten. Neu ban muon giu ban goc, truyen ARGS
 # voi ten out khac.
-GRAFT_DEFAULT_OLD     := codestral_mamba_only.nimq
+GRAFT_DEFAULT_OLD     := test/codestral/models/codestral_mamba_only.nimq
 GRAFT_DEFAULT_PATTERN := $(shell python3 -c "print('MMMA'*16)" 2>/dev/null || echo MMMA)
-GRAFT_DEFAULT_OUT     := codestral_mamba_only.nimq
+GRAFT_DEFAULT_OUT     := test/codestral/models/codestral_mamba_only.nimq
 
-INFER_LORA_DEFAULT_CKPT  := jamba_parallel_lora.bin
+INFER_LORA_DEFAULT_CKPT  := test/codestral/models/jamba_parallel_lora.bin
 # SUA: template "[INST] ...[/INST] " dung cho Codestral (Mistral tokenizer V3,
 # sentencepiece) - KHONG phai ChatML "<|user|>/<|assistant|>" (xem
 # finetune_lora.nim/lineToText va infer_lora.nim). Giu khoang trang sau
@@ -129,16 +153,16 @@ INFER_LORA_DEFAULT_TEMP  := 0.7
 # tokenizer THAT qua newHfTokenizer(hfDir) VA doc trong so goc qua nimqPath -
 # 2 gia tri nay TRUOC DAY khong duoc Makefile truyen, nen se roi vao
 # CFG_HF_DIR_DEFAULT/CFG_NIMQ_PATH_DEFAULT hard-code RIENG trong infer_lora.nim
-# ("/Volumes/Data 1/..." - KHAC voi "Data 2" cua finetune_lora.nim/GRAFT_DEFAULT_*
-# o tren) - dat lai o day cho KHOP voi phan con lai cua pipeline nay.
-INFER_LORA_DEFAULT_HFDIR := /Volumes/Data 2/models/Mamba-Codestral-7B-v0.1
+# (truoc day moi binary co mot default path khac nhau); dat lai o day cho khop
+# voi tokenizer va base checkpoint dang nam trong test/codestral/models/.
+INFER_LORA_DEFAULT_HFDIR := test/codestral/models/hf
 INFER_LORA_DEFAULT_NIMQ  := $(GRAFT_DEFAULT_OUT)
 
 # infer-deepseek (nim_inference.nim) KHONG lien quan pipeline Mamba/LoRA -
 # la inference rieng cho 1 model GPTQ khac (deepseek-coder). Backend mac
 # dinh la "auto" giong newBackend() khong tham so dung khap noi trong repo.
-INFER_DEEPSEEK_DEFAULT_MODEL   := TheBloke/deepseek-coder-6.7B-instruct-GPTQ
-INFER_DEEPSEEK_DEFAULT_NIMQ    := model.nimq
+INFER_DEEPSEEK_DEFAULT_MODEL   := test/deepseek-inference/models
+INFER_DEEPSEEK_DEFAULT_NIMQ    := test/deepseek-inference/models/model.nimq
 INFER_DEEPSEEK_DEFAULT_BACKEND := auto
 
 build-graft:
@@ -156,10 +180,13 @@ build-finetune:
 # Gop LoRA vao fp4 lam token rac -> TAT. LoRA chay rieng.
 export BYBY_MERGE_LORA ?= 0
 export BYBY_ONE_DISPATCH ?= 0
+# Empty preserves -d:backend (auto by default); accepts vulkan/metal at runtime.
+export BYBY_INFER_BACKEND
 export BYBY_PREFILL_RESIDENT ?= 1
 export BYBY_GEMV_VARIANT ?= auto
 export BYBY_PREFILL_FP4_KERNEL ?= auto
 export BYBY_GPU_AUTOTUNE ?= 1
+export BYBY_Q4_TUNED ?= 1
 export BYBY_VULKAN_TENSOR_CORES ?= 1
 export BYBY_MERGE_ALL_LAYERS_SESSION ?= 1
 export BYBY_MERGE_QKV_ATTN_SESSION ?= 1
@@ -172,32 +199,16 @@ export BYBY_G_DIAGNOSTICS ?= 0
 export BYBY_TRACE_BLOCKS ?= 0
 export BYBY_MACOS_HIGH_PRIORITY ?= 1
 
-# One-dispatch duoc build mac dinh; -d:noOneDispatch de bo han khoi binary.
-# Keep the Metal extension reproducible even when bybylang is a fresh submodule.
-.PHONY: prepare-resident-metal
-prepare-resident-metal:
-	@if ! grep -q 'proc metalSessionMatmulMpsNTEnc' vendor/bybylang/backends/metal/metal_backend.nim; then \
-		patch --dry-run -d vendor/bybylang -p1 < patches/bybylang-resident-mps.patch >/dev/null && \
-		patch -d vendor/bybylang -p1 < patches/bybylang-resident-mps.patch; \
-	fi
-
-.PHONY: prepare-vulkan-inference
-prepare-vulkan-inference: prepare-resident-metal
-	@if ! grep -q 'proc vulkanTensorCoreAvailable' vendor/bybylang/backends/vulkan/vulkan_driver.nim; then \
-		patch --dry-run -d vendor/bybylang -p1 < patches/bybylang-inference-gpu.patch >/dev/null && \
-		patch -d vendor/bybylang -p1 < patches/bybylang-inference-gpu.patch; \
-	fi
-
-build-infer-lora: prepare-vulkan-inference
+build-infer-lora:
 	$(NIM) c $(NIMFLAGS) --nimcache:$(INFER_LORA_NIMCACHE) -o:$(INFER_LORA_BIN) $(INFER_LORA_SRC)
 
 build-compact-lora:
-	$(NIM) c $(NIMFLAGS) -o:$(COMPACT_LORA_BIN) compact_lora_checkpoint.nim
+	$(NIM) c $(NIMFLAGS) -o:$(COMPACT_LORA_BIN) $(COMPACT_LORA_SRC)
 
 build-migrate-lora:
-	$(NIM) c $(NIMFLAGS) -o:$(MIGRATE_LORA_BIN) migrate_lora_json_to_bin.nim
+	$(NIM) c $(NIMFLAGS) -o:$(MIGRATE_LORA_BIN) $(MIGRATE_LORA_SRC)
 
-build-nim-inference: prepare-vulkan-inference
+build-nim-inference:
 	$(NIM) c $(NIMFLAGS) --nimcache:$(NIM_INFER_NIMCACHE) -o:$(NIM_INFER_BIN) $(NIM_INFER_SRC)
 
 build-spectron:
@@ -218,7 +229,7 @@ ifeq ($(strip $(ARGS)),)
 	fi
 	@if [ ! -f "$(GRAFT_DEFAULT_OLD)" ]; then \
 		echo "[graft] LOI: khong thay $(GRAFT_DEFAULT_OLD)."; \
-		echo "[graft] File nay phai co truoc (output cua quantize_codestral_bin <hf_dir> $(GRAFT_DEFAULT_OLD))."; \
+		echo "[graft] File nay phai co truoc (output cua test/codestral/quantize_codestral_bin <hf_dir> $(GRAFT_DEFAULT_OLD))."; \
 		echo "[graft] Huong dan: make graft ARGS=\"<old.bin> <pattern vd MMAMMSM> <out.bin>\""; \
 		echo "[graft]         hoac: make graft ARGS=\"--from-hf <hf.bin> <vocab> <embedDim> <nHeads> <ffMult> <nLayers> <pattern> <out.bin>\""; \
 		exit 1; \
@@ -233,7 +244,7 @@ endif
 # ── finetune-mamba: finetune_lora.nim GIO DOC DUOC ARGV (tuy chon), fallback
 # ve config cung (CFG_*_DEFAULT trong finetune_lora.nim) neu khong truyen gi.
 # Thu tu argv: initMode oldCheckpoint hfDir hfSource nimqPath outCheckpointPath ──
-# vd tuy chinh: make finetune-mamba ARGS="codestral - - nimq codestral_mamba_7b_fp4.nimq my_lora.bin"
+# vd tuy chinh: make finetune-mamba ARGS="codestral - test/codestral/models/hf nimq test/codestral/models/codestral_mamba_only.nimq test/codestral/models/my_lora.bin"
 # (dung "-" cho tham so muon giu mac dinh nhung van can set tham so sau no)
 finetune-mamba: build-finetune
 ifeq ($(strip $(ARGS)),)
@@ -250,7 +261,7 @@ endif
 # argv day du: ckptPath prompt temperature hfDir nimqPath (2 tham so cuoi MOI
 # them - infer_lora.nim can ca hfDir (tokenizer that) LAN nimqPath (trong so
 # goc, dung khi fallback ve Mamba thuan luc chua co checkpoint LoRA nao)).
-# vd tuy chinh: make infer-lora ARGS="jamba_lora.bin '[INST] Xin chao[/INST] ' 0.7 '/path/hf' model.nimq"
+# vd tuy chinh: make infer-lora ARGS="test/codestral/models/jamba_lora.bin '[INST] Xin chao[/INST] ' 0.7 test/codestral/models/hf test/codestral/models/codestral_mamba_only.nimq"
 infer-lora: build-infer-lora
 ifeq ($(strip $(ARGS)),)
 	@echo "[infer-lora] Khong truyen ARGS -> dung mac dinh:"
@@ -289,7 +300,7 @@ infer-mamba: infer-lora
 # Mamba. Backend mac dinh "auto" (giong newBackend() khong tham so dung
 # khap repo - tu chon GPU co san, raise loi neu khong co GPU thay vi am
 # tham roi ve CPU). ──
-# vd tuy chinh: make infer-deepseek ARGS="TheBloke/deepseek-coder-6.7B-instruct-GPTQ model.nimq auto"
+# vd tuy chinh: make infer-deepseek ARGS="test/deepseek-inference/models test/deepseek-inference/models/model.nimq auto"
 infer-deepseek: build-nim-inference
 ifeq ($(strip $(ARGS)),)
 	@echo "[infer-deepseek] Khong truyen ARGS -> dung mac dinh:"
@@ -314,8 +325,8 @@ run-spectron: build-spectron
 # ── mamba-pipeline: chay toan bo finetunemamba.sh (bien env co san se
 # tu dong SKIP_TO_FINETUNE neu da co checkpoint adaptive - xem script) ──
 mamba-pipeline:
-	@echo "[mamba-pipeline] Dang chay ./finetunemamba.sh (dat bien env truoc make de tuy chinh, vd: SKIP_TO_FINETUNE=1 make mamba-pipeline)"
-	./finetunemamba.sh
+	@echo "[mamba-pipeline] Dang chay ./test/codestral/finetunemamba.sh (dat bien env truoc make de tuy chinh, vd: SKIP_TO_FINETUNE=1 make mamba-pipeline)"
+	./test/codestral/finetunemamba.sh
 # ── Bien dich toan bo shader Vulkan (.comp -> .spv). Can glslc (Vulkan SDK / brew install shaderc).
 # Dung: make shaders   (them -B de ep build lai)
 VK_KERNEL_DIR := vendor/bybylang/backends/vulkan/kernels

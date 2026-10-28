@@ -2,6 +2,9 @@
 *.nimq
 *.bin
 *.zip
+*.prev
+*.prev.tmp
+*.before_audit
 jamba_parallel*
 python_code_dataset_*.jsonl
 
@@ -37,8 +40,5 @@ codestral_mamba_7b_fp4.nimq
 llama_cpp_metal_inference_kernels.zip
 model.nimq
 vendor/.DS_Store
-vendor/bybylang
-patches/bybylang-inference-gpu.patch
 test_vulkan_tensor_core.nim
-patches/bybylang-resident-mps.patch
 test_safe_merge_lora

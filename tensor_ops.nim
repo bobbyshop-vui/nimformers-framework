@@ -377,7 +377,7 @@ proc whereT*(cond: openArray[bool], a, b: Tensor): Tensor =
 #
 #    GPU THẬT: mỗi bước Hillis-Steele (offset = 1,2,4,8,...) đưa TOÀN BỘ
 #    phần tử tham gia bước đó vào 1 lệnh GPU thật (beAdd/beMul - đã có kernel
-#    Metal/CUDA/OpenCL/TSIC chạy thật, không phải mô phỏng) thay vì vòng lặp
+#    Metal/CUDA/OpenCL/Vulkan chạy thật, không phải mô phỏng) thay vì vòng lặp
 #    CPU per-element. Việc "gather" chỉ số cur/prev vẫn làm trên CPU (đây là
 #    bước đánh chỉ số/reshape, không phải phép tính toán học), nhưng phép
 #    CỘNG/NHÂN thật sự - phần chiếm hầu hết FLOPs khi dimSize lớn - chạy trên
