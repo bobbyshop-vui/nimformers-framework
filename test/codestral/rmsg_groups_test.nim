@@ -120,6 +120,10 @@ proc runThread(t: var Thread; w: seq[uint32]; env: var Env;
     of OP_U_SHRK: t.U[a] = t.U[b] shr nextWord()
     of OP_U_SHLK: t.U[a] = t.U[b] shl nextWord()
     of OP_U_LOAD_U8: t.U[a] = uint32(env.memU8[int(t.U[b] + nextWord())])
+    of OP_U_LOAD_U32:
+      let off = int(t.U[b] + nextWord())
+      t.U[a] = uint32(env.memU8[off]) or (uint32(env.memU8[off + 1]) shl 8) or
+        (uint32(env.memU8[off + 2]) shl 16) or (uint32(env.memU8[off + 3]) shl 24)
     of OP_U_LOAD_CONSTF: t.R[a] = env.constF32[int(t.U[b] + nextWord())]
     of OP_U_LOAD_IN: t.R[a] = env.inF32[int(t.U[b] + nextWord())]
     of OP_U_STORE_F32: env.memF32[int(t.U[b] + nextWord())] = t.R[a]
@@ -368,6 +372,40 @@ proc runFp4Km2RowCheck() =
     echo &"fp4km-2row K={K} N={N}: rel err new={worst:.2e}, old={oldWorst:.2e}"
     if worst >= 2e-4 or oldWorst >= 2e-4: quit(1)
 
+proc runDynamicFp4Check() =
+  const K = 8192
+  const N = 4
+  doAssert fp4KmTgCandidates(K, 4, 1024, 65536, "max") == @[1024]
+  doAssert fp4KmTgCandidates(4096, 4, 1024, 65536, "max") == @[512]
+  doAssert fp4KmTgCandidates(K, 8, 1024, 32768, "max") == @[512]
+  doAssert fp4KmTgCandidates(K, 4, 128, 65536, "max") == @[128]
+  doAssert fp4KmTgCandidates(K, 4, 1024, 65536, "2048").len == 0
+  var source = newSeq[float32](N * K)
+  var x = newSeq[float32](8 * K)
+  for i in 0 ..< source.len: source[i] = float32(sin(float64(i) * 0.017) * 0.03)
+  for i in 0 ..< x.len: x[i] = float32(cos(float64(i) * 0.013))
+  let qt = quantizeFp4KM(source, @[N, K])
+  let decoded = dequantizeTensor(qt)
+  let lut = buildFp4KmLutQ(qt)
+  for batch in [1, 8]:
+    var expected = newSeq[float32](batch * N)
+    for b in 0 ..< batch:
+      for n in 0 ..< N:
+        var dot = 0.0
+        for k in 0 ..< K: dot += float64(x[b * K + k]) * float64(decoded[n * K + k])
+        expected[b * N + n] = float32(dot)
+    for tg in [32, 64, 128, 256, 512, 1024]:
+      let rows = if batch == 1: 4 else: 8
+      let prog = if batch == 1: buildFp4KmGemvTunedProgram(K, N, tg, rows)
+                 else: buildFp4KmGemmTunedProgram(K, N, tg, rows)
+      var env = Env(memF32: newSeq[float32](batch * N), memU8: qt.data,
+                    constF32: lut, inF32: x)
+      let groups = if batch == 1: N div rows else: N
+      dispatch(prog.words, env, groups * tg, tg, Fp4KmLutLen + rows * tg)
+      for i, want in expected:
+        doAssert abs(env.memF32[i] - want) < max(1e-5'f32, abs(want) * 1e-4'f32)
+  echo "PASS: FP4 GEMV/GEMM groups 32..1024 match dequantized dot; device/shared limits"
+
 randomize(7)
 runCase(512, 8, 32)    # cach cu: n_groups=8
 runCase(512, 1, 64)    # cach TRAIN: 1 nhom tren toan C
@@ -375,6 +413,7 @@ runCase(512, 1, 32)
 runCase(2048, 1, 256)  # gan kich thuoc that (C=8192 -> tg=256)
 runCase(2048, 8, 128)
 runFp4Km2RowCheck()
+runDynamicFp4Check()
 runLinearPlusStepCheck()
 runM2TrainingNormFiniteDiff()
 echo "TAT CA OK"

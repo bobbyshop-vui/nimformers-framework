@@ -18,6 +18,9 @@ import session_vm_dispatch
 import jit_vm
 import fp4_gemv_vm
 import fp4_gemv_gpu
+import vendor/bybylang/backends/vulkan/vulkan_driver as vkDriver
+when defined(macosx):
+  import vendor/bybylang/backends/metal/metal_backend as metalDriver
 import quant      # QuantTensor, QuantKind
 import nimformer   # Linear (weightQ/useQuant/weight/bias/loraA..)
 
@@ -177,7 +180,7 @@ type
 
 var gLoraGpu* = initTable[string, GpuLora]()
 
-proc prepareLoraGpu*(ctx: Backend; name: string; loraA, loraB: seq[float32];
+proc prepareLoraGpu*(ctx: Backend; name: string; loraA, loraB: openArray[float32];
                      r, inF, outF: int; scale: float32): bool =
   ## Upload A [r,inF] và B [outF,r] (fp32, nhỏ) 1 lần. Kernel = 2 gemv bytecode.
   if r <= 0 or loraA.len != r * inF or loraB.len != outF * r: return false
@@ -265,7 +268,7 @@ proc uploadInt4WeightOnce(ctx: Backend; name: string; qt: QuantTensor; K, N: int
   doAssert int4AsymSupported(K, groupSize),
     "uploadInt4WeightOnce " & name & ": K=" & $K & " groupSize=" & $groupSize & " khong ho tro tren GPU"
   var c: Int4LinCacheGpu
-  c.wBuf = sessionUploadBytesShared(be, qt.data)
+  c.wBuf = sessionUploadBytesShared(be, qt.bytes)
   c.knName = vmKernelForBe(buildInt4AsymGemvProgram(K, N, groupSize),
     "int4_gemv_" & $K & "x" & $N & "_g" & $groupSize, be)
   c.N = N; c.groupSize = groupSize
@@ -300,22 +303,37 @@ proc tuneFp4Plan(ctx: Backend; c: Fp4LinCacheGpu; batch: int): Fp4Plan =
     else: Fp4Plan(kn: c.m8JitName, label: "legacy-M8", tg: GemvTg,
       rows: 8, bytes: (Fp4KmLutLen + 8 * GemvTg) * 4)
   var candidates = @[baseline]
-  let forcedTg = (try: parseInt(getEnv("BYBY_GEMV_TG", "0")) except ValueError: 0)
-  for tg in [32, 64, 128]:
-    if c.cols mod (tg * 8) != 0 or (forcedTg != 0 and forcedTg != tg): continue
-    let rows = if batch == 1: 4 else: 8
+  let setting = getEnv("BYBY_GEMV_TG", "max")
+  var maxThreads, maxShared: int
+  if be == byby.gbVulkan:
+    let caps = vkDriver.vulkanDeviceCaps()
+    maxThreads = vkDriver.vulkanMaxTgThreads()
+    maxShared = caps.maxSharedBytes
+    when defined(macosx):
+      # Intel/MoltenVK advertises 1024 but its translated eight-row FP4
+      # shader can time out there. 512 is GPU-parity tested on Iris 640.
+      # Keep NVIDIA/Linux device limits intact.
+      if batch > 1 and caps.properties.vendorID == 0x8086'u32:
+        maxThreads = min(maxThreads, 512)
+  else:
+    when defined(macosx):
+      maxThreads = int(metalDriver.metalDeviceMaxTgThreads())
+      maxShared = int(metalDriver.metalDeviceMaxTgBytes())
+  let rows = if batch == 1: 4 else: 8
+  for tg in fp4KmTgCandidates(c.cols, rows, maxThreads, maxShared, setting):
     if batch == 1 and c.rows mod rows != 0: continue
     let prog = if batch == 1: buildFp4KmGemvTunedProgram(c.cols, c.rows, tg, rows)
                else: buildFp4KmGemmTunedProgram(c.cols, c.rows, tg, rows)
     let label = "wide" & $rows & "-tg" & $tg
-    let kn = vmKernelForBe(prog, "fp4_" & label & "_" & key, be)
-    candidates.add Fp4Plan(kn: kn, label: label, tg: tg, rows: rows,
-      bytes: (Fp4KmLutLen + rows * tg) * 4)
+    try:
+      let kn = vmKernelForBe(prog, "fp4_" & label & "_" & key, be)
+      candidates.add Fp4Plan(kn: kn, label: label, tg: tg, rows: rows,
+        bytes: (Fp4KmLutLen + rows * tg) * 4)
+    except CatchableError as e:
+      stderr.writeLine "[gpu-tune] skip " & label & ": " & e.msg
   if candidates.len == 1: return baseline
   if getEnv("BYBY_GPU_AUTOTUNE", "1") == "0":
-    result = candidates[1]
-    gFp4Plans[key] = result
-    return
+    return baseline
   var data = newSeq[float32](batch * c.cols)
   for i in 0 ..< data.len: data[i] = float32((i * 17 mod 101) - 50) / 64
   var hX = byby.sessionUpload(be, data)
@@ -340,7 +358,12 @@ proc tuneFp4Plan(ctx: Backend; c: Fp4LinCacheGpu; batch: int): Fp4Plan =
   var valid = newSeq[bool](candidates.len)
   var timings = newSeq[seq[float]](candidates.len)
   for i, plan in candidates:
-    discard dispatch(plan)
+    try:
+      discard dispatch(plan)
+    except CatchableError as e:
+      if i == 0: raise
+      stderr.writeLine "[gpu-tune] skip " & plan.label & ": " & e.msg
+      continue
     let values = byby.sessionRead(be, hY, batch * c.rows)
     if i == 0:
       reference = values
@@ -361,6 +384,10 @@ proc tuneFp4Plan(ctx: Backend; c: Fp4LinCacheGpu; batch: int): Fp4Plan =
   var bestMs = high(float)
   for i in 0 ..< candidates.len:
     if not valid[i]: continue
+    if setting notin ["auto", "0", ""] and i == 0 and valid.len > 1:
+      var hasValidRequested = false
+      for j in 1 ..< valid.len: hasValidRequested = hasValidRequested or valid[j]
+      if hasValidRequested: continue
     timings[i].sort()
     if timings[i][1] < bestMs:
       best = i; bestMs = timings[i][1]
@@ -407,7 +434,7 @@ proc prepareGpuLinForLinear*(ctx: Backend; name: string; lin: var Linear): GpuLi
                  elif pairRows: "fp4km2_gemv_" else: "fp4km_gemv_") & $K & "x" & $N & "_g" & $gsz
       # vmKernelForBe: Vulkan -> kernelNameFor+GLSL cache; Metal -> MSL dispatch
       let kn = vmKernelForBe(prog, tag, be)
-      uploadFp4WeightOnce(ctx, name, lin.weightQ.data, lut, N, K, kn,
+      uploadFp4WeightOnce(ctx, name, lin.weightQ.bytes, lut, N, K, kn,
                           rowsPerTg = gemvRows)
       if be == byby.gbVulkan and name in gFp4CacheGpu:
         var c = gFp4CacheGpu[name]
@@ -434,12 +461,12 @@ proc prepareGpuLinForLinear*(ctx: Backend; name: string; lin: var Linear): GpuLi
           let plan = tuneFp4Plan(ctx, c, 8)
           c.m8JitName = plan.kn; c.m8TgSize = plan.tg
         gFp4CacheGpu[name] = c
-    lin.weightQ.data = @[]   # host trung -> giai phong, GPU da giu ban Shared
+    lin.weightQ.clearPayload()   # host trung -> giai phong, GPU da giu ban Shared
     lin.gpuCacheName = name
     result = markFp4Lin(ctx, name, lin.bias.data, K, N)
   elif lin.useQuant and lin.weightQ.kind == qkInt4Asymmetric and int4AsymSupported(K, lin.weightQ.groupSize):
     uploadInt4WeightOnce(ctx, name, lin.weightQ, K, N)
-    lin.weightQ.data = @[]   # host trung -> giai phong, GPU da giu ban Shared
+    lin.weightQ.clearPayload()   # host trung -> giai phong, GPU da giu ban Shared
     result.name = name; result.K = K; result.N = N
     result.knF32 = gInt4CacheGpu[name].knName
     result.wF32 = gInt4CacheGpu[name].scZpBuf
@@ -456,18 +483,18 @@ proc prepareGpuLinForLinear*(ctx: Backend; name: string; lin: var Linear): GpuLi
   else:
     # FP32 master: block G attn/fuseGate train full. Chi chap nhan weight.len==K*N.
     let expected = K * N
-    if expected <= 0 or lin.weight.data.len != expected:
+    if expected <= 0 or lin.weight.floatValues.len != expected:
       raise newException(ValueError, "prepareGpuLinForLinear " & name &
         ": lin.useQuant=" & $lin.useQuant &
         (if lin.useQuant: " weightQ.kind=" & $lin.weightQ.kind else: "") &
-        " weight.len=" & $lin.weight.data.len & " expected=" & $expected &
+        " weight.len=" & $lin.weight.floatValues.len & " expected=" & $expected &
         " - khong quant hop le va khong co FP32 master.")
     let prog = buildF32GemvProgram(K, N, 1.0'f32, false)
     let kn = vmKernelForBe(prog, "f32_gemv_" & $K & "x" & $N, be)
     result.name = name; result.K = K; result.N = N
     result.knF32 = kn
-    result.wF32 = if be == byby.gbVulkan: byby.sessionUploadPrivate(be, lin.weight.data)
-                  else: byby.sessionUpload(be, lin.weight.data)
+    result.wF32 = if be == byby.gbVulkan: byby.sessionUploadPrivate(be, lin.weight.floatValues)
+                  else: sessionUploadFloatsShared(be, lin.weight.floatValues)
     if (be == byby.gbMetal and result.wF32.metalHandle == nil) or
        (be == byby.gbVulkan and result.wF32.vulkanHandle.buf == nil):
       raise newException(CatchableError, "prepareGpuLinForLinear: FP32 GPU upload failed: " & name)
@@ -477,12 +504,13 @@ proc prepareGpuLinForLinear*(ctx: Backend; name: string; lin: var Linear): GpuLi
     lin.residentFp32Ready = true
     lin.residentFp32NT = true
     lin.weight.data = @[]
+    lin.weight.mappedData = default(MappedView[float32])
     result.biasH = byby.sessionUploadPrivate(be, uploadBiasOrRaise(name, lin.bias.data, N))
     result.hasBias = true
     result.ready = true
     result.isFp4 = false
     result.isInt4 = false
-  discard prepareLoraGpu(ctx, name, lin.loraA, lin.loraB, lin.loraR, K, N, lin.loraScale)
+  discard prepareLoraGpu(ctx, name, lin.loraAValues, lin.loraBValues, lin.loraR, K, N, lin.loraScale)
   gLinCache[name] = result
 
 proc uploadBiasOrRaise(name: string; bias: seq[float32]; N: int): seq[float32] =

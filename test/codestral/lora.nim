@@ -116,6 +116,7 @@ type
     scale*: float32       ## = alpha / r
     A*: Tensor            ## shape [r, inF]
     B*: Tensor            ## shape [outF, r]
+    mappedA*, mappedB*: MappedView[float32]
 
   LoraTrainState* = object
     lr*, wd*: float32
@@ -128,6 +129,15 @@ type
                                              ## giu ban fp32 thuong truc trong RAM - dequant qua LUT
                                              ## MOI LAN mergeIn, xoa ngay sau restoreBase). Rong = mode
                                              ## cu, hanh vi KHONG doi (backward-compatible 100%).
+
+template aValues*(ad: LoraAdapter): untyped = weightValues(ad.A.data, ad.mappedA)
+template bValues*(ad: LoraAdapter): untyped = weightValues(ad.B.data, ad.mappedB)
+
+proc attachAdapter(lin: var Linear; ad: LoraAdapter) =
+  lin.loraA = ad.A.data
+  lin.loraB = ad.B.data
+  lin.mappedLoraA = ad.mappedA
+  lin.mappedLoraB = ad.mappedB
 
 proc newLoraAdapter*(inF, outF, r: int, alpha: float32 = -1'f32): LoraAdapter =
   ## alpha mặc định = 2*r (giống rule-of-thumb phổ biến, cũng là alpha=8,r=4
@@ -181,7 +191,8 @@ proc mergedWeight*(base: Tensor, ad: LoraAdapter, ctx: Backend): Tensor =
   ## W_eff = W_base + scale * B @ A, shape giữ nguyên [outF, inF].
   ## Toàn bộ nhân/cộng ở đây đi qua beMul/beAdd (GPU), KHÔNG còn vòng for
   ## CPU tự cộng dồn từng phần tử như trước.
-  let delta = matmul2D(ctx, ad.B, ad.A)   # [outF,r]@[r,inF] -> [outF,inF], da GPU (beMatmul)
+  let delta = matmul2D(ctx, Tensor(shape: ad.B.shape, data: @(ad.bValues)),
+    Tensor(shape: ad.A.shape, data: @(ad.aValues)))   # [outF,r]@[r,inF] -> [outF,inF], da GPU (beMatmul)
   let scaled = beMul(ctx, delta.data, constArr(ad.scale, delta.data.len))
   result = newTensor(base.shape)
   result.data = beAdd(ctx, base.data, scaled)
@@ -362,7 +373,7 @@ proc dequantViaLUT(qt: QuantTensor): seq[float32] =
       else:
         lut = buildDecodeLUT(qt.cf)
         gLutNameCache[qt.cf.name] = lut
-      let raw = decodeArrayLUT(qt.data, lut)
+      let raw = decodeArrayLUT(qt.bytes, lut)
       let s = if qt.scale.len > 0: qt.scale[0] else: 1'f32
       if s == 1'f32: return raw
       result = newSeq[float32](raw.len)
@@ -404,12 +415,12 @@ proc dropZeroLoraAdapters*(lo: var JambaLora): seq[string] =
   ## (Adapter khoi tao B=0 va khong nhan gradient luc train se roi vao truong hop nay.)
   for name, ad in lo.adapters:
     var zeroA = true
-    for v in ad.A.data:
+    for v in ad.aValues:
       if v != 0'f32:
         zeroA = false
         break
     var zeroB = true
-    for v in ad.B.data:
+    for v in ad.bValues:
       if v != 0'f32:
         zeroB = false
         break
@@ -448,12 +459,20 @@ proc mergeLoraIntoQuantBase*(lo: var JambaLora, verbose = true): int =
     let outF = base.shape[0]
     let inF = base.shape[1]
     if ad.inF != inF or ad.outF != outF or ad.r <= 0 or
-       ad.A.data.len != ad.r * inF or ad.B.data.len != outF * ad.r:
+       ad.aValues.len != ad.r * inF or ad.bValues.len != outF * ad.r:
       raise newException(ValueError, "mergeLoraIntoQuantBase: shape adapter khong khop base: " & name)
     # Chi preflight tren tensor co precision thap, KHONG cap phat dequant
     # full-size ~128MB va khong requant hang tram trieu phan tu vo ich.
     if base.kind in {qkFp4KM, qkInt4, qkInt4Asymmetric, qkCustom} and not tryLowBit:
       inc skippedLowBit
+      continue
+    let budgetMiB = (try: parseInt(getEnv("BYBY_MERGE_SCRATCH_MIB", "256")) except ValueError: 256)
+    # Two dense FP32 matrices plus quant candidate and row scratch. Division
+    # avoids overflow; skip preserves the exact fused adapter on GPU.
+    let elements = int64(outF) * int64(inF)
+    if budgetMiB <= 0 or elements > int64(budgetMiB) * 1024 * 1024 div 32:
+      inc rejected
+      if verbose: echo "[lora-merge] scratch budget exceeded; keep fused adapter: " & name
       continue
     # INT8/FP8 cung co the lam mat delta; bat buoc qua guard nhu FP4.
     var w = dequantViaLUT(base)
@@ -469,11 +488,11 @@ proc mergeLoraIntoQuantBase*(lo: var JambaLora, verbose = true): int =
     for o in 0 ..< outF:
       for i in 0 ..< inF: deltaRow[i] = 0'f32
       for r in 0 ..< ad.r:
-        let b = ad.B.data[o * ad.r + r] * ad.scale
+        let b = ad.bValues[o * ad.r + r] * ad.scale
         if b == 0'f32: continue
         let ar = r * inF
         for i in 0 ..< inF:
-          deltaRow[i] += b * ad.A.data[ar + i]
+          deltaRow[i] += b * ad.aValues[ar + i]
       let row = o * inF
       for i in 0 ..< inF:
         let d = deltaRow[i]
@@ -713,8 +732,7 @@ proc mergeInUploadStreamingJamba*(m: var NimformerModelJamba, lora: var JambaLor
           # useQuant) giu NGUYEN VEN dang nen, khong bao gio bi dequant/merge
           # ra fp32 - tranh dung bloat ~27GB tung gay OOM.
           let ad = lora.adapters[name]
-          m.blocks[i].mambaReal.inProj.loraA = ad.A.data
-          m.blocks[i].mambaReal.inProj.loraB = ad.B.data
+          attachAdapter(m.blocks[i].mambaReal.inProj, ad)
           m.blocks[i].mambaReal.inProj.loraR = ad.r
           m.blocks[i].mambaReal.inProj.loraScale = ad.scale
           echo "[lora]     " & name & ": GAN adapter r=" & $ad.r & " scale=" & $ad.scale
@@ -732,8 +750,7 @@ proc mergeInUploadStreamingJamba*(m: var NimformerModelJamba, lora: var JambaLor
           # useQuant) giu NGUYEN VEN dang nen, khong bao gio bi dequant/merge
           # ra fp32 - tranh dung bloat ~27GB tung gay OOM.
           let ad = lora.adapters[name]
-          m.blocks[i].mambaReal.outProj.loraA = ad.A.data
-          m.blocks[i].mambaReal.outProj.loraB = ad.B.data
+          attachAdapter(m.blocks[i].mambaReal.outProj, ad)
           m.blocks[i].mambaReal.outProj.loraR = ad.r
           m.blocks[i].mambaReal.outProj.loraScale = ad.scale
           echo "[lora]     " & name & ": GAN adapter r=" & $ad.r & " scale=" & $ad.scale
@@ -747,8 +764,7 @@ proc mergeInUploadStreamingJamba*(m: var NimformerModelJamba, lora: var JambaLor
           let name = p & ".attn.qkvProj.weight"
           if name in lora.adapters:
             let ad = lora.adapters[name]
-            m.blocks[i].attn.qkvProj.loraA = ad.A.data
-            m.blocks[i].attn.qkvProj.loraB = ad.B.data
+            attachAdapter(m.blocks[i].attn.qkvProj, ad)
             m.blocks[i].attn.qkvProj.loraR = ad.r
             m.blocks[i].attn.qkvProj.loraScale = ad.scale
             echo "[lora]     " & name & ": GAN adapter r=" & $ad.r & " scale=" & $ad.scale
@@ -761,8 +777,7 @@ proc mergeInUploadStreamingJamba*(m: var NimformerModelJamba, lora: var JambaLor
           let name = p & ".attn.outProj.weight"
           if name in lora.adapters:
             let ad = lora.adapters[name]
-            m.blocks[i].attn.outProj.loraA = ad.A.data
-            m.blocks[i].attn.outProj.loraB = ad.B.data
+            attachAdapter(m.blocks[i].attn.outProj, ad)
             m.blocks[i].attn.outProj.loraR = ad.r
             m.blocks[i].attn.outProj.loraScale = ad.scale
             echo "[lora]     " & name & ": GAN adapter r=" & $ad.r & " scale=" & $ad.scale
@@ -780,8 +795,7 @@ proc mergeInUploadStreamingJamba*(m: var NimformerModelJamba, lora: var JambaLor
           # useQuant) giu NGUYEN VEN dang nen, khong bao gio bi dequant/merge
           # ra fp32 - tranh dung bloat ~27GB tung gay OOM.
           let ad = lora.adapters[name]
-          m.blocks[i].mamba.inProj.loraA = ad.A.data
-          m.blocks[i].mamba.inProj.loraB = ad.B.data
+          attachAdapter(m.blocks[i].mamba.inProj, ad)
           m.blocks[i].mamba.inProj.loraR = ad.r
           m.blocks[i].mamba.inProj.loraScale = ad.scale
           echo "[lora]     " & name & ": GAN adapter r=" & $ad.r & " scale=" & $ad.scale
@@ -799,8 +813,7 @@ proc mergeInUploadStreamingJamba*(m: var NimformerModelJamba, lora: var JambaLor
           # useQuant) giu NGUYEN VEN dang nen, khong bao gio bi dequant/merge
           # ra fp32 - tranh dung bloat ~27GB tung gay OOM.
           let ad = lora.adapters[name]
-          m.blocks[i].mamba.outProj.loraA = ad.A.data
-          m.blocks[i].mamba.outProj.loraB = ad.B.data
+          attachAdapter(m.blocks[i].mamba.outProj, ad)
           m.blocks[i].mamba.outProj.loraR = ad.r
           m.blocks[i].mamba.outProj.loraScale = ad.scale
           echo "[lora]     " & name & ": GAN adapter r=" & $ad.r & " scale=" & $ad.scale
@@ -819,8 +832,7 @@ proc mergeInUploadStreamingJamba*(m: var NimformerModelJamba, lora: var JambaLor
           # useQuant) giu NGUYEN VEN dang nen, khong bao gio bi dequant/merge
           # ra fp32 - tranh dung bloat ~27GB tung gay OOM.
           let ad = lora.adapters[name]
-          m.blocks[i].attn.qkvProj.loraA = ad.A.data
-          m.blocks[i].attn.qkvProj.loraB = ad.B.data
+          attachAdapter(m.blocks[i].attn.qkvProj, ad)
           m.blocks[i].attn.qkvProj.loraR = ad.r
           m.blocks[i].attn.qkvProj.loraScale = ad.scale
           echo "[lora]     " & name & ": GAN adapter r=" & $ad.r & " scale=" & $ad.scale
@@ -838,8 +850,7 @@ proc mergeInUploadStreamingJamba*(m: var NimformerModelJamba, lora: var JambaLor
           # useQuant) giu NGUYEN VEN dang nen, khong bao gio bi dequant/merge
           # ra fp32 - tranh dung bloat ~27GB tung gay OOM.
           let ad = lora.adapters[name]
-          m.blocks[i].attn.outProj.loraA = ad.A.data
-          m.blocks[i].attn.outProj.loraB = ad.B.data
+          attachAdapter(m.blocks[i].attn.outProj, ad)
           m.blocks[i].attn.outProj.loraR = ad.r
           m.blocks[i].attn.outProj.loraScale = ad.scale
           echo "[lora]     " & name & ": GAN adapter r=" & $ad.r & " scale=" & $ad.scale
@@ -858,8 +869,7 @@ proc mergeInUploadStreamingJamba*(m: var NimformerModelJamba, lora: var JambaLor
           # useQuant) giu NGUYEN VEN dang nen, khong bao gio bi dequant/merge
           # ra fp32 - tranh dung bloat ~27GB tung gay OOM.
           let ad = lora.adapters[name]
-          m.blocks[i].mamba.inProj.loraA = ad.A.data
-          m.blocks[i].mamba.inProj.loraB = ad.B.data
+          attachAdapter(m.blocks[i].mamba.inProj, ad)
           m.blocks[i].mamba.inProj.loraR = ad.r
           m.blocks[i].mamba.inProj.loraScale = ad.scale
           echo "[lora]     " & name & ": GAN adapter r=" & $ad.r & " scale=" & $ad.scale
@@ -877,8 +887,7 @@ proc mergeInUploadStreamingJamba*(m: var NimformerModelJamba, lora: var JambaLor
           # useQuant) giu NGUYEN VEN dang nen, khong bao gio bi dequant/merge
           # ra fp32 - tranh dung bloat ~27GB tung gay OOM.
           let ad = lora.adapters[name]
-          m.blocks[i].mamba.outProj.loraA = ad.A.data
-          m.blocks[i].mamba.outProj.loraB = ad.B.data
+          attachAdapter(m.blocks[i].mamba.outProj, ad)
           m.blocks[i].mamba.outProj.loraR = ad.r
           m.blocks[i].mamba.outProj.loraScale = ad.scale
           echo "[lora]     " & name & ": GAN adapter r=" & $ad.r & " scale=" & $ad.scale
@@ -896,8 +905,7 @@ proc mergeInUploadStreamingJamba*(m: var NimformerModelJamba, lora: var JambaLor
           # useQuant) giu NGUYEN VEN dang nen, khong bao gio bi dequant/merge
           # ra fp32 - tranh dung bloat ~27GB tung gay OOM.
           let ad = lora.adapters[name]
-          m.blocks[i].attn.qkvProj.loraA = ad.A.data
-          m.blocks[i].attn.qkvProj.loraB = ad.B.data
+          attachAdapter(m.blocks[i].attn.qkvProj, ad)
           m.blocks[i].attn.qkvProj.loraR = ad.r
           m.blocks[i].attn.qkvProj.loraScale = ad.scale
           echo "[lora]     " & name & ": GAN adapter r=" & $ad.r & " scale=" & $ad.scale
@@ -915,8 +923,7 @@ proc mergeInUploadStreamingJamba*(m: var NimformerModelJamba, lora: var JambaLor
           # useQuant) giu NGUYEN VEN dang nen, khong bao gio bi dequant/merge
           # ra fp32 - tranh dung bloat ~27GB tung gay OOM.
           let ad = lora.adapters[name]
-          m.blocks[i].attn.outProj.loraA = ad.A.data
-          m.blocks[i].attn.outProj.loraB = ad.B.data
+          attachAdapter(m.blocks[i].attn.outProj, ad)
           m.blocks[i].attn.outProj.loraR = ad.r
           m.blocks[i].attn.outProj.loraScale = ad.scale
           echo "[lora]     " & name & ": GAN adapter r=" & $ad.r & " scale=" & $ad.scale
@@ -934,8 +941,7 @@ proc mergeInUploadStreamingJamba*(m: var NimformerModelJamba, lora: var JambaLor
           # useQuant) giu NGUYEN VEN dang nen, khong bao gio bi dequant/merge
           # ra fp32 - tranh dung bloat ~27GB tung gay OOM.
           let ad = lora.adapters[name]
-          m.blocks[i].fuseGate.loraA = ad.A.data
-          m.blocks[i].fuseGate.loraB = ad.B.data
+          attachAdapter(m.blocks[i].fuseGate, ad)
           m.blocks[i].fuseGate.loraR = ad.r
           m.blocks[i].fuseGate.loraScale = ad.scale
           echo "[lora]     " & name & ": GAN adapter r=" & $ad.r & " scale=" & $ad.scale
@@ -952,8 +958,7 @@ proc mergeInUploadStreamingJamba*(m: var NimformerModelJamba, lora: var JambaLor
       # lech trainer hien tai (loraTargets chi R). Bat: BYBY_APPLY_LMHEAD_LORA=1.
       if getEnv("BYBY_APPLY_LMHEAD_LORA") == "1":
         let ad = lora.adapters[name]
-        m.outProj.loraA = ad.A.data
-        m.outProj.loraB = ad.B.data
+        attachAdapter(m.outProj, ad)
         m.outProj.loraR = ad.r
         m.outProj.loraScale = ad.scale
         echo "[lora]     " & name & ": GAN adapter r=" & $ad.r & " scale=" & $ad.scale & " (BYBY_APPLY_LMHEAD_LORA=1)"
@@ -1197,7 +1202,7 @@ when not defined(noOneDispatch):
   var gOdActive* = false
 
   proc odLinHasLora(lin: Linear; K, N: int): bool =
-    lin.loraR > 0 and lin.loraA.len == lin.loraR * K and lin.loraB.len == N * lin.loraR
+    lin.loraR > 0 and lin.loraAValues.len == lin.loraR * K and lin.loraBValues.len == N * lin.loraR
 
   proc odLinOk(l: Linear): string =
     if not (l.useQuant and l.weightQ.kind == qkFp4KM): return "khong phai fp4-KM"
@@ -1281,11 +1286,11 @@ when not defined(noOneDispatch):
         let lutOut = fp4_gemv_gpu.buildFp4KmLutQ(mr[].outProj.weightQ)
         odAddLayer(st, st.slotOfBlock[i], mr[].aLog.data, mr[].dSkip.data, mr[].dtBias.data, mr[].normWeight.data,
           mr[].convWeight.data, mr[].convBias.data, blk[].ln1.gamma.data,
-          mr[].inProj.weightQ.data, lutIn, mr[].outProj.weightQ.data, lutOut,
-          (if odLinHasLora(mr[].inProj, hidden, P): mr[].inProj.loraA else: @[]),
-          (if odLinHasLora(mr[].inProj, hidden, P): mr[].inProj.loraB else: @[]),
-          (if odLinHasLora(mr[].outProj, C, hidden): mr[].outProj.loraA else: @[]),
-          (if odLinHasLora(mr[].outProj, C, hidden): mr[].outProj.loraB else: @[]))
+          mr[].inProj.weightQ.bytes, lutIn, mr[].outProj.weightQ.bytes, lutOut,
+          (if odLinHasLora(mr[].inProj, hidden, P): @(mr[].inProj.loraAValues) else: @[]),
+          (if odLinHasLora(mr[].inProj, hidden, P): @(mr[].inProj.loraBValues) else: @[]),
+          (if odLinHasLora(mr[].outProj, C, hidden): @(mr[].outProj.loraAValues) else: @[]),
+          (if odLinHasLora(mr[].outProj, C, hidden): @(mr[].outProj.loraBValues) else: @[]))
       odFinish(ctx, st)
       odInstall(st)
       # KHONG giai phong weight host o day: vong prepareGpuModel ben duoi van nap cache fp4 rieng

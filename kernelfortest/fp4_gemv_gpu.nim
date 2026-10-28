@@ -49,7 +49,7 @@ type
 var gFp4CacheGpu* = initTable[string, Fp4LinCacheGpu]()
 const Fp4KmMblock* = 4
 
-proc sessionUploadBytesShared*(backend: byby.GpuBackend, data: seq[uint8]): byby.SessionHandle =
+proc sessionUploadBytesShared*(backend: byby.GpuBackend, data: openArray[uint8]): byby.SessionHandle =
   ## Weight FP4 packed → Shared buffer (llama.cpp-style: không ghim Private/wired).
   ## Metal: metalUploadBytes → MTLResourceStorageModeShared.
   ## Vulkan: vulkanSessionUploadU8 / vulkanSessionUploadBytes.
@@ -68,7 +68,12 @@ proc sessionUploadBytesShared*(backend: byby.GpuBackend, data: seq[uint8]): byby
   else:
     discard
 
-proc uploadFp4WeightOnce*(ctx: Backend, name: string; wq: seq[uint8];
+proc sessionUploadFloatsShared*(backend: byby.GpuBackend;
+                                data: openArray[float32]): byby.SessionHandle =
+  let p = if data.len > 0: cast[ptr UncheckedArray[uint8]](unsafeAddr data[0]) else: nil
+  sessionUploadBytesShared(backend, toOpenArray(p, 0, data.len * 4 - 1))
+
+proc uploadFp4WeightOnce*(ctx: Backend, name: string; wq: openArray[uint8];
                            lut: seq[float32]; rows, cols: int; jitName: string;
                            rowsPerTg = 1) =
   ## Upload W (u8 Shared) + lut (fp32 Private, nhỏ) 1 LẦN.
@@ -185,6 +190,10 @@ proc encodeFp4GemmRows*(c: Fp4LinCacheGpu; hIn: byby.SessionHandle;
   ## hIn/hOut PHAI chua du fp4GemmPaddedRows(c, M) hang (hang pad cua hIn = 0;
   ## hang pad cua hOut la rac, caller bo qua).
   if M <= 0: return true
+  if hIn.kind == byby.gbVulkan and hOut.kind == byby.gbVulkan:
+    var outHandle = hOut.vulkanHandle
+    if vkDrv.vulkanSessionFp4GemmEnc(hIn.vulkanHandle, c.wBuf.vulkanHandle,
+        c.lutBuf.vulkanHandle, outHandle, M, c.cols, c.rows): return true
   let K = c.cols
   let N = c.rows
   let mRun = fp4GemmPaddedRows(c, M)

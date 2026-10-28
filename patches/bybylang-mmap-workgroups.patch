@@ -1,0 +1,174 @@
+--- a/backends/metal/metal_backend.nim
++++ b/backends/metal/metal_backend.nim
+@@ -586,19 +586,18 @@
+     ## transpose CPU truoc). Dung cho attention decode (K/V-cache).
+     metal_matmul_nt_enc_c(a, b, c, cint(m), cint(k), cint(n)) != 0
+ 
+-  proc metalUploadBytes*(data: seq[uint8]): MetalBufferHandle =
++  proc metalUploadBytes*(data: openArray[uint8]): MetalBufferHandle =
+     discard metalInit()
+-    var d = data
+-    metal_upload_bytes_c(addr d[0], cint(d.len))
+-
+-  proc metalUploadPrivate*(data: seq[float32]): MetalBufferHandle =
++    if data.len == 0: return nil
++    metal_upload_bytes_c(unsafeAddr data[0], cint(data.len))
++
++  proc metalUploadPrivate*(data: openArray[float32]): MetalBufferHandle =
+     ## Bản Private-storage của metalSessionUpload - CHỈ dùng cho resident
+     ## weight fp32 (int8/int4-symmetric/tied-embedding qua beResidentUploadFp32)
+     ## mà CPU không đọc/ghi lại sau lúc upload.
+     discard metalInit()
+     if data.len == 0: return nil
+-    var d = data
+-    metal_upload_private_c(addr d[0], cint(d.len))
++    metal_upload_private_c(unsafeAddr data[0], cint(data.len))
+ 
+   proc metalUploadBytesPrivate*(data: seq[uint8]): MetalBufferHandle =
+     ## Bản Private-storage của metalUploadBytes - dùng cho wq (Q4 packed) resident.
+@@ -748,8 +747,8 @@
+   proc metalSessionMatmulEnc*(a, b, c: MetalBufferHandle, m, k, n: int): bool = false
+   proc metalSessionMatmulNTEnc*(a, b, c: MetalBufferHandle, m, k, n: int): bool = false
+   proc metalInit*(): bool = false
+-  proc metalUploadBytes*(data: seq[uint8]): MetalBufferHandle = nil
+-  proc metalUploadPrivate*(data: seq[float32]): MetalBufferHandle = nil
++  proc metalUploadBytes*(data: openArray[uint8]): MetalBufferHandle = nil
++  proc metalUploadPrivate*(data: openArray[float32]): MetalBufferHandle = nil
+   proc metalUploadBytesPrivate*(data: seq[uint8]): MetalBufferHandle = nil
+   proc metalSessionMatmulQ4Enc*(a, wq, scales, zeros, c: MetalBufferHandle,
+                                  m, k, n, groupSize, nGroupsPerRow: int): bool = false
+@@ -832,3 +831,7 @@
+     raise newException(CatchableError, "Metal backend chỉ khả dụng trên macOS")
+   proc metalAttentionFusedBackward*(q, k, v, s_matrix, dy: seq[float32], B, H, S, D: int, scale: float32): tuple[dq, dk, dv: seq[float32]] =
+     raise newException(CatchableError, "Metal backend chỉ khả dụng trên macOS")
++
++when defined(macosx):
++  proc metalDeviceMaxTgThreads*(): cint {.importc: "metal_device_max_tg_threads", header: "metal_shim.h".}
++  proc metalDeviceMaxTgBytes*(): cint {.importc: "metal_device_max_tg_bytes", header: "metal_shim.h".}
+--- a/backends/metal/metal_shim.h
++++ b/backends/metal/metal_shim.h
+@@ -370,6 +370,10 @@
+ /* JIT: compile Metal source luc runtime (bytecode lower -> kernel moi). */
+ int metal_jit_compile(const char* source, const char* kernelName);
+ 
++
++int metal_device_max_tg_threads(void);
++int metal_device_max_tg_bytes(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+--- a/backends/metal/metal_shim.m
++++ b/backends/metal/metal_shim.m
+@@ -2611,3 +2611,12 @@
+         return 1;
+     }
+ }
++
++int metal_device_max_tg_threads(void) {
++    if (!gDevice) return 0;
++    return (int)gDevice.maxThreadsPerThreadgroup.width;
++}
++int metal_device_max_tg_bytes(void) {
++    if (!gDevice) return 0;
++    return (int)gDevice.maxThreadgroupMemoryLength;
++}
+--- a/backends/vulkan/q4_autotune.nim
++++ b/backends/vulkan/q4_autotune.nim
+@@ -61,7 +61,7 @@
+   var plans = @[VkQ4Plan(kind: q4Reference, name: "reference-tg128")]
+   let geometries = if M == 1: @[(4, 1)] else: @[(1, 8), (2, 4)]
+   for (rows, batch) in geometries:
+-    for tg in [32, 64, 128]:
++    for tg in [32, 64, 128, 256, 512, 1024]:
+       if tg > gDeviceCaps.maxThreads or rows * batch * tg * 4 > gDeviceCaps.maxSharedBytes: continue
+       try:
+         plans.add q4Compile(tg, rows, batch)
+--- a/backends/vulkan/vulkan_caps.nim
++++ b/backends/vulkan/vulkan_caps.nim
+@@ -237,3 +237,16 @@
+ 
+ proc deviceName*(caps: VulkanCaps): string =
+   $cast[cstring](unsafeAddr caps.properties.deviceName[0])
++
++proc deviceClass*(deviceType: uint32): string =
++  case deviceType
++  of 1: "iGPU"
++  of 2: "dGPU"
++  of 3: "virtual-GPU"
++  of 4: "CPU"
++  else: "other"
++
++proc useDeviceLocalWeights*(deviceType: uint32; mode = "auto"): bool =
++  ## Private/device-local resident weights are permitted only on a dGPU.
++  ## An old DEVICE_LOCAL=1 setting must never force the iGPU/UMA path private.
++  deviceType == 2'u32 and mode in ["auto", "1"]
+--- a/backends/vulkan/vulkan_driver.nim
++++ b/backends/vulkan/vulkan_driver.nim
+@@ -537,9 +537,7 @@
+   lib.vkCmdCopyBuffer = loadInstanceProc[typeof(lib.vkCmdCopyBuffer)]("vkCmdCopyBuffer")
+   lib.vkResetCommandBuffer = loadInstanceProc[typeof(lib.vkResetCommandBuffer)]("vkResetCommandBuffer")
+ 
+-  # ---- 3. Chọn physical device đầu tiên (giống Metal: "GPU đầu tiên tìm
+-  # thấy" - Iris Plus 640 là GPU duy nhất trên máy Intel Mac này nên không
+-  # cần logic chọn phức tạp) ----
++  # ---- 3. Prefer a discrete GPU; allow explicit device index selection. ----
+   var devCount: uint32 = 0
+   gpuCheck(lib.vkEnumeratePhysicalDevices(gInstance, addr devCount, nil) == VK_SUCCESS, "vkEnumeratePhysicalDevices (dem) that bai")
+   gpuCheck(devCount > 0, "Khong tim thay physical device Vulkan nao")
+@@ -630,7 +628,12 @@
+   gpuCheck(lib.vkCreateCommandPool(gDevice, addr poolInfo, nil, addr gCommandPool) == VK_SUCCESS, "vkCreateCommandPool that bai")
+ 
+   gInitialized = true
++  let weightMemory = if useDeviceLocalWeights(gDeviceCaps.properties.deviceType,
++      getEnv("BYBY_VULKAN_DEVICE_LOCAL", "auto")): "device-local/VRAM"
++    else: "host-visible/shared"
+   stderr.writeLine "[vulkan] device=" & gDeviceCaps.deviceName &
++    " type=" & deviceClass(gDeviceCaps.properties.deviceType) &
++    " residentWeights=" & weightMemory &
+     " subgroup=" & $gDeviceCaps.subgroupSize & " maxThreads=" & $gDeviceCaps.maxThreads &
+     " sharedBytes=" & $gDeviceCaps.maxSharedBytes &
+     " matrix=" & (if gCoopEnabled: "KHR_cooperative_matrix FP16/FP32" else: "scalar")
+@@ -1335,8 +1338,7 @@
+ proc uploadResidentData(data: pointer; nBytes: uint64): VulkanBufferHandle =
+   ensureInit()
+   let localMode = getEnv("BYBY_VULKAN_DEVICE_LOCAL", "auto")
+-  let deviceLocal = localMode == "1" or
+-    (localMode == "auto" and gDeviceCaps.properties.deviceType == 2)
++  let deviceLocal = useDeviceLocalWeights(gDeviceCaps.properties.deviceType, localMode)
+   let allocBytes = max(4'u64, (nBytes + 3) and not 3'u64)
+   let flags = if deviceLocal: VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+               else: VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT or VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+@@ -1363,11 +1365,11 @@
+     vulkanSessionFree(result)
+     raise newException(CatchableError, "resident Vulkan upload failed: " & gVkLastError)
+ 
+-proc vulkanSessionUploadPrivate*(data: seq[float32]): VulkanBufferHandle =
++proc vulkanSessionUploadPrivate*(data: openArray[float32]): VulkanBufferHandle =
+   uploadResidentData((if data.len > 0: cast[pointer](unsafeAddr data[0]) else: nil),
+     uint64(data.len * sizeof(float32)))
+ 
+-proc vulkanSessionUploadBytesPrivate*(data: seq[uint8]): VulkanBufferHandle =
++proc vulkanSessionUploadBytesPrivate*(data: openArray[uint8]): VulkanBufferHandle =
+   uploadResidentData((if data.len > 0: cast[pointer](unsafeAddr data[0]) else: nil), uint64(data.len))
+ 
+ proc dispatchGeneric(shaderName: string, buffers: openArray[VulkanBufferHandle],
+@@ -2219,6 +2221,6 @@
+   gVkTgBytes = 0
+ 
+ # Alias used by fp4 / session upload path
+-proc vulkanSessionUploadU8*(data: seq[uint8]): VulkanBufferHandle =
++proc vulkanSessionUploadU8*(data: openArray[uint8]): VulkanBufferHandle =
+   ## Discrete GPUs retain weights in device-local VRAM after one staging copy.
+   vulkanSessionUploadBytesPrivate(data)
+--- a/gpubackend.nim
++++ b/gpubackend.nim
+@@ -982,7 +982,7 @@
+   else:
+     discard
+ 
+-proc sessionUploadPrivate*(backend: GpuBackend, data: seq[float32]): SessionHandle =
++proc sessionUploadPrivate*(backend: GpuBackend, data: openArray[float32]): SessionHandle =
+   ## Bản Private-storage của sessionUpload - CHỈ dùng cho weight RESIDENT
+   ## (upload 1 LẦN lúc load model, CPU không đọc/ghi lại sau đó) - hiện dùng
+   ## cho beResidentUploadFp32 (weight int8/int4-symmetric/tied-embedding qua

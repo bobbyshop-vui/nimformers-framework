@@ -940,7 +940,7 @@ proc loadCheckpointLoraBin*(path: string): tuple[model: NimformerModelJamba, lor
   for name, qt in newBlockQuant:
     if name notin byName:
       raise newException(ValueError, "Checkpoint co newBlock khong ton tai trong model: " & name)
-    if name notin expectedNewBlocks or qt.shape != byName[name][].shape or qt.data.len == 0:
+    if name notin expectedNewBlocks or qt.shape != byName[name][].shape or qt.bytes.len == 0:
       raise newException(ValueError, "Checkpoint newBlock quant sai shape/data: " & name)
   var lo: JambaLora
   lo.adapters = initTable[string, LoraAdapter]()

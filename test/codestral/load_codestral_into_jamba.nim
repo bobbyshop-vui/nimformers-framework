@@ -26,6 +26,7 @@ import jamba_hybrid
 import mamba2_real
 import sharded_hf_loader
 import rawbin   # RawBinTensor
+import std/os
 import quant    # loadQuantStateDict, dequantizeTensor - cho nguon .nimq (da quantize fp4)
 
 const
@@ -189,7 +190,7 @@ proc loadCodestralQuantResidentFromNimq*(m: var NimformerModelJamba, nimqPath: s
   ## thang vao model nhu loadCodestralIntoJambaFromNimq (khong quant-resident
   ## cho phan nay, khong can thiet).
   echo &"[load_codestral] (quant-resident) Doc {nimqPath} ..."
-  var sd = quant.loadQuantStateDict(nimqPath).sd
+  var sd = quant.loadQuantStateDict(nimqPath, mapped = getEnv("BYBY_MODEL_MMAP", "1") != "0").sd
   var byName = initTable[string, QuantTensor]()
   for (name, qt) in sd.mitems: byName[name] = move(qt)
   # NGHI VAN #2 cho RSS-sau-load cao bat thuong (xem bao cao debug): truoc
@@ -219,9 +220,9 @@ proc loadCodestralQuantResidentFromNimq*(m: var NimformerModelJamba, nimqPath: s
     if name notin byName:
       missing.add(name & " (missing)")
     elif not sourceShapeMatches(name, byName[name].shape, expectedShape) or
-         byName[name].data.len == 0:
+         byName[name].bytes.len == 0:
       missing.add(name & " (shape=" & $byName[name].shape & ", expected=" &
-                  $expectedShape & ", data=" & $byName[name].data.len & ")")
+                  $expectedShape & ", data=" & $byName[name].bytes.len & ")")
 
   proc dequantSmall(name: string): RawBinTensor =
     let qt = byName[name]
@@ -252,7 +253,7 @@ proc loadCodestralQuantResidentFromNimq*(m: var NimformerModelJamba, nimqPath: s
     let qt = byName[LmHeadName]
     var expectedLen = 1
     for d in qt.shape: expectedLen *= d
-    if qt.shape == m.outProj.weight.shape and qt.data.len > 0:
+    if qt.shape == m.outProj.weight.shape and qt.bytes.len > 0:
       result["outProj.weight"] = qt
       byName.del(LmHeadName)   # giai phong ban trong byName, result da giu roi
     else:
@@ -261,7 +262,7 @@ proc loadCodestralQuantResidentFromNimq*(m: var NimformerModelJamba, nimqPath: s
     # Cho phép checkpoint tied-embedding hợp lệ: dùng đúng embed làm lm_head.
     # Nếu shape không khớp thì giữ fail-fast, tuyệt đối không để random lm_head.
     if EmbedName in byName and byName[EmbedName].shape == m.outProj.weight.shape and
-       byName[EmbedName].data.len > 0:
+       byName[EmbedName].bytes.len > 0:
       discard
     else:
       missingRequired.add(LmHeadName & " (missing and no valid tied embedding)")

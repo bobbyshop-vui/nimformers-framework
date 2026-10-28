@@ -6,6 +6,8 @@
 ## Không có main/test ở đây — đây là thư viện thuần, import vào chỗ khác dùng.
 
 import std/math
+import mapped_weights
+export mapped_weights
 import customfloat
 
 type
@@ -37,7 +39,15 @@ type
                          ## do double-quantization thô — xem quantize_int4_asymmetric_per_group
                          ## bên export_to_nimq.py).
     cf*: CustomFloat     ## dùng cho qkFp8E4M3/E5M2/qkCustom/qkAuto
+    mappedData*: MappedView[uint8]
     data*: seq[uint8]
+
+template bytes*(qt: QuantTensor): untyped =
+  weightValues(qt.data, qt.mappedData)
+
+proc clearPayload*(qt: var QuantTensor) =
+  qt.data = @[]
+  qt.mappedData = default(MappedView[uint8])
 
 proc numelQ(shape: seq[int]): int =
   result = 1
@@ -67,8 +77,8 @@ proc quantizeInt8*(arr: openArray[float32], shape: seq[int]): QuantTensor =
 
 proc dequantizeInt8*(qt: QuantTensor): seq[float32] =
   let sc = qt.scale[0]
-  result = newSeq[float32](qt.data.len)
-  for i, b in qt.data:
+  result = newSeq[float32](qt.bytes.len)
+  for i, b in qt.bytes:
     result[i] = float32(cast[int8](b)) * sc
 
 proc quantizeInt4*(arr: openArray[float32], shape: seq[int]): QuantTensor =
@@ -107,8 +117,8 @@ proc dequantizeInt4*(qt: QuantTensor): seq[float32] =
   for i in 0 ..< n:
     let byteIdx = i div 2
     var nibble: uint8
-    if i mod 2 == 0: nibble = qt.data[byteIdx] and 0x0F'u8
-    else: nibble = (qt.data[byteIdx] shr 4) and 0x0F'u8
+    if i mod 2 == 0: nibble = qt.bytes[byteIdx] and 0x0F'u8
+    else: nibble = (qt.bytes[byteIdx] shr 4) and 0x0F'u8
     result[i] = lut[int(nibble)]
 
 # ─────────────────────────────────────────────────────────────
@@ -176,8 +186,8 @@ proc dequantizeInt4Asymmetric*(qt: QuantTensor): seq[float32] =
           for k in 0 ..< 16: lut[k] = (float32(k) - zp) * sc   # tính lại LUT chỉ khi sang group mới
         let byteIdx = rowByteOff + c div 2
         var nibble: uint8
-        if c mod 2 == 0: nibble = qt.data[byteIdx] and 0x0F'u8
-        else: nibble = (qt.data[byteIdx] shr 4) and 0x0F'u8
+        if c mod 2 == 0: nibble = qt.bytes[byteIdx] and 0x0F'u8
+        else: nibble = (qt.bytes[byteIdx] shr 4) and 0x0F'u8
         result[r * nCols + c] = lut[int(nibble)]
   elif qt.scale.len > 1:
     doAssert qt.shape.len == 2, "per-row int4 chỉ hỗ trợ tensor 2D"
@@ -192,8 +202,8 @@ proc dequantizeInt4Asymmetric*(qt: QuantTensor): seq[float32] =
       for c in 0 ..< nCols:
         let byteIdx = rowByteOff + c div 2
         var nibble: uint8
-        if c mod 2 == 0: nibble = qt.data[byteIdx] and 0x0F'u8
-        else: nibble = (qt.data[byteIdx] shr 4) and 0x0F'u8
+        if c mod 2 == 0: nibble = qt.bytes[byteIdx] and 0x0F'u8
+        else: nibble = (qt.bytes[byteIdx] shr 4) and 0x0F'u8
         result[r * nCols + c] = lut[int(nibble)]
   else:
     let sc = qt.scale[0]
@@ -201,8 +211,8 @@ proc dequantizeInt4Asymmetric*(qt: QuantTensor): seq[float32] =
     for i in 0 ..< n:
       let byteIdx = i div 2
       var nibble: uint8
-      if i mod 2 == 0: nibble = qt.data[byteIdx] and 0x0F'u8
-      else: nibble = (qt.data[byteIdx] shr 4) and 0x0F'u8
+      if i mod 2 == 0: nibble = qt.bytes[byteIdx] and 0x0F'u8
+      else: nibble = (qt.bytes[byteIdx] shr 4) and 0x0F'u8
       result[i] = (float32(nibble) - zp) * sc
 
 # ─────────────────────────────────────────────────────────────
@@ -271,10 +281,10 @@ proc quantizeRaw*(arr: openArray[float32], shape: seq[int]): QuantTensor =
     copyMem(addr result.data[i*4], addr vv, 4)
 
 proc dequantizeRaw*(qt: QuantTensor): seq[float32] =
-  let n = qt.data.len div 4
+  let n = qt.bytes.len div 4
   result = newSeq[float32](n)
   for i in 0 ..< n:
-    copyMem(addr result[i], unsafeAddr qt.data[i*4], 4)
+    copyMem(addr result[i], unsafeAddr qt.bytes[i*4], 4)
 
 # ═════════════════════════════════════════════════════════════
 # FP4-KM  —  "Q4_K_M nhưng FP4"
@@ -458,13 +468,13 @@ proc dequantizeFp4KM*(qt: QuantTensor): seq[float32] =
   for r in 0 ..< R:
     for j in 0 ..< nG:
       let gi = r * nG + j
-      let sb = qt.data[nibEnd + gi]
+      let sb = qt.bytes[nibEnd + gi]
       var s = e4m3Lut[int(sb)] * globalScale
       if s > 1e30'f32 or s != s: s = 0'f32
       let off = r * C + j * g
       let blk = gi * half
       for t in 0 ..< half:
-        let b = qt.data[blk + t]
+        let b = qt.bytes[blk + t]
         result[off + t]        = lut[int(b and 0x0F'u8)] * s
         result[off + t + half] = lut[int(b shr 4)] * s
 
@@ -494,7 +504,7 @@ proc dequantizeTensor*(qt: QuantTensor): seq[float32] =
     # file MOI qua quantizeFloatDtype ban sua (co scale thuc, xem giai thich
     # o do) - neu khong nhan lai o day, decode ra toan gia tri be xiu/0 sai
     # hoan toan so voi weight goc.
-    let raw = decodeArray(qt.data, qt.cf)
+    let raw = decodeArray(qt.bytes, qt.cf)
     let s = if qt.scale.len > 0: qt.scale[0] else: 1'f32
     if s == 1'f32: raw
     else:
@@ -538,8 +548,8 @@ proc dequantizeTensorTransposed*(qt: QuantTensor): seq[float32] =
             for k in 0 ..< 16: lut[k] = (float32(k) - zp) * sc
           let byteIdx = rowByteOff + c div 2
           var nibble: uint8
-          if c mod 2 == 0: nibble = qt.data[byteIdx] and 0x0F'u8
-          else: nibble = (qt.data[byteIdx] shr 4) and 0x0F'u8
+          if c mod 2 == 0: nibble = qt.bytes[byteIdx] and 0x0F'u8
+          else: nibble = (qt.bytes[byteIdx] shr 4) and 0x0F'u8
           result[c * nRows + r] = lut[int(nibble)]   # ghi thẳng layout transposed
     elif qt.scale.len > 1:
       for r in 0 ..< nRows:
@@ -550,8 +560,8 @@ proc dequantizeTensorTransposed*(qt: QuantTensor): seq[float32] =
         for c in 0 ..< nCols:
           let byteIdx = rowByteOff + c div 2
           var nibble: uint8
-          if c mod 2 == 0: nibble = qt.data[byteIdx] and 0x0F'u8
-          else: nibble = (qt.data[byteIdx] shr 4) and 0x0F'u8
+          if c mod 2 == 0: nibble = qt.bytes[byteIdx] and 0x0F'u8
+          else: nibble = (qt.bytes[byteIdx] shr 4) and 0x0F'u8
           result[c * nRows + r] = lut[int(nibble)]
     else:
       let sc = qt.scale[0]
@@ -562,8 +572,8 @@ proc dequantizeTensorTransposed*(qt: QuantTensor): seq[float32] =
         for c in 0 ..< nCols:
           let byteIdx = rowByteOff + c div 2
           var nibble: uint8
-          if c mod 2 == 0: nibble = qt.data[byteIdx] and 0x0F'u8
-          else: nibble = (qt.data[byteIdx] shr 4) and 0x0F'u8
+          if c mod 2 == 0: nibble = qt.bytes[byteIdx] and 0x0F'u8
+          else: nibble = (qt.bytes[byteIdx] shr 4) and 0x0F'u8
           result[c * nRows + r] = lut[int(nibble)]
   of qkInt4:
     let sc = qt.scale[0]
@@ -578,15 +588,15 @@ proc dequantizeTensorTransposed*(qt: QuantTensor): seq[float32] =
       for c in 0 ..< nCols:
         let byteIdx = rowByteOff + c div 2
         var nibble: uint8
-        if c mod 2 == 0: nibble = qt.data[byteIdx] and 0x0F'u8
-        else: nibble = (qt.data[byteIdx] shr 4) and 0x0F'u8
+        if c mod 2 == 0: nibble = qt.bytes[byteIdx] and 0x0F'u8
+        else: nibble = (qt.bytes[byteIdx] shr 4) and 0x0F'u8
         result[c * nRows + r] = lut[int(nibble)]
   of qkInt8:
     let sc = qt.scale[0]
     for r in 0 ..< nRows:
       let rowOff = r * nCols
       for c in 0 ..< nCols:
-        result[c * nRows + r] = float32(cast[int8](qt.data[rowOff + c])) * sc
+        result[c * nRows + r] = float32(cast[int8](qt.bytes[rowOff + c])) * sc
   else:
     # Hiếm gặp (fp32 raw / fp8 / custom / auto) — không phải đường nóng
     # (đường nóng q/k/v/o/gate/up/down/lm_head luôn dùng int4 asymmetric
@@ -635,10 +645,10 @@ proc writeQuantTensor(f: File, qt: QuantTensor) =
   var mb = int32(qt.cf.mantissaBits)
   discard f.writeBuffer(addr eb, 4)
   discard f.writeBuffer(addr mb, 4)
-  var dlen = int32(qt.data.len)
+  var dlen = int32(qt.bytes.len)
   discard f.writeBuffer(addr dlen, 4)
-  if qt.data.len > 0:
-    discard f.writeBuffer(unsafeAddr qt.data[0], qt.data.len)
+  if qt.bytes.len > 0:
+    discard f.writeBuffer(unsafeAddr qt.bytes[0], qt.bytes.len)
 
 proc readQuantTensor(f: File): QuantTensor =
   var kindByte: uint8
@@ -672,65 +682,31 @@ proc readQuantTensor(f: File): QuantTensor =
   if dlen > 0:
     discard f.readBuffer(addr result.data[0], dlen)
 
-# LOAD TOC DO CAO (readString/readQuantTensor o tren gio KHONG con duoc
-# loadQuantStateDict dung nua, giu lai nguyen vi khong noi nao khac trong
-# codebase goi toi, xoa di khong loi gi nhung khong can thiet): ly do
-# llama.cpp/llama-cli load model NHANH HON HAN o day - no mmap() THANG file
-# GGUF vao dia chi ao (khong doc/copy gi luc "load", kernel chi lam page
-# table, tu nap trang vao RAM khi THUC SU cham toi tensor do luc infer -
-# "load" gan nhu tuc thi, dac biet khi file da nam san trong page cache tu
-# lan chay truoc). loadQuantStateDict ban goc lam NGUOC LAI hoan toan:
-# open()+f.readBuffer() RIENG LE cho TUNG field cua TUNG tensor (kindByte,
-# ndims, moi chieu shape, scale, zero_point, groupSize, eb, mb, data) - voi
-# model 7B hang tram tensor x 5-6 field/tensor = VAI NGAN syscall read() +
-# VAI NGAN lan cap phat heap nho le, chay TUAN TU DON LUONG - chinh la buoc
-# "Doc codestral_mamba_only.nimq" cham thay vi gan-tuc-thi nhu llama-cli.
-#
-# CHUA lam duoc mmap THAT o day (doi hoi doi QuantTensor.data TU seq[uint8]
-# SO HUU rieng SANG con tro-vao-vung-map dung chung - dung cham rat nhieu
-# noi dang dung qt.data nhu seq[uint8] binh thuong khap codebase, rui ro cao
-# khi sua ma khong compile-check duoc tai day). Thay vao do: doc CA FILE vao
-# DUY NHAT 1 buffer RAM bang 1 lan readFile() (1 syscall lon, OS/page-cache
-# xu ly tuan tu rat nhanh, khac han vai ngan syscall nho rai rac), roi parse
-# tung tensor bang copyMem TU buffer RAM do - giam so syscall read() xuong
-# CON 1 cho CA FILE, giu nguyen 100% dinh dang file NIMQ2 va cau truc
-# QuantTensor.data: seq[uint8] (downstream code dung qt.data KHONG can sua
-# gi ca, van la seq[uint8] so huu binh thuong).
-
-proc rdBuf(buf: string, pos: var int, dst: pointer, n: int) =
-  doAssert pos + n <= buf.len,
-    "loadQuantStateDict: file .nimq ngan hon du lieu can doc (file hong hoac bi cat cut?)"
-  if n > 0: copyMem(dst, unsafeAddr buf[pos], n)
-  pos += n
-
-proc rdI32(buf: string, pos: var int): int32 =
-  rdBuf(buf, pos, addr result, 4)
-
-proc rdStringBuf(buf: string, pos: var int): string =
-  let n = int(rdI32(buf, pos))
-  result = newString(n)
-  if n > 0: rdBuf(buf, pos, addr result[0], n)
-
-proc rdQuantTensorBuf(buf: string, pos: var int): QuantTensor =
-  var kindByte: uint8
-  rdBuf(buf, pos, addr kindByte, 1)
-  result.kind = QuantKind(kindByte)
-  let ndims = int(rdI32(buf, pos))
-  result.shape = newSeq[int](ndims)
+proc readMappedQuantTensor*(c: var WeightCursor; mapped = true): QuantTensor =
+  let kind = readValue[uint8](c)
+  if kind > uint8(high(QuantKind)): raise newException(IOError, "Invalid quant kind")
+  result.kind = QuantKind(kind)
+  let ndims = c.readCount(4)
+  if ndims > 8: raise newException(IOError, "Invalid tensor rank")
   for i in 0 ..< ndims:
-    result.shape[i] = int(rdI32(buf, pos))
-  let nScales = int(rdI32(buf, pos))
-  result.scale = newSeq[float32](nScales)
-  if nScales > 0: rdBuf(buf, pos, addr result.scale[0], nScales * 4)
-  result.zero_point = newSeq[float32](nScales)
-  if nScales > 0: rdBuf(buf, pos, addr result.zero_point[0], nScales * 4)
-  result.groupSize = int(rdI32(buf, pos))
-  let eb = int(rdI32(buf, pos))
-  let mb = int(rdI32(buf, pos))
+    let d = int(readValue[int32](c))
+    if d <= 0: raise newException(IOError, "Invalid tensor dimension")
+    result.shape.add d
+  let ns = c.readCount(4)
+  result.scale = readSeq[float32](c, ns)
+  result.zero_point = readSeq[float32](c, ns)
+  result.groupSize = int(readValue[int32](c))
+  let eb = int(readValue[int32](c))
+  let mb = int(readValue[int32](c))
+  if eb < 0 or mb < 0 or eb > 8 or mb > 23:
+    raise newException(IOError, "Invalid custom float format")
   result.cf = newCustomFloat(eb, mb)
-  let dlen = int(rdI32(buf, pos))
-  result.data = newSeq[uint8](dlen)
-  if dlen > 0: rdBuf(buf, pos, addr result.data[0], dlen)
+  let n = c.readCount()
+  if mapped:
+    result.mappedData = mappedView[uint8](c.owner, c.pos, n)
+    c.pos += n
+  else:
+    result.data = readSeq[uint8](c, n)
 
 proc saveQuantStateDict*(path: string, arch: array[5, int], sd: seq[(string, QuantTensor)]) =
   var f = open(path, fmWrite)
@@ -745,17 +721,12 @@ proc saveQuantStateDict*(path: string, arch: array[5, int], sd: seq[(string, Qua
     writeString(f, name)
     writeQuantTensor(f, qt)
 
-proc loadQuantStateDict*(path: string): tuple[arch: array[5, int], sd: seq[(string, QuantTensor)]] =
-  let buf = readFile(path)   # 1 syscall duy nhat cho CA FILE, xem giai thich o tren
-  var pos = 0
-  let magic = rdStringBuf(buf, pos)
-  doAssert magic == MagicStr, "File không đúng định dạng NIMQ1: " & path
-  var archI32: array[5, int32]
-  for i in 0 ..< 5: archI32[i] = rdI32(buf, pos)
-  for i in 0 ..< 5: result.arch[i] = int(archI32[i])
-  let n = int(rdI32(buf, pos))
-  result.sd = newSeqOfCap[(string, QuantTensor)](n)
+proc loadQuantStateDict*(path: string; mapped = false): tuple[arch: array[5, int], sd: seq[(string, QuantTensor)]] =
+  var c = WeightCursor(owner: mapWeights(path))
+  if c.readString() != MagicStr:
+    raise newException(IOError, "Invalid NIMQ checkpoint: " & path)
+  for i in 0 ..< 5: result.arch[i] = int(readValue[int32](c))
+  let n = c.readCount()
   for i in 0 ..< n:
-    let name = rdStringBuf(buf, pos)
-    let qt = rdQuantTensorBuf(buf, pos)
-    result.sd.add((name, qt))
+    let name = c.readString()
+    result.sd.add((name, readMappedQuantTensor(c, mapped)))

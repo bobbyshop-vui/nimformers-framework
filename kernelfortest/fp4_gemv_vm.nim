@@ -524,7 +524,7 @@ proc emitKmReduceDynamic(p: var VmProgram; accum: openArray[uint32]; tg: int;
 proc buildFp4KmGemvTunedProgram*(K, N, tg, rows: int): VmProgram =
   ## Four-byte packed loads cover eight weights/lane. Wider groups split K
   ## over more lanes; rows reuse the activation. No weight repacking required.
-  doAssert tg in [32, 64, 128, 256] and rows in [2, 4]
+  doAssert tg in [32, 64, 128, 256, 512, 1024] and rows in [2, 4]
   doAssert K > 0 and K mod (tg * 8) == 0 and N > 0 and N mod rows == 0
   const acc = [4'u32, 12'u32, 13'u32, 14'u32]
   const partial = [8'u32, 9'u32, 10'u32, 11'u32]
@@ -562,7 +562,7 @@ proc buildFp4KmGemvTunedProgram*(K, N, tg, rows: int): VmProgram =
 
 proc buildFp4KmGemmTunedProgram*(K, N, tg, batchRows: int): VmProgram =
   ## Batched variant: decode one packed word/scale for all input rows.
-  doAssert tg in [32, 64, 128, 256] and batchRows in [4, 8]
+  doAssert tg in [32, 64, 128, 256, 512, 1024] and batchRows in [4, 8]
   doAssert K > 0 and K mod (tg * 8) == 0 and N > 0
   const acc = [4'u32, 6'u32, 10'u32, 11'u32, 12'u32, 13'u32, 14'u32, 15'u32]
   var p: VmProgram
@@ -974,3 +974,18 @@ proc buildInt4AsymGemvProgram*(K, N, groupSize: int): VmProgram =
   p.emitIfEnd()
   p.emitHalt()
   result = p
+
+proc fp4KmTgCandidates*(K, rows, maxThreads, maxSharedBytes: int;
+                         setting = "auto"): seq[int] =
+  ## Reduction geometry is exact: never clamp a compiled kernel at dispatch.
+  for tg in [32, 64, 128, 256, 512, 1024]:
+    if tg <= maxThreads and K > 0 and K mod (tg * 8) == 0 and
+       (Fp4KmLutLen + rows * tg) * 4 <= maxSharedBytes:
+      result.add tg
+  if setting == "max":
+    if result.len > 0: result = @[result[^1]]
+  elif setting != "auto" and setting != "0" and setting.len > 0:
+    var selected: seq[int]
+    for tg in result:
+      if $tg == setting: selected.add tg
+    result = selected

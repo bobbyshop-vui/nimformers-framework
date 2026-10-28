@@ -1,5 +1,7 @@
 # Makefile — build project Nimformer
 
+.DEFAULT_GOAL := all
+
 NIM      := nim
 NIMFLAGS := -d:release --hints:off --mm:arc --opt:speed --path:. --path:test/codestral --path:test/deepseek-inference --path:test/spectron --path:kernelfortest
 INFER_LORA_NIMCACHE := nimcache/infer-lora
@@ -54,26 +56,37 @@ SPECTRON_BIN    := test_inferencespectron$(EXE_EXT)
 CLEAN_BINS      := $(TEST_BIN) $(GRAFT_BIN) $(FINETUNE_BIN) $(INFER_LORA_BIN) \
                    $(COMPACT_LORA_BIN) $(MIGRATE_LORA_BIN) $(NIM_INFER_BIN) $(SPECTRON_BIN)
 
-.PHONY: shaders all build run run-cpu run-metal run-opencl run-cuda clean \
-        download-models download-datasets \
+.PHONY: prepare-backend shaders all build run run-cpu run-metal run-opencl run-cuda clean \
+        download-models download-datasets download-codestral-tokenizer \
         build-graft build-finetune build-infer-lora build-compact-lora \
         build-migrate-lora build-nim-inference build-spectron \
         graft finetune-mamba infer-lora infer-mamba infer-deepseek run-spectron mamba-pipeline
 
+# The bundled checkout currently lacks submodule Git metadata. Keep backend
+# source changes reviewable and reproducible in the parent repository.
+prepare-backend:
+	@if patch --dry-run --reverse --batch -s -p1 -d vendor/bybylang < patches/bybylang-mmap-workgroups.patch >/dev/null 2>&1; then \
+		:; \
+	elif patch --dry-run --forward --batch -s -p1 -d vendor/bybylang < patches/bybylang-mmap-workgroups.patch >/dev/null 2>&1; then \
+		patch --forward --batch -s -p1 -d vendor/bybylang < patches/bybylang-mmap-workgroups.patch; \
+	else \
+		echo "Backend patch conflicts; inspect patches/bybylang-mmap-workgroups.patch before building."; exit 1; \
+	fi
+
 all: build run
 
-build:
+build: prepare-backend
 	$(NIM) c $(NIMFLAGS) $(TEST_SRC)
 
-run:
+run: prepare-backend
 	$(NIM) c $(NIMFLAGS) $(TEST_SRC)
 	$(RUN_PREFIX)$(TEST_BIN)
 
-run-cpu:
+run-cpu: prepare-backend
 	$(NIM) c $(NIMFLAGS) -d:backend=cpu $(TEST_SRC)
 	$(RUN_PREFIX)$(TEST_BIN)
 
-run-metal:
+run-metal: prepare-backend
 ifeq ($(IS_MACOS),yes)
 	$(NIM) c $(NIMFLAGS) -d:backend=metal $(TEST_SRC)
 	$(RUN_PREFIX)$(TEST_BIN)
@@ -81,7 +94,7 @@ else
 	@echo "Metal chi ho tro tren macOS"
 endif
 
-run-opencl:
+run-opencl: prepare-backend
 	$(NIM) c $(NIMFLAGS) -d:backend=opencl $(TEST_SRC)
 	$(RUN_PREFIX)$(TEST_BIN)
 
@@ -95,7 +108,7 @@ else
 	$(RM_RF) nimcache
 	$(RM_F) model_*.nimq
 endif
-run-cuda:
+run-cuda: prepare-backend
 	$(NIM) c $(NIMFLAGS) -d:backend=cuda $(TEST_SRC)
 	$(RUN_PREFIX)$(TEST_BIN)
 
@@ -112,6 +125,10 @@ download-models:
 	curl -fL --retry 3 -C - https://huggingface.co/bobbydeveloper2014/codestral-v0.1-7b-nimq/resolve/main/codestral_mamba_only.nimq -o test/codestral/models/codestral_mamba_only.nimq; \
 	curl -fL --retry 3 -C - https://huggingface.co/bobbydeveloper2014/codestral-v0.1-nimq-qlora-linearattention/resolve/main/jamba_parallel_lora.bin -o test/codestral/models/jamba_parallel_lora.bin; \
 	echo 'test/codestral/models/hf' > test/codestral/models/jamba_parallel_lora.bin.hf_tokenizer_dir
+
+# Repair tokenizer assets without downloading multi-GB model weights again.
+download-codestral-tokenizer:
+	bash test/codestral/download_codestral_tokenizer.sh "$(INFER_LORA_DEFAULT_HFDIR)"
 
 download-datasets:
 	@set -eu; \
@@ -165,10 +182,10 @@ INFER_DEEPSEEK_DEFAULT_MODEL   := test/deepseek-inference/models
 INFER_DEEPSEEK_DEFAULT_NIMQ    := test/deepseek-inference/models/model.nimq
 INFER_DEEPSEEK_DEFAULT_BACKEND := auto
 
-build-graft:
+build-graft: prepare-backend
 	$(NIM) c $(NIMFLAGS) -o:$(GRAFT_BIN) $(GRAFT_SRC)
 
-build-finetune:
+build-finetune: prepare-backend
 	$(NIM) c $(NIMFLAGS) -o:$(FINETUNE_BIN) $(FINETUNE_SRC)
 
 # Infer defaults: independent decode kernels in one session + resident GPU
@@ -178,10 +195,14 @@ build-finetune:
 # BYBY_GEMV_VARIANT=0 / BYBY_PREFILL_PARALLEL=0 / BYBY_MAMBA_SCAN_PARALLEL=0 /
 # BYBY_LP_SCAN_SERIAL=1 / BYBY_FP4_PAD_M=0.
 # Gop LoRA vao fp4 lam token rac -> TAT. LoRA chay rieng.
+export BYBY_MODEL_MMAP ?= 1
+export BYBY_MERGE_SCRATCH_MIB ?= 256
+export BYBY_GEMV_TG ?= max
 export BYBY_MERGE_LORA ?= 0
 export BYBY_ONE_DISPATCH ?= 0
-# Empty preserves -d:backend (auto by default); accepts vulkan/metal at runtime.
-export BYBY_INFER_BACKEND
+# Auto selects the available backend; request Vulkan explicitly when needed.
+export BYBY_INFER_BACKEND ?= auto
+export BYBY_VULKAN_DEVICE_LOCAL ?= auto
 export BYBY_PREFILL_RESIDENT ?= 1
 export BYBY_GEMV_VARIANT ?= auto
 export BYBY_PREFILL_FP4_KERNEL ?= auto
@@ -199,19 +220,19 @@ export BYBY_G_DIAGNOSTICS ?= 0
 export BYBY_TRACE_BLOCKS ?= 0
 export BYBY_MACOS_HIGH_PRIORITY ?= 1
 
-build-infer-lora:
+build-infer-lora: prepare-backend
 	$(NIM) c $(NIMFLAGS) --nimcache:$(INFER_LORA_NIMCACHE) -o:$(INFER_LORA_BIN) $(INFER_LORA_SRC)
 
-build-compact-lora:
+build-compact-lora: prepare-backend
 	$(NIM) c $(NIMFLAGS) -o:$(COMPACT_LORA_BIN) $(COMPACT_LORA_SRC)
 
-build-migrate-lora:
+build-migrate-lora: prepare-backend
 	$(NIM) c $(NIMFLAGS) -o:$(MIGRATE_LORA_BIN) $(MIGRATE_LORA_SRC)
 
-build-nim-inference:
+build-nim-inference: prepare-backend
 	$(NIM) c $(NIMFLAGS) --nimcache:$(NIM_INFER_NIMCACHE) -o:$(NIM_INFER_BIN) $(NIM_INFER_SRC)
 
-build-spectron:
+build-spectron: prepare-backend
 	$(NIM) c $(NIMFLAGS) -o:$(SPECTRON_BIN) $(SPECTRON_SRC)
 
 # ── graft: build + TU DONG CHAY. Khong truyen ARGS -> dung mac dinh

@@ -42,3 +42,9 @@ model.nimq
 vendor/.DS_Store
 test_vulkan_tensor_core.nim
 test_safe_merge_lora
+.DS_Store
+.DS_Store
+
+# Local tokenizer runtime and downloaded Hugging Face assets
+.runtime/
+test/codestral/models/hf/

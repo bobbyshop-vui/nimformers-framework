@@ -121,9 +121,9 @@ proc writeQLoraQ4Tensor*(writer: var QLoraBinWriter, name: string, qt: QuantTens
   writeI32(writer.stream, int32(qt.zero_point.len))
   for v in qt.zero_point:
     writer.stream.writeData(unsafeAddr v, 4)
-  writeI64(writer.stream, int64(qt.data.len))
-  if qt.data.len > 0:
-    writer.stream.writeData(unsafeAddr qt.data[0], qt.data.len)
+  writeI64(writer.stream, int64(qt.bytes.len))
+  if qt.bytes.len > 0:
+    writer.stream.writeData(unsafeAddr qt.bytes[0], qt.bytes.len)
   inc writer.tensorCount
 
 proc writeQLoraTensor*(writer: var QLoraBinWriter, t: QLoraBinTensor) =
