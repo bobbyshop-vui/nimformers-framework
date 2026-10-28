@@ -56,45 +56,39 @@ SPECTRON_BIN    := test_inferencespectron$(EXE_EXT)
 CLEAN_BINS      := $(TEST_BIN) $(GRAFT_BIN) $(FINETUNE_BIN) $(INFER_LORA_BIN) \
                    $(COMPACT_LORA_BIN) $(MIGRATE_LORA_BIN) $(NIM_INFER_BIN) $(SPECTRON_BIN)
 
-.PHONY: prepare-backend shaders all build run run-cpu run-metal run-opencl run-cuda clean \
+.PHONY: shaders all build run run-cpu run-metal run-opencl run-cuda clean \
         download-models download-datasets download-codestral-tokenizer \
         build-graft build-finetune build-infer-lora build-compact-lora \
         build-migrate-lora build-nim-inference build-spectron \
         graft finetune-mamba infer-lora infer-mamba infer-deepseek run-spectron mamba-pipeline
 
-# The bundled checkout currently lacks submodule Git metadata. Keep backend
-# source changes reviewable and reproducible in the parent repository.
-prepare-backend:
-	@if patch --dry-run --reverse --batch -s -p1 -d vendor/bybylang < patches/bybylang-mmap-workgroups.patch >/dev/null 2>&1; then \
-		:; \
-	elif patch --dry-run --forward --batch -s -p1 -d vendor/bybylang < patches/bybylang-mmap-workgroups.patch >/dev/null 2>&1; then \
-		patch --forward --batch -s -p1 -d vendor/bybylang < patches/bybylang-mmap-workgroups.patch; \
-	else \
-		echo "Backend patch conflicts; inspect patches/bybylang-mmap-workgroups.patch before building."; exit 1; \
-	fi
-
 all: build run
 
-build: prepare-backend
+build
+	$(NIM) check $(NIMFLAGS) $(TEST_SRC)
 	$(NIM) c $(NIMFLAGS) $(TEST_SRC)
 
-run: prepare-backend
+run
+	$(NIM) check $(NIMFLAGS) $(TEST_SRC)
 	$(NIM) c $(NIMFLAGS) $(TEST_SRC)
 	$(RUN_PREFIX)$(TEST_BIN)
 
-run-cpu: prepare-backend
+run-cpu
+	$(NIM) check $(NIMFLAGS) -d:backend=cpu $(TEST_SRC)
 	$(NIM) c $(NIMFLAGS) -d:backend=cpu $(TEST_SRC)
 	$(RUN_PREFIX)$(TEST_BIN)
 
-run-metal: prepare-backend
+run-metal
 ifeq ($(IS_MACOS),yes)
+	$(NIM) check $(NIMFLAGS) -d:backend=metal $(TEST_SRC)
 	$(NIM) c $(NIMFLAGS) -d:backend=metal $(TEST_SRC)
 	$(RUN_PREFIX)$(TEST_BIN)
 else
 	@echo "Metal chi ho tro tren macOS"
 endif
 
-run-opencl: prepare-backend
+run-opencl
+	$(NIM) check $(NIMFLAGS) -d:backend=opencl $(TEST_SRC)
 	$(NIM) c $(NIMFLAGS) -d:backend=opencl $(TEST_SRC)
 	$(RUN_PREFIX)$(TEST_BIN)
 
@@ -108,7 +102,8 @@ else
 	$(RM_RF) nimcache
 	$(RM_F) model_*.nimq
 endif
-run-cuda: prepare-backend
+run-cuda
+	$(NIM) check $(NIMFLAGS) -d:backend=cuda $(TEST_SRC)
 	$(NIM) c $(NIMFLAGS) -d:backend=cuda $(TEST_SRC)
 	$(RUN_PREFIX)$(TEST_BIN)
 
@@ -182,10 +177,12 @@ INFER_DEEPSEEK_DEFAULT_MODEL   := test/deepseek-inference/models
 INFER_DEEPSEEK_DEFAULT_NIMQ    := test/deepseek-inference/models/model.nimq
 INFER_DEEPSEEK_DEFAULT_BACKEND := auto
 
-build-graft: prepare-backend
+build-graft
+	$(NIM) check $(NIMFLAGS) $(GRAFT_SRC)
 	$(NIM) c $(NIMFLAGS) -o:$(GRAFT_BIN) $(GRAFT_SRC)
 
-build-finetune: prepare-backend
+build-finetune
+	$(NIM) check $(NIMFLAGS) $(FINETUNE_SRC)
 	$(NIM) c $(NIMFLAGS) -o:$(FINETUNE_BIN) $(FINETUNE_SRC)
 
 # Infer defaults: independent decode kernels in one session + resident GPU
@@ -220,20 +217,25 @@ export BYBY_G_DIAGNOSTICS ?= 0
 export BYBY_TRACE_BLOCKS ?= 0
 export BYBY_MACOS_HIGH_PRIORITY ?= 1
 
-build-infer-lora: prepare-backend
+build-infer-lora
 	$(NIM) check $(NIMFLAGS) kernelfortest/fp4_gemv_gpu.nim
+	$(NIM) check $(NIMFLAGS) $(INFER_LORA_SRC)
 	$(NIM) c $(NIMFLAGS) --nimcache:$(INFER_LORA_NIMCACHE) -o:$(INFER_LORA_BIN) $(INFER_LORA_SRC)
 
-build-compact-lora: prepare-backend
+build-compact-lora
+	$(NIM) check $(NIMFLAGS) $(COMPACT_LORA_SRC)
 	$(NIM) c $(NIMFLAGS) -o:$(COMPACT_LORA_BIN) $(COMPACT_LORA_SRC)
 
-build-migrate-lora: prepare-backend
+build-migrate-lora
+	$(NIM) check $(NIMFLAGS) $(MIGRATE_LORA_SRC)
 	$(NIM) c $(NIMFLAGS) -o:$(MIGRATE_LORA_BIN) $(MIGRATE_LORA_SRC)
 
-build-nim-inference: prepare-backend
+build-nim-inference
+	$(NIM) check $(NIMFLAGS) $(NIM_INFER_SRC)
 	$(NIM) c $(NIMFLAGS) --nimcache:$(NIM_INFER_NIMCACHE) -o:$(NIM_INFER_BIN) $(NIM_INFER_SRC)
 
-build-spectron: prepare-backend
+build-spectron
+	$(NIM) check $(NIMFLAGS) $(SPECTRON_SRC)
 	$(NIM) c $(NIMFLAGS) -o:$(SPECTRON_BIN) $(SPECTRON_SRC)
 
 # ── graft: build + TU DONG CHAY. Khong truyen ARGS -> dung mac dinh

@@ -64,7 +64,7 @@ proc sessionUploadBytesShared*(backend: byby.GpuBackend, data: openArray[uint8])
     else:
       result.metalHandle = nil
   of byby.gbVulkan:
-    result.vulkanHandle = vkDrv.vulkanSessionUploadU8(data)
+    result.vulkanHandle = vkDrv.vulkanSessionUploadU8(@data)
   else:
     discard
 
