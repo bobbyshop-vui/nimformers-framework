@@ -1,6 +1,0 @@
-# Tested tokenizer runtime. Install into the matching embedded Python directory.
-mistral-common==1.12.0
-tokenizers==0.23.3
-sentencepiece==0.2.2
-# Existing Python 3.10 extensions on macOS can still use NumPy's 1.x ABI.
-numpy>=1.25,<2; python_version < "3.13"

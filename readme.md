@@ -53,17 +53,11 @@ files, download only its tokenizer/config assets:
 make download-codestral-tokenizer
 ```
 
-Nimpy may embed a different Python from the shell's active Conda environment.
-Tokenizer import errors print the embedded version. For an embedded Python 3.10,
-install dependencies locally with the matching interpreter:
-
-```sh
-python3.10 -m pip install --target .runtime/codestral-tokenizer/3.10 -r test/codestral/tokenizer-requirements.txt
-```
-
-The tokenizer loader reads this version-specific directory automatically when
-run from the repository root; `BYBY_TOKENIZER_DEPS` can select another dependency
-root. This does not install packages into the active Conda environment.
+Codestral inference reads `tokenizer.model.v3` (or `tokenizer.model`) directly
+with the pure Nim tokenizer in `test/codestral/sentencepiece_native.nim`. It uses
+the model's BPE/Unigram rules, normalization and byte fallback. No Python tokenizer
+packages or SentencePiece library installation is required. `make build-infer-lora`
+builds inference with `-d:codestralInference`, excluding the PyTorch/Nimpy loaders.
 
 ### Run DeepSeek Coder with `nim_inference`
 

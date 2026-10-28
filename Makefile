@@ -5,6 +5,7 @@
 NIM      := nim
 NIMFLAGS := -d:release --hints:off --mm:arc --opt:speed --path:. --path:test/codestral --path:test/deepseek-inference --path:test/spectron --path:kernelfortest
 INFER_LORA_NIMCACHE := nimcache/infer-lora
+INFER_LORA_NIMFLAGS := $(NIMFLAGS) -d:codestralInference
 NIM_INFER_NIMCACHE := nimcache/nim-inference
 
 TEST_SRC  := test/spectron/test_nimformer.nim
@@ -64,21 +65,21 @@ CLEAN_BINS      := $(TEST_BIN) $(GRAFT_BIN) $(FINETUNE_BIN) $(INFER_LORA_BIN) \
 
 all: build run
 
-build
+build:
 	$(NIM) check $(NIMFLAGS) $(TEST_SRC)
 	$(NIM) c $(NIMFLAGS) $(TEST_SRC)
 
-run
+run:
 	$(NIM) check $(NIMFLAGS) $(TEST_SRC)
 	$(NIM) c $(NIMFLAGS) $(TEST_SRC)
 	$(RUN_PREFIX)$(TEST_BIN)
 
-run-cpu
+run-cpu:
 	$(NIM) check $(NIMFLAGS) -d:backend=cpu $(TEST_SRC)
 	$(NIM) c $(NIMFLAGS) -d:backend=cpu $(TEST_SRC)
 	$(RUN_PREFIX)$(TEST_BIN)
 
-run-metal
+run-metal:
 ifeq ($(IS_MACOS),yes)
 	$(NIM) check $(NIMFLAGS) -d:backend=metal $(TEST_SRC)
 	$(NIM) c $(NIMFLAGS) -d:backend=metal $(TEST_SRC)
@@ -87,7 +88,7 @@ else
 	@echo "Metal chi ho tro tren macOS"
 endif
 
-run-opencl
+run-opencl:
 	$(NIM) check $(NIMFLAGS) -d:backend=opencl $(TEST_SRC)
 	$(NIM) c $(NIMFLAGS) -d:backend=opencl $(TEST_SRC)
 	$(RUN_PREFIX)$(TEST_BIN)
@@ -102,7 +103,7 @@ else
 	$(RM_RF) nimcache
 	$(RM_F) model_*.nimq
 endif
-run-cuda
+run-cuda:
 	$(NIM) check $(NIMFLAGS) -d:backend=cuda $(TEST_SRC)
 	$(NIM) c $(NIMFLAGS) -d:backend=cuda $(TEST_SRC)
 	$(RUN_PREFIX)$(TEST_BIN)
@@ -155,8 +156,8 @@ GRAFT_DEFAULT_PATTERN := $(shell python3 -c "print('MMMA'*16)" 2>/dev/null || ec
 GRAFT_DEFAULT_OUT     := test/codestral/models/codestral_mamba_only.nimq
 
 INFER_LORA_DEFAULT_CKPT  := test/codestral/models/jamba_parallel_lora.bin
-# SUA: template "[INST] ...[/INST] " dung cho Codestral (Mistral tokenizer V3,
-# sentencepiece) - KHONG phai ChatML "<|user|>/<|assistant|>" (xem
+# Template "[INST] ...[/INST] " dung cho Codestral (Mistral tokenizer V3),
+# khong phai ChatML "<|user|>/<|assistant|>" (xem
 # finetune_lora.nim/lineToText va infer_lora.nim). Giu khoang trang sau
 # "[/INST]" cho khop phan phoi luc train (xem comment trong infer_lora.nim).
 INFER_LORA_DEFAULT_PROMPT:= [INST] Xin chao[/INST] 
@@ -177,11 +178,11 @@ INFER_DEEPSEEK_DEFAULT_MODEL   := test/deepseek-inference/models
 INFER_DEEPSEEK_DEFAULT_NIMQ    := test/deepseek-inference/models/model.nimq
 INFER_DEEPSEEK_DEFAULT_BACKEND := auto
 
-build-graft
+build-graft:
 	$(NIM) check $(NIMFLAGS) $(GRAFT_SRC)
 	$(NIM) c $(NIMFLAGS) -o:$(GRAFT_BIN) $(GRAFT_SRC)
 
-build-finetune
+build-finetune:
 	$(NIM) check $(NIMFLAGS) $(FINETUNE_SRC)
 	$(NIM) c $(NIMFLAGS) -o:$(FINETUNE_BIN) $(FINETUNE_SRC)
 
@@ -217,24 +218,24 @@ export BYBY_G_DIAGNOSTICS ?= 0
 export BYBY_TRACE_BLOCKS ?= 0
 export BYBY_MACOS_HIGH_PRIORITY ?= 1
 
-build-infer-lora
+build-infer-lora:
 	$(NIM) check $(NIMFLAGS) kernelfortest/fp4_gemv_gpu.nim
-	$(NIM) check $(NIMFLAGS) $(INFER_LORA_SRC)
-	$(NIM) c $(NIMFLAGS) --nimcache:$(INFER_LORA_NIMCACHE) -o:$(INFER_LORA_BIN) $(INFER_LORA_SRC)
+	$(NIM) check $(INFER_LORA_NIMFLAGS) $(INFER_LORA_SRC)
+	$(NIM) c $(INFER_LORA_NIMFLAGS) --nimcache:$(INFER_LORA_NIMCACHE) -o:$(INFER_LORA_BIN) $(INFER_LORA_SRC)
 
-build-compact-lora
+build-compact-lora:
 	$(NIM) check $(NIMFLAGS) $(COMPACT_LORA_SRC)
 	$(NIM) c $(NIMFLAGS) -o:$(COMPACT_LORA_BIN) $(COMPACT_LORA_SRC)
 
-build-migrate-lora
+build-migrate-lora:
 	$(NIM) check $(NIMFLAGS) $(MIGRATE_LORA_SRC)
 	$(NIM) c $(NIMFLAGS) -o:$(MIGRATE_LORA_BIN) $(MIGRATE_LORA_SRC)
 
-build-nim-inference
+build-nim-inference:
 	$(NIM) check $(NIMFLAGS) $(NIM_INFER_SRC)
 	$(NIM) c $(NIMFLAGS) --nimcache:$(NIM_INFER_NIMCACHE) -o:$(NIM_INFER_BIN) $(NIM_INFER_SRC)
 
-build-spectron
+build-spectron:
 	$(NIM) check $(NIMFLAGS) $(SPECTRON_SRC)
 	$(NIM) c $(NIMFLAGS) -o:$(SPECTRON_BIN) $(SPECTRON_SRC)
 

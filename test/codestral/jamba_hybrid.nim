@@ -24,7 +24,8 @@ import backend
 import rawbin            # checkpoint .bin thô - dung RIENG cho pipeline fine-tune,
                           # KHONG dung .nimq (quant.saveQuantStateDict/loadQuantStateDict)
                           # o day - .nimq chi danh cho nim_inference.nim/test_nimformer.nim
-import pytorch_bin_loader  # loadAllHFTensors: doc THANG tu HF .bin/.safetensors vao RAM,
+when not defined(codestralInference):
+  import pytorch_bin_loader  # HF file loading is training-only; inference has no Python bridge.
                             # KHONG ghi ra file trung gian nao tren dia
 import nimformer
 import mamba2_ssm_gpu       # RMSNorm fwd/bwd bang micro-kernel GPU
@@ -1020,68 +1021,69 @@ proc loadCheckpoint*(path: string, useSession: bool = true): tuple[model: Nimfor
       stderr.writeLine("[CANH BAO] Checkpoint .bin thieu tham so '" & name & "' - giu khoi tao random")
   result = (m, step)
 
-# ═══════════════════════════════════════════════════════════════
-# NẠP TRỌNG SỐ TỪ MODEL HF (đã export bằng pytorch_bin_loader.nim) VÀO
-# JAMBA. QUAN TRỌNG: Mamba-1B (HF, kiến trúc mamba_ssm gốc: A_log, D, x_proj,
-# dt_proj, conv1d, in_proj, out_proj...) KHÔNG cùng schema với Mamba2SSD ở
-# đây (SSD/quadratic-form tự viết, tham số hoá khác hẳn). KHÔNG có phép map
-# 1-1 tự động đúng nghĩa toán học giữa 2 kiến trúc này - copy thẳng theo tên
-# gần giống nhau (vd "embeddings.weight" -> "embed.weight") CHỈ hợp lý cho
-# embedding/lm_head (nếu cùng dim), còn phần thân SSD phải huấn luyện lại
-# từ đầu (init random, dùng embedding của HF làm điểm khởi đầu tốt hơn thôi).
-# Hàm dưới đây làm đúng phần "hợp lý tự động" đó, phần còn lại bạn tự thêm
-# theo manifest in ra từ pytorch_bin_loader.
-proc loadEmbeddingFromHF*(m: var NimformerModelJamba, hfBinPath: string,
-                           hfEmbedKey: string = "backbone.embedding.weight") =
-  ## Doc TRUC TIEP tu file .bin GOC cua HF (pytorch_model.bin/.safetensors,
-  ## qua pytorch_bin_loader.loadAllHFTensors) - KHONG can xuat ra file trung
-  ## gian nao truoc (khong .nimq, khong ban sao .bin nao khac).
-  ## Luu y: "backbone.embedding.weight" (SO IT, khong phai "embeddings") la
-  ## key that su cua mamba_ssm/MambaLMHeadModel (Mamba-Chat-2.8B dung kien
-  ## truc nay) - kiem tra lai bang manifest neu ban doi model khac.
-  let tensors = loadAllHFTensors(hfBinPath)
-  for t in tensors:
-    if t.name == hfEmbedKey:
-      if t.data.len == m.embed.weight.data.len:
-        m.embed.weight.data = t.data
-        echo &"[jamba] Da nap embedding tu HF ({hfEmbedKey}), {t.data.len} gia tri"
-      else:
-        stderr.writeLine(&"[CANH BAO] Shape embedding HF ({t.data.len}) khong khop model Jamba ({m.embed.weight.data.len}) - bo qua")
-      return
-  stderr.writeLine(&"[CANH BAO] Khong thay key '{hfEmbedKey}' trong {hfBinPath}")
+when not defined(codestralInference):
+  # ═══════════════════════════════════════════════════════════════
+  # NẠP TRỌNG SỐ TỪ MODEL HF (đã export bằng pytorch_bin_loader.nim) VÀO
+  # JAMBA. QUAN TRỌNG: Mamba-1B (HF, kiến trúc mamba_ssm gốc: A_log, D, x_proj,
+  # dt_proj, conv1d, in_proj, out_proj...) KHÔNG cùng schema với Mamba2SSD ở
+  # đây (SSD/quadratic-form tự viết, tham số hoá khác hẳn). KHÔNG có phép map
+  # 1-1 tự động đúng nghĩa toán học giữa 2 kiến trúc này - copy thẳng theo tên
+  # gần giống nhau (vd "embeddings.weight" -> "embed.weight") CHỈ hợp lý cho
+  # embedding/lm_head (nếu cùng dim), còn phần thân SSD phải huấn luyện lại
+  # từ đầu (init random, dùng embedding của HF làm điểm khởi đầu tốt hơn thôi).
+  # Hàm dưới đây làm đúng phần "hợp lý tự động" đó, phần còn lại bạn tự thêm
+  # theo manifest in ra từ pytorch_bin_loader.
+  proc loadEmbeddingFromHF*(m: var NimformerModelJamba, hfBinPath: string,
+                             hfEmbedKey: string = "backbone.embedding.weight") =
+    ## Doc TRUC TIEP tu file .bin GOC cua HF (pytorch_model.bin/.safetensors,
+    ## qua pytorch_bin_loader.loadAllHFTensors) - KHONG can xuat ra file trung
+    ## gian nao truoc (khong .nimq, khong ban sao .bin nao khac).
+    ## Luu y: "backbone.embedding.weight" (SO IT, khong phai "embeddings") la
+    ## key that su cua mamba_ssm/MambaLMHeadModel (Mamba-Chat-2.8B dung kien
+    ## truc nay) - kiem tra lai bang manifest neu ban doi model khac.
+    let tensors = loadAllHFTensors(hfBinPath)
+    for t in tensors:
+      if t.name == hfEmbedKey:
+        if t.data.len == m.embed.weight.data.len:
+          m.embed.weight.data = t.data
+          echo &"[jamba] Da nap embedding tu HF ({hfEmbedKey}), {t.data.len} gia tri"
+        else:
+          stderr.writeLine(&"[CANH BAO] Shape embedding HF ({t.data.len}) khong khop model Jamba ({m.embed.weight.data.len}) - bo qua")
+        return
+    stderr.writeLine(&"[CANH BAO] Khong thay key '{hfEmbedKey}' trong {hfBinPath}")
 
-# ═══════════════════════════════════════════════════════════════
-# NẠP TOÀN BỘ khối 'M' (Mamba-only) TRỰC TIẾP TỪ pytorch_model.bin GỐC, không
-# ghi ra bất kỳ file .bin/.nimq trung gian nào - tránh nhân đôi dung lượng
-# đĩa khi checkpoint HF gốc đã nặng vài GB (yêu cầu bắt buộc của project).
-# Chỉ map được các tên tự trùng/khai báo qua `nameMap`; tên nào không khớp
-# giữ nguyên random-init (in cảnh báo tổng hợp, không log từng cái để đỡ rối
-# - xem thêm cảnh báo "KHÔNG map 1-1 tự động" phía trên).
-# ═══════════════════════════════════════════════════════════════
-proc loadMambaOnlyFromHFBin*(hfBinPath: string, vocab, embedDim, nHeads, ffMult, nLayers: int,
-                              nameMap: Table[string, string] = initTable[string, string](),
-                              useSession: bool = true):
-                             tuple[model: NimformerModelJamba, matched, total: int] =
-  var pattern = ""
-  for _ in 0 ..< nLayers: pattern.add('M')
-  var m = newNimformerModelJamba(vocab, embedDim, nHeads, ffMult, pattern, useSession)
+  # ═══════════════════════════════════════════════════════════════
+  # NẠP TOÀN BỘ khối 'M' (Mamba-only) TRỰC TIẾP TỪ pytorch_model.bin GỐC, không
+  # ghi ra bất kỳ file .bin/.nimq trung gian nào - tránh nhân đôi dung lượng
+  # đĩa khi checkpoint HF gốc đã nặng vài GB (yêu cầu bắt buộc của project).
+  # Chỉ map được các tên tự trùng/khai báo qua `nameMap`; tên nào không khớp
+  # giữ nguyên random-init (in cảnh báo tổng hợp, không log từng cái để đỡ rối
+  # - xem thêm cảnh báo "KHÔNG map 1-1 tự động" phía trên).
+  # ═══════════════════════════════════════════════════════════════
+  proc loadMambaOnlyFromHFBin*(hfBinPath: string, vocab, embedDim, nHeads, ffMult, nLayers: int,
+                                nameMap: Table[string, string] = initTable[string, string](),
+                                useSession: bool = true):
+                               tuple[model: NimformerModelJamba, matched, total: int] =
+    var pattern = ""
+    for _ in 0 ..< nLayers: pattern.add('M')
+    var m = newNimformerModelJamba(vocab, embedDim, nHeads, ffMult, pattern, useSession)
 
-  let tensors = loadAllHFTensors(hfBinPath)   # CHI o RAM - khong ghi file nao ra dia
-  var lookup = initTable[string, RawBinTensor]()
-  for t in tensors:
-    lookup[t.name] = t
+    let tensors = loadAllHFTensors(hfBinPath)   # CHI o RAM - khong ghi file nao ra dia
+    var lookup = initTable[string, RawBinTensor]()
+    for t in tensors:
+      lookup[t.name] = t
 
-  var matched = 0
-  let plist = paramList(m)
-  for (name, t) in plist:
-    let hfName = (if name in nameMap: nameMap[name] else: name)
-    if hfName in lookup and lookup[hfName].data.len == t[].data.len:
-      t[].data = lookup[hfName].data
-      inc matched
-  echo &"[jamba] Da nap truc tiep tu {hfBinPath}: {matched}/{plist.len} tham so khop ten " &
-       "(phan con lai la Mamba2SSD tu viet, KHONG map 1-1 tu dong duoc voi mamba_ssm goc " &
-       "- can nameMap hoac train lai tu dau, xem ghi chu dau file)"
-  result = (m, matched, plist.len)
+    var matched = 0
+    let plist = paramList(m)
+    for (name, t) in plist:
+      let hfName = (if name in nameMap: nameMap[name] else: name)
+      if hfName in lookup and lookup[hfName].data.len == t[].data.len:
+        t[].data = lookup[hfName].data
+        inc matched
+    echo &"[jamba] Da nap truc tiep tu {hfBinPath}: {matched}/{plist.len} tham so khop ten " &
+         "(phan con lai la Mamba2SSD tu viet, KHONG map 1-1 tu dong duoc voi mamba_ssm goc " &
+         "- can nameMap hoac train lai tu dau, xem ghi chu dau file)"
+    result = (m, matched, plist.len)
 
 # ═══════════════════════════════════════════════════════════════
 # NẠP WEIGHT NORM PRETRAIN (preset rms-fin). BẮT BUỘC phải gọi sau khi nạp

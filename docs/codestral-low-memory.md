@@ -125,8 +125,9 @@ This is one short-prompt case, including initial GPU preparation; longer prompts
 batches and T4 VRAM usage still need measurement on the target configuration.
 
 If tokenizer assets are missing, run `make download-codestral-tokenizer` without
-redownloading weights. Nimpy reports its embedded Python version on package
-import failure. Dependencies can be isolated in `.runtime/codestral-tokenizer/X.Y`
-using the matching `pythonX.Y` and
-`test/codestral/tokenizer-requirements.txt`. The loader checks the tokenizer
-before constructing or dequantizing the model.
+redownloading weights. Codestral inference loads `tokenizer.model.v3` or
+`tokenizer.model` with the pure Nim tokenizer. It builds vocabulary tries once,
+uses the embedded normalization rules, and preserves Codestral's whitespace and
+byte-fallback behavior. No Python tokenizer packages, Nimpy, C++ shim, or
+SentencePiece library are required by `make build-infer-lora`. The loader checks
+the tokenizer before constructing or dequantizing the model.

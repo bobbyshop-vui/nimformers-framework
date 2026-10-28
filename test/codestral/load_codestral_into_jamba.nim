@@ -24,7 +24,8 @@ import std/[tables, strformat, strutils, os]   # os: getEnv cho BYBY_ALLOW_RANDO
 import nimformer
 import jamba_hybrid
 import mamba2_real
-import sharded_hf_loader
+when not defined(codestralInference):
+  import sharded_hf_loader
 import rawbin   # RawBinTensor
 import std/os
 import quant    # loadQuantStateDict, dequantizeTensor - cho nguon .nimq (da quantize fp4)
@@ -408,12 +409,13 @@ proc loadCodestralQuantResidentFromNimq*(m: var NimformerModelJamba, nimqPath: s
        &"({rBlockIdx.len} block 'R'), {smallAssigned} field nho gan THANH CONG " &
        &"(smallTensors trong file={smallTensors.len})."
 
-proc loadCodestralIntoJamba*(m: var NimformerModelJamba, hfDir: string) =
-  ## Doc THANG tu safetensors goc (~14GB bf16 tren dia, ~28GB sau khi giai
-  ## nen fp32 trong RAM - xem canh bao RAM trong sharded_hf_loader.nim).
-  echo &"[load_codestral] Doc {hfDir} (chi RAM) ..."
-  let tensors = loadAllHFTensorsSharded(hfDir)
-  loadCodestralIntoJambaFromTensors(m, tensors)
+when not defined(codestralInference):
+  proc loadCodestralIntoJamba*(m: var NimformerModelJamba, hfDir: string) =
+    ## Doc THANG tu safetensors goc (~14GB bf16 tren dia, ~28GB sau khi giai
+    ## nen fp32 trong RAM - xem canh bao RAM trong sharded_hf_loader.nim).
+    echo &"[load_codestral] Doc {hfDir} (chi RAM) ..."
+    let tensors = loadAllHFTensorsSharded(hfDir)
+    loadCodestralIntoJambaFromTensors(m, tensors)
 
 proc loadCodestralIntoJambaFromNimq*(m: var NimformerModelJamba, nimqPath: string) =
   ## Doc tu FILE DA QUANTIZE fp4 (~3.5GB tren dia - xem quantize_codestral.nim
