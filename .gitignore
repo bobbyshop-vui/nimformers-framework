@@ -59,3 +59,10 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 examples/c/smoke
+
+# BybyLang AOT test outputs
+test/bybylang_test/*_bin
+test/bybylang_test/*_bin.nim
+test/bybylang_test/nim.cfg
+.gitignore
+

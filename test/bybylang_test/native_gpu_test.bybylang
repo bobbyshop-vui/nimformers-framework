@@ -1,0 +1,51 @@
+# Native BybyLang GPU DSL test: no Nim import needed, but it exercises the
+# same Nimformers backend (vendor/bybylang/gpubackend.nim) through `gpu ...`.
+
+print "=== native BybyLang GPU DSL ==="
+gpu backend is "auto"
+
+gpu array X = [1, 2, 3, 4]
+gpu array Y = [10, 20, 30, 40]
+gpu array P = [1, 2, 3, 4, 5, 6]
+gpu array Q = [1, 0, 0, 1, 1, 1]
+
+gpu add X, Y -> Z size 4
+if Z != @[11'f32, 22, 33, 44]:
+    print "FAIL native add: " & $Z
+    quit(1)
+print "PASS native add -> " & $Z
+
+gpu matmul P, Q -> R m 2 k 3 n 2
+if R != @[4'f32, 5, 10, 11]:
+    print "FAIL native matmul: " & $R
+    quit(1)
+print "PASS native matmul -> " & $R
+
+gpu softmax X -> SM rows 1 cols 4
+sum1 = SM[0] + SM[1] + SM[2] + SM[3]
+if sum1 < 0.999 or sum1 > 1.001:
+    print "FAIL native softmax sum: " & $sum1
+    quit(1)
+print "PASS native softmax sum=" & $sum1
+
+gpu relu X -> RELU
+if RELU != X:
+    print "FAIL native relu: " & $RELU
+    quit(1)
+print "PASS native relu -> " & $RELU
+
+# Native BybyLang micro-kernel block: emitted bytecode is lowered and
+# dispatched by the Nimformers micro-VM runtime.
+micro kernel byby_double X -> DOUBLED threads 4 tg 4 out 4:
+  emitULid 0
+  emitULoadIn 1 0 0
+  emitAdd 1 1 1
+  emitUStoreF32 1 0 0
+  emitHalt
+
+if DOUBLED != @[2'f32, 4, 6, 8]:
+    print "FAIL native micro kernel: " & $DOUBLED
+    quit(1)
+print "PASS native micro kernel -> " & $DOUBLED
+
+print "=== native BybyLang GPU test PASSED ==="

@@ -1,0 +1,117 @@
+# BybyLang integration test: import the Nim C-ABI module and call it.
+#
+# `import nim "..."` is a real Nim import placed at the top of the generated
+# source.  The relative path points at lib_c_api.nim in the repository root.
+# BybyLang passes non-DSL lines through as Nim, so the calls below exercise
+# the same functions the Python/ctypes layer uses.
+
+import nim "../../lib_c_api"
+
+print "=== BybyLang -> imported Nimformers C ABI ==="
+print "abi version: " & $nimf_abi_version()
+
+ctx = nimf_context_create(0)
+if ctx == nil:
+    print "FAIL context create: " & $nimf_last_error()
+    quit(1)
+print "backend: " & $nimf_context_backend_name(ctx)
+
+# ---------------------------------------------------------------- elementwise
+A = @[1'f32, 2, 3, 4]
+B = @[10'f32, 20, 30, 40]
+C = newSeq[float32](4)
+if nimf_add(ctx, addr A[0], addr B[0], addr C[0], 4) != 0:
+    print "FAIL add status: " & $nimf_last_error()
+    quit(1)
+if C != @[11'f32, 22, 33, 44]:
+    print "FAIL add value: " & $C
+    quit(1)
+print "PASS add -> " & $C
+
+# ---------------------------------------------------------------- matmul 2x3 * 3x2
+M = @[1'f32, 2, 3, 4, 5, 6]
+W = @[1'f32, 0, 0, 1, 1, 1]
+Y = newSeq[float32](4)
+if nimf_matmul(ctx, addr M[0], addr W[0], addr Y[0], 2, 3, 2) != 0:
+    print "FAIL matmul status: " & $nimf_last_error()
+    quit(1)
+if Y != @[4'f32, 5, 10, 11]:
+    print "FAIL matmul value: " & $Y
+    quit(1)
+print "PASS matmul -> " & $Y
+
+# ---------------------------------------------------------------- softmax
+S = @[1'f32, 2, 3, 4]
+SO = newSeq[float32](4)
+if nimf_softmax(ctx, addr S[0], addr SO[0], 1, 4) != 0:
+    print "FAIL softmax status: " & $nimf_last_error()
+    quit(1)
+total = SO[0] + SO[1] + SO[2] + SO[3]
+if total < 0.999 or total > 1.001:
+    print "FAIL softmax sum: " & $total
+    quit(1)
+print "PASS softmax sum=" & $total
+
+# ---------------------------------------------------------------- layernorm
+G = @[1'f32, 1, 1, 1]
+BE = @[0'f32, 0, 0, 0]
+LN = newSeq[float32](4)
+if nimf_layernorm(ctx, addr S[0], addr G[0], addr BE[0], addr LN[0], 1, 4, 1e-5) != 0:
+    print "FAIL layernorm status: " & $nimf_last_error()
+    quit(1)
+mean = (LN[0] + LN[1] + LN[2] + LN[3]) / 4.0
+if abs(mean) > 0.001:
+    print "FAIL layernorm mean: " & $mean
+    quit(1)
+print "PASS layernorm mean=" & $mean
+
+# ---------------------------------------------------------------- quantization
+SHAPE = @[4'i64]
+Q = nimf_quantize(addr S[0], 4, addr SHAPE[0], 1, 1, 0, 0)
+if Q == nil:
+    print "FAIL quantize: " & $nimf_last_error()
+    quit(1)
+DQ = newSeq[float32](4)
+if nimf_quant_dequantize(Q, addr DQ[0], 4) != 4:
+    print "FAIL dequantize status"
+    quit(1)
+for i in 0..<4:
+    if abs(DQ[i] - S[i]) > 0.1:
+        print "FAIL quant element " & $i & ": " & $DQ[i]
+        quit(1)
+print "PASS int8 quantize/dequantize -> " & $DQ
+discard nimf_quant_destroy(Q)
+
+# ---------------------------------------------------------------- micro-VM
+prog = nimf_vm_create()
+if prog == nil:
+    print "FAIL vm create: " & $nimf_last_error()
+    quit(1)
+discard nimf_vm_emit(prog, 0x10'u32, 1, 0, 0, 0)   # load mem[R0] into R1
+discard nimf_vm_emit(prog, 0x20'u32, 1, 1, 1, 0)   # R1 plus R1
+discard nimf_vm_emit(prog, 0x11'u32, 1, 0, 0, 0)   # store R1 into mem[R0]
+discard nimf_vm_emit(prog, 0x01'u32, 0, 0, 0, 0)   # halt
+VMEM = @[1'f32, 2, 3, 4]
+if nimf_vm_run(ctx, prog, addr VMEM[0], 4, 4, 0, 4) != 0:
+    print "FAIL vm run: " & $nimf_last_error()
+    quit(1)
+if VMEM != @[2'f32, 4, 6, 8]:
+    print "FAIL vm value: " & $VMEM
+    quit(1)
+print "PASS micro-VM -> " & $VMEM
+discard nimf_vm_destroy(prog)
+
+# ---------------------------------------------------------------- attention
+QA = @[1'f32, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+ATTO = newSeq[float32](16)
+ATTS = newSeq[float32](16)
+if nimf_attention(ctx, addr QA[0], addr QA[0], addr QA[0], nil, 0, 1, 1, 4, 4, 0.5, addr ATTO[0], addr ATTS[0]) != 0:
+    print "FAIL attention status: " & $nimf_last_error()
+    quit(1)
+if ATTO[0] != ATTO[0]:
+    print "FAIL attention produced NaN"
+    quit(1)
+print "PASS attention out0=" & $ATTO[0] & " score0=" & $ATTS[0]
+
+discard nimf_context_destroy(ctx)
+print "=== BybyLang C ABI test PASSED ==="

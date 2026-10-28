@@ -338,3 +338,13 @@ It covers every op family against NumPy, quantization round trips,
 NIMQ save/load (including a real Spectron checkpoint when present), the
 micro-VM (run/save/load/lower/merge), resident weights, tokenizers, and an
 end-to-end tiny Llama generation from a synthetic checkpoint.
+
+There is also a BybyLang integration suite that imports `lib_c_api` from a
+`.bybylang` script and calls the C ABI directly, alongside native `gpu ...`
+DSL checks:
+
+```sh
+make bybylang-test
+```
+
+See [`test/bybylang_test/README.md`](../test/bybylang_test/README.md).
