@@ -48,3 +48,4 @@ test_safe_merge_lora
 # Local tokenizer runtime and downloaded Hugging Face assets
 .runtime/
 test/codestral/models/hf/
+*/.DS_Store
