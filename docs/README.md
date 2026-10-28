@@ -5,6 +5,7 @@ This directory is the user documentation for the public Nimformer APIs. Use the 
 ## Getting started
 
 - [Getting Started](getting-started.md): install/build prerequisites, imports, backend selection, and a small example.
+- [Python and C ABI](python-api.md): `ctypes`/NumPy bindings, the stable C header, quantization, NIMQ state dicts, micro-VM dispatch, tokenizers, and Llama generation.
 - [Backend API](backend-api.md): backend creation and `be*` GPU operations.
 - [Tensor Operations API](tensor-ops-api.md): tensor views, shape operations, reductions, comparisons, scans, and dropout.
 - [Base Model API](base-model-api.md): tensors, layers, transformer blocks, model forward/backward, and APF Adam.
@@ -45,5 +46,6 @@ This directory is the user documentation for the public Nimformer APIs. Use the 
 | `test/spectron/test_nimformer.nim` / `test/spectron/test_inferencespectron.nim` | [Training API](training-api.md) |
 | `test/codestral/rawbin.nim` / `test/codestral/qlorabin.nim` / `test/codestral/checkpoint.nim` | [Checkpoint and Binary Formats](checkpoint-formats.md) |
 | `vendor/bybylang/` | [BybyLang DSL](bybylang-api.md), [Sessions](gpu-session-api.md), [Micro-VM/JIT](microkernel-api.md) |
+| `lib_c_api.nim` / `nimformers/` / `include/nimformers.h` | [Python and C ABI](python-api.md) |
 
 The signatures shown here are for user-facing modules and facade exports. Internal kernels and test/benchmark-only helpers are not stable application APIs. Source files remain the final authority when an API is marked experimental or backend-specific.

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nimformers"
+version = "2.0.0"
+description = "ctypes/NumPy bindings for the Nimformers C ABI (math kernels, quantization, micro-VM, Llama inference)"
+readme = "docs/python-api.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{ name = "Nimformers contributors" }]
+dependencies = ["numpy>=1.21"]
+keywords = ["nim", "transformers", "metal", "vulkan", "quantization", "llm"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.setuptools]
+packages = ["nimformers"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+nimformers = ["py.typed", "libnimformers.dylib", "libnimformers.so", "nimformers.dll"]
+
+[tool.pytest.ini_options]
+testpaths = ["test/python_test"]
+addopts = "-ra"

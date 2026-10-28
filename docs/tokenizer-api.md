@@ -40,13 +40,39 @@ standard library and local files.
 
 ```nim
 proc newHFTokenizer*(modelPath: string): HFTokenizer
-proc encode*(tok: HFTokenizer, text: string): seq[int]
-proc decode*(tok: HFTokenizer, ids: seq[int]): string
+proc encode*(tok: HFTokenizer, text: string,
+             addSpecialTokens: bool = true): seq[int]
+proc decode*(tok: HFTokenizer, ids: seq[int],
+             skipSpecialTokens: bool = true): string
 proc applyChatTemplate*(tok: HFTokenizer, userText: string,
                         systemText: string = ""): seq[int]
 ```
 
-`applyChatTemplate` reads the model's tokenizer configuration and returns token IDs, including the model's expected role markers. Pass those IDs to `generate` from [LLaMA Inference API](llama-inference-api.md).
+`HFTokenizer` is implemented in `test/deepseek-inference/native_hf_tokenizer.nim`
+and re-exported by `nim_inference.nim`. It reads local `tokenizer.json` and
+`tokenizer_config.json` directly: byte-level BPE vocabulary/merges, Unicode
+pre-tokenizer splits, added tokens, BOS/EOS and decode rules. A local
+`tokenizer.model` can instead use the native SentencePiece reader. Regex matching
+and chat-template rendering are implemented in Nim; no PCRE, tokenizer library,
+Nimpy or Python runtime is needed. Unsupported tokenizer stages or template syntax
+produce an explicit error rather than silently selecting a different tokenizer.
+
+`applyChatTemplate` renders the checkpoint's template with Jinja loop scoping and
+whitespace control, then encodes without adding a second set of special tokens.
+Pass these IDs to `generate` from [LLaMA Inference API](llama-inference-api.md).
+DeepSeek's byte-level decoder streams new bytes once and retains incomplete UTF-8
+until the next token; it does not decode the entire history for every new token.
+`newLlamaLConfig` also reads `config.json` natively, including GQA and RoPE scaling.
+
+Native tokenizer fixture tests:
+
+```sh
+nim c -r --path:test/deepseek-inference test/deepseek-inference/test_native_hf_tokenizer.nim
+```
+
+Append a local DeepSeek Coder 6.7B tokenizer directory to also check exact checkpoint
+IDs. The config regression is `test/deepseek-inference/test_native_llama_config.nim`;
+it uses the same module search paths as `make build-nim-inference`.
 
 ## Training BPE tokenizer
 

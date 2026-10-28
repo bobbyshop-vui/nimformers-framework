@@ -49,3 +49,13 @@ test_safe_merge_lora
 .runtime/
 test/codestral/models/hf/
 */.DS_Store
+
+# C ABI shared library and Python artifacts
+libnimformers.dylib
+libnimformers.so
+nimformers.dll
+*.bvm
+__pycache__/
+*.py[cod]
+.pytest_cache/
+examples/c/smoke

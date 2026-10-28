@@ -6,6 +6,36 @@ Start with the [documentation index](docs/README.md), then see [Getting Started]
 
 Model-specific programs and data live under `test/spectron/`, `test/codestral/`, and `test/deepseek-inference/`. Model assets live in each project's `models/` folder. The FP4 GEMV micro-kernel modules live under `kernelfortest/`; shared runtime modules remain at the project root.
 
+## Python and C ABI
+
+The core framework is available as a shared library with a stable C ABI
+(`lib_c_api.nim`). It exposes backend selection, owned tensors, every math /
+neural-network kernel, int8/int4/fp8/fp4/custom-float quantization, NIMQ
+state dicts, the micro-VM bytecode builder and dispatch, resident weights,
+tokenizers, and Llama inference.
+
+Build it and run the Python tests:
+
+```sh
+make build-for-python
+make python-test
+```
+
+```python
+import numpy as np
+from nimformers import Context
+
+with Context() as ctx:                 # auto -> Metal/Vulkan
+    a = np.random.randn(4, 8).astype(np.float32)
+    b = np.random.randn(8, 16).astype(np.float32)
+    print(ctx.matmul(a, b).shape)
+    print(ctx.softmax(a).sum(axis=-1))
+```
+
+The Python package lives in `nimformers/`, the C header in
+`include/nimformers.h`, examples in `examples/python/` and `examples/c/`, and
+the full reference in [`docs/python-api.md`](docs/python-api.md).
+
 ## AI model co-authors and acknowledgements
 
 The following model developers are acknowledged. Their GitHub handles are linked for reference:
@@ -68,6 +98,11 @@ make infer-deepseek ARGS='./test/deepseek-inference/models ./test/deepseek-infer
 ```
 
 Use `metal`, `vulkan`, or `auto` as the backend argument when supported on the machine.
+
+`nim_inference` loads the model config and tokenizer with Nim's standard library.
+It reads the local DeepSeek byte-level BPE vocabulary, merge rules, added tokens
+and chat template directly; Nimpy, Transformers and Python tokenizer packages are
+not required. Build it with `make build-nim-inference`.
 
 ### Run Codestral with the QLoRA adapter
 

@@ -7,6 +7,9 @@ NIMFLAGS := -d:release --hints:off --mm:arc --opt:speed --path:. --path:test/cod
 INFER_LORA_NIMCACHE := nimcache/infer-lora
 INFER_LORA_NIMFLAGS := $(NIMFLAGS) -d:codestralInference
 NIM_INFER_NIMCACHE := nimcache/nim-inference
+C_API_SRC := lib_c_api.nim
+C_API_NIMCACHE := nimcache/c-api
+C_API_CHECK_NIMCACHE := nimcache/c-api-check
 
 TEST_SRC  := test/spectron/test_nimformer.nim
 
@@ -23,6 +26,21 @@ else
         IS_MACOS := no
     endif
 endif
+
+# Shared-library name for the C ABI (Python ctypes / C / Rust consumers).
+ifeq ($(IS_WINDOWS),yes)
+    C_API_LIB := nimformers.dll
+else
+    ifeq ($(IS_MACOS),yes)
+        C_API_LIB := libnimformers.dylib
+    else
+        C_API_LIB := libnimformers.so
+    endif
+endif
+
+PYTHON ?= python3
+PYTEST ?= pytest
+PYTEST_FLAGS ?= -v
 
 ifeq ($(IS_WINDOWS),yes)
     EXE_EXT    := 
@@ -54,13 +72,14 @@ COMPACT_LORA_BIN := compact_lora_checkpoint$(EXE_EXT)
 MIGRATE_LORA_BIN := migrate_lora_json_to_bin$(EXE_EXT)
 NIM_INFER_BIN   := nim_inference$(EXE_EXT)
 SPECTRON_BIN    := test_inferencespectron$(EXE_EXT)
-CLEAN_BINS      := $(TEST_BIN) $(GRAFT_BIN) $(FINETUNE_BIN) $(INFER_LORA_BIN) \
+CLEAN_BINS      := $(TEST_BIN) $(GRAFT_BIN) $(FINETUNE_BIN) $(INFER_LORA_BIN) $(C_API_LIB) \
                    $(COMPACT_LORA_BIN) $(MIGRATE_LORA_BIN) $(NIM_INFER_BIN) $(SPECTRON_BIN)
 
 .PHONY: shaders all build run run-cpu run-metal run-opencl run-cuda clean \
         download-models download-datasets download-codestral-tokenizer \
         build-graft build-finetune build-infer-lora build-compact-lora \
-        build-migrate-lora build-nim-inference build-spectron \
+        build-migrate-lora build-nim-inference build-spectron build-for-python \
+        python-test python-example c-example \
         graft finetune-mamba infer-lora infer-mamba infer-deepseek run-spectron mamba-pipeline
 
 all: build run
@@ -238,6 +257,24 @@ build-nim-inference:
 build-spectron:
 	$(NIM) check $(NIMFLAGS) $(SPECTRON_SRC)
 	$(NIM) c $(NIMFLAGS) -o:$(SPECTRON_BIN) $(SPECTRON_SRC)
+
+build-for-python:
+	$(NIM) check $(NIMFLAGS) --nimcache:$(C_API_CHECK_NIMCACHE) $(C_API_SRC)
+	$(NIM) c $(NIMFLAGS) --app:lib --nimcache:$(C_API_NIMCACHE) -o:$(C_API_LIB) $(C_API_SRC)
+	@echo "Built $(C_API_LIB) (C ABI v2); header: include/nimformers.h"
+
+python-test: build-for-python
+	@echo "[python-test] Suite: test/python_test"
+	@echo "[python-test] Library: $(C_API_LIB) (C ABI v2)"
+	$(PYTEST) $(PYTEST_FLAGS) test/python_test
+	@echo "[python-test] Suite finished."
+
+python-example: build-for-python
+	$(PYTHON) examples/python/basic.py
+
+c-example: build-for-python
+	$(CC) -Iinclude examples/c/smoke.c -L. -lnimformers -Wl,-rpath,$(CURDIR) -o examples/c/smoke
+	DYLD_LIBRARY_PATH=. LD_LIBRARY_PATH=. ./examples/c/smoke
 
 # ── graft: build + TU DONG CHAY. Khong truyen ARGS -> dung mac dinh
 # GRAFT_DEFAULT_*. Neu file old.bin/.nimq mac dinh chua ton tai, IN HUONG
