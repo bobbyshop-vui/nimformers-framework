@@ -46,6 +46,25 @@ make download-models
 
 The target creates the model directories under `test/` as needed, downloads the base weights, tokenizer/config files and adapter, then writes the Codestral tokenizer-directory sidecar used by `infer-lora`. It uses `curl` with retries and resume support.
 
+If Codestral weights are already present but `newHfTokenizer` reports missing
+files, download only its tokenizer/config assets:
+
+```sh
+make download-codestral-tokenizer
+```
+
+Nimpy may embed a different Python from the shell's active Conda environment.
+Tokenizer import errors print the embedded version. For an embedded Python 3.10,
+install dependencies locally with the matching interpreter:
+
+```sh
+python3.10 -m pip install --target .runtime/codestral-tokenizer/3.10 -r test/codestral/tokenizer-requirements.txt
+```
+
+The tokenizer loader reads this version-specific directory automatically when
+run from the repository root; `BYBY_TOKENIZER_DEPS` can select another dependency
+root. This does not install packages into the active Conda environment.
+
 ### Run DeepSeek Coder with `nim_inference`
 
 `infer-deepseek` builds `test/deepseek-inference/nim_inference.nim`. The first argument is the local model directory (for `config.json` and tokenizer files), the second is the `.nimq` weights file, and the remaining arguments are backend, prompt, token limit, temperature, top-p, and system prompt.
@@ -65,7 +84,7 @@ make infer-lora \
   ARGS='test/codestral/models/jamba_parallel_lora.bin "[INST] Write a Python function for Fibonacci.[/INST]" 0.7 test/codestral/models/hf test/codestral/models/codestral_mamba_only.nimq'
 ```
 
-`infer-lora` accepts `<checkpoint.bin> <prompt> <temperature>` for this QLoRA checkpoint. The binary metadata selects the base `.nimq`; the sidecar points the tokenizer loader at the current base-model directory. `infer-mamba` is an alias for `infer-lora`. To choose the backend explicitly, prefix the command with `BYBY_INFER_BACKEND=metal` or `BYBY_INFER_BACKEND=vulkan`.
+`infer-lora` accepts `<checkpoint.bin> <prompt> <temperature>` for this QLoRA checkpoint. The binary metadata selects the base `.nimq`; the sidecar points the tokenizer loader at the current base-model directory. `infer-mamba` is an alias for `infer-lora`. `make infer-lora` defaults to `auto`, preserving automatic backend selection on macOS and other platforms. It checks the selected device type: dGPU weights go to device-local VRAM; iGPU weights use host-visible/shared memory. To override the backend explicitly, use `make infer-lora BYBY_INFER_BACKEND=metal` or `make infer-lora BYBY_INFER_BACKEND=vulkan`.
 
 ### Train Spectron with `test/spectron/test_nimformer.nim`
 

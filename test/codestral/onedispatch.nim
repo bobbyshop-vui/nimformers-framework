@@ -162,8 +162,8 @@ proc odFp4Bytes*(K, N: int): int = N * (K div 2) + N * (K div 32)
 
 proc odAddLayer*(st: var OdState; blockIdx: int;
                  aLog, dSkip, dtBias, normW, convW, convB, ln1Gamma: seq[float32];
-                 inW: seq[uint8]; inLut: seq[float32];
-                 outW: seq[uint8]; outLut: seq[float32];
+                 inW: openArray[uint8]; inLut: seq[float32];
+                 outW: openArray[uint8]; outLut: seq[float32];
                  loraAIn, loraBIn, loraAOut, loraBOut: seq[float32] = @[]) =
   ## Layer PHAI duoc them theo thu tu 0,1,2,... (slot = chi so khoi).
   let sh = st.sh

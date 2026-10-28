@@ -65,6 +65,15 @@ type
                              # decode rieng thanh chuoi rong.
     stopIds*: seq[int]     # gap 1 trong cac id nay -> DUNG generate
 
+# Nimpy can load a different Python from the shell's active Conda environment.
+# Local dependencies are isolated by the version of the embedded interpreter.
+let pySys = pyImport("sys")
+let embeddedPythonVersion = $pySys.version_info[0].to(int) & "." & $pySys.version_info[1].to(int)
+let tokenizerDepsRoot = getEnv("BYBY_TOKENIZER_DEPS", getCurrentDir() / ".runtime" / "codestral-tokenizer")
+let tokenizerDeps = tokenizerDepsRoot / embeddedPythonVersion
+if dirExists(tokenizerDeps):
+  discard pySys.path.insert(0, tokenizerDeps)
+
 let pyBuiltins = pyImport("builtins")
 proc pyLen(o: PyObject): int = pyBuiltins.len(o).to(int)
 
@@ -350,14 +359,17 @@ proc newHfTokenizer*(hfDir: string): HfTokenizer =
       return result
     except CatchableError as e:
       raise newException(IOError,
-        &"[hf_tokenizer] Ca mistral_common lan tokenizers deu that bai ({e.msg}).")
+        &"[hf_tokenizer] Ca mistral_common lan tokenizers deu that bai ({e.msg}). " &
+        &"Nimpy dang dung Python {embeddedPythonVersion}; cai package bang dung phien ban: " &
+        &"python{embeddedPythonVersion} -m pip install --target \"{tokenizerDeps}\" -r test/codestral/tokenizer-requirements.txt")
 
   raise newException(IOError,
     &"[hf_tokenizer] KHONG tim thay tekken.json/tokenizer.model* lan tokenizer.json " &
     &"trong {hfDir}. KHONG the finetune/infer dung nghia neu khong co tokenizer THAT " &
     "cua chinh checkpoint nay - dung getOrTrainBPE (BPE tu che) se lam embedding " &
     "pretrain tro thanh tra cuu ngau nhien (xem giai thich dau file). Tai lai model " &
-    "voi day du file tokenizer (huggingface-cli download se tu tai kem neu co).")
+    "voi day du file tokenizer. Chay `make download-codestral-tokenizer` " &
+    "de chi tai tokenizer/config, khong tai lai trong so.")
 
 # ───────────────────────────────────────────────────────────────────────
 # ENCODE / DECODE

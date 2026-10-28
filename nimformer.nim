@@ -16,6 +16,9 @@ type
   Tensor* = object
     data*: seq[float32]
     shape*: seq[int]
+    mappedData*: MappedView[float32]
+
+template floatValues*(t: Tensor): untyped = weightValues(t.data, t.mappedData)
 
 proc numel(shape: seq[int]): int =
   result = 1
@@ -73,7 +76,7 @@ proc transpose*(x: Tensor): Tensor =
   result.data = newSeq[float32](rows * cols)
   for i in 0 ..< rows:
     for j in 0 ..< cols:
-      result.data[j * rows + i] = x.data[i * cols + j]
+      result.data[j * rows + i] = x.floatValues[i * cols + j]
 
 # ===================================================================
 # Linear (forward/backward dùng Metal matmul)
@@ -103,9 +106,13 @@ type
                                    ## của type này (xem comment weightQ ở trên: "KHÔNG bao giờ
                                    ## expand hết ra fp32 một lần rồi giữ mãi"). loraA:[r,inF]
                                    ## phẳng, loraB:[outF,r] phẳng, rỗng (@[]) nếu không gắn.
+    mappedLoraA*, mappedLoraB*: MappedView[float32]
     loraR*: int                   ## rank r; 0 = KHÔNG có LoRA gắn (mặc định, code cũ không đổi)
     loraScale*: float32           ## alpha / r
     gpuCacheName*: string         ## ten trong gFp4CacheGpu sau prepareGpuLinForLinear (FP4-KM)
+
+template loraAValues*(l: Linear): untyped = weightValues(l.loraA, l.mappedLoraA)
+template loraBValues*(l: Linear): untyped = weightValues(l.loraB, l.mappedLoraB)
 
 proc newLinear*(inF, outF: int; initializeWeights = true): Linear =
   let scale = sqrt(2'f32 / float32(inF))
@@ -123,6 +130,7 @@ proc setQuantWeight*(l: var Linear, qt: QuantTensor) =
   l.weightQ = qt
   l.useQuant = true
   l.weight.data = @[]
+  l.weight.mappedData = default(MappedView[float32])
   # A Linear may already have a resident FP32/Q4 copy from an earlier binding.
   # It must not silently keep serving that stale copy after its quant source
   # changes; force the next forward to use the newly bound weightQ.
@@ -170,7 +178,7 @@ proc uploadResident*(l: var Linear, ctx: Backend, sparsityPct: float32 = 0.0'f32
       stderr.writeLine "[SPARSITY] cat " & $nPruned & "/" & $l.weightQ.scale.len &
         " khoi (nguong scale <= " & $threshold & ")"
     let nGroupsPerRow = (l.inF + l.weightQ.groupSize - 1) div l.weightQ.groupSize
-    l.residentW = beResidentUploadQ4(ctx, l.weightQ.data, l.weightQ.scale, l.weightQ.zero_point,
+    l.residentW = beResidentUploadQ4(ctx, @(l.weightQ.bytes), l.weightQ.scale, l.weightQ.zero_point,
                                       l.inF, l.outF, l.weightQ.groupSize, nGroupsPerRow)
     l.residentReady = true
   elif l.useQuant:
@@ -188,7 +196,8 @@ proc uploadResident*(l: var Linear, ctx: Backend, sparsityPct: float32 = 0.0'f32
     # thong = gap doi RAM thuc te dung so voi can thiet). Giai phong ngay,
     # giong het pattern setQuantWeight() da lam o tren.
     l.weight.data = @[]
-  elif l.weight.data.len > 0:
+    l.weight.mappedData = default(MappedView[float32])
+  elif l.weight.floatValues.len > 0:
     # Linear fp32 thường (vd. tied-embedding lm_head dùng thẳng embW) -
     # transpose 1 LẦN thay vì mỗi token.
     let wT = transpose(l.weight).data
@@ -248,7 +257,7 @@ proc forward*(l: Linear, x: Tensor, ctx: Backend): Tensor =
         y = fp4GemmGpuRows(ctx, l.gpuCacheName, x.data, rows)
       elif l.useQuant and l.weightQ.kind == qkInt4Asymmetric and l.weightQ.groupSize > 0:
         let nGroupsPerRow = (l.inF + l.weightQ.groupSize - 1) div l.weightQ.groupSize
-        y = beMatmulQ4(ctx, x.data, l.weightQ.data, l.weightQ.scale, l.weightQ.zero_point,
+        y = beMatmulQ4(ctx, x.data, @(l.weightQ.bytes), l.weightQ.scale, l.weightQ.zero_point,
                         rows, l.inF, l.outF, l.weightQ.groupSize, nGroupsPerRow)
       else:
         var wT: seq[float32]
@@ -281,10 +290,10 @@ proc forward*(l: Linear, x: Tensor, ctx: Backend): Tensor =
   # nhỏ này RẺ hơn rất nhiều so với matmul chính [rows,inF]x[inF,outF]. TRÁNH
   # đúng lỗi bloat ~27GB (merge vật lý ra fp32 cho cả 105 tham số lớn) từng
   # gây OOM/Killed - xem comment ở định nghĩa Linear/loraA phía trên.
-  if l.loraR > 0 and l.loraA.len == l.loraR * l.inF and l.loraB.len == l.outF * l.loraR:
+  if l.loraR > 0 and l.loraAValues.len == l.loraR * l.inF and l.loraBValues.len == l.outF * l.loraR:
     pfTime("lin.lora"):
-      let At = transpose(Tensor(shape: @[l.loraR, l.inF], data: l.loraA))   # [inF, r]
-      let Bt = transpose(Tensor(shape: @[l.outF, l.loraR], data: l.loraB))  # [r, outF]
+      let At = transpose(Tensor(shape: @[l.loraR, l.inF], data: @(l.loraAValues)))   # [inF, r]
+      let Bt = transpose(Tensor(shape: @[l.outF, l.loraR], data: @(l.loraBValues)))  # [r, outF]
       let xA = beMatmul(ctx, x.data, rows, l.inF, At.data, l.inF, l.loraR)       # [rows, r]
       let delta = beMatmul(ctx, xA, rows, l.loraR, Bt.data, l.loraR, l.outF)     # [rows, outF]
       for i in 0 ..< result.data.len:
@@ -300,8 +309,8 @@ proc forward*(l: Linear, x: Tensor, ctx: Backend): Tensor =
     if gLoraSizeMismatchWarned < 10:
       inc gLoraSizeMismatchWarned
       stderr.writeLine("[canh bao] LoRA adapter kich thuoc khong khop cho 1 Linear " &
-        "(r=" & $l.loraR & ", loraA.len=" & $l.loraA.len & " (can " & $(l.loraR * l.inF) &
-        "), loraB.len=" & $l.loraB.len & " (can " & $(l.outF * l.loraR) &
+        "(r=" & $l.loraR & ", loraA.len=" & $l.loraAValues.len & " (can " & $(l.loraR * l.inF) &
+        "), loraB.len=" & $l.loraBValues.len & " (can " & $(l.outF * l.loraR) &
         ")) - bo qua delta LoRA cho tham so nay, dung weight goc.")
 proc backward*(l: Linear, x: Tensor, dOut: Tensor, ctx: Backend): tuple[dX, dW, dB: Tensor] =
   ## Backward Linear: 

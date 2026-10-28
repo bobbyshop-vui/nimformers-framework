@@ -25,6 +25,9 @@
 ##       int64 nElems
 ##       float32[nElems] data thô (4 byte/phần tử, không nén)
 
+import mapped_weights
+export mapped_weights
+import std/strutils
 import std/streams
 import std/tables
 
@@ -33,6 +36,9 @@ type
     name*: string
     shape*: seq[int]
     data*: seq[float32]
+    mappedData*: MappedView[float32]
+
+template floatValues*(t: RawBinTensor): untyped = weightValues(t.data, t.mappedData)
 
 const RAWBIN_MAGIC* = "NIMBIN1\0"  # đúng 8 byte
 
@@ -91,9 +97,9 @@ proc saveRawBin*(path: string, meta: Table[string, string], tensors: seq[RawBinT
       writeI32(f, int32(t.shape.len))
       for s in t.shape:
         writeI32(f, int32(s))
-      writeI64(f, int64(t.data.len))
-      if t.data.len > 0:
-        f.writeData(unsafeAddr t.data[0], t.data.len * 4)
+      writeI64(f, int64(t.floatValues.len))
+      if t.floatValues.len > 0:
+        f.writeData(unsafeAddr t.floatValues[0], t.floatValues.len * 4)
   finally:
     f.close()
 
@@ -124,9 +130,9 @@ proc writeRawTensor*(writer: var RawBinWriter, tensor: RawBinTensor) =
   writeStrLP(writer.stream, tensor.name)
   writeI32(writer.stream, int32(tensor.shape.len))
   for dim in tensor.shape: writeI32(writer.stream, int32(dim))
-  writeI64(writer.stream, int64(tensor.data.len))
-  if tensor.data.len > 0:
-    writer.stream.writeData(unsafeAddr tensor.data[0], tensor.data.len * 4)
+  writeI64(writer.stream, int64(tensor.floatValues.len))
+  if tensor.floatValues.len > 0:
+    writer.stream.writeData(unsafeAddr tensor.floatValues[0], tensor.floatValues.len * 4)
   inc writer.tensorCount
 
 proc finishRawBin*(writer: var RawBinWriter) =
@@ -206,3 +212,42 @@ proc loadRawBin*(path: string): tuple[meta: Table[string, string], tensors: seq[
     result = (meta, tensors)
   finally:
     f.close()
+
+proc readMappedRawTensor*(c: var WeightCursor; mapAdapter = true): RawBinTensor =
+  result.name = c.readString()
+  let nd = c.readCount(4)
+  if nd > 8: raise newException(IOError, "Invalid raw tensor rank")
+  var expected = 1
+  for i in 0 ..< nd:
+    let d = int(readValue[int32](c))
+    if d <= 0 or expected > high(int) div d:
+      raise newException(IOError, "Invalid raw tensor shape")
+    result.shape.add d
+    expected *= d
+  let n64 = readValue[int64](c)
+  if n64 < 0 or n64 > int64(high(int) div 4) or n64 != int64(expected):
+    raise newException(IOError, "Invalid raw tensor element count")
+  let n = int(n64)
+  if mapAdapter and (result.name.startsWith("adapter::") or
+      (nd == 2 and result.name.startsWith("newBlock::") and result.name.endsWith(".weight"))):
+    result.mappedData = mappedView[float32](c.owner, c.pos, n)
+    c.pos += n * 4
+  else:
+    result.data = readSeq[float32](c, n)
+
+proc readMappedMeta*(c: var WeightCursor): Table[string, string] =
+  let n = c.readCount()
+  if n > 10000: raise newException(IOError, "Invalid metadata count")
+  result = initTable[string, string]()
+  for i in 0 ..< n:
+    let k = c.readString()
+    result[k] = c.readString()
+
+proc loadMappedRawBin*(path: string): tuple[meta: Table[string, string], tensors: seq[RawBinTensor]] =
+  var c = WeightCursor(owner: mapWeights(path), pos: 8)
+  let magic = mappedView[uint8](c.owner, 0, 8)
+  if equalMem(magic.dataPtr, cstring(RAWBIN_MAGIC), 8) == false:
+    raise newException(IOError, "Invalid NIMBIN1 checkpoint")
+  result.meta = c.readMappedMeta()
+  let n = c.readCount()
+  for i in 0 ..< n: result.tensors.add c.readMappedRawTensor()

@@ -69,9 +69,9 @@ proc writeQuantTensorRaw(s: Stream, qt: QuantTensor) =
   writeI32(s, int32(qt.groupSize))
   writeI32(s, int32(max(qt.cf.exponentBits, 1)))
   writeI32(s, int32(qt.cf.mantissaBits))
-  writeI32(s, int32(qt.data.len))
-  if qt.data.len > 0:
-    s.writeData(unsafeAddr qt.data[0], qt.data.len)
+  writeI32(s, int32(qt.bytes.len))
+  if qt.bytes.len > 0:
+    s.writeData(unsafeAddr qt.bytes[0], qt.bytes.len)
 
 proc quantizeNewBlock*(data: seq[float32], shape: seq[int],
                       kind: QuantKind, groupSize: int): QuantTensor =
@@ -157,9 +157,9 @@ proc saveQLora4Bin*(path: string, meta: Table[string, string],
       writeStrLP(f, t.name)
       writeI32(f, int32(t.shape.len))
       for s in t.shape: writeI32(f, int32(s))
-      writeI64(f, int64(t.data.len))
-      if t.data.len > 0:
-        f.writeData(unsafeAddr t.data[0], t.data.len * 4)
+      writeI64(f, int64(t.floatValues.len))
+      if t.floatValues.len > 0:
+        f.writeData(unsafeAddr t.floatValues[0], t.floatValues.len * 4)
     writeI32(f, int32(quantTensors.len))
     for (name, qt) in quantTensors:
       writeStrLP(f, name)
@@ -402,7 +402,7 @@ proc convert*(src, dst: string, kind: QuantKind = qkInt4Asymmetric, groupSize: i
         let qt = quantizeNewBlock(t.data, t.shape, kind, groupSize)
         quantList.add((t.name, qt))
         let ratio = if t.data.len > 0: (t.data.len * 4).float / max(qt.data.len.float, 1.0) else: 0.0
-        echo &"[qlora4]   {t.name}: shape={t.shape}  {humanSize(int64(t.data.len)*4)} -> quant {qt.kind} {humanSize(int64(qt.data.len))} (~{ratio:.1f}x)"
+        echo &"[qlora4]   {t.name}: shape={t.shape}  {humanSize(int64(t.data.len)*4)} -> quant {qt.kind} {humanSize(int64(qt.bytes.len))} (~{ratio:.1f}x)"
       else:
         fp32Keep.add(t)
         let reason = if isSensitiveFullTrain: "attn/fuseGate full-train (fp32)"
@@ -439,3 +439,19 @@ when isMainModule:
     elif a == "--fp4km": kind = qkFp4KM
     elif a.startsWith("--group="): gs = parseInt(a[8 .. ^1])
   convert(src, dst, kind, gs)
+
+proc loadMappedQLora4Bin*(path: string): tuple[meta: Table[string, string],
+    fp32Tensors: seq[RawBinTensor], quantWeights: Table[string, QuantTensor]] =
+  var c = WeightCursor(owner: mapWeights(path), pos: 8)
+  let magic = mappedView[uint8](c.owner, 0, 8)
+  if not equalMem(magic.dataPtr, cstring(MAGIC_QLORA4), 8):
+    raise newException(IOError, "Invalid NIMBIN4 checkpoint")
+  result.meta = c.readMappedMeta()
+  let nr = c.readCount()
+  for i in 0 ..< nr: result.fp32Tensors.add c.readMappedRawTensor()
+  let nq = c.readCount()
+  result.quantWeights = initTable[string, QuantTensor]()
+  for i in 0 ..< nq:
+    let name = c.readString()
+    if name in result.quantWeights: raise newException(IOError, "Duplicate quant tensor: " & name)
+    result.quantWeights[name] = c.readMappedQuantTensor()

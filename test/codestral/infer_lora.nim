@@ -362,10 +362,14 @@ proc loadBinaryLoraForInfer*(path: string): tuple[model: NimformerModelJamba, lo
   var newBlockQuant: Table[string, QuantTensor]
   if isQLora4Bin(path):
     echo "[infer] Phát hiện NIMBIN4 (QLoRA 4-bit) — newBlock giữ nén, dequant on-the-fly lúc generate()..."
-    let q = loadQLora4Bin(path)
+    let q = if getEnv("BYBY_MODEL_MMAP", "1") != "0": loadMappedQLora4Bin(path) else: loadQLora4Bin(path)
     meta = q.meta
     tensors = q.fp32Tensors
     newBlockQuant = q.quantWeights
+  elif getEnv("BYBY_MODEL_MMAP", "1") != "0":
+    let loaded = loadMappedRawBin(path)
+    meta = loaded.meta
+    tensors = loaded.tensors
   else:
     var reader = openRawBinReader(path)
     defer: reader.closeRawBinReader()
@@ -416,7 +420,46 @@ proc loadBinaryLoraForInfer*(path: string): tuple[model: NimformerModelJamba, lo
     echo &"[infer] Thanh phan: R(Mamba2Real)={cR} P(Mamba2Real+Linear++ sum)={cP} " &
          &"G(Mamba2Real+gated Linear++ fuseGate)={cG} M(Mamba)={cM} " &
          &"A(LinearPlusAttention)={cA} S(Spectron)={cS}"
-  var m = newNimformerModelJamba(parseInt(meta["vocab"]), parseInt(meta["hidden"]),
+  # Validate the tokenizer before model construction or base dequantization.
+  let checkpointVocab = parseInt(meta["vocab"])
+  let hfDirSidecar = path & ".hf_tokenizer_dir"
+  let bpeSidecar = path & ".bpe.json"
+  var tok: AnyTokenizer
+  if fileExists(hfDirSidecar):
+    let hfT = newHfTokenizer(readFile(hfDirSidecar).strip)
+    if vocabSizeHf(hfT) != checkpointVocab:
+      raise newException(ValueError,
+        &"[infer] HF tokenizer vocab ({vocabSizeHf(hfT)}) KHAC checkpoint vocab ({checkpointVocab}); " &
+        "token ID co the van nam trong bien nhung co y nghia khac, se tao logits/token rac.")
+    tok = AnyTokenizer(kind: atkHf, hf: hfT)
+  elif fileExists(bpeSidecar):
+    let bpeTok = loadBPE(bpeSidecar)
+    if vocabSize(bpeTok) != checkpointVocab:
+      raise newException(ValueError,
+        &"[infer] BPE tokenizer vocab ({vocabSize(bpeTok)}) KHAC checkpoint vocab ({checkpointVocab}); " &
+        "token ID co the van nam trong bien nhung khong con cung y nghia voi embedding/lm_head.")
+    tok = AnyTokenizer(kind: atkBpe, bpe: bpeTok)
+  else:
+    # SUA: TRUOC DAY goi thang loadBPE(bpeSidecar) khi hfDirSidecar khong co -
+    # neu checkpoint tu CFG_INIT_MODE=="codestral" (dung tokenizer HF that,
+    # KHONG co .bpe.json) thi ca 2 sidecar deu thieu -> crash bang mot
+    # IOError "cannot open ...bpe.json" kho hieu, de tuong lam phai finetune
+    # lai. THUC RA khong can: sidecar ".hf_tokenizer_dir" chi la 1 dong text
+    # chua duong dan toi thu muc HF goc - tu tao duoc bang tay, KHONG can
+    # chay lai finetune_lora. (Ban finetune_lora.nim moi da tu ghi sidecar
+    # nay SOM, ngay sau khi tokenizer san sang - loi nay chi con gap voi
+    # checkpoint cu luu TRUOC ban va cho.)
+    raise newException(IOError,
+      &"[infer] Khong tim thay sidecar tokenizer nao cho checkpoint '{path}' " &
+      &"(da thu '{hfDirSidecar}' va '{bpeSidecar}'). Neu checkpoint nay train " &
+      "o CFG_INIT_MODE=\"codestral\" (tokenizer HF that), tu tao sidecar bang " &
+      "1 lenh, KHONG can finetune lai:\n" &
+      &"  echo -n \"/duong/dan/toi/thu-muc-model-HF\" > \"{hfDirSidecar}\"\n" &
+      "(dung DUNG duong dan CFG_HF_DIR luc finetune, vd thu muc Mamba-Codestral-" &
+      "7B-v0.1 da tai ve). Neu checkpoint train o CFG_INIT_MODE=\"graft\" (BPE tu " &
+      &"train) thi thieu '{bpeSidecar}' that su can finetune lai (BPE khong " &
+      "tai tao lai duoc tu con so khac).")
+  var m = newNimformerModelJamba(checkpointVocab, parseInt(meta["hidden"]),
                                   parseInt(meta["nHeads"]), parseInt(meta["ffMult"]),
                                   pattern, useSession = true,
                                   mambaRealDState = CFG_CODESTRAL_DSTATE,
@@ -470,7 +513,7 @@ proc loadBinaryLoraForInfer*(path: string): tuple[model: NimformerModelJamba, lo
   var seenNewBlocks = initTable[string, bool]()
   for name, qt in newBlockQuant:
     if name notin byName or name notin expectedNewBlocks or
-       qt.shape != byName[name][].shape or qt.data.len == 0:
+       qt.shape != byName[name][].shape or qt.bytes.len == 0:
       raise newException(ValueError, "[infer] newBlock quant sai shape/data: " & name)
     if name in seenNewBlocks:
       raise newException(ValueError, "[infer] checkpoint trung newBlock quant: " & name)
@@ -490,9 +533,10 @@ proc loadBinaryLoraForInfer*(path: string): tuple[model: NimformerModelJamba, lo
           "[infer] checkpoint co hai nguon newBlock (raw/quant hoac trung ten): " & name)
       var expectedElements = 1
       for dim in tensor.shape: expectedElements *= dim
-      if tensor.shape != byName[name][].shape or tensor.data.len != expectedElements:
+      if tensor.shape != byName[name][].shape or tensor.floatValues.len != expectedElements:
         raise newException(ValueError, "[infer] newBlock raw sai shape/data: " & name)
       byName[name][].data = tensor.data
+      byName[name][].mappedData = tensor.mappedData
       seenNewBlocks[name] = true
     elif tensor.name.startsWith("adapter::"):
       let rest = tensor.name[9 .. ^1]
@@ -512,21 +556,23 @@ proc loadBinaryLoraForInfer*(path: string): tuple[model: NimformerModelJamba, lo
         var ad: LoraAdapter
         ad.inF = adIn; ad.outF = adOut; ad.r = adRank
         ad.alpha = adAlpha; ad.scale = adAlpha / float32(adRank)
-        ad.A = newTensor(@[adRank, adIn]); ad.B = newTensor(@[adOut, adRank])
+        ad.A = Tensor(shape: @[adRank, adIn]); ad.B = Tensor(shape: @[adOut, adRank])
         lo.adapters[adapterName] = ad
       if part == "A":
         if adapterName in seenAdapterA:
           raise newException(ValueError, "[infer] checkpoint trung LoRA tensor A: " & adapterName)
-        if tensor.shape != lo.adapters[adapterName].A.shape or tensor.data.len != lo.adapters[adapterName].A.data.len:
+        if tensor.shape != lo.adapters[adapterName].A.shape or tensor.floatValues.len != lo.adapters[adapterName].r * lo.adapters[adapterName].inF:
           raise newException(ValueError, "[infer] LoRA A sai shape/data: " & adapterName)
         lo.adapters[adapterName].A.data = tensor.data
+        lo.adapters[adapterName].mappedA = tensor.mappedData
         seenAdapterA[adapterName] = true
       elif part == "B":
         if adapterName in seenAdapterB:
           raise newException(ValueError, "[infer] checkpoint trung LoRA tensor B: " & adapterName)
-        if tensor.shape != lo.adapters[adapterName].B.shape or tensor.data.len != lo.adapters[adapterName].B.data.len:
+        if tensor.shape != lo.adapters[adapterName].B.shape or tensor.floatValues.len != lo.adapters[adapterName].r * lo.adapters[adapterName].outF:
           raise newException(ValueError, "[infer] LoRA B sai shape/data: " & adapterName)
         lo.adapters[adapterName].B.data = tensor.data
+        lo.adapters[adapterName].mappedB = tensor.mappedData
         seenAdapterB[adapterName] = true
       else:
         raise newException(ValueError, "[infer] checkpoint LoRA part la: " & part)
@@ -563,43 +609,6 @@ proc loadBinaryLoraForInfer*(path: string): tuple[model: NimformerModelJamba, lo
   # (NIMBIN4 + quantResident: weight.data đã @[], phải nối weightQ trước
   # mergeInUploadStreamingJamba / uploadResident, kể cả block A linear.)
   bindQuantBaseToLinears(m, lo)
-  let hfDirSidecar = path & ".hf_tokenizer_dir"
-  let bpeSidecar = path & ".bpe.json"
-  var tok: AnyTokenizer
-  if fileExists(hfDirSidecar):
-    let hfT = newHfTokenizer(readFile(hfDirSidecar).strip)
-    if vocabSizeHf(hfT) != m.vocab:
-      raise newException(ValueError,
-        &"[infer] HF tokenizer vocab ({vocabSizeHf(hfT)}) KHAC checkpoint vocab ({m.vocab}); " &
-        "token ID co the van nam trong bien nhung co y nghia khac, se tao logits/token rac.")
-    tok = AnyTokenizer(kind: atkHf, hf: hfT)
-  elif fileExists(bpeSidecar):
-    let bpeTok = loadBPE(bpeSidecar)
-    if vocabSize(bpeTok) != m.vocab:
-      raise newException(ValueError,
-        &"[infer] BPE tokenizer vocab ({vocabSize(bpeTok)}) KHAC checkpoint vocab ({m.vocab}); " &
-        "token ID co the van nam trong bien nhung khong con cung y nghia voi embedding/lm_head.")
-    tok = AnyTokenizer(kind: atkBpe, bpe: bpeTok)
-  else:
-    # SUA: TRUOC DAY goi thang loadBPE(bpeSidecar) khi hfDirSidecar khong co -
-    # neu checkpoint tu CFG_INIT_MODE=="codestral" (dung tokenizer HF that,
-    # KHONG co .bpe.json) thi ca 2 sidecar deu thieu -> crash bang mot
-    # IOError "cannot open ...bpe.json" kho hieu, de tuong lam phai finetune
-    # lai. THUC RA khong can: sidecar ".hf_tokenizer_dir" chi la 1 dong text
-    # chua duong dan toi thu muc HF goc - tu tao duoc bang tay, KHONG can
-    # chay lai finetune_lora. (Ban finetune_lora.nim moi da tu ghi sidecar
-    # nay SOM, ngay sau khi tokenizer san sang - loi nay chi con gap voi
-    # checkpoint cu luu TRUOC ban va cho.)
-    raise newException(IOError,
-      &"[infer] Khong tim thay sidecar tokenizer nao cho checkpoint '{path}' " &
-      &"(da thu '{hfDirSidecar}' va '{bpeSidecar}'). Neu checkpoint nay train " &
-      "o CFG_INIT_MODE=\"codestral\" (tokenizer HF that), tu tao sidecar bang " &
-      "1 lenh, KHONG can finetune lai:\n" &
-      &"  echo -n \"/duong/dan/toi/thu-muc-model-HF\" > \"{hfDirSidecar}\"\n" &
-      "(dung DUNG duong dan CFG_HF_DIR luc finetune, vd thu muc Mamba-Codestral-" &
-      "7B-v0.1 da tai ve). Neu checkpoint train o CFG_INIT_MODE=\"graft\" (BPE tu " &
-      &"train) thi thieu '{bpeSidecar}' that su can finetune lai (BPE khong " &
-      "tai tao lai duoc tu con so khac).")
   echo &"[infer] Da load checkpoint {path}: {lo.adapters.len} LoRA adapter (block R) + " &
        &"{newBlockQuant.len} newBlock quant (Attention train full). " &
        "Base Mamba lay tu .nimq, khong nam trong checkpoint."
@@ -764,7 +773,7 @@ proc sampleToken(logits: seq[float32], vocab: int, cfg: SamplerCfg,
 
 proc quantShapeMatches(lin: Linear; qt: QuantTensor): bool =
   qt.shape.len == 2 and qt.shape[0] == lin.outF and qt.shape[1] == lin.inF and
-    qt.data.len > 0
+    qt.bytes.len > 0
 
 proc sequenceLinearReady(lin: Linear; name: string; lora: JambaLora): bool =
   if lin.residentReady or lin.residentFp32Ready: return true
@@ -805,15 +814,15 @@ proc sequenceBlockWeightsReady(m: NimformerModelJamba; lora: JambaLora;
   true
 
 proc restoreSequenceWeight(lin: var Linear; name: string;
-                           lora: JambaLora): seq[uint8] =
+                           lora: JambaLora): QuantTensor =
   ## prepareGpuModel uploads packed weights to the recurrent GEMV cache and
   ## drops the Linear's host copy. Temporarily borrow the existing quantBase
-  ## bytes for batched sequence GEMM; this is a shared seq reference, not a
-  ## second model-sized copy, and is restored immediately after the block.
-  result = lin.weightQ.data
-  if lin.useQuant and result.len == 0 and not lin.residentReady and
+  ## payload for batched sequence GEMM. Retain the mapping owner as well as
+  ## metadata, then restore the prior tensor immediately after the block.
+  result = lin.weightQ
+  if lin.useQuant and result.bytes.len == 0 and not lin.residentReady and
      not lin.residentFp32Ready and name in lora.quantBase:
-    lin.weightQ.data = lora.quantBase[name].data
+    lin.weightQ = lora.quantBase[name]
 
 proc forwardRSequenceBlock(m: var NimformerModelJamba; lora: JambaLora;
                            blockIdx: int; x: Tensor; ctx: Backend):
@@ -831,8 +840,8 @@ proc forwardRSequenceBlock(m: var NimformerModelJamba; lora: JambaLora;
       m.blocks[blockIdx].ln1.gamma, m.blocks[blockIdx].rms1.eps, ctx,
       saveBackwardCache = false, exportTerminalState = true)
   finally:
-    m.blocks[blockIdx].mambaReal.inProj.weightQ.data = oldIn
-    m.blocks[blockIdx].mambaReal.outProj.weightQ.data = oldOut
+    m.blocks[blockIdx].mambaReal.inProj.weightQ = oldIn
+    m.blocks[blockIdx].mambaReal.outProj.weightQ = oldOut
 
 proc forwardPSequenceBlock(m: var NimformerModelJamba; lora: JambaLora;
                            blockIdx: int; x: Tensor; ctx: Backend):
@@ -846,7 +855,7 @@ proc forwardPSequenceBlock(m: var NimformerModelJamba; lora: JambaLora;
     root & ".attn.qkvProj.weight", lora)
   let oldAttnOut = restoreSequenceWeight(m.blocks[blockIdx].attn.outProj,
     root & ".attn.outProj.weight", lora)
-  var oldGate: seq[uint8] = @[]
+  var oldGate: QuantTensor
   var gatePtr: ptr Linear = nil
   if m.blocks[blockIdx].kind == bkMambaRealGated:
     oldGate = restoreSequenceWeight(m.blocks[blockIdx].fuseGate,
@@ -859,12 +868,12 @@ proc forwardPSequenceBlock(m: var NimformerModelJamba; lora: JambaLora;
       m.blocks[blockIdx].rms1.eps, ctx, saveBackwardCache = false,
       exportTerminalState = true, fuseGate = gatePtr)
   finally:
-    m.blocks[blockIdx].mambaReal.inProj.weightQ.data = oldIn
-    m.blocks[blockIdx].mambaReal.outProj.weightQ.data = oldOut
-    m.blocks[blockIdx].attn.qkvProj.weightQ.data = oldQkv
-    m.blocks[blockIdx].attn.outProj.weightQ.data = oldAttnOut
+    m.blocks[blockIdx].mambaReal.inProj.weightQ = oldIn
+    m.blocks[blockIdx].mambaReal.outProj.weightQ = oldOut
+    m.blocks[blockIdx].attn.qkvProj.weightQ = oldQkv
+    m.blocks[blockIdx].attn.outProj.weightQ = oldAttnOut
     if m.blocks[blockIdx].kind == bkMambaRealGated:
-      m.blocks[blockIdx].fuseGate.weightQ.data = oldGate
+      m.blocks[blockIdx].fuseGate.weightQ = oldGate
 
 proc importParallelPrefillState(ctx: Backend; blockIdx: int;
                                 cache: HybridBlockKernelCache;
@@ -1410,8 +1419,8 @@ proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenize
     if name in gFp4CacheGpu and gFp4CacheGpu[name].residentReady and
        ((ctx.kind.toByby() == gbMetal and gFp4CacheGpu[name].wBuf.metalHandle != nil) or
         (ctx.kind.toByby() == gbVulkan and gFp4CacheGpu[name].wBuf.vulkanHandle.buf != nil)):
-      freedPackedBytes += qt.data.len
-      qt.data = @[]
+      freedPackedBytes += qt.bytes.len
+      qt.clearPayload()
   if freedPackedBytes > 0:
     echo "[infer] Packed GPU cache ready; released " &
       $(freedPackedBytes div (1024 * 1024)) & " MiB duplicate host weights."
