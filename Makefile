@@ -221,6 +221,7 @@ export BYBY_TRACE_BLOCKS ?= 0
 export BYBY_MACOS_HIGH_PRIORITY ?= 1
 
 build-infer-lora: prepare-backend
+	$(NIM) check $(NIMFLAGS) kernelfortest/fp4_gemv_gpu.nim
 	$(NIM) c $(NIMFLAGS) --nimcache:$(INFER_LORA_NIMCACHE) -o:$(INFER_LORA_BIN) $(INFER_LORA_SRC)
 
 build-compact-lora: prepare-backend
