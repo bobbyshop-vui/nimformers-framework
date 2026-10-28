@@ -36,6 +36,12 @@ The Python package lives in `nimformers/`, the C header in
 `include/nimformers.h`, examples in `examples/python/` and `examples/c/`, and
 the full reference in [`docs/python-api.md`](docs/python-api.md).
 
+The same ABI can be imported from the vendored BybyLang compiler:
+
+```sh
+make bybylang-test     # test/bybylang_test/*.bybylang
+```
+
 ## AI model co-authors and acknowledgements
 
 The following model developers are acknowledged. Their GitHub handles are linked for reference:

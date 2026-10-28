@@ -7,6 +7,7 @@ NIMFLAGS := -d:release --hints:off --mm:arc --opt:speed --path:. --path:test/cod
 INFER_LORA_NIMCACHE := nimcache/infer-lora
 INFER_LORA_NIMFLAGS := $(NIMFLAGS) -d:codestralInference
 NIM_INFER_NIMCACHE := nimcache/nim-inference
+BYBYLANG_TEST_BINS := test/bybylang_test/native_gpu_test_bin test/bybylang_test/capi_test_bin
 C_API_SRC := lib_c_api.nim
 C_API_NIMCACHE := nimcache/c-api
 C_API_CHECK_NIMCACHE := nimcache/c-api-check
@@ -73,13 +74,14 @@ MIGRATE_LORA_BIN := migrate_lora_json_to_bin$(EXE_EXT)
 NIM_INFER_BIN   := nim_inference$(EXE_EXT)
 SPECTRON_BIN    := test_inferencespectron$(EXE_EXT)
 CLEAN_BINS      := $(TEST_BIN) $(GRAFT_BIN) $(FINETUNE_BIN) $(INFER_LORA_BIN) $(C_API_LIB) \
-                   $(COMPACT_LORA_BIN) $(MIGRATE_LORA_BIN) $(NIM_INFER_BIN) $(SPECTRON_BIN)
+                   $(COMPACT_LORA_BIN) $(MIGRATE_LORA_BIN) $(NIM_INFER_BIN) $(SPECTRON_BIN) \
+                   $(BYBYLANG_TEST_BINS) $(addsuffix .nim,$(BYBYLANG_TEST_BINS))
 
 .PHONY: shaders all build run run-cpu run-metal run-opencl run-cuda clean \
         download-models download-datasets download-codestral-tokenizer \
         build-graft build-finetune build-infer-lora build-compact-lora \
         build-migrate-lora build-nim-inference build-spectron build-for-python \
-        python-test python-example c-example \
+        python-test python-example c-example bybylang-test \
         graft finetune-mamba infer-lora infer-mamba infer-deepseek run-spectron mamba-pipeline
 
 all: build run
@@ -275,6 +277,9 @@ python-example: build-for-python
 c-example: build-for-python
 	$(CC) -Iinclude examples/c/smoke.c -L. -lnimformers -Wl,-rpath,$(CURDIR) -o examples/c/smoke
 	DYLD_LIBRARY_PATH=. LD_LIBRARY_PATH=. ./examples/c/smoke
+
+bybylang-test:
+	bash ./test/bybylang_test/run.sh
 
 # ── graft: build + TU DONG CHAY. Khong truyen ARGS -> dung mac dinh
 # GRAFT_DEFAULT_*. Neu file old.bin/.nimq mac dinh chua ton tai, IN HUONG
