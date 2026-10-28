@@ -6,7 +6,7 @@
 ## (bytecode micro-VM JIT, không MSL viết tay), 1 command buffer / token.
 ## KHÔNG merge fp32, KHÔNG fallback CPU/fp32.
 
-import std/[math, random, strformat, os, strutils, json, tables, times, sequtils, algorithm, sets]
+import std/[math, random, strformat, os, strutils, json, tables, times, sequtils, algorithm, sets, terminal]
 import nimformer
 import backend
 import quant
@@ -1517,8 +1517,6 @@ proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenize
   stderr.writeLine "[infer] DEBUG: pattern=" & m.pattern & ", adapters=" & $lora.adapters.len & ", defaultPreset=" & defaultPreset & ", presetName=" & presetName
 
   var printedText = decodeAny(tok, ids)
-  stdout.write(printedText)
-  stdout.flushFile()
 
   let promptLen = ids.len
   var sd = initStreamDecoder(tok, ids[^1])
@@ -1535,6 +1533,12 @@ proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenize
   echo "[infer] Prefill xong - bat dau decode."
   echo &"[infer] RSS sau prefill: {rssMB()}"
 
+  stdout.write(printedText)
+  stdout.flushFile()
+  # Notebook and redirected output must contain no terminal cursor controls.
+  # BYBY_PROGRESS=0 also disables updates for notebook runners that emulate a TTY.
+  let liveProgress = getEnv("BYBY_PROGRESS", "auto") != "0" and
+                     isatty(stdout) and isatty(stderr) and getEnv("TERM", "") != "dumb"
   var stoppedBy = ""
   var firstStepTime = 0.0
   let decodeStart = monoSecs()
@@ -1604,13 +1608,13 @@ proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenize
       stdout.flushFile()
       printedText.add(delta)
 
-    # Ghim tok/s cố định 1 chỗ (dòng 1, góc trên terminal) bằng ANSI cursor
-    # save/restore - không đụng vị trí đang in chữ generate ở dưới.
-    let curTokPerSec = 1.0 / max(stepTime, 1e-6)
-    stdout.write("\e7\e[1;1H\e[K")
-    stdout.write(&"[{genIds.len}/{maxNewTokens} tok | {curTokPerSec:.2f} tok/s | {(stepTime*1000):.0f} ms/tok]")
-    stdout.write("\e8")
-    stdout.flushFile()
+    # Keep terminal-only progress on stderr, outside the generated text stream.
+    if liveProgress:
+      let curTokPerSec = 1.0 / max(stepTime, 1e-6)
+      stderr.write("\e7\e[1;1H\e[K")
+      stderr.write(&"[{genIds.len}/{maxNewTokens} tok | {curTokPerSec:.2f} tok/s | {(stepTime*1000):.0f} ms/tok]")
+      stderr.write("\e8")
+      stderr.flushFile()
 
   # xa not byte UTF-8 con giu lai
   let tail = streamDelta(sd, tok, genIds, final = true)
@@ -1619,6 +1623,8 @@ proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenize
     stdout.flushFile()
     printedText.add(tail)
 
+  stdout.write("\n")
+  stdout.flushFile()
   if stoppedBy.len == 0:
     stderr.writeLine &"[infer] het {maxNewTokens} token ma chua gap stop token."
   var distinctGen: seq[int] = @[]
@@ -1647,7 +1653,6 @@ proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenize
   let splitSummary = decodeSplitSummary()
   if splitSummary.len > 0: stderr.writeLine splitSummary
 
-  stdout.write("\n")
   result = printedText
 
 
