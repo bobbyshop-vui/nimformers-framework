@@ -190,8 +190,8 @@ proc prepareLoraGpu*(ctx: Backend; name: string; loraA, loraB: openArray[float32
   var g: GpuLora
   g.r = r; g.inF = inF; g.outF = outF
   g.scale = scale
-  g.aBuf = byby.sessionUploadPrivate(be, loraA)
-  g.bBuf = byby.sessionUploadPrivate(be, loraB)
+  g.aBuf = byby.sessionUploadPrivate(be, @(loraA))
+  g.bBuf = byby.sessionUploadPrivate(be, @(loraB))
   g.hT = byby.sessionUploadPrivate(be, newSeq[float32](max(r, 64)))   # ghi được: kernel ghi vào memF32
   # Vulkan: kernelNameFor + cache GLSL (encodeVmKernel can cachedGlslSource).
   # Metal: vmKernel / dispatch MSL. Truoc day luon vmKernel(Metal) -> Vulkan warmup fail.
@@ -493,7 +493,7 @@ proc prepareGpuLinForLinear*(ctx: Backend; name: string; lin: var Linear): GpuLi
     let kn = vmKernelForBe(prog, "f32_gemv_" & $K & "x" & $N, be)
     result.name = name; result.K = K; result.N = N
     result.knF32 = kn
-    result.wF32 = if be == byby.gbVulkan: byby.sessionUploadPrivate(be, lin.weight.floatValues)
+    result.wF32 = if be == byby.gbVulkan: byby.sessionUploadPrivate(be, @(lin.weight.floatValues))
                   else: sessionUploadFloatsShared(be, lin.weight.floatValues)
     if (be == byby.gbMetal and result.wF32.metalHandle == nil) or
        (be == byby.gbVulkan and result.wF32.vulkanHandle.buf == nil):
