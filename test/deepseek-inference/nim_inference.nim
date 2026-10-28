@@ -1,10 +1,11 @@
 ## generate.nim
 ## File DUY NHẤT: nimformer_llama (RoPE + RMSNorm + SwiGLU + GQA + KV-cache paged)
-## + tokenizer + vòng lặp sinh văn bản, gộp chung 1 file theo yêu cầu.
+## + tokenizer HF thuần Nim + vòng lặp sinh văn bản.
 
-import std/[math, random, sequtils, tables, algorithm, os, strformat, strutils, times, json, sets, heapqueue]
+import std/[math, random, sequtils, tables, algorithm, os, strformat, strutils, times, json, sets, heapqueue, terminal]
 import nimformers  # Tensor, Linear, newLinear, flatten2D, transpose, Embedding, addT...
-import nimpy
+import native_hf_tokenizer
+export native_hf_tokenizer
 
 # ─────────────────────────────────────────────────────────────
 # DEBUG: BYBY_DEBUG_PATH=1 để biết CHÍNH XÁC layer đầu tiên đang chạy đường
@@ -2407,34 +2408,46 @@ proc forwardStep*(m: LlamaModelL, ids: seq[int], ctx: Backend, cache: var KVCach
   cache.seqLen += ids.len
 
 # ===================================================================
-# Load config + weights từ checkpoint HF/GPTQ (qua nimpy + quant.nim)
+# Read local config.json directly; quant.nim loads the compressed weights.
 # ===================================================================
 proc newLlamaLConfig*(modelPath: string): LlamaLConfig =
-  let transformers = pyImport("transformers")
-  let cfg = transformers.AutoConfig.from_pretrained(modelPath, trust_remote_code = true)
-  result.vocabSize = cfg.vocab_size.to(int)
-  result.hiddenSize = cfg.hidden_size.to(int)
-  result.intermediateSize = cfg.intermediate_size.to(int)
-  result.nLayers = cfg.num_hidden_layers.to(int)
-  result.nHeads = cfg.num_attention_heads.to(int)
-  try:
-    result.nKVHeads = cfg.num_key_value_heads.to(int)
-  except CatchableError:
-    result.nKVHeads = result.nHeads   # model không dùng GQA -> MHA thường
-  result.maxPositionEmbeddings = cfg.max_position_embeddings.to(int)
-  result.rmsNormEps = (try: cfg.rms_norm_eps.to(float32) except CatchableError: 1e-5'f32)
-  result.ropeTheta = (try: cfg.rope_theta.to(float32) except CatchableError: 10000'f32)
-  # THÊM: đọc rope_scaling - trước đây bị bỏ hoàn toàn -> model dùng
-  # rope_scaling (vd deepseek-coder-6.7B-GPTQ: {'type':'linear','factor':4.0})
-  # bị tính RoPE sai ngay từ block 0, không liên quan gì tới quantize.
+  let path = if fileExists(modelPath) and modelPath.endsWith(".json"): modelPath
+             else: modelPath / "config.json"
+  if not fileExists(path):
+    raise newException(IOError, "[nim_inference] config.json not found: " & path)
+  let cfg = parseFile(path)
+  if cfg.kind != JObject:
+    raise newException(ValueError, "[nim_inference] model config must be a JSON object")
+  proc requiredInt(name: string): int =
+    if not cfg.hasKey(name) or cfg[name].kind != JInt or cfg[name].getInt() <= 0:
+      raise newException(ValueError, "[nim_inference] missing/invalid config field: " & name)
+    cfg[name].getInt()
+  proc optionalFloat(name: string, fallback: float32): float32 =
+    if cfg.hasKey(name) and cfg[name].kind in {JInt, JFloat}: cfg[name].getFloat().float32
+    else: fallback
+  result.vocabSize = requiredInt("vocab_size")
+  result.hiddenSize = requiredInt("hidden_size")
+  result.intermediateSize = requiredInt("intermediate_size")
+  result.nLayers = requiredInt("num_hidden_layers")
+  result.nHeads = requiredInt("num_attention_heads")
+  result.nKVHeads = if cfg.hasKey("num_key_value_heads") and cfg["num_key_value_heads"].kind == JInt:
+                      requiredInt("num_key_value_heads")
+                    else: result.nHeads
+  result.maxPositionEmbeddings = if cfg.hasKey("max_position_embeddings"):
+                                   requiredInt("max_position_embeddings") else: 2048
+  result.rmsNormEps = optionalFloat("rms_norm_eps", 1e-6'f32)
+  result.ropeTheta = optionalFloat("rope_theta", 10000'f32)
   result.ropeScalingType = ""
   result.ropeScalingFactor = 1.0'f32
-  try:
-    let rs = cfg.rope_scaling
-    result.ropeScalingType = rs["type"].to(string)
-    result.ropeScalingFactor = rs["factor"].to(float32)
-  except CatchableError:
-    discard
+  if cfg.hasKey("rope_scaling") and cfg["rope_scaling"].kind == JObject:
+    let rs = cfg["rope_scaling"]
+    result.ropeScalingType = rs.getOrDefault("rope_type").getStr(
+      rs.getOrDefault("type").getStr(""))
+    result.ropeScalingFactor = rs.getOrDefault("factor").getFloat(1.0).float32
+    if result.ropeScalingFactor <= 0:
+      raise newException(ValueError, "[nim_inference] rope_scaling.factor must be positive")
+  if result.hiddenSize mod result.nHeads != 0 or result.nHeads mod result.nKVHeads != 0:
+    raise newException(ValueError, "[nim_inference] incompatible hidden size / attention head counts")
 
 proc loadLlamaWeightsL*(m: var LlamaModelL, path: string) =
   echo &"  đang đọc file {path} ..."
@@ -2546,46 +2559,6 @@ proc uploadAllResidentWeights*(m: var LlamaModelL, ctx: Backend) =
   # (xem 3 vi tri da sua trong fusedNormQKVRoPE/fusedResidualNormFFN(Continue)).
   echo "  xong - weight resident trên GPU, không upload lại mỗi token."
 
-
-type
-  HFTokenizer* = object
-    tok: PyObject
-    eosId*, vocabSize*: int
-
-proc newHFTokenizer*(modelPath: string): HFTokenizer =
-  let transformers = pyImport("transformers")
-  result.tok = transformers.AutoTokenizer.from_pretrained(modelPath, trust_remote_code = true)
-  result.eosId = (try: result.tok.eos_token_id.to(int) except CatchableError: -1)
-  result.vocabSize = result.tok.vocab_size.to(int)
-
-proc encode*(tok: HFTokenizer, text: string): seq[int] =
-  tok.tok.encode(text, add_special_tokens = true).to(seq[int])
-
-proc decode*(tok: HFTokenizer, ids: seq[int]): string =
-  tok.tok.decode(ids, skip_special_tokens = true).to(string)
-
-proc applyChatTemplate*(tok: HFTokenizer, userText: string, systemText: string = ""): seq[int] =
-  ## Dùng ĐÚNG chat template khai báo trong tokenizer_config.json của model
-  ## (tokenizer.apply_chat_template) thay vì tự bịa prompt dạng Alpaca
-  ## "### Instruction:/### Response:" - model instruct-tuned (Llama/Qwen/...)
-  ## được train với special token/định dạng RIÊNG (vd <|start_header_id|>...
-  ## hay <|im_start|>...) nên prompt sai định dạng -> model không nhận ra
-  ## ranh giới lượt hỏi/đáp, sinh lan man/không bám câu hỏi (đúng triệu chứng
-  ## gặp phải: sinh 99 token không ra code).
-  ## Trả thẳng token ids (tokenize=true) - KHÔNG qua encode() lần nữa, vì
-  ## chat template đã tự chèn sẵn special token (BOS/header...), encode lại
-  ## với add_special_tokens=true sẽ chèn BOS 2 lần.
-  ## SUA: `%*` là macro của std/json (dựng JsonNode Nim thuần), KHÔNG phải
-  ## API của nimpy - nimpy không có `%*`. Build messages bằng std/json (chắc
-  ## chắn có sẵn) rồi đẩy qua Python bằng json.loads(), tránh phụ thuộc API
-  ## dict/list không rõ ràng của nimpy.
-  var msgs = newJArray()
-  if systemText.len > 0:
-    msgs.add(%*{"role": "system", "content": systemText})
-  msgs.add(%*{"role": "user", "content": userText})
-  let jsonMod = pyImport("json")
-  let messages = jsonMod.loads($msgs)
-  result = tok.tok.apply_chat_template(messages, tokenize = true, add_generation_prompt = true).to(seq[int])
 
 proc sampleTopP(ctx: Backend, logits: seq[float32], temperature: float32 = 0.7'f32, topP: float32 = 0.9'f32,
                  recentIds: openArray[int] = [], repeatPenalty: float32 = 1.3'f32,
@@ -2733,7 +2706,11 @@ proc generate*(m: LlamaModelL, tok: HFTokenizer, ctx: Backend, promptIds: seq[in
                         cache.maxSeqLen, m.blocks[idx].attn.headDim)
   let warmupTime = epochTime() - warmupStart
 
-  stdout.write(tok.decode(promptIds))
+  var tokenStream = initTokenStream(tok)
+  stdout.write(tokenStream.pushTokens(promptIds))
+  stdout.flushFile()
+  let liveProgress = getEnv("BYBY_PROGRESS", "auto") != "0" and
+                     isatty(stdout) and isatty(stderr) and getEnv("TERM", "") != "dumb"
 
   # ---- ĐO TOK/S: tách riêng prefill (xử lý cả prompt 1 lần, số liệu
   # "prompt tokens/s") và decode (sinh từng token 1, số liệu "tok/s" thật sự
@@ -2749,7 +2726,7 @@ proc generate*(m: LlamaModelL, tok: HFTokenizer, ctx: Backend, promptIds: seq[in
   # dùng để loại trừ khỏi repetition penalty (xem sampleTopP ở trên).
   var noPenaltyIds: seq[int] = @[]
   for ws in ["\n", "\n\n", " ", "  ", "    ", "\t", ":\n", ":\n    "]:
-    for id in tok.tok.encode(ws, add_special_tokens = false).to(seq[int]):
+    for id in tok.encode(ws, addSpecialTokens = false):
       if id notin noPenaltyIds: noPenaltyIds.add(id)
 
   var logits = m.forwardStep(promptIds, ctx, cache, isPrefill = true)
@@ -2766,20 +2743,11 @@ proc generate*(m: LlamaModelL, tok: HFTokenizer, ctx: Backend, promptIds: seq[in
   var generated = 1
   var decodeStart = epochTime()   # tính từ SAU prefill, không tính token đầu tiên (đã sinh trong prefill)
 
-  # ---- DECODE: từng token 1, O(S) mỗi bước qua KV-cache paged ----
-  # SỬA: KHÔNG decode từng token id riêng lẻ (tok.decode(@[nextId])) — với
-  # BPE/byte-level tokenizer, 1 ký tự multi-byte (UTF-8) hoặc 1 từ thường bị
-  # tách thành NHIỀU token id; decode rời từng id làm tokenizer không ghép
-  # lại được byte-pair/UTF-8 đúng, ra ký tự rác kiểu "模/同/临" và mất
-  # khoảng trắng giữa từ. Fix: decode lại TOÀN BỘ allIds mỗi bước, in phần
-  # delta (text mới) so với lần in trước - đúng cách streaming chuẩn.
-  var printedText = tok.decode(promptIds)   # phần đã in ra (prompt) rồi
-  block:
-    let fullText0 = tok.decode(allIds)      # allIds = promptIds + nextId đầu tiên
-    if fullText0.len > printedText.len:
-      stdout.write(fullText0[printedText.len ..< fullText0.len])
-      stdout.flushFile()
-    printedText = fullText0
+  # Native byte streaming consumes each token once and holds incomplete UTF-8.
+  # It does not re-decode the entire generated history on every token.
+  if nextId != tok.eosId:
+    stdout.write(tokenStream.pushTokens(@[nextId]))
+    stdout.flushFile()
 
   while generated < maxNewTokens:
     if nextId == tok.eosId: break
@@ -2792,41 +2760,18 @@ proc generate*(m: LlamaModelL, tok: HFTokenizer, ctx: Backend, promptIds: seq[in
     allIds.add(nextId)
     inc generated
 
-    # Ghim tok/s cố định 1 chỗ (dòng 1, góc trên terminal) bằng ANSI cursor
-    # save/restore - không đụng vị trí đang in chữ generate ở dưới.
-    let instTokS = (if stepTime > 0: 1.0 / stepTime else: 0.0)
-    stdout.write("\e7\e[1;1H\e[K")
-    stdout.write(&"[{generated}/{maxNewTokens} tok | {instTokS:.2f} tok/s | {(stepTime*1000):.0f} ms/tok]")
-    stdout.write("\e8")
-    stdout.flushFile()
+    if liveProgress:
+      let instTokS = (if stepTime > 0: 1.0 / stepTime else: 0.0)
+      stderr.write("\e7\e[1;1H\e[K")
+      stderr.write(&"[{generated}/{maxNewTokens} tok | {instTokS:.2f} tok/s | {(stepTime*1000):.0f} ms/tok]")
+      stderr.write("\e8")
+      stderr.flushFile()
 
     if nextId == tok.eosId: break
-    # SỬA (loại bỏ O(T^2)): KHÔNG decode lại allIds (toàn bộ lịch sử) mỗi
-    # bước - trước đây mỗi token mới lại tokenizer.decode() TOÀN BỘ chuỗi
-    # đã sinh, chi phí O(T) mỗi bước x T bước = O(T^2) tổng, độc lập với
-    # GPU/backend (đây là CPU/Python HF work). Với generate dài, cái này tự
-    # nó có thể vượt xa chi phí forward pass GPU.
-    # Fix: chỉ decode 1 cửa sổ đuôi nhỏ (đủ ghép lại byte-pair/UTF-8 đa byte
-    # bị cắt ở token cuối) thay vì toàn bộ allIds - giống streaming
-    # incremental của llama.cpp (chỉ detokenize token mới + vài token ngữ
-    # cảnh liền trước để xử lý biên UTF-8, không phải cả chuỗi).
-    const tailWindow = 8
-    let winStart = max(0, allIds.len - tailWindow - 1)
-    let prevWinText = tok.decode(allIds[winStart ..< allIds.len - 1])
-    let fullWinText = tok.decode(allIds[winStart ..< allIds.len])
-    if fullWinText.len > prevWinText.len and fullWinText[0 ..< prevWinText.len] == prevWinText:
-      printedText.add(fullWinText[prevWinText.len ..< fullWinText.len])
-      stdout.write(fullWinText[prevWinText.len ..< fullWinText.len])
-      stdout.flushFile()
-    else:
-      # Hiếm: biên token làm đổi cách decode phần trong cửa sổ -> rơi về
-      # decode toàn bộ CHỈ lần này để đảm bảo đúng, không đánh đổi đúng đắn
-      # lấy tốc độ.
-      let fullText = tok.decode(allIds)
-      if fullText.len > printedText.len:
-        stdout.write(fullText[printedText.len ..< fullText.len])
-        stdout.flushFile()
-      printedText = fullText
+    stdout.write(tokenStream.pushTokens(@[nextId]))
+    stdout.flushFile()
+  stdout.write(tokenStream.pushTokens([], final = true))
+  stdout.flushFile()
   let decodeTime = epochTime() - decodeStart
   let decodedCount = generated - 1   # không tính token đầu (sinh trong lúc prefill)
   stdout.write("\n")
@@ -2886,8 +2831,10 @@ when isMainModule:
 
   echo "Loading config..."
   let cfg = newLlamaLConfig(modelPath)
-  echo "Loading tokenizer..."
+  echo "Loading native tokenizer..."
   let tok = newHFTokenizer(modelPath)
+  # Validate/render the checkpoint's template before allocating model/GPU buffers.
+  let promptIds = tok.applyChatTemplate(promptText, systemText = systemText)
   echo &"Init backend ({backendName})..."
   let ctx = newBackend(backendName)
   echo "Building model..."
@@ -2909,6 +2856,5 @@ when isMainModule:
   # SỬA: prompt Alpaca "### Instruction:/### Response:" cũ KHÔNG khớp chat
   # template thật của model -> dùng applyChatTemplate (tokenizer_config.json
   # của chính model) để token hoá đúng định dạng nó được train.
-  let promptIds = tok.applyChatTemplate(promptText, systemText = systemText)
   discard generate(model, tok, ctx, promptIds, maxNewTokens = maxNewTokens,
                     temperature = temperature, topP = topP)
