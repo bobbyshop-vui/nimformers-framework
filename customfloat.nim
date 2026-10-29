@@ -181,8 +181,19 @@ proc computeRequiredExponentBits*(arr: openArray[float32], expMargin = APF_EXP_M
 
   let maxExp = int(floor(log2(float(maxAbs))))
   let minExp = int(floor(log2(float(minAbs))))
-  let expSpan = (maxExp - minExp) + 2 * expMargin + 2
-  result = max(1, int(ceil(log2(float(max(expSpan, 2))))))
+  # CustomFloat uses a fixed IEEE-style bias, not a per-tensor exponent
+  # offset. The span alone cannot describe values far from exponent zero:
+  # e.g. [0.001, 0.002] used to select too few bits and flush to zero.
+  # Reserve exponent 0 for zero and the all-ones exponent for Inf/NaN.
+  let margin = max(0, expMargin)
+  result = 2
+  while true:
+    let bias = (1 shl (result - 1)) - 1
+    let minNormalExp = 1 - bias
+    let maxNormalExp = ((1 shl result) - 2) - bias
+    if minExp - margin >= minNormalExp and maxExp + margin <= maxNormalExp:
+      break
+    inc result
 
 proc computeRequiredMantissaBits*(arr: openArray[float32],
                                    relErrorTol = APF_DEFAULT_REL_ERROR_TOL,

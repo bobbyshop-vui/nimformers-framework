@@ -1,4 +1,7 @@
+
 ## 6. LLaMA-style Inference (`test/deepseek-inference/nim_inference.nim`)
+
+[English](llama-inference-api.md) | [Tiếng Việt](llama-inference-api.vi.md)
 
 This file bundles the whole inference pipeline for LLaMA-architecture models: RoPE, RMSNorm, SwiGLU FFN, GQA (Grouped-Query Attention) with a "paged" KV-cache, an HF tokenizer, and the text-generation loop (prefill + decode).
 
@@ -12,6 +15,7 @@ proc forward*(rn: RMSNormL, x: Tensor, ctx: Backend): Tensor
 ```
 `rmsNormPrep` separates the "reduce" part (squaring + row-sum, then `1/sqrt(mean+eps)` on CPU) from the "scale" part, so callers can fuse the scale step into the next submodule's GPU session instead of opening a separate one.
 
+
 ### 6.2. RoPE (Rotary Position Embedding)
 
 ```nim
@@ -22,6 +26,7 @@ proc applyRoPEInplace*(rope: RoPEL, ctx: Backend, data: var seq[float32],
 ```
 Supports `rope_scaling` read from an HF `AutoConfig` (`scalingType = "linear"` or `"dynamic"` NTK-aware), needed for models that use scaling (e.g. `deepseek-coder-6.7B-GPTQ`). `applyRoPEInplace`: `data` layout is flat `[B, T, H, D]`; `posOffset` is the absolute position of the first token in `T` (used when decoding one token at a time, `T=1` but position > 0).
 
+
 ### 6.3. SwiGLU FeedForward
 
 ```nim
@@ -30,6 +35,7 @@ proc forward*(ff: SwiGLUL, x: Tensor, ctx: Backend): Tensor
 ```
 Fuses sigmoid + mul + mul into a single GPU session; falls back to individual `beXxx` calls if the backend can't open a session.
 
+
 ### 6.4. KV-Cache (paged, for GQA)
 
 ```nim
@@ -37,6 +43,7 @@ proc newKVCacheL*(nLayers, nKVHeads, headDim, maxSeqLen: int): KVCacheL
 proc appendKV*(cache: var KVCacheL, layer: int, kNew, vNew: seq[float32], nTok: int)
 ```
 Per-layer layout: `[nKVHeads, maxSeqLen, headDim]`, `B=1`. `appendKV` writes `kNew`/`vNew` (layout `[nTok, nKVHeads, headDim]`) sequentially into the cache at `[cache.seqLen .. cache.seqLen+nTok)`.
+
 
 ### 6.5. GQA Attention & TransformerBlockLlama
 
@@ -56,6 +63,7 @@ proc forward*(blk: TransformerBlockLlama, x: Tensor, rope: RoPEL,
 ```
 `forwardPrefill` processes the whole prompt in a single forward pass; `forwardDecode` generates one new token at a time, reading/writing the KV-cache.
 
+
 ### 6.6. Full LLaMA model
 
 ```nim
@@ -64,6 +72,7 @@ proc forwardStep*(m: LlamaModelL, ids: seq[int], ctx: Backend, cache: var KVCach
 ```
 `isPrefill=true`: `ids` = the full prompt (T tokens). `isPrefill=false`: `ids` = exactly 1 new token (decode).
 
+
 ### 6.7. Loading config & weights from Hugging Face / GPTQ
 
 ```nim
@@ -71,7 +80,8 @@ proc newLlamaLConfig*(modelPath: string): LlamaLConfig
 proc loadLlamaWeightsL*(m: var LlamaModelL, path: string)
 proc uploadAllResidentWeights*(m: var LlamaModelL, ctx: Backend)
 ```
-`newLlamaLConfig` reads `AutoConfig` via `nimpy`/`transformers`. `loadLlamaWeightsL` reads a `.nimq` checkpoint (via `loadQuantStateDict`) and builds the state dict by tensor name. `uploadAllResidentWeights` uploads **all** weights resident to the GPU once after loading — required to get good decode speed.
+`newLlamaLConfig` reads the local `config.json` directly with Nim, including GQA and RoPE scaling; it does not require `nimpy`/`transformers`. `loadLlamaWeightsL` reads a `.nimq` checkpoint (via `loadQuantStateDict`) and builds the state dict by tensor name. `uploadAllResidentWeights` uploads **all** weights resident to the GPU once after loading — required to get good decode speed.
+
 
 ### 6.8. HF tokenizer & text generation
 

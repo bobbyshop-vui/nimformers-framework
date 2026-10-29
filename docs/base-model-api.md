@@ -1,4 +1,8 @@
+
 ## 5. Base Model (`nimformer.nim`)
+
+[English](base-model-api.md) | [Tiếng Việt](base-model-api.vi.md)
+
 
 ### 5.1. Tensor & basic ops
 
@@ -31,6 +35,7 @@ proc forward*(ln: LayerNorm, x: Tensor, ctx: Backend): Tensor
 proc backward*(ln: LayerNorm, x: Tensor, dOut: Tensor, ctx: Backend): tuple[dX, dGamma, dBeta: Tensor]
 ```
 
+
 ### 5.4. Causal Self-Attention
 
 ```nim
@@ -39,6 +44,7 @@ proc forward*(attn: CausalSelfAttention, x: Tensor, ctx: Backend): Tensor
 proc backward*(attn: CausalSelfAttention, x: Tensor, dOut: Tensor, ctx: Backend): tuple[
   dX, dQkvW, dQkvB, dProjW, dProjB: Tensor]
 ```
+
 
 ### 5.5. FeedForward & TransformerBlock
 
@@ -62,6 +68,7 @@ proc newEmbedding*(vocab, dim: int): Embedding
 proc lookupBatch*(e: Embedding, idsBatch: seq[seq[int]], ctx: Backend): Tensor
 proc backward*(e: Embedding, idsBatch: seq[seq[int]], dOut: Tensor, ctx: Backend): Tensor
 ```
+
 
 ### 5.7. Full model
 

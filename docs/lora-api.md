@@ -1,6 +1,10 @@
+
 # LoRA API
 
+[English](lora-api.md) | [Tiếng Việt](lora-api.vi.md)
+
 The LoRA implementation is in `test/codestral/lora.nim` and targets `NimformerModelJamba`. Training and command-line inference are implemented in `test/codestral/finetune_lora.nim` and `test/codestral/infer_lora.nim`.
+
 
 ## Adapter types and construction
 
@@ -24,6 +28,7 @@ proc newLoraTrainState*(lora: JambaLora, lr: float32 = 1e-4'f32,
 ```
 
 `A` has shape `[r, inF]`, `B` has shape `[outF, r]`, and the merged update is `(alpha / r) * B @ A`. A negative `alpha` selects the implementation default (`2*r`). The base parameter is restored after each LoRA training step.
+
 
 ## Attach, train, merge, and restore
 
@@ -64,6 +69,7 @@ proc graftBlocks*(old: var NimformerModelJamba, newPattern: string,
 
 `graftBlocks` adds new `A` (attention) or `S` (Spectron) blocks into a block pattern while copying the existing `M` blocks in order.
 
+
 ## GPU inference helpers
 
 ```nim
@@ -85,6 +91,7 @@ proc generate*(m: var NimformerModelJamba, lora: var JambaLora,
 
 Decode profiling helpers are `decodeProfileSummary()` and `decodeSplitSummary()`. `initMicroVmJit` initializes the bytecode/JIT cache and `warmupMicroVmJit` warms it up. `setGpuDisableLora`, `setGpuNormPreset`, `normPresetDescription`, `lpSelfCheck`, and `graftBlocks` support advanced model preparation/debugging; see their source doc comments for constraints.
 
+
 ## Inference CLI
 
-`test/codestral/infer_lora.nim` is the executable entry point for `.bin`/LoRA checkpoints. It exposes public helpers `loadBinaryLoraForInfer`, `defaultSamplerCfg`, `forwardPrefillBatch`, and `generate`; command-line options are printed by `./infer_lora_bin --help` after building that target. The CLI and its environment variables can change more frequently than the library API.
+`test/codestral/infer_lora.nim` is the executable entry point for `.bin`/LoRA checkpoints. It exposes public helpers `loadBinaryLoraForInfer`, `defaultSamplerCfg`, `forwardPrefillBatch`, and `generate`. The CLI takes `<checkpoint> <prompt> <temperature> [hfDir] [nimqPath]`; it does not implement a `--help` option. See the [Make command guide](make-commands.md) for examples and backend environment variables. The CLI and its environment variables can change more frequently than the library API.

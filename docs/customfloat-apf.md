@@ -1,4 +1,7 @@
+
 ## 3. CustomFloat / APF (`customfloat.nim`)
+
+[English](customfloat-apf.md) | [Tiếng Việt](customfloat-apf.vi.md)
 
 A custom floating-point format with arbitrary exponent/mantissa bit widths, used to compress data below standard float32 precision, plus an "APF" mechanism that automatically picks the right format.
 

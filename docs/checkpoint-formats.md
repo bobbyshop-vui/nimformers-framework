@@ -1,6 +1,10 @@
+
 # Checkpoint and Binary Formats
 
+[English](checkpoint-formats.md) | [Tiếng Việt](checkpoint-formats.vi.md)
+
 The project currently has three distinct model-data formats. Use the format expected by the script/module you are running; `.nimq` and `.bin` are not interchangeable.
+
 
 ## `.nimq` quantized state dict
 
@@ -14,6 +18,7 @@ proc loadQuantStateDict*(path: string):
 ```
 
 The architecture tuple stores `[vocab, embedDim, nHeads, nLayers, ffMult]`. Each named tensor stores its quantization kind, shape, scales/zero-points, group size, CustomFloat metadata, and packed bytes. The high-level quantizers and `.nimq` exporter are documented in [Quantization and `.nimq`](quantization-nimq.md).
+
 
 ## Raw `.bin` state dict
 
@@ -75,6 +80,7 @@ proc isQLoraBin*(path: string): bool
 ```
 
 Use `isQLoraBin` to identify this container. The format magic is `NIMQLR1\0`; tensors may be stored raw or in the supported Q4 representation.
+
 
 ## Training progress checkpoints
 
