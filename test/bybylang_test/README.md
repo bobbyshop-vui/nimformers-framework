@@ -5,6 +5,8 @@
 
 These tests use the BybyLang DSL/compiler in
 [`vendor/bybylang`](../../vendor/bybylang) to exercise Nimformers.
+For a line-by-line explanation of the DSL and C ABI calls, see the
+[BybyLang test API reference](../../docs/bybylang-tests.md).
 
 - `capi_test.bybylang` — `import nim "../../lib_c_api"` and calls the C ABI
   from BybyLang: context/backend, elementwise add, matmul, softmax,
