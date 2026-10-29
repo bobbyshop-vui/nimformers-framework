@@ -5,6 +5,8 @@
 
 Bộ test dùng DSL/compiler BybyLang trong
 [`vendor/bybylang`](../../vendor/bybylang) để kiểm tra Nimformers.
+Xem [tham khảo API test BybyLang](../../docs/bybylang-tests.vi.md) để biết
+giải thích theo từng dòng cho DSL và các lời gọi C ABI.
 
 - `capi_test.bybylang`: import `../../lib_c_api` qua `import nim` và gọi C
   ABI: context/backend, cộng từng phần tử, matmul, softmax, LayerNorm,

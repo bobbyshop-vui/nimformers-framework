@@ -37,6 +37,7 @@ This directory is the user documentation for the public Nimformer APIs. Use the 
 - [GPU Session API](gpu-session-api.md): encode multiple operations per GPU session, resident buffers, and lifecycle rules.
 - [Micro-VM / JIT API](microkernel-api.md): bytecode instructions, lowering, JIT cache, and persistent-kernel constraints.
 - [BybyLang integration tests](../test/bybylang_test/README.md): BybyLang scripts that import `lib_c_api` and exercise the C ABI plus the native `gpu ...` DSL.
+- [BybyLang test API reference](bybylang-tests.md): run and extend the two `.bybylang` tests, with every DSL command and C ABI call explained.
 - [BybyLang GPU API and DSL](bybylang-api.md): GPU backend functions, DSL syntax, session blocks, imports, and native micro-kernel blocks.
 - [BybyLang language reference](bybylang-language.md): the project-local bilingual edition of the vendored README, including syntax and hardware simulation.
 - [Codestral Low Memory](codestral-low-memory.md): mmap model/adapter loading, bounded merge, device workgroups, and Vulkan Tensor Cores.
@@ -57,6 +58,7 @@ This directory is the user documentation for the public Nimformer APIs. Use the 
 | `test/codestral/lora.nim` / `test/codestral/infer_lora.nim` | [LoRA API](lora-api.md) |
 | `test/codestral/finetune_lora.nim` | [LoRA Fine-Tuning and Resume APIs](finetune-lora-api.md) |
 | `test/spectron/test_nimformer.nim` / `test/spectron/test_inferencespectron.nim` | [Training API](training-api.md) |
+| `test/bybylang_test/*.bybylang` | [BybyLang test API reference](bybylang-tests.md) |
 | `test/codestral/rawbin.nim` / `test/codestral/qlorabin.nim` / `test/codestral/checkpoint.nim` | [Checkpoint and Binary Formats](checkpoint-formats.md) |
 | `vendor/bybylang/` | [BybyLang DSL](bybylang-api.md), [Language reference](bybylang-language.md), [Sessions](gpu-session-api.md), [Micro-VM/JIT](microkernel-api.md) |
 | `lib_c_api.nim` / `nimformers/` / `include/nimformers.h` | [Python and C ABI](python-api.md) |
@@ -72,9 +74,9 @@ switch; Vietnamese pages link to Vietnamese counterparts where available.
 
 Update both editions together when changing an API, command, or example. Keep
 signatures and code blocks identical; translate explanations rather than command
-or identifier names. English heading anchors are also retained in Vietnamese
-pages so deep links continue to work. READMEs and API references follow the same
-convention.
+or identifier names. Use the anchors generated from each edition's Markdown
+headings; do not add raw HTML anchors to mirror headings from the other language.
+READMEs and API references follow the same convention.
 
 `vendor/bybylang` is a Git submodule. Its bilingual language manual lives in
 `docs/bybylang-language*.md` so the framework repository tracks both editions;

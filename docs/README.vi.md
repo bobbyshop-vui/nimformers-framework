@@ -55,6 +55,8 @@ lượng tử hóa, backend, session và micro-VM.
   cache JIT và giới hạn kernel persistent.
 - [Test tích hợp BybyLang](../test/bybylang_test/README.vi.md): import
   `lib_c_api`, kiểm tra C ABI và native DSL `gpu ...`.
+- [Tham khảo API test BybyLang](bybylang-tests.vi.md): cách chạy và mở rộng
+  hai test `.bybylang`, giải thích từng lệnh DSL và lời gọi C ABI.
 - [API BybyLang GPU/DSL](bybylang-api.vi.md): hàm backend, cú pháp DSL,
   session, import và micro-kernel native.
 - [Tham khảo ngôn ngữ BybyLang](bybylang-language.vi.md): bản tài liệu
@@ -81,6 +83,8 @@ lượng tử hóa, backend, session và micro-VM.
 - `test/codestral/finetune_lora.nim`: [fine-tune và resume](finetune-lora-api.vi.md).
 - `test/spectron/test_nimformer.nim` / `test/spectron/test_inferencespectron.nim`:
   [API training](training-api.vi.md).
+- `test/bybylang_test/*.bybylang`:
+  [tham khảo API test BybyLang](bybylang-tests.vi.md).
 - `test/codestral/rawbin.nim` / `test/codestral/qlorabin.nim` /
   `test/codestral/checkpoint.nim`: [định dạng checkpoint](checkpoint-formats.vi.md).
 - `vendor/bybylang/`: [DSL](bybylang-api.vi.md), [ngôn ngữ](bybylang-language.vi.md),
@@ -100,8 +104,9 @@ liên kết chuyển ngôn ngữ; liên kết trong bản Việt dẫn tới b�
 
 Khi đổi API, lệnh hoặc ví dụ, cập nhật cả hai bản trong cùng thay đổi.
 Giữ chữ ký hàm và code block giống nhau; dịch phần giải thích thay vì đổi
-identifier/lệnh. Anchor tiếng Anh được giữ thêm ở bản Việt để liên kết sâu
-vẫn hoạt động sau dịch tiêu đề. README và API tham chiếu cũng theo quy ước này.
+identifier/lệnh. Dùng anchor Markdown tự sinh theo heading của từng ngôn ngữ;
+không thêm raw HTML anchor để mô phỏng heading của bản còn lại. README và API
+tham chiếu cũng theo quy ước này.
 
 `vendor/bybylang` là Git submodule. Bản song ngữ của tài liệu ngôn ngữ đặt
 ở `docs/bybylang-language*.md` để được theo dõi trong repo framework; README
