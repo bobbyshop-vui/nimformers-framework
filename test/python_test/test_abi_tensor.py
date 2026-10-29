@@ -11,8 +11,8 @@ def test_abi_version(ctx):
 
 
 def test_backend_name(ctx):
-    assert ctx.backend in {"metal", "vulkan"}
-    assert ctx.backend_id in {1, 2}
+    assert ctx.backend in {"metal", "vulkan", "cpu"}
+    assert ctx.backend_id in {1, 2, 4}
 
 
 def test_invalid_backend():

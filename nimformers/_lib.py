@@ -143,6 +143,11 @@ def _bind(lib: ct.CDLL) -> None:
     _fn(lib, "nimf_last_error", [], CSTR)
     _fn(lib, "nimf_clear_error", [], None)
     _fn(lib, "nimf_free_string", [V], None)
+    _fn(lib, "nimf_cpu_isa", [], CINT)
+    _fn(lib, "nimf_cpu_isa_name", [], CSTR)
+    _fn(lib, "nimf_cpu_features", [], CU32)
+    _fn(lib, "nimf_cpu_cache_sizes", [I64, I64, I64], CINT)
+    _fn(lib, "nimf_cpu_block_sizes", [I64, I64, I64], CINT)
 
     _fn(lib, "nimf_context_create", [CINT], V)
     _fn(lib, "nimf_context_create_name", [CSTR], V)

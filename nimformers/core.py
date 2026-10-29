@@ -25,8 +25,10 @@ _BACKENDS = {
     "vulkan": 2,
     "cuda": 3,   # legacy alias, redirected to Vulkan by the Nim backend
     "opencl": 2,  # legacy alias for Vulkan
+    "cpu": 4,    # runtime-dispatched SIMD CPU backend (no GPU required)
 }
 _COMPARE_OPS = {"gt": 0, "lt": 1, "eq": 2, "ge": 3, "le": 4}
+_CPU_ISA_NAMES = {0: "scalar", 1: "sse4", 2: "avx", 3: "avx2", 4: "avx512", 5: "neon"}
 
 
 # ---------------------------------------------------------------------
@@ -222,8 +224,8 @@ class Context:
     Parameters
     ----------
     backend:
-        ``"auto"`` (default), ``"metal"``, ``"vulkan"``, or ``"cuda"``
-        (legacy alias for Vulkan).
+        ``"auto"`` (default), ``"metal"``, ``"vulkan"``, ``"cuda"``
+        (legacy alias for Vulkan), or ``"cpu"`` (SIMD CPU backend).
     library:
         Optional path to ``libnimformers.dylib`` / ``.so`` / ``.dll``.
     forbid_cpu_fallback:
@@ -1097,6 +1099,45 @@ class Context:
     def version(self) -> str:
         value = self.lib.nimf_version()
         return value.decode() if value else ""
+
+
+def cpu_info() -> dict:
+    """Return the detected CPU ISA, feature bits, cache sizes and matmul tiles.
+
+    This does not require a :class:`Context`; it reports the process-wide
+    CPU backend configuration (the C constructor detects it once).
+    """
+    lib = get_library()
+    isa = int(lib.nimf_cpu_isa())
+    raw_name = lib.nimf_cpu_isa_name()
+    features = int(lib.nimf_cpu_features())
+    l1 = np.zeros(1, dtype=np.int64)
+    l2 = np.zeros(1, dtype=np.int64)
+    l3 = np.zeros(1, dtype=np.int64)
+    lib.nimf_cpu_cache_sizes(
+        l1.ctypes.data_as(I64), l2.ctypes.data_as(I64), l3.ctypes.data_as(I64))
+    mc = np.zeros(1, dtype=np.int64)
+    nc = np.zeros(1, dtype=np.int64)
+    kc = np.zeros(1, dtype=np.int64)
+    lib.nimf_cpu_block_sizes(
+        mc.ctypes.data_as(I64), nc.ctypes.data_as(I64), kc.ctypes.data_as(I64))
+    return {
+        "isa": isa,
+        "isa_name": raw_name.decode() if raw_name else _CPU_ISA_NAMES.get(isa, "unknown"),
+        "features": features,
+        "has_sse4": bool(features & 1),
+        "has_avx": bool(features & 2),
+        "has_avx2": bool(features & 4),
+        "has_fma": bool(features & 8),
+        "has_avx512": bool(features & 16),
+        "has_neon": bool(features & 32),
+        "l1_bytes": int(l1[0]),
+        "l2_bytes": int(l2[0]),
+        "l3_bytes": int(l3[0]),
+        "block_mc": int(mc[0]),
+        "block_nc": int(nc[0]),
+        "block_kc": int(kc[0]),
+    }
 
 
 # Backwards-compatible name used by the original ctypes wrapper.

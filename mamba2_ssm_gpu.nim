@@ -7,6 +7,7 @@ import std/math
 import std/[times, os, strformat, strutils, sequtils]
 import backend
 import vendor/bybylang/gpubackend as byby
+import vendor/bybylang/backends/cpu/cpu_backend as cpu
 import session_vm
 import jit_vm
 import session_vm_dispatch
@@ -407,6 +408,12 @@ proc runMicroVm*(ctx: Backend; program: VmProgram; memF32: var seq[float32];
   ## Retry timeout chỉ áp dụng cho buffer scratch được upload từ host ở đây;
   ## KHÔNG replay các API encode trực tiếp trên state recurrent resident.
   let be = ctx.kind.toByby()
+  if be == byby.gbCpu:
+    let ts = if tgSize > 0: tgSize else: max(1, min(nThreads, 256))
+    let tf = max(0, tgBytes div 4)
+    if not cpu.vmRun(program.words, memF32, @[], nThreads, tf, ts):
+      raise newException(CatchableError, "CPU microVM failed: " & cpu.cpuLastErrorMessage())
+    return true
   checkVmScratchCapacity(ctx, memF32.len, tag)
   let kn = kernelNameFor(ctx, program, tag)   # hash/JIT truoc sessionBegin
   for attempt in 0 .. 1:
@@ -471,6 +478,13 @@ proc runMicroVmChain*(ctx: Backend; steps: openArray[MvmStep]; memF32: var seq[f
   ## Nếu command buffer timeout, cả chain được replay từ bản scratch host gốc;
   ## không dùng cơ chế này cho persistent recurrent state.
   let be = ctx.kind.toByby()
+  if be == byby.gbCpu:
+    for step in steps:
+      let ts = if step.tgSize > 0: step.tgSize else: max(1, min(step.nThreads, 256))
+      if not cpu.vmRun(step.prog.words, memF32, @[], step.nThreads,
+                       max(0, step.tgBytes div 4), ts):
+        raise newException(CatchableError, "CPU microVM chain failed: " & cpu.cpuLastErrorMessage())
+    return true
   checkVmScratchCapacity(ctx, memF32.len, "stage chain")
   let names = steps.mapIt(kernelNameFor(ctx, it.prog, it.tag))   # truoc sessionBegin
   for attempt in 0 .. 1:
@@ -538,6 +552,14 @@ proc runMicroVmChainGroups*(ctx: Backend; groups: openArray[seq[MvmStep]];
       discard runMicroVmChain(ctx, g, memF32)
     return true
   let be = ctx.kind.toByby()
+  if be == byby.gbCpu:
+    for g in groups:
+      for step in g:
+        let ts = if step.tgSize > 0: step.tgSize else: max(1, min(step.nThreads, 256))
+        if not cpu.vmRun(step.prog.words, memF32, @[], step.nThreads,
+                         max(0, step.tgBytes div 4), ts):
+          raise newException(CatchableError, "CPU grouped microVM chain failed: " & cpu.cpuLastErrorMessage())
+    return true
   checkVmScratchCapacity(ctx, memF32.len, "stage chain groups")
   var names: seq[seq[string]]
   for g in groups:
@@ -602,6 +624,17 @@ proc runMicroVmChainSparse*(ctx: Backend; steps: openArray[MvmStep]; totalLen: i
   ## truoc (khong co cong don/atomic). Loi/timeout -> raise (khong retry); caller
   ## tu fallback ve runMicroVmChain.
   let be = ctx.kind.toByby()
+  if be == byby.gbCpu:
+    var mem = newSeq[float32](totalLen)
+    for i in 0 ..< head.len: mem[i] = head[i]
+    for step in steps:
+      let ts = if step.tgSize > 0: step.tgSize else: max(1, min(step.nThreads, 256))
+      if not cpu.vmRun(step.prog.words, mem, @[], step.nThreads,
+                       max(0, step.tgBytes div 4), ts):
+        raise newException(CatchableError, "CPU sparse microVM chain failed: " & cpu.cpuLastErrorMessage())
+    for r in reads:
+      result.add mem[r.off ..< r.off + r.len]
+    return
   checkVmScratchCapacity(ctx, totalLen, "sparse stage chain")
   doAssert head.len > 0 and head.len <= totalLen
   var outLen = 0

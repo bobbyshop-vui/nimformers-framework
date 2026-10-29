@@ -37,6 +37,7 @@ import quant
 import vendor/bybylang/gpubackend as byby
 import vendor/bybylang/micro_kernel as micro
 import mamba2_ssm_gpu
+import vendor/bybylang/backends/cpu/cpu_backend as cpub
 import native_hf_tokenizer as hf
 import sentencepiece_native as sp
 import nim_inference as nfinfer
@@ -115,6 +116,47 @@ proc nimf_last_error*(): cstring {.exportc: "nimf_last_error", cdecl, dynlib.} =
 
 proc nimf_clear_error*() {.exportc: "nimf_clear_error", cdecl, dynlib.} =
   lastError.setLen(0)
+
+proc nimf_cpu_isa*(): cint {.exportc: "nimf_cpu_isa", cdecl, dynlib.} =
+  ## Numeric CPU ISA: 0=scalar, 1=SSE4, 2=AVX, 3=AVX2, 4=AVX-512, 5=NEON.
+  let info = cpub.cpuInfo()
+  result = if info.hasNeon: 5 else: cint(info.isa)
+
+var cpuIsaNameBuf {.threadvar.}: string
+proc nimf_cpu_isa_name*(): cstring {.exportc: "nimf_cpu_isa_name", cdecl, dynlib.} =
+  let info = cpub.cpuInfo()
+  cpuIsaNameBuf = if info.hasNeon: "neon" else: info.isaName
+  cpuIsaNameBuf.cstring
+
+proc nimf_cpu_features*(): uint32 {.exportc: "nimf_cpu_features", cdecl, dynlib.} =
+  ## Bitmask: 1=SSE4 2=AVX 4=AVX2 8=FMA 16=AVX-512 32=NEON.
+  let f = cpub.cpuFeatures()
+  if f.sse4: result = result or 1'u32
+  if f.avx: result = result or 2'u32
+  if f.avx2: result = result or 4'u32
+  if f.fma: result = result or 8'u32
+  if f.avx512: result = result or 16'u32
+  if f.neon: result = result or 32'u32
+
+proc nimf_cpu_cache_sizes*(l1, l2, l3: ptr int64): cint
+    {.exportc: "nimf_cpu_cache_sizes", cdecl, dynlib.} =
+  if l1 == nil or l2 == nil or l3 == nil:
+    return fail("null CPU cache output pointer")
+  let info = cpub.cpuInfo()
+  l1[] = int64(info.l1Bytes)
+  l2[] = int64(info.l2Bytes)
+  l3[] = int64(info.l3Bytes)
+  ok()
+
+proc nimf_cpu_block_sizes*(mc, nc, kc: ptr int64): cint
+    {.exportc: "nimf_cpu_block_sizes", cdecl, dynlib.} =
+  if mc == nil or nc == nil or kc == nil:
+    return fail("null CPU block output pointer")
+  let b = cpub.cpuBlockSizes()
+  mc[] = int64(b.mc)
+  nc[] = int64(b.nc)
+  kc[] = int64(b.kc)
+  ok()
 
 proc nimf_free_string*(p: cstring) {.exportc: "nimf_free_string", cdecl, dynlib.} =
   if p != nil:
@@ -196,15 +238,16 @@ proc invalidBuf(buf: pointer; n: int64): bool {.inline.} =
 
 proc nimf_context_create*(backendKind: cint): pointer
     {.exportc: "nimf_context_create", cdecl, dynlib.} =
-  ## 0 = auto, 1 = Metal, 2 = Vulkan, 3 = CUDA (alias of Vulkan).
+  ## 0 = auto, 1 = Metal, 2 = Vulkan, 3 = CUDA (alias of Vulkan), 4 = CPU.
   try:
     let name = case backendKind
       of 0: "auto"
       of 1: "metal"
       of 2: "vulkan"
       of 3: "cuda"
+      of 4: "cpu"
       else:
-        return failPtr("backendKind must be 0(auto), 1(Metal), 2(Vulkan) or 3(CUDA)")
+        return failPtr("backendKind must be 0(auto), 1(Metal), 2(Vulkan), 3(CUDA) or 4(CPU)")
     let ctx = cast[ptr NimfContext](allocShared0(sizeof(NimfContext)))
     if ctx == nil: return failPtr("context allocation failed")
     ctx.backend = newBackend(name)
@@ -242,6 +285,7 @@ proc nimf_context_backend*(handle: pointer): cint
   of bkMetal: result = 1
   of bkCuda: result = 2
   of bkVulkan: result = 2
+  of bkCpu: result = 4
 
 proc nimf_context_backend_name*(handle: pointer): cstring
     {.exportc: "nimf_context_backend_name", cdecl, dynlib.} =
@@ -253,6 +297,7 @@ proc nimf_context_backend_name*(handle: pointer): cstring
   of bkMetal: result = "metal"
   of bkCuda: result = "vulkan"
   of bkVulkan: result = "vulkan"
+  of bkCpu: result = "cpu"
 
 proc nimf_context_sync*(handle: pointer): cint
     {.exportc: "nimf_context_sync", cdecl, dynlib.} =

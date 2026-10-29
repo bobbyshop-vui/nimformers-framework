@@ -15,6 +15,9 @@ For a line-by-line explanation of the DSL and C ABI calls, see the
   same `vendor/bybylang/gpubackend.nim` runtime, plus a native
   `micro kernel ...:` block that lowers emitted bytecode through the
   Nimformers micro-VM.
+- `cpu_test.bybylang` — the same DSL and a micro-kernel on the SIMD CPU
+  backend (`gpu backend is "cpu"`), including a CPU `session:` block; no GPU
+  required.
 - `nim.cfg` — extra Nim search paths needed when the generated executable
   imports `lib_c_api` (root modules plus the model-specific paths it uses).
 - `run.sh` — AOT-compiles and runs both tests.

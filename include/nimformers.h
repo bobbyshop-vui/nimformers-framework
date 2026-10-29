@@ -53,6 +53,7 @@ extern "C" {
 #define NIMF_BACKEND_METAL  1
 #define NIMF_BACKEND_VULKAN 2
 #define NIMF_BACKEND_CUDA   3  /* legacy alias; redirected to Vulkan */
+#define NIMF_BACKEND_CPU    4  /* runtime-dispatched SIMD CPU backend */
 
 /* Quantization kinds for nimf_quantize(). */
 #define NIMF_QK_FP32_RAW        0
@@ -79,6 +80,11 @@ typedef struct NimfLlama        NimfLlama;
 /* ============================== runtime ============================== */
 
 NIMF_API uint32_t    NIMF_CALL nimf_abi_version(void);
+NIMF_API int32_t     NIMF_CALL nimf_cpu_isa(void);
+NIMF_API const char* NIMF_CALL nimf_cpu_isa_name(void);
+NIMF_API uint32_t    NIMF_CALL nimf_cpu_features(void);
+NIMF_API int32_t     NIMF_CALL nimf_cpu_cache_sizes(int64_t* l1, int64_t* l2, int64_t* l3);
+NIMF_API int32_t     NIMF_CALL nimf_cpu_block_sizes(int64_t* mc, int64_t* nc, int64_t* kc);
 NIMF_API const char* NIMF_CALL nimf_version(void);
 NIMF_API const char* NIMF_CALL nimf_last_error(void);
 NIMF_API void        NIMF_CALL nimf_clear_error(void);

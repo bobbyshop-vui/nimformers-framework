@@ -9,7 +9,9 @@ The Python package in `nimformers/` is a thin `ctypes`/NumPy layer over that
 ABI; the same symbols are usable from C, C++, Rust, Go, or any FFI that can
 call C.
 
-The ABI version is **2** and is reported by `nimf_abi_version()`.
+The ABI version is **2** and is reported by `nimf_abi_version()`.  Backend
+selection includes `"cpu"`, a runtime-dispatched SIMD backend (SSE4/AVX2/
+AVX-512/NEON) that needs no GPU; see [CPU Backend](cpu-backend.md).
 
 For installation, runnable examples, checkpoint inspection, and troubleshooting
 see the [Python walkthrough](python-guide.md). For Make target
@@ -63,7 +65,7 @@ The Python loader searches, in order:
 import numpy as np
 from nimformers import Context
 
-with Context() as ctx:                     # auto -> Metal or Vulkan
+with Context() as ctx:                     # auto -> Metal/Vulkan, or CPU if no GPU
     a = np.random.randn(4, 8).astype(np.float32)
     b = np.random.randn(8, 16).astype(np.float32)
 
@@ -76,13 +78,14 @@ with Context() as ctx:                     # auto -> Metal or Vulkan
 ```
 
 `Context` is aliased as `Nimformers` and `nimformers.capi.Nimformers` for
-backwards compatibility with the original wrapper.
+backwards compatibility with the original wrapper.  `nimformers.cpu_info()`
+reports the detected CPU ISA/features/cache tiles without creating a context.
 
 ## Context
 
 | Member | Meaning |
 | --- | --- |
-| `Context(backend="auto", library=None, forbid_cpu_fallback=None)` | Create a backend context. Backends: `auto`, `metal`, `vulkan`, `cuda`/`opencl` (legacy Vulkan aliases). |
+| `Context(backend="auto", library=None, forbid_cpu_fallback=None)` | Create a backend context. Backends: `auto`, `metal`, `vulkan`, `cpu`, `cuda`/`opencl` (legacy Vulkan aliases). |
 | `ctx.backend` / `ctx.backend_id` | Backend name / numeric id. |
 | `ctx.abi_version`, `ctx.version` | ABI and library version. |
 | `ctx.sync()` | Best-effort device synchronisation. |

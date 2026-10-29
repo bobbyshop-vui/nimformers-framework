@@ -15,6 +15,7 @@ This directory is the user documentation for the public Nimformer APIs. Use the 
 - [Getting Started](getting-started.md): install/build prerequisites, imports, backend selection, and a small example.
 - [Python and C ABI](python-api.md): `ctypes`/NumPy bindings, the stable C header, quantization, NIMQ state dicts, micro-VM dispatch, tokenizers, and Llama generation.
 - [Backend API](backend-api.md): backend creation and `be*` GPU operations.
+- [CPU Backend](cpu-backend.md): SIMD ISA dispatch (SSE4/AVX2/AVX-512/NEON), AVX-offset policy, L3-aware matmul blocking, CPU sessions and micro-VM.
 - [Tensor Operations API](tensor-ops-api.md): tensor views, shape operations, reductions, comparisons, scans, and dropout.
 - [Base Model API](base-model-api.md): tensors, layers, transformer blocks, model forward/backward, and APF Adam.
 - [Hybrid Jamba Model API](jamba-model-api.md): mixed Mamba/attention model construction, batch forward, training, and checkpoints.
@@ -49,7 +50,7 @@ This directory is the user documentation for the public Nimformer APIs. Use the 
 | Module | Documentation |
 | --- | --- |
 | `nimformers.nim` | [Getting Started](getting-started.md), [Backend](backend-api.md), [Tensor Ops](tensor-ops-api.md), [Base Model](base-model-api.md), [Quantization](quantization-nimq.md), [Micro-VM](microkernel-api.md) |
-| `backend.nim` | [Backend API](backend-api.md), [GPU Session API](gpu-session-api.md) |
+| `backend.nim` | [Backend API](backend-api.md), [GPU Session API](gpu-session-api.md), [CPU Backend](cpu-backend.md) |
 | `tensor_ops.nim` | [Tensor Operations API](tensor-ops-api.md) |
 | `nimformer.nim` | [Base Model API](base-model-api.md) |
 | `test/deepseek-inference/nim_inference.nim` | [LLaMA Inference API](llama-inference-api.md), [Tokenizer APIs](tokenizer-api.md) |

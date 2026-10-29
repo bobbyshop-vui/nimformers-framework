@@ -7,7 +7,7 @@ NIMFLAGS := -d:release --hints:off --mm:arc --opt:speed --path:. --path:test/cod
 INFER_LORA_NIMCACHE := nimcache/infer-lora
 INFER_LORA_NIMFLAGS := $(NIMFLAGS) -d:codestralInference
 NIM_INFER_NIMCACHE := nimcache/nim-inference
-BYBYLANG_TEST_BINS := test/bybylang_test/native_gpu_test_bin test/bybylang_test/capi_test_bin
+BYBYLANG_TEST_BINS := test/bybylang_test/native_gpu_test_bin test/bybylang_test/cpu_test_bin test/bybylang_test/capi_test_bin
 C_API_SRC := lib_c_api.nim
 C_API_NIMCACHE := nimcache/c-api
 C_API_CHECK_NIMCACHE := nimcache/c-api-check
@@ -81,7 +81,7 @@ CLEAN_BINS      := $(TEST_BIN) $(GRAFT_BIN) $(FINETUNE_BIN) $(INFER_LORA_BIN) $(
         download-models download-datasets download-codestral-tokenizer \
         build-graft build-finetune build-infer-lora build-compact-lora \
         build-migrate-lora build-nim-inference build-spectron build-for-python \
-        python-test python-example c-example bybylang-test \
+        python-test python-example c-example bybylang-test bench-gflops \
         graft finetune-mamba infer-lora infer-mamba infer-deepseek run-spectron mamba-pipeline
 
 all: build run
@@ -280,6 +280,9 @@ c-example: build-for-python
 
 bybylang-test:
 	bash ./test/bybylang_test/run.sh
+
+bench-gflops: build-for-python
+	$(PYTHON) benchmarks/bench_gflops.py
 
 # ── graft: build + TU DONG CHAY. Khong truyen ARGS -> dung mac dinh
 # GRAFT_DEFAULT_*. Neu file old.bin/.nimq mac dinh chua ton tai, IN HUONG
