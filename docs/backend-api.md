@@ -1,6 +1,10 @@
+
 ## 2. Backend API (`backend.nim`)
 
+[English](backend-api.md) | [Tiếng Việt](backend-api.vi.md)
+
 `backend.nim` is the unified application layer over `vendor/bybylang`. Every `be*` function below takes `ctx: Backend` first.
+
 
 ### 2.1. Backend init / management
 
@@ -26,6 +30,7 @@ Converts a `BackendKind` into BybyLang's internal `GpuBackend`. `newBackend("cud
 
 `BackendKind` exposes `bkMetal`, `bkCuda` (compatibility value routed to Vulkan), and `bkVulkan`. `Backend` stores the selected kind in its public `kind` field.
 
+
 ### 2.2. Matrix operations
 
 ```nim
@@ -49,6 +54,7 @@ proc beMatmulQ4*(ctx: Backend, a: openArray[float32], wq: openArray[uint8],
 ```
 Matrix multiply against an int4-quantized weight (asymmetric, per-group) without dequantizing the whole thing to fp32 first. Always guarantees a correctly sized `M*N` result (zero-padded if the backend returns fewer elements).
 
+
 ### 2.3. Resident weights on GPU (inference optimization)
 
 ```nim
@@ -66,6 +72,7 @@ proc beResidentFreeFp32*(ctx: Backend, w: var SessionHandle)
 ```
 Same idea for regular fp32/tied-embedding weights: `wT` must be dequantized + transposed **once** before calling `beResidentUploadFp32`. This is the main mechanism that keeps `Linear.forward` from having to dequant + transpose the whole matrix every token.
 
+
 ### 2.4. Element-wise ops & activations
 
 ```nim
@@ -82,6 +89,7 @@ proc beApfluBackward*(ctx: Backend, x, dy: openArray[float32],
                        alpha: float32 = 0.1, beta: float32 = 0.1): seq[float32]
 ```
 `beApflu`/`beApfluBackward`: a custom "APF Linear Unit" activation configurable via `alpha`/`beta`, plus its backward gradient.
+
 
 ### 2.5. Softmax / LayerNorm / Embedding / Attention
 
@@ -117,6 +125,7 @@ proc beAttentionFusedBackward*(ctx: Backend, q, k, v, s_matrix, dy: openArray[fl
 ```
 Attention (Q, K, V, mask) fused into a single kernel call. `B`=batch size, `H`=number of heads, `S`=sequence length, `D`=head dimension. `beAttentionFusedBackward` reuses the `s_matrix` saved from forward to compute `dq`, `dk`, `dv`.
 
+
 ### 2.6. Indexing / tensor-layout helpers
 
 ```nim
@@ -135,6 +144,7 @@ proc beConcatGpu*(ctx: Backend, flatSrc: seq[float32], srcBase, srcDimSize,
 
 These low-level wrappers are used by `tensor_ops.nim`; tensor-oriented forms are documented in [Tensor Operations API](tensor-ops-api.md).
 
+
 ### 2.7. CustomFloat / APF helpers (via `backend.nim`)
 
 ```nim
@@ -150,6 +160,7 @@ Thin wrappers calling `customfloat.encodeArray` / `decodeArray` / `apfCastForTra
 
 
 ---
+
 
 ## 8. Selecting a Backend
 
@@ -167,6 +178,6 @@ newBackend("cuda") # legacy alias; redirects to Vulkan
 
 `newBackend("cpu")` is rejected. `"opencl"` is a compatibility spelling redirected to Vulkan.
 
-The repository Makefile has target names for backend-specific commands; they are build/run conveniences, not backend API names. See `make help` or the root Makefile for targets in the current checkout.
+The repository Makefile has target names for backend-specific commands; they are build/run conveniences, not backend API names. See the [Make command guide](make-commands.md) or the root Makefile for targets in the current checkout.
 
 ---

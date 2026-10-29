@@ -1,6 +1,10 @@
+
 # LoRA Fine-Tuning and Resume APIs (`test/codestral/finetune_lora.nim`)
 
+[English](finetune-lora-api.md) | [Tiếng Việt](finetune-lora-api.vi.md)
+
 This module contains the disk-backed training/resume utilities for `NimformerModelJamba` and `JambaLora`. The main training entry point is built/run as a program; import its exported types/functions only when writing a custom trainer. Core adapter operations are in [LoRA API](lora-api.md).
+
 
 ## Streaming batches
 
@@ -25,6 +29,7 @@ proc skipSteps*(b: var StreamingBatcher, steps: int)
 ```
 
 `DatasetSchema` selects the expected JSONL fields. `TargetIgnore` marks labels excluded from masked loss. `nextBatch` streams/tokenizes examples into a reusable token buffer rather than loading the entire corpus into RAM.
+
 
 ## Checkpoint and resume
 
@@ -51,6 +56,7 @@ proc restoreLayerProgressForStep*(lo: var JambaLora, ckptPath: string,
 
 LoRA checkpoints use `.bin` or the supported QLoRA 4-bit variant. Metadata records model pattern, quantization path, step/epoch, and normalization settings; incompatible normalization metadata is rejected on resume. Layer-by-layer transient progress is documented in [Checkpoint and Binary Formats](checkpoint-formats.md).
 
+
 ## Disk-backed optimizer state
 
 ```nim
@@ -67,6 +73,7 @@ proc clearAdamState*(st: var ApfAdamState)
 ```
 
 Adam moments (`m`, `v`, `step`) live on disk so training large models does not require keeping every optimizer tensor in RAM. The store validates payload length before accepting a snapshot.
+
 
 ## Training step and integrity helpers
 

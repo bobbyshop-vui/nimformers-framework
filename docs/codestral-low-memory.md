@@ -1,4 +1,7 @@
+
 # Codestral: mmap, 16 GiB machines and Vulkan Tensor Cores
+
+[English](codestral-low-memory.md) | [Tiếng Việt](codestral-low-memory.vi.md)
 
 Codestral inference defaults to `BYBY_MODEL_MMAP=1`. NIMQ2 payloads stay in a
 read-only file mapping. NIMBIN1/NIMBIN4 LoRA A/B and large raw `newBlock::* .weight`
@@ -12,6 +15,7 @@ allocation to device-local VRAM on discrete GPUs; Metal uses shared buffers.
 These uploads can copy into GPU memory: mmap does not make system RAM and a
 T4's separate VRAM the same allocation. After upload, redundant host payload
 references are cleared. Raw sidecars use mapped FP32 views until upload.
+
 
 ## Run
 
@@ -32,11 +36,10 @@ iGPU/UMA uses host-visible coherent/shared buffers. Even
 `BYBY_VULKAN_DEVICE_LOCAL=1` cannot force private weights on an iGPU.
 The default is `auto`; `0` can disable device-local uploads on a dGPU.
 The startup log prints `type=iGPU residentWeights=host-visible/shared` or
-`type=dGPU residentWeights=device-local/VRAM`. The Makefile prepares the companion
-BybyLang source patch automatically. That patch lives in
-`patches/bybylang-mmap-workgroups.patch`, because this workspace's populated
-submodule directory has no Git metadata and Git cannot display its file diffs.
-`make prepare-backend` is idempotent and stops on conflicting backend changes.
+`type=dGPU residentWeights=device-local/VRAM`. The current checkout uses the
+backend sources under `vendor/bybylang/`; its root Makefile does not define
+a `prepare-backend` target. See the [Make command guide](make-commands.md)
+for the supported build/run commands.
 
 `BYBY_GEMV_TG=max` is the FP4 default. It requests the largest supported group
 that fits the matrix geometry, device thread limit, and shared memory. The
@@ -57,6 +60,7 @@ smaller width than it was compiled for.
   1024; this does not cap NVIDIA/Linux or native Metal.
 - Vulkan Q4 tuning also considers widths through 1024 within device limits.
 
+
 ## Merge within the memory budget
 
 Keep `BYBY_MERGE_LORA=0` for inference. It preserves the original adapter delta
@@ -75,6 +79,7 @@ A 16 GiB inference limit also depends on prompt length, batch size, model state,
 GPU allocations and other running processes. Loader measurements alone do not
 establish the full inference peak. Host RAM and the T4's 16 GB VRAM are separate
 budgets.
+
 
 ## NVIDIA T4 / Tensor Cores
 
@@ -95,6 +100,7 @@ and [KHR cooperative matrix specification](https://docs.vulkan.org/refpages/late
 `matrix=KHR_cooperative_matrix FP16/FP32` when available, otherwise `matrix=scalar`.
 Older NV-only drivers need a driver update for this KHR path. Unsupported devices
 and shader compiler failures retain ordinary Vulkan compute.
+
 
 ## Verification
 

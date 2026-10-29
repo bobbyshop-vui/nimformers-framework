@@ -1,6 +1,10 @@
+
 # Hybrid Jamba Model API (`test/codestral/jamba_hybrid.nim`)
 
+[English](jamba-model-api.md) | [Tiếng Việt](jamba-model-api.vi.md)
+
 `NimformerModelJamba` supports mixed Mamba/attention/Spectron and Mamba2Real block patterns. Import `jamba_hybrid` for model construction/training or `infer_lora`/`lora` for the optimized LoRA inference path.
+
 
 ## Model and block construction
 
@@ -18,6 +22,7 @@ proc backward*(n: RmsNorm, x, dOut: Tensor,
 ```
 
 The `pattern` selects a block per character; consult `charToKind` in `test/codestral/jamba_hybrid.nim` for the exact accepted symbols. `quantResident` constructs supported quantized Mamba2Real weights in resident form.
+
 
 ## Forward and generation
 
@@ -44,6 +49,7 @@ proc uploadResidentJamba*(m: var NimformerModelJamba, ctx: Backend,
 
 `forwardBatchSession` is the session-oriented inference path. Incremental `newJambaGenState`/`forwardStepJamba` currently require a pure Mamba2Real pattern; mixed patterns need their sequence/batch path and the appropriate cache support.
 
+
 ## Training and checkpoint
 
 ```nim
@@ -65,6 +71,7 @@ proc loadCheckpoint*(path: string, useSession: bool = true):
 
 Jamba checkpoints use the raw `.bin` container, not `.nimq`. See [Checkpoint and Binary Formats](checkpoint-formats.md).
 
+
 ## Hugging Face loaders
 
 ```nim
@@ -81,6 +88,7 @@ proc syncRmsFromBaseNorms*(m: var NimformerModelJamba)
 ```
 
 These loaders map tensor names to this model's parameter names. Check their warnings/manifest output; unmapped tensors are not implicitly guaranteed to load.
+
 
 ## LoRA extension
 

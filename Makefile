@@ -93,18 +93,18 @@ build:
 run:
 	$(NIM) check $(NIMFLAGS) $(TEST_SRC)
 	$(NIM) c $(NIMFLAGS) $(TEST_SRC)
-	$(RUN_PREFIX)$(TEST_BIN)
+	./test/spectron/$(TEST_BIN)
 
 run-cpu:
 	$(NIM) check $(NIMFLAGS) -d:backend=cpu $(TEST_SRC)
 	$(NIM) c $(NIMFLAGS) -d:backend=cpu $(TEST_SRC)
-	$(RUN_PREFIX)$(TEST_BIN)
+	./test/spectron/$(TEST_BIN)
 
 run-metal:
 ifeq ($(IS_MACOS),yes)
 	$(NIM) check $(NIMFLAGS) -d:backend=metal $(TEST_SRC)
 	$(NIM) c $(NIMFLAGS) -d:backend=metal $(TEST_SRC)
-	$(RUN_PREFIX)$(TEST_BIN)
+	./test/spectron/$(TEST_BIN)
 else
 	@echo "Metal chi ho tro tren macOS"
 endif
@@ -112,7 +112,7 @@ endif
 run-opencl:
 	$(NIM) check $(NIMFLAGS) -d:backend=opencl $(TEST_SRC)
 	$(NIM) c $(NIMFLAGS) -d:backend=opencl $(TEST_SRC)
-	$(RUN_PREFIX)$(TEST_BIN)
+	./test/spectron/$(TEST_BIN)
 
 clean:
 ifeq ($(IS_WINDOWS),yes)
@@ -127,7 +127,7 @@ endif
 run-cuda:
 	$(NIM) check $(NIMFLAGS) -d:backend=cuda $(TEST_SRC)
 	$(NIM) c $(NIMFLAGS) -d:backend=cuda $(TEST_SRC)
-	$(RUN_PREFIX)$(TEST_BIN)
+	./test/spectron/$(TEST_BIN)
 
 # Download public Hugging Face assets into the paths used by inference/training.
 download-models:

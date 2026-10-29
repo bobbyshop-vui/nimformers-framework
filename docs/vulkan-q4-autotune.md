@@ -1,6 +1,10 @@
+
 # Vulkan Q4 Autotuner
 
+[English](vulkan-q4-autotune.md) | [Tiếng Việt](vulkan-q4-autotune.vi.md)
+
 The dynamic Q4 Vulkan autotuner is implemented in `vendor/bybylang/backends/vulkan/q4_autotune.nim` and is reached through resident Q4/session matmul. It validates candidate kernels against a reference result, times candidates, and caches the selected plan by matrix geometry and quantization settings.
+
 
 ## Public low-level API
 
@@ -14,6 +18,7 @@ proc vulkanSessionMatmulQ4Enc*(a: VulkanBufferHandle,
 ```
 
 These APIs use internal Vulkan buffer handles; application code should normally use `beResidentUploadQ4`, `residentPrepareQ4`, and `sessionMatmulQ4` documented in [Backend API](backend-api.md) and [GPU Session API](gpu-session-api.md).
+
 
 ## Environment controls
 

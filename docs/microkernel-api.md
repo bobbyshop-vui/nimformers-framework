@@ -1,6 +1,10 @@
+
 # Micro-VM and JIT API
 
+[English](microkernel-api.md) | [Tiếng Việt](microkernel-api.vi.md)
+
 The micro-VM bytecode API lives in `vendor/bybylang/micro_kernel/session_vm.nim`; GPU encoding is in `session_vm_dispatch.nim`; Metal/Vulkan source lowering and the JIT cache live in `jit_vm.nim`. The root-level `session_vm.nim`, `session_vm_dispatch.nim`, and `jit_vm.nim` are compatibility shims.
+
 
 ## Program and instruction emitters
 
@@ -35,6 +39,7 @@ Integer/address emitters: `emitUTgid`, `emitULid`, `emitUConst`, `emitUAdd`, `em
 
 Advanced JIT address/virtual-thread emitters include `emitGridBarrier`, `emitGridEpilogue`, `emitBaseF32`, `emitBaseU8`, `emitBaseLut`, `emitBaseIn`, `emitULoadMeta`, `emitVtgBegin`, `emitVtgEnd`, and `emitLoadVact`. Some opcodes are backend-specific; inspect `OP_*` comments in `session_vm.nim` before using them.
 
+
 ## Bytecode persistence and source lowering
 
 ```nim
@@ -45,6 +50,7 @@ proc lowerBytecodeToGlsl*(p: VmProgram, kernelName: string): string
 ```
 
 `lowerBytecodeToMetal` and `lowerBytecodeToGlsl` produce kernel source; they do not dispatch it. Use the session encoder APIs in [GPU Session API](gpu-session-api.md) to set a pipeline, buffers, and dispatch geometry.
+
 
 ## JIT cache
 
@@ -68,9 +74,11 @@ proc cachedGlslSource*(cache: var JitCache, kernelName: string): string
 proc mergePrograms*(parts: openArray[VmProgram]): VmProgram
 ```
 
+
 ## DSL support
 
 For a kernel declared in `.bybylang`, use a `micro kernel NAME INPUT -> OUTPUT threads N tg N out N:` block with one `emit...` instruction per indented line. The compiler constructs a `VmProgram`, lowers it to the selected backend, dispatches inside a session, and returns the output vector. Full syntax and a working example are in [BybyLang GPU API and DSL](bybylang-api.md) and `vendor/bybylang/demo/demo_gpu.bybylang`.
+
 
 ## Execution limits
 

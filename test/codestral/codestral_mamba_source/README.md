@@ -1,6 +1,10 @@
+
 # Codestral Mamba v0.1 — class source bundle
 
+[English](README.md) | [Tiếng Việt](README.vi.md)
+
 This ZIP contains class definitions and the exact published architecture configuration for **mistralai/Mamba-Codestral-7B-v0.1**. No model weights are included.
+
 
 ## What is inside
 
@@ -13,9 +17,11 @@ This ZIP contains class definitions and the exact published architecture configu
 - `upstream/params.json` — published original Mistral parameter configuration.
 - `upstream_sources.txt` — exact upstream source links used as references.
 
+
 ## Exact architecture configuration
 
 The published HF config identifies the model as `Mamba2ForCausalLM` with 64 layers, hidden size 4096, state size 128, 128 heads, head dimension 64, 8 groups, convolution kernel 4, expand 2, vocabulary size 32768, and bf16 weights.
+
 
 ## Dependencies
 
@@ -26,6 +32,7 @@ python3.10 -m pip install torch mamba-ssm causal-conv1d einops
 ```
 
 The official model card recommends `mamba_ssm` and `causal-conv1d`; Mistral's inference repository also publishes Codestral-Mamba support.
+
 
 ## Important
 

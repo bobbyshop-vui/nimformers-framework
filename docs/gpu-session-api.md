@@ -1,4 +1,7 @@
+
 ## 11. Session API (`sessionXxx`, low-level multi-op GPU sessions)
+
+[English](gpu-session-api.md) | [Tiếng Việt](gpu-session-api.vi.md)
 
 Each immediate `beXxx` call performs its own operation and may upload/read data for that call. The **Session API**, re-exported by `backend.nim` from `vendor/bybylang/gpubackend.nim`, lets you open a **single session** and encode several operations into it back-to-back, reading results back to the CPU once at the end — this is how `beAddLayernormFused`, `SwiGLUL.forward`, and fused RoPE/attention/decode paths avoid multiple GPU round-trips per layer.
 
@@ -59,6 +62,7 @@ proc sessionFree*(backend: GpuBackend, h: var SessionHandle)
 ```
 `sessionRead` reads `n` float32 values back from a GPU handle to the CPU — call this **once**, after `sessionEnd`, not between ops. `sessionFree` releases a handle's GPU-side memory; always free every handle you allocated (uploads and scratch buffers alike), even on the failure path.
 
+
 ### 11.1. Typical usage pattern
 
 ```nim
@@ -84,6 +88,7 @@ Rules of thumb:
 - Chain every op's `bool` result with `and` and check it once, right before `sessionEnd` — don't call `sessionRead` until after a successful `sessionEnd`.
 - Free every handle (`sessionFree`) on both the success and the fallback path, to avoid leaking GPU memory.
 - The Spectron trainer in `test/spectron/test_nimformer.nim` currently creates the model with `useSession = true`; change that argument in its main block to compare the non-session path.
+
 
 ### 11.2. Where the Session API is already used in this codebase
 

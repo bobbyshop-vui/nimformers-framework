@@ -1,10 +1,24 @@
 # Nimformer Framework
 
+[English](readme.md) | [Tiếng Việt](readme.vi.md)
+
 Nimformer is a Nim framework for transformer inference and training with Metal and Vulkan GPU backends. The API references, usage guides, file formats, and BybyLang GPU programming docs are in [`docs/`](docs/README.md).
 
 Start with the [documentation index](docs/README.md), then see [Getting Started](docs/getting-started.md) for a minimal program.
 
+Practical guides:
+
+- [Make commands](docs/make-commands.md): build versus run, binary outputs,
+  required data, `ARGS`, backends, and cleanup.
+- [Train/chat Spectron with `test_nimformer`](docs/spectron-guide.md): configuration,
+  JSONL, BPE, checkpoints/resume, loss, and a Nim import example.
+- [Python from source to API](docs/python-guide.md): wrapper/shared-library setup,
+  NumPy, quantization, NIMQ, micro-VM, and troubleshooting.
+- [BybyLang walkthrough](docs/bybylang-guide.md): compiler, DSL/AOT, sessions,
+  micro-kernels, and the C ABI.
+
 Model-specific programs and data live under `test/spectron/`, `test/codestral/`, and `test/deepseek-inference/`. Model assets live in each project's `models/` folder. The FP4 GEMV micro-kernel modules live under `kernelfortest/`; shared runtime modules remain at the project root.
+
 
 ## Python and C ABI
 
@@ -42,6 +56,7 @@ The same ABI can be imported from the vendored BybyLang compiler:
 make bybylang-test     # test/bybylang_test/*.bybylang
 ```
 
+
 ## AI model co-authors and acknowledgements
 
 The following model developers are acknowledged. Their GitHub handles are linked for reference:
@@ -62,6 +77,7 @@ The following model developers are acknowledged. Their GitHub handles are linked
 
 This is an AI model and developer acknowledgement list; it does not replace individual human authorship or imply endorsement by the developers.
 
+
 ## Hugging Face models and inference
 
 These repositories contain the model files used by the inference targets in this project:
@@ -71,6 +87,7 @@ These repositories contain the model files used by the inference targets in this
 | [DeepSeek Coder 6.7B NimQ](https://huggingface.co/bobbydeveloper2014/deepseek-coder-6.7b-nimq) | `model.nimq`, `config.json`, and tokenizer files for `test/deepseek-inference/nim_inference.nim` | `infer-deepseek` |
 | [Codestral v0.1 7B NimQ](https://huggingface.co/bobbydeveloper2014/codestral-v0.1-7b-nimq) | Codestral base weights, model config, and Tekken/HF tokenizer files | `infer-lora` base |
 | [Codestral v0.1 QLoRA LinearAttention](https://huggingface.co/bobbydeveloper2014/codestral-v0.1-nimq-qlora-linearattention) | `jamba_parallel_lora.bin` adapter checkpoint; it uses the Codestral NimQ base above | `infer-lora` adapter |
+
 
 ### Download the models
 
@@ -95,6 +112,7 @@ the model's BPE/Unigram rules, normalization and byte fallback. No Python tokeni
 packages or SentencePiece library installation is required. `make build-infer-lora`
 builds inference with `-d:codestralInference`, excluding the PyTorch/Nimpy loaders.
 
+
 ### Run DeepSeek Coder with `nim_inference`
 
 `infer-deepseek` builds `test/deepseek-inference/nim_inference.nim`. The first argument is the local model directory (for `config.json` and tokenizer files), the second is the `.nimq` weights file, and the remaining arguments are backend, prompt, token limit, temperature, top-p, and system prompt.
@@ -110,20 +128,23 @@ It reads the local DeepSeek byte-level BPE vocabulary, merge rules, added tokens
 and chat template directly; Nimpy, Transformers and Python tokenizer packages are
 not required. Build it with `make build-nim-inference`.
 
+
 ### Run Codestral with the QLoRA adapter
 
-The adapter file does not contain the base Mamba weights. `infer_lora` reads the base `.nimq` from `test/codestral/models/` and uses the tokenizer directory recorded in the checkpoint sidecar. The command below writes that sidecar and runs from the project root:
+The adapter file does not contain the base Mamba weights. `infer_lora` reads the base `.nimq` and uses the tokenizer directory recorded in the checkpoint sidecar. `make download-models` writes the default tokenizer sidecar. Run inference from the project root:
 
 ```sh
 make infer-lora \
   ARGS='test/codestral/models/jamba_parallel_lora.bin "[INST] Write a Python function for Fibonacci.[/INST]" 0.7 test/codestral/models/hf test/codestral/models/codestral_mamba_only.nimq'
 ```
 
-`infer-lora` accepts `<checkpoint.bin> <prompt> <temperature>` for this QLoRA checkpoint. The binary metadata selects the base `.nimq`; the sidecar points the tokenizer loader at the current base-model directory. `infer-mamba` is an alias for `infer-lora`. `make infer-lora` defaults to `auto`, preserving automatic backend selection on macOS and other platforms. It checks the selected device type: dGPU weights go to device-local VRAM; iGPU weights use host-visible/shared memory. To override the backend explicitly, use `make infer-lora BYBY_INFER_BACKEND=metal` or `make infer-lora BYBY_INFER_BACKEND=vulkan`.
+`infer-lora` accepts `<checkpoint.bin> <prompt> <temperature> [hfDir] [nimqPath]`. The binary metadata selects the base `.nimq`; the sidecar points the tokenizer loader at the current base-model directory. The last two CLI arguments configure the base-Mamba fallback path. `infer-mamba` is an alias for `infer-lora`. `make infer-lora` defaults to `auto`, preserving automatic backend selection on macOS and other platforms. It checks the selected device type: dGPU weights go to device-local VRAM; iGPU weights use host-visible/shared memory. To override the backend explicitly, use `make infer-lora BYBY_INFER_BACKEND=metal` or `make infer-lora BYBY_INFER_BACKEND=vulkan`.
+
 
 ### Train Spectron with `test/spectron/test_nimformer.nim`
 
 `test/spectron/test_nimformer.nim` is the Spectron training program. `make run` compiles and runs it; it reads `test/spectron/databricks-dolly-15k.jsonl` and all six Python/Nim code JSONLs in `test/spectron/`, trains or loads its byte-level BPE tokenizer, trains the model, and saves the checkpoint and tokenizer under `test/spectron/models/`. It scans each code JSONL and keeps a reservoir sample of up to 4,000 valid examples per file, so it uses all six datasets without loading their combined 1.3 GB into memory. The BPE training slice samples from each source. Change the `CFG_*` constants near the top of `test/spectron/test_nimformer.nim` to adjust the datasets, sample limit, model size, step count, batch, sequence length, or learning rate.
+
 
 #### Download the Python and Nim code datasets
 
@@ -140,6 +161,7 @@ make run
 ```
 
 `make run` compiles and trains with the default `auto` backend, 6,000 steps, batch 32, and sequence length 128. It writes `test/spectron/models/spectron_bpe_tokenizer.json` when no tokenizer exists, saves `test/spectron/models/finetune.nimq` every five steps, and resumes from an existing checkpoint. The checkpoint keeps model weights and step count, but Adam moments restart when resuming. On macOS, `make run-metal` compiles with the Metal backend.
+
 
 ### Run the trained Spectron checkpoint
 

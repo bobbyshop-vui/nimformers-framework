@@ -1,4 +1,7 @@
+
 # Python and C ABI
+
+[English](python-api.md) | [Tiếng Việt](python-api.vi.md)
 
 `lib_c_api.nim` exposes the Nimformers core as a stable, C-only shared
 library (`libnimformers.dylib` / `libnimformers.so` / `nimformers.dll`).
@@ -8,6 +11,10 @@ call C.
 
 The ABI version is **2** and is reported by `nimf_abi_version()`.
 
+For installation, runnable examples, checkpoint inspection, and troubleshooting
+see the [Python walkthrough](python-guide.md). For Make target
+inputs and outputs, see the [Make command guide](make-commands.md).
+
 ## Build
 
 ```sh
@@ -15,6 +22,16 @@ make build-for-python      # checks and builds the shared library
 make python-test           # builds, then runs the pytest suite
 make python-example        # runs examples/python/basic.py
 make c-example             # builds and runs examples/c/smoke.c
+```
+
+For an isolated source install:
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e '.[test]'
+make build-for-python
+make python-test PYTEST='python -m pytest' PYTEST_FLAGS=-q
 ```
 
 `pip install .` only installs the Python layer; it does not build the Nim
@@ -38,6 +55,7 @@ The Python loader searches, in order:
 4. the repository root,
 5. the current directory and `build/`,
 6. the platform dynamic-loader path (`find_library("nimformers")`).
+
 
 ## Quick start
 
@@ -75,18 +93,31 @@ All math methods accept array-like values, convert to contiguous `float32`,
 and return NumPy arrays. Broadcasting follows NumPy rules for elementwise
 operations.
 
+
 ## Math operations
+
 
 ### Elementwise and activations
 
 ```python
-ctx.add(a, b)            ctx.sub(a, b)           ctx.mul(a, b)        ctx.div(a, b)
-ctx.add_scalar(x, 1.0)   ctx.mul_scalar(x, 2.0)  ctx.neg(x)           ctx.pow(x, 2.0)
-ctx.relu(x)              ctx.sqrt(x)             ctx.exp(x)           ctx.log(x)
-ctx.sigmoid(x)           ctx.tanh(x)
+ctx.add(a, b)
+ctx.sub(a, b)
+ctx.mul(a, b)
+ctx.div(a, b)
+ctx.add_scalar(x, 1.0)
+ctx.mul_scalar(x, 2.0)
+ctx.neg(x)
+ctx.pow(x, 2.0)
+ctx.relu(x)
+ctx.sqrt(x)
+ctx.exp(x)
+ctx.log(x)
+ctx.sigmoid(x)
+ctx.tanh(x)
 ctx.apflu(x, alpha=0.1, beta=0.1)
 ctx.apflu_backward(x, dy, alpha=0.1, beta=0.1)
 ```
+
 
 ### Matrix multiplication
 
@@ -106,6 +137,7 @@ matches the Q4 kernel's `(nibble - zero) * scale` decoding).  For repeated
 calls, upload the weight once with `ctx.resident_q4(q)` and use
 `resident.linear(x)`.
 
+
 ### Normalisation and attention
 
 ```python
@@ -123,6 +155,7 @@ ctx.attention_backward(q, k, v, scores, dy, scale=None)   # -> (dq, dk, dv)
 **causal**; `mask` is accepted for ABI compatibility but is not applied by
 those kernels.
 
+
 ### Data movement and reductions
 
 ```python
@@ -136,8 +169,11 @@ ctx.argmax_with_values(x, axis=-1)       # -> (values, indices)
 ctx.masked_fill(x, mask, value)
 ctx.where(cond, a, b)
 
-ctx.sum(x, axis=-1)       ctx.mean(x, axis=-1)      ctx.max(x, axis=-1)
-ctx.cumsum(x, axis=-1)    ctx.cumprod(x, axis=-1)
+ctx.sum(x, axis=-1)
+ctx.mean(x, axis=-1)
+ctx.max(x, axis=-1)
+ctx.cumsum(x, axis=-1)
+ctx.cumprod(x, axis=-1)
 ctx.affine_scan(a, b, axis=-1)           # h[t] = a[t]h[t-1] + b[t], h[-1]=0
 
 ctx.permute(x, dims)                     # dims is the new axis order
@@ -146,6 +182,7 @@ ctx.split_slice(x, axis, offset, size)
 ctx.concat([a, b, ...], axis=0)
 ctx.stack([a, b, ...], axis=0)
 ```
+
 
 ## Tensors
 
@@ -163,6 +200,7 @@ copy = t.numpy()                 # safe copy (default)
 clone = t.clone()
 t.close()
 ```
+
 
 ## Quantization
 
@@ -192,11 +230,12 @@ raw, (e, m) = ctx.apf_cast_training(x)
 x3 = ctx.apf_decode_training(raw, e, m, x.size)
 ```
 
+
 ## NIMQ state dicts
 
 ```python
 sd = ctx.load_state_dict("model.nimq", mapped=True)   # mmap payloads
-sd = ctx.create_state_dict(arch=(vocab, hidden, ff, layers, heads))
+sd = ctx.create_state_dict(arch=(vocab, hidden, heads, layers, ff_mult))
 sd["model.layers.0.self_attn.q_proj.weight"] = q
 sd.append("model.norm.weight", norm_q)
 sd.names, sd.arch, len(sd)
@@ -207,6 +246,13 @@ sd.close()
 `sd[name]` returns a `QuantTensor` handle cached by the state dict. Closing
 the state dict closes those handles. `sd.to_dict()` dequantizes everything
 (useful for inspection of small checkpoints).
+
+The architecture above matches the Spectron/exporter convention. NIMQ stores
+five integers without a universal model schema; other writers may assign
+different meanings. Inspect the corresponding model loader before constructing
+architecture metadata. Loading a Spectron state dict exposes its tensors; it
+does not instantiate a Python Spectron training model.
+
 
 ## Micro-VM (micro-kernel dispatch)
 
@@ -242,6 +288,7 @@ out = ctx.vm_run(prog, data, tg_size=64)
 Threadgroup memory is requested in float slots via `tg_floats`; `tg_size`
 forces the threads per threadgroup (0 = backend default).
 
+
 ## Tokenizers
 
 ```python
@@ -261,6 +308,7 @@ sp.close()
 
 `apply_chat_template` raises if the model has no supported chat template.
 
+
 ## Llama inference
 
 ```python
@@ -278,6 +326,7 @@ path; the loader pins quantized weights on the GPU once. Loading a multi-GB chec
 time and RAM. Prompt tokens outside the model vocabulary are rejected with a
 clear error.
 
+
 ## C usage
 
 The public header is [`include/nimformers.h`](../include/nimformers.h) and
@@ -293,6 +342,7 @@ Ownership and error rules are documented at the top of the header. In short:
 status `0` is success, `nimf_last_error()` explains failures, and strings
 returned by the library (state-dict names, decoded text, lowered source,
 program keys) must be released with `nimf_free_string()`.
+
 
 ## Coverage
 
@@ -316,6 +366,12 @@ applications (`infer_lora`, Jamba/Hybrid training, Spectron training) remain
 command-line programs; their building blocks are available through the APIs
 above.
 
+The wrapper has no automatic differentiation engine or model-level Adam/`fit`
+API. Backward kernels such as `layernorm_backward` and `attention_backward`
+must be composed explicitly. Use the Nim training entry points for the
+existing Spectron/Codestral trainers; see the [Spectron walkthrough](spectron-guide.md).
+
+
 ## Threading and lifetime
 
 - One context per thread. GPU calls on the same context must be serialised.
@@ -324,6 +380,7 @@ above.
   become invalid after `close()`.
 - `Prog.run` updates a C-contiguous input in place and also returns it; pass
   a copy if you need the original.
+
 
 ## Tests
 

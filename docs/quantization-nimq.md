@@ -1,4 +1,8 @@
+
 ## 4. Quantization (`quant.nim`)
+
+[English](quantization-nimq.md) | [Tiếng Việt](quantization-nimq.vi.md)
+
 
 ### 4.1. Quantization kinds
 
@@ -24,6 +28,7 @@ type QuantTensor* = object
   cf*: CustomFloat          # used for qkFp8E4M3/E5M2/qkCustom/qkAuto
   data*: seq[uint8]
 ```
+
 
 ### 4.2. Quantize / dequantize
 
@@ -64,6 +69,7 @@ let raw = dequantizeTensor(qt)
 let qtAuto = quantizeTensor(data, shape, qkAuto, gradArr = grad)
 ```
 
+
 ### 4.3. Reading/writing `.nimq` checkpoints
 
 ```nim
@@ -81,6 +87,7 @@ let (arch, sd) = loadQuantStateDict("model.nimq")
 
 ---
 
+
 ## 9. Exporting from Hugging Face → `.nimq`
 
 ```
@@ -94,9 +101,10 @@ Supports both standard and GPTQ models. Use `test/deepseek-inference/verify_gptq
 
 ---
 
+
 ## 10. `.nimq` file format
 
-- Header: `NIMQ1`
+- Header: length-prefixed `NIMQ2` (the current loader rejects older magic values)
 - Architecture: 5 integers (`vocab`, `embedDim`, `nHeads`, `nLayers`, `ffMult`)
 - A list of `(name, QuantTensor)` entries
 - Convention: weights use the chosen quantization kind; biases and LayerNorm (`gamma`/`beta`) always use `qkFp32Raw`

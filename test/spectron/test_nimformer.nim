@@ -1116,6 +1116,8 @@ type
   NimformerModelSpectron* = object
     embed*: Embedding
     blocks*: seq[TransformerBlockSpectron]
+    finalNorm*: LayerNorm
+    useFinalNorm*: bool
     outProj*: Linear
     vocab*: int
 
@@ -1126,12 +1128,16 @@ proc newNimformerModelSpectron*(vocab, embedDim, nHeads, nLayers, ffMult: int,
   result.blocks = newSeq[TransformerBlockSpectron](nLayers)
   for i in 0 ..< nLayers:
     result.blocks[i] = newTransformerBlockSpectron(embedDim, nHeads, ffMult, useSession)
+  result.finalNorm = newLayerNorm(embedDim)
+  result.useFinalNorm = true
   result.outProj = newLinear(embedDim, vocab)
 
 proc forwardBatch*(m: NimformerModelSpectron, idsBatch: seq[seq[int]], ctx: Backend): Tensor =
   var x = m.embed.lookupBatch(idsBatch, ctx)
   for blk in m.blocks:
     x = blk.forward(x, ctx)
+  if m.useFinalNorm:
+    x = m.finalNorm.forward(x, ctx)
   result = m.outProj.forward(x, ctx)
 
 proc forward*(m: NimformerModelSpectron, ids: seq[int], ctx: Backend): Tensor =
@@ -1145,6 +1151,7 @@ type
     ## có thể lặp qua và gọi apfAdamStep cho từng cái mà không cần biết
     ## cấu trúc chi tiết bên trong từng block.
     dOutProjW*, dOutProjB*: Tensor
+    dFinalNormG*, dFinalNormB*: Tensor
     dBlocks*: seq[tuple[
       dAttnQkvW, dAttnQkvB, dAttnOutW, dAttnOutB,
       dMambaInW, dMambaInB, dMambaOutW, dMambaOutB,
@@ -1161,10 +1168,18 @@ proc backwardBatch*(m: NimformerModelSpectron, idsBatch: seq[seq[int]], dLoss: T
     x = blk.forward(x, ctx)
     hiddenStates.add(x)
 
-  let dOutProj = m.outProj.backward(x, dLoss, ctx)
+  # The SSM branch is unnormalized; residual magnitudes must not set the
+  # softmax temperature. Backpropagate through the same final norm as forward.
+  let headInput = if m.useFinalNorm: m.finalNorm.forward(x, ctx) else: x
+  let dOutProj = m.outProj.backward(headInput, dLoss, ctx)
   result.dOutProjW = dOutProj.dW
   result.dOutProjB = dOutProj.dB
   var dOut = dOutProj.dX
+  if m.useFinalNorm:
+    let dNorm = m.finalNorm.backward(x, dOut, ctx)
+    dOut = dNorm.dX
+    result.dFinalNormG = dNorm.dGamma
+    result.dFinalNormB = dNorm.dBeta
 
   result.dBlocks = newSeq[typeof(result.dBlocks[0])](m.blocks.len)
   for i in countdown(m.blocks.len - 1, 0):
@@ -1224,6 +1239,7 @@ proc softmaxCrossEntropy*(logits: Tensor, targets: seq[seq[int]], ctx: Backend):
 type
   ModelAdamState* = object
     outProjW*, outProjB*: ApfAdamState
+    finalNormG*, finalNormB*: ApfAdamState
     blocks*: seq[tuple[
       attnQkvW, attnQkvB, attnOutW, attnOutB,
       mambaInW, mambaInB, mambaOutW, mambaOutB,
@@ -1235,6 +1251,8 @@ type
 proc newModelAdamState*(m: NimformerModelSpectron): ModelAdamState =
   result.outProjW = newApfAdamState(m.outProj.weight.data.len)
   result.outProjB = newApfAdamState(m.outProj.bias.data.len)
+  result.finalNormG = newApfAdamState(m.finalNorm.gamma.data.len)
+  result.finalNormB = newApfAdamState(m.finalNorm.beta.data.len)
   result.embed = newApfAdamState(m.embed.weight.data.len)
   result.blocks = newSeq[typeof(result.blocks[0])](m.blocks.len)
   for i, blk in m.blocks:
@@ -1276,6 +1294,9 @@ proc modelToStateDict(m: NimformerModelSpectron): seq[(string, QuantTensor)] =
   add("embed.weight", m.embed.weight)
   add("outProj.weight", m.outProj.weight)
   add("outProj.bias", m.outProj.bias)
+  if m.useFinalNorm:
+    add("finalNorm.gamma", m.finalNorm.gamma)
+    add("finalNorm.beta", m.finalNorm.beta)
   for i, blk in m.blocks:
     let p = &"block{i}."
     add(p & "attn.qkvProj.weight", blk.attn.qkvProj.weight)
@@ -1310,6 +1331,16 @@ proc stateDictToModel(sd: seq[(string, QuantTensor)],
   restore("embed.weight", result.embed.weight)
   restore("outProj.weight", result.outProj.weight)
   restore("outProj.bias", result.outProj.bias)
+  # Old checkpoints have no final norm. Preserve their inference exactly;
+  # the training entry point explicitly enables it when resuming those files.
+  let hasNormG = "finalNorm.gamma" in lookup
+  let hasNormB = "finalNorm.beta" in lookup
+  if hasNormG != hasNormB:
+    raise newException(ValueError, "Checkpoint thieu mot tensor finalNorm")
+  result.useFinalNorm = hasNormG
+  if result.useFinalNorm:
+    restore("finalNorm.gamma", result.finalNorm.gamma)
+    restore("finalNorm.beta", result.finalNorm.beta)
   for i in 0 ..< result.blocks.len:
     let p = &"block{i}."
     restore(p & "attn.qkvProj.weight", result.blocks[i].attn.qkvProj.weight)
@@ -1402,6 +1433,9 @@ proc trainStep*(m: var NimformerModelSpectron, adam: var ModelAdamState,
   discard apfAdamStep(m.outProj.weight, grads.dOutProjW, adam.outProjW, lr, requantizeEvery = requantizeEvery)
   discard apfAdamStep(m.outProj.bias, grads.dOutProjB, adam.outProjB, lr, requantizeEvery = requantizeEvery)
   discard apfAdamStep(m.embed.weight, grads.dEmbed, adam.embed, lr, requantizeEvery = requantizeEvery)
+  if m.useFinalNorm:
+    discard apfAdamStep(m.finalNorm.gamma, grads.dFinalNormG, adam.finalNormG, lr, requantizeEvery = requantizeEvery)
+    discard apfAdamStep(m.finalNorm.beta, grads.dFinalNormB, adam.finalNormB, lr, requantizeEvery = requantizeEvery)
 
   for i in 0 ..< m.blocks.len:
     let g = grads.dBlocks[i]
@@ -1553,10 +1587,15 @@ when isMainModule:
     echo &"== Tim thay checkpoint {CFG_CHECKPOINT_PATH} -> nap lai de resume train =="
     (model, startStep) = loadCheckpoint(CFG_CHECKPOINT_PATH)
     echo &"  -> resume tu step {startStep + 1} (checkpoint da train {startStep} step)"
+    if not model.useFinalNorm:
+      model.useFinalNorm = true
+      echo "  -> bat final LayerNorm truoc lm head de on dinh logits cua checkpoint cu"
   else:
     model = newNimformerModelSpectron(vocab, CFG_EMBED_DIM, CFG_N_HEADS, CFG_N_LAYERS,
                                         CFG_FF_MULT, useSession = true)
-  var adam = newModelAdamState(model)   # Adam moment chua duoc luu trong checkpoint - luon bat dau lai tu 0
+  var adam = newModelAdamState(model)
+  if startStep > 0:
+    echo "  [resume] Adam moments chua duoc luu; optimizer bat dau lai tu step 0"
 
   # Encode toan bo corpus 1 lan bang BPE da train, dung chung cho sampling.
   let corpusIds = encodeBPE(tok, rawCorpus)
@@ -1580,12 +1619,19 @@ when isMainModule:
   echo &"== Bat dau train demo: {CFG_N_STEPS} buoc (tu step {startStep + 1}), batch={CFG_BATCH_SIZE}, seq={CFG_SEQ_LEN} =="
   # SUA: vong lap chay CFG_N_STEPS buoc TIEP THEO ke tu startStep (khong phai
   # luon quay lai step 1) - resume dung so step da luu trong checkpoint.
+  var lossSum = 0.0
+  var lossCount = 0
   for step in (startStep + 1) .. (startStep + CFG_N_STEPS):
     let (ids, targets) = sampleBatch(corpusIds, CFG_BATCH_SIZE, CFG_SEQ_LEN, rng)
     let loss = trainStep(model, adam, ids, targets, ctx, lr = CFG_LR,
                           requantizeEvery = CFG_REQUANTIZE_EVERY)
-    if step mod CFG_LOG_EVERY == 0 or step == startStep + 1:
-      echo &"step {step:>5} | loss = {loss:.4f}"
+    lossSum += float64(loss)
+    inc lossCount
+    if step mod CFG_LOG_EVERY == 0 or step == startStep + 1 or step == startStep + CFG_N_STEPS:
+      let meanLoss = lossSum / float64(lossCount)
+      echo &"step {step:>5} | loss = {loss:.4f} | mean_loss({lossCount}) = {meanLoss:.4f}"
+      lossSum = 0.0
+      lossCount = 0
 
     if step mod CFG_CHECKPOINT_EVERY == 0:
       saveCheckpoint(model, CFG_CHECKPOINT_PATH, step)

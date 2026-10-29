@@ -1,4 +1,8 @@
+
 # Tokenizer APIs
+
+[English](tokenizer-api.md) | [Tiếng Việt](tokenizer-api.vi.md)
+
 
 ## Hugging Face tokenizer (`hf_tokenizer.nim`)
 
@@ -33,6 +37,7 @@ test/codestral/test_sentencepiece_native.nim`. Run the actual checkpoint ID
 regressions with `nim c -r --path:test/codestral
 test/codestral/test_hf_tokenizer_assets.nim [hfDir]`. Both tests use only Nim's
 standard library and local files.
+
 
 ## Tokenizer wrapper used by LLaMA inference
 
@@ -74,14 +79,18 @@ Append a local DeepSeek Coder 6.7B tokenizer directory to also check exact check
 IDs. The config regression is `test/deepseek-inference/test_native_llama_config.nim`;
 it uses the same module search paths as `make build-nim-inference`.
 
+
 ## Training BPE tokenizer
 
 The Spectron training program in `test/spectron/test_nimformer.nim` exposes its byte-level BPE helpers:
 
 ```nim
-proc newBpeTokenizer*(pathOrName: string): BpeTokenizer
-proc encode*(tok: BpeTokenizer, s: string): seq[int]
-proc decode*(tok: BpeTokenizer, ids: seq[int]): string
+proc trainBPE*(corpusText: string, numMerges: int): BPETokenizer
+proc getOrTrainBPE*(corpusText: string, numMerges: int): BPETokenizer
+proc loadBPE*(path: string): BPETokenizer
+proc saveBPE*(tok: BPETokenizer, path: string)
+proc encodeBPE*(tok: BPETokenizer, s: string): seq[int]
+proc decodeBPEStr*(tok: BPETokenizer, ids: seq[int]): string
 ```
 
-`pathOrName` may be a local `tokenizer.json` or a Transformers model path/name. This training tokenizer is distinct from `HfTokenizer`; use the type paired with the model pipeline.
+`corpusText` is the training text; `getOrTrainBPE` loads the saved Spectron tokenizer if it exists, otherwise trains and saves one. `loadBPE`/`saveBPE` use a local tokenizer JSON file. This training tokenizer is distinct from `HfTokenizer`; use the type paired with the model pipeline.
