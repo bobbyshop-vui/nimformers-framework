@@ -22,7 +22,7 @@ from ._lib import (
     library_path,
     load_library,
 )
-from .core import Context, Nimformers, ResidentF32Weights, ResidentQ4Weights
+from .core import Context, Nimformers, ResidentF32Weights, ResidentQ4Weights, cpu_info
 from .model import LlamaConfig, LlamaModel
 from .quant import KIND_IDS, QuantKind, QuantTensor
 from .state import StateDict
@@ -49,6 +49,7 @@ __all__ = [
     "ResidentF32Weights",
     "ResidentQ4Weights",
     "abi_version",
+    "cpu_info",
     "library_path",
     "load_library",
     "get_library",

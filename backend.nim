@@ -26,6 +26,7 @@ type
     bkMetal = "metal"
     bkCuda = "cuda"
     bkVulkan = "vulkan"
+    bkCpu = "cpu"
 
   Backend* = object
     kind*: BackendKind
@@ -37,14 +38,11 @@ proc toByby*(bk: BackendKind): byby.GpuBackend =
   # CUDA execution path from Nimformer. All CUDA selections use Vulkan.
   of bkCuda: byby.gbVulkan
   of bkVulkan: byby.gbVulkan
+  of bkCpu: byby.gbCpu
 
 proc resolveBackendKind(want: string): BackendKind =
   case want
-  of "cpu":
-    raise newException(ValueError,
-      "resolveBackendKind(\"cpu\"): backend CPU da bi GO BO khoi framework " &
-      "nay theo yeu cau - khong con lua chon CPU nao, tuong minh hay khong " &
-      "cung khong duoc. Chon 1 trong: metal/cuda/opencl(vulkan)/auto.")
+  of "cpu": bkCpu
   of "metal": bkMetal
   of "cuda":
     stderr.writeLine "[Framework] backend 'cuda' is deprecated/disabled; redirecting to Vulkan"
@@ -54,20 +52,16 @@ proc resolveBackendKind(want: string): BackendKind =
                           # da nen tang fallback (xem toByby: bkVulkan -> gbVulkan)
                           # - chap nhan ca 2 ten string de tuong thich nguoc.
   of "auto":
-    # "auto" -> Tự động dò backend qua BybyLang. Khong tim thay GPU nao (CUDA/
-    # Metal/Vulkan) -> RAISE luon, khong con nhanh bkCpu nao de roi vao nua
-    # (truoc day con "fallback bkCpu neu gForbidCpuFallback=false" - gio bo
-    # HAN, backend CPU khong ton tai trong enum nay nua nen khong co gi de tra ve).
+    # "auto" -> detect the best available backend. When no GPU is present the
+    # runtime now falls back to the SIMD CPU backend instead of failing.
     let chosen = byby.detectBackend()
     case chosen
     of byby.gbCuda: bkCuda
     of byby.gbMetal: bkMetal
     of byby.gbVulkan: bkVulkan
     of byby.gbCpu, byby.gbAuto:
-      raise newException(CatchableError,
-        "resolveBackendKind(\"auto\"): KHÔNG tìm thấy GPU nào (CUDA/Metal/Vulkan) " &
-        "trên máy này. Backend CPU đã bị GỠ BỎ khỏi framework - không có gì để " &
-        "fallback về. Cắm GPU / cài driver rồi thử lại.")
+      stderr.writeLine "[Framework] no GPU detected; using the CPU backend"
+      bkCpu
   else:
     raise newException(ValueError, "backend khong duoc ho tro: " & want)
 

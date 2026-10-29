@@ -28,6 +28,11 @@ neural-network kernel, int8/int4/fp8/fp4/custom-float quantization, NIMQ
 state dicts, the micro-VM bytecode builder and dispatch, resident weights,
 tokenizers, and Llama inference.
 
+The `cpu` backend runs the same API, sessions, resident weights, and
+micro-kernels without a GPU. It uses runtime-dispatched SSE4/AVX2/AVX-512/
+NEON kernels with a small-op SSE policy (AVX frequency offset) and L3-aware
+matmul blocking; see [`docs/cpu-backend.md`](docs/cpu-backend.md).
+
 Build it and run the Python tests:
 
 ```sh
@@ -54,6 +59,15 @@ The same ABI can be imported from the vendored BybyLang compiler:
 
 ```sh
 make bybylang-test     # test/bybylang_test/*.bybylang
+```
+
+Measure FP32 matmul GFLOPS on CPU, Metal, and Vulkan:
+
+```sh
+python3 benchmarks/bench_gflops.py --backends cpu,metal,vulkan
+
+# 8096^3 tiled mode (avoids the iGPU watchdog for one huge dispatch)
+python3 benchmarks/bench_gflops.py --gpu-8096
 ```
 
 

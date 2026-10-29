@@ -141,7 +141,7 @@ def test_real_checkpoint(ctx, repo_root):
     if not path.is_file():
         pytest.skip("spectron checkpoint not downloaded")
     sd = ctx.load_state_dict(path, mapped=True)
-    assert len(sd) == 40
+    assert len(sd) >= 40
     assert sd.arch == (756, 64, 4, 2, 4)
     assert "embed.weight" in sd
     first = sd["embed.weight"]

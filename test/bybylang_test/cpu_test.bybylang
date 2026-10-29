@@ -1,0 +1,45 @@
+# Native BybyLang test with the SIMD CPU backend: no GPU required.
+print "=== BybyLang CPU backend ==="
+gpu backend is "cpu"
+
+gpu array X = [1, 2, 3, 4]
+gpu array Y = [10, 20, 30, 40]
+
+gpu add X, Y -> Z size 4
+if Z != @[11'f32, 22, 33, 44]:
+    print "FAIL cpu add: " & $Z
+    quit(1)
+print "PASS cpu add -> " & $Z
+
+gpu array P = [1, 2, 3, 4, 5, 6]
+gpu array Q = [1, 0, 0, 1, 1, 1]
+gpu matmul P, Q -> R m 2 k 3 n 2
+if R != @[4'f32, 5, 10, 11]:
+    print "FAIL cpu matmul: " & $R
+    quit(1)
+print "PASS cpu matmul -> " & $R
+
+# CPU session batching must work without a GPU command buffer.
+session:
+  gpu add X, Y -> SESZ size 4
+  gpu relu SESZ -> SESRELU
+
+if SESRELU != @[11'f32, 22, 33, 44]:
+    print "FAIL cpu session: " & $SESRELU
+    quit(1)
+print "PASS cpu session -> " & $SESRELU
+
+# The same native micro-kernel block now runs through the CPU VM interpreter.
+micro kernel cpu_double X -> DOUBLED threads 4 tg 4 out 4:
+  emitULid 0
+  emitULoadIn 1 0 0
+  emitAdd 1 1 1
+  emitUStoreF32 1 0 0
+  emitHalt
+
+if DOUBLED != @[2'f32, 4, 6, 8]:
+    print "FAIL cpu micro kernel: " & $DOUBLED
+    quit(1)
+print "PASS cpu micro kernel -> " & $DOUBLED
+
+print "=== BybyLang CPU backend PASSED ==="
