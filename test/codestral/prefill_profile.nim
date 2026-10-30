@@ -6,7 +6,7 @@
 import std/[os, monotimes, times, tables, algorithm, strformat]
 export monotimes
 
-var gPfEnabled* = getEnv("BYBY_PREFILL_PROFILE", "0") != "0"
+var gPfEnabled* = getEnv("BYBY_PREFILL_PROFILE", "1") != "0"
 var gPfActive* = false
 var gPfTotal = initOrderedTable[string, float]()   ## ms
 var gPfCount = initOrderedTable[string, int]()
