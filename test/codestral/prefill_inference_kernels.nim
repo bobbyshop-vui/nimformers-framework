@@ -158,28 +158,39 @@ proc buildCompactPrefixScanProgram*(L: M2Lay; coalesced = false): VmProgram =
   p.emitHalt()
   result = p
 
-proc buildPrefixParallelScanProgram*(L: M2Lay; tg: int; continuation = false): VmProgram =
+proc buildPrefixParallelScanProgram*(L: M2Lay; tg: int; continuation = false;
+                                    stateLanes = 1): VmProgram =
   ## Inclusive affine prefix scan over time, one threadgroup per (batch, head,
-  ## channel). Each lane is a timestep; N remains a short per-lane loop to
-  ## avoid exploding the grid by another dState factor. The affine operator
-  ## (a2,b2) o (a1,b1) = (a2*a1, b2+a2*b1) is associative, so Hillis-Steele
-  ## gives the same recurrence as buildM2ScanProgram, modulo FP32 order.
+  ## channel and state-lane. State lanes stride over N, shortening the long
+  ## serial state loop. The final y reduction combines their partial sums.
+  ## The affine operator (a2,b2) o (a1,b1) = (a2*a1, b2+a2*b1) is
+  ## associative, so Hillis-Steele gives the same recurrence modulo FP32 order.
   ##
   ## Two ping-pong banks hold (a,b) pairs. Padded lanes are the identity
   ## (1,0), and every lane reaches each barrier. Output state[t+1] is written
   ## in the exact layout consumed by the backward kernel.
-  doAssert tg >= L.T and (tg and (tg - 1)) == 0 and tg <= gTgCap,
+  doAssert tg >= L.T and (tg and (tg - 1)) == 0 and tg * stateLanes <= gTgCap,
     "Mamba2 parallel scan requires a power-of-two threadgroup >= T"
+  doAssert stateLanes > 0 and L.N mod stateLanes == 0 and
+    tg * 4 * stateLanes <= 1024,
+    "Mamba2 parallel scan state lanes exceed shared-memory or N limits"
   let T = L.T
   let N = L.N
   let HD = L.HD
   let cDim = L.cDim
   var p: VmProgram
   p.emitUTgid(0)                    # one group per (b,hd)
-  p.emitULid(1)                     # lane = timestep
+  p.emitULid(1)                     # local lane = stateLane*tg + timestep
+  var timeShift = 0
+  var timeMask = tg - 1
+  while timeMask > 0:
+    inc timeShift
+    timeMask = timeMask shr 1
+  p.emitUAndK(4, 1, uint32(tg - 1)) # U4 = timestep lane
+  p.emitUShrK(13, 1, uint32(timeShift)) # U13 = first state index
+  p.emitUToR(15, 13)                # R15 = state lane for final y owner test
+  p.emitUToR(14, 1)                 # R14 = shared index base (flat local id)
   p.emitUToR(0, 0)                  # R0 = group/channel id for emitDecodeBHD
-  p.emitUToR(14, 1)
-  p.emitRToU(4, 14)                 # U4 = t
   p.emitDecodeBHD(L)                # U0=b, U1=hd, U2=h, U3=g
 
   # Per-lane addresses: convolution row, dt, output state[t+1], yPre.
@@ -204,8 +215,7 @@ proc buildPrefixParallelScanProgram*(L: M2Lay; tg: int; continuation = false): V
   p.emitUToR(10, 4); p.emitLoadConstF32(11, float32(T))
   p.emitCmpLt(7, 10, 11)
   p.emitLoadConstF32(4, 0.0'f32)                               # y accumulator
-  p.emitUConst(13, 0)                                          # n index
-  p.emitLoadConstF32(12, float32(N))
+  p.emitLoadConstF32(12, float32(N div stateLanes))
   sessionVmForGpu(p, 12):
     # Neutral affine pair for padding. Valid lanes replace it with
     # (exp(dt*A), dt*B*x). Recompute A_h each n because scan scratch registers
@@ -264,13 +274,36 @@ proc buildPrefixParallelScanProgram*(L: M2Lay; tg: int; continuation = false): V
       p.emitUStoreF32(5, 0, uint32(L.states))
       p.emitULoadF32(6, 12, uint32(L.conv))                   # C_t,g,n
       p.emitFma(4, 6, 5, 4)
-    p.emitUAddK(13, 13, 1)
+    p.emitUAddK(13, 13, uint32(stateLanes))
 
-  sessionVmIfGpu(p, 7):
-    p.emitULoadF32(3, 10, uint32(L.conv))
-    p.emitULoadF32(2, 2, uint32(L.dSkip))
-    p.emitFma(4, 2, 3, 4)
-    p.emitUStoreF32(4, 9, uint32(L.yPre))
+  if stateLanes == 1:
+    sessionVmIfGpu(p, 7):
+      p.emitULoadF32(3, 10, uint32(L.conv))
+      p.emitULoadF32(2, 2, uint32(L.dSkip))
+      p.emitFma(4, 2, 3, 4)
+      p.emitUStoreF32(4, 9, uint32(L.yPre))
+  else:
+    # The scan banks are dead once the per-time state is written. Reuse bank
+    # zero for state-lane partial y sums, then reduce them in a fixed order.
+    # This barrier prevents overwriting bank zero while a peer may still read
+    # it as the final scan source (the source bank depends on log2(tg)).
+    p.emitBarrierTg()
+    p.emitTgStoreF32(4, 14, 0)
+    p.emitBarrierTg()
+    p.emitLoadConstF32(4, 0.0'f32)
+    for lane in 0 ..< stateLanes:
+      p.emitUToR(11, 4)                                        # current t
+      p.emitAddConst(11, 11, float32(lane * tg))
+      p.emitTgLoadF32(5, 11, 0)
+      p.emitAdd(4, 4, 5)
+    p.emitLoadConstF32(9, 1.0'f32)
+    p.emitCmpLt(9, 15, 9)                                     # state lane 0
+    p.emitMul(8, 7, 9)                                        # active t & lane 0
+    sessionVmIfGpu(p, 8):
+      p.emitULoadF32(3, 10, uint32(L.conv))
+      p.emitULoadF32(2, 2, uint32(L.dSkip))
+      p.emitFma(4, 2, 3, 4)
+      p.emitUStoreF32(4, 9, uint32(L.yPre))
   p.emitHalt()
   result = p
 

@@ -124,6 +124,91 @@ proc medianMs(samples: var seq[float64]): float64 =
   if samples.len mod 2 == 1: samples[samples.len div 2]
   else: (samples[samples.len div 2 - 1] + samples[samples.len div 2]) / 2
 
+proc scanStateLaneCandidate(N, tg: int): int =
+  ## Increase N parallelism only when the dispatch and VM shared-memory limits
+  ## permit it. The runtime parity probe below can still reject this candidate.
+  for lanes in [4, 2]:
+    if N mod lanes == 0 and tg * lanes <= gTgCap and tg * 4 * lanes <= 1024:
+      return lanes
+  1
+
+proc scanProbeSeed(L: M2Lay; arenaElems: int): seq[float32] =
+  ## Small finite, nonzero inputs make the scan autotuner's parity check catch
+  ## bad state indexing and reduction races instead of comparing zero outputs.
+  result = newSeq[float32](arenaElems)
+  for h in 0 ..< L.H:
+    result[L.aLog + h] = -0.35'f32 - float32(h mod 5) * 0.025'f32
+    result[L.dSkip + h] = 0.2'f32 + float32(h mod 7) * 0.03'f32
+  for t in 0 ..< L.T:
+    for h in 0 ..< L.H:
+      result[L.dt + t * L.H + h] = 0.05'f32 +
+        float32((t * 3 + h * 5) mod 13) * 0.002'f32
+      let hdBase = t * L.cDim + h * L.D
+      for d in 0 ..< L.D:
+        result[L.conv + hdBase + d] =
+          float32(((t * 11 + h * 3 + d * 7) mod 19) - 9) * 0.004'f32
+      let group = h div (L.H div L.G)
+      for n in 0 ..< L.N:
+        let bOff = L.conv + t * L.cDim + L.C + group * L.N + n
+        let cOff = L.conv + t * L.cDim + L.C + L.GN + group * L.N + n
+        result[bOff] = 0.3'f32 + float32((t + h + n) mod 11) * 0.01'f32
+        result[cOff] = float32(((t * 5 + h + n * 3) mod 17) - 8) * 0.015'f32
+  for hd in 0 ..< L.HD:
+    for n in 0 ..< L.N:
+      result[L.states + hd * L.N + n] =
+        float32(((hd * 3 + n * 7) mod 13) - 6) * 0.01'f32
+
+proc verifyScanStateLanes(ctx: Backend; L: M2Lay; tg, candidateLanes: int;
+                          probe: SessionHandle;
+                          baselineProg, candidateProg: VmProgram;
+                          baselineKn, candidateKn: string): tuple[ok: bool, maxError, tolerance: float32] =
+  let be = ctx.kind.toByby()
+  let yCount = L.T * L.C
+  let stateCount = L.HD * L.N
+  let span = yCount + stateCount
+  var readback = sessionAllocScratch(be, 2 * span)
+  let readbackReady = if be == byby.gbVulkan: readback.vulkanHandle.buf != nil
+                      else: readback.metalHandle != nil
+  require(readbackReady, "scan parity readback allocation failed")
+  var sessionOpen = false
+  try:
+    require(sessionBegin(be), "scan parity sessionBegin failed")
+    sessionOpen = true
+    encodeMicroVm(ctx, baselineProg, probe, L.HD * tg, tg * 16,
+      "scan_parity_baseline", tg, baselineKn)
+    require(sessionCopyInto(be, probe, readback, L.yPre, 0, yCount),
+      "scan parity baseline y copy failed")
+    require(sessionCopyInto(be, probe, readback,
+      L.states + L.T * stateCount, yCount, stateCount),
+      "scan parity baseline terminal-state copy failed")
+    encodeMicroVm(ctx, candidateProg, probe, L.HD * tg * candidateLanes,
+      tg * 16 * candidateLanes, "scan_parity_candidate", tg * candidateLanes,
+      candidateKn)
+    require(sessionCopyInto(be, probe, readback, L.yPre, span, yCount),
+      "scan parity candidate y copy failed")
+    require(sessionCopyInto(be, probe, readback,
+      L.states + L.T * stateCount, span + yCount, stateCount),
+      "scan parity candidate terminal-state copy failed")
+    let ended = sessionEnd(be)
+    sessionOpen = false
+    require(ended, "scan parity sessionEnd failed: " & sessionGetLastError(be))
+    let got = sessionRead(be, readback, 2 * span)
+    if got.len < 2 * span: return (false, 1.0e30'f32, 0'f32)
+    var maxAbs, maxValue = 0'f32
+    for i in 0 ..< span:
+      let a = got[i]
+      let b = got[span + i]
+      if a != a or b != b or abs(a) > 1e20'f32 or abs(b) > 1e20'f32:
+        return (false, 1.0e30'f32, 0'f32)
+      maxAbs = max(maxAbs, abs(a - b))
+      maxValue = max(maxValue, max(abs(a), abs(b)))
+    result.maxError = maxAbs
+    result.tolerance = max(2e-5'f32, maxValue * 1e-4'f32)
+    result.ok = maxAbs <= result.tolerance
+  finally:
+    if sessionOpen: discard sessionEnd(be)
+    sessionFree(be, readback)
+
 proc chooseScanMode*(ctx: Backend; T, H, D, N, G, K, C: int; eps: float32;
                      groups: int; continuation: bool): string =
   ## Compare the real GPU kernels once per backend/shape. The parallel probe
@@ -153,29 +238,50 @@ proc chooseScanMode*(ctx: Backend; T, H, D, N, G, K, C: int; eps: float32;
       &"{parallelArena * sizeof(float32) div (1024*1024)} MiB (limit {maxProbeMiB}); serial"
     return
 
-  var serialSamples, parallelSamples: seq[float64]
+  var serialSamples, baselineSamples, candidateSamples: seq[float64]
   let tuneStart = getMonoTimeIfPf()
   var probe: SessionHandle
   var probeReady = false
   try:
     let serialProg = buildCompactPrefixScanProgram(serialL)
-    let parallelProg = buildPrefixParallelScanProgram(parallelL, tg, continuation)
+    let baselineProg = buildPrefixParallelScanProgram(parallelL, tg, continuation, 1)
+    let candidateLanes = scanStateLaneCandidate(N, tg)
+    let candidateProg = if candidateLanes > 1:
+      buildPrefixParallelScanProgram(parallelL, tg, continuation, candidateLanes)
+      else: baselineProg
     let serialTag = "@prefix_compact_" & m2Tag(serialL) & "_coalescedfalse"
-    let parallelTag = "@prefix_parallel_carry_" & m2Tag(parallelL) & "_" & $continuation
-    checkVmScratchCapacity(ctx, tg * 4, "parallel scan autotune")
+    let baselineTag = "@prefix_parallel_carry_" & m2Tag(parallelL) & "_" & $continuation & "_n1"
+    let candidateTag = "@prefix_parallel_carry_" & m2Tag(parallelL) & "_" & $continuation & "_n" & $candidateLanes
+    checkVmScratchCapacity(ctx, tg * 4 * candidateLanes, "parallel scan autotune")
     let serialKn = vmKernelForBe(serialProg, serialTag, be)
-    let parallelKn = vmKernelForBe(parallelProg, parallelTag, be)
+    let baselineKn = vmKernelForBe(baselineProg, baselineTag, be)
+    let candidateKn = if candidateLanes > 1:
+      vmKernelForBe(candidateProg, candidateTag, be)
+      else: baselineKn
     if be == byby.gbVulkan:
-      let jobs = @[
+      var jobs = @[
         (serialKn, jit_vm.lowerBytecodeToGlslCached(serialProg, serialKn)),
-        (parallelKn, jit_vm.lowerBytecodeToGlslCached(parallelProg, parallelKn))]
+        (baselineKn, jit_vm.lowerBytecodeToGlslCached(baselineProg, baselineKn))]
+      if candidateLanes > 1:
+        jobs.add((candidateKn, jit_vm.lowerBytecodeToGlslCached(candidateProg, candidateKn)))
       byby.sessionJitPrewarm(be, jobs)
-    var seed = newSeq[float32](max(serialArena, parallelArena))
+    var candidateAccepted = false
+    var seed = scanProbeSeed(parallelL, max(serialArena, parallelArena))
     probe = sessionUpload(be, seed)
     seed = @[]
     probeReady = if be == byby.gbVulkan: probe.vulkanHandle.buf != nil
                  else: probe.metalHandle != nil
     require(probeReady, "scan autotune scratch allocation failed")
+    if candidateLanes > 1:
+      let parity = verifyScanStateLanes(ctx, parallelL, tg, candidateLanes,
+        probe, baselineProg, candidateProg, baselineKn, candidateKn)
+      if parity.ok:
+        candidateAccepted = true
+        echo &"[prefill-scan] auto T={T}: state-lanes={candidateLanes} parity " &
+          &"passed (max-error={parity.maxError:.3g} tolerance={parity.tolerance:.3g})"
+      else:
+        echo &"[prefill-scan] auto T={T}: state-lanes={candidateLanes} rejected " &
+          &"(max-error={parity.maxError:.3g} tolerance={parity.tolerance:.3g}); using 1"
     proc sampleBatch(prog: VmProgram; kn: string; nThreads, tgBytes, tgSize,
                      repeats: int): float64 =
       require(sessionBegin(be), "scan autotune sessionBegin failed")
@@ -184,27 +290,62 @@ proc chooseScanMode*(ctx: Backend; T, H, D, N, G, K, C: int; eps: float32;
         encodeMicroVm(ctx, prog, probe, nThreads, tgBytes, "scan_autotune", tgSize, kn)
       require(sessionEnd(be), "scan autotune sessionEnd failed: " & sessionGetLastError(be))
       float64((getMonoTime() - t0).inNanoseconds) / 1e6 / float64(repeats)
-    # Warm both pipelines in one command buffer. Vulkan fence waits are costly
+    # Warm all candidates in one command buffer. Vulkan fence waits are costly
     # on MoltenVK, so measure batches of dispatches instead of ending a session
     # after every single sample.
     require(sessionBegin(be), "scan autotune warmup sessionBegin failed")
     encodeMicroVm(ctx, serialProg, probe, serialL.HD, 4, "scan_autotune_warm", 0, serialKn)
-    encodeMicroVm(ctx, parallelProg, probe, parallelL.HD * tg, tg * 16,
-      "scan_autotune_warm", tg, parallelKn)
+    encodeMicroVm(ctx, baselineProg, probe, parallelL.HD * tg, tg * 16,
+      "scan_autotune_warm", tg, baselineKn)
+    if candidateAccepted:
+      encodeMicroVm(ctx, candidateProg, probe, parallelL.HD * tg * candidateLanes,
+        tg * 16 * candidateLanes, "scan_autotune_warm", tg * candidateLanes, candidateKn)
     require(sessionEnd(be), "scan autotune warmup sessionEnd failed: " & sessionGetLastError(be))
     # Alternate candidate order; each command buffer has two repeated dispatches.
-    for i in 0 ..< 2:
-      if i mod 2 == 0:
-        serialSamples.add sampleBatch(serialProg, serialKn, serialL.HD, 4, 0, 2)
-        parallelSamples.add sampleBatch(parallelProg, parallelKn, parallelL.HD * tg, tg * 16, tg, 2)
-      else:
-        parallelSamples.add sampleBatch(parallelProg, parallelKn, parallelL.HD * tg, tg * 16, tg, 2)
-        serialSamples.add sampleBatch(serialProg, serialKn, serialL.HD, 4, 0, 2)
+    if candidateAccepted:
+      for i in 0 ..< 2:
+        if i == 0:
+          serialSamples.add sampleBatch(serialProg, serialKn, serialL.HD, 4, 0, 2)
+          baselineSamples.add sampleBatch(baselineProg, baselineKn,
+            parallelL.HD * tg, tg * 16, tg, 2)
+          candidateSamples.add sampleBatch(candidateProg, candidateKn,
+            parallelL.HD * tg * candidateLanes, tg * 16 * candidateLanes,
+            tg * candidateLanes, 2)
+        else:
+          candidateSamples.add sampleBatch(candidateProg, candidateKn,
+            parallelL.HD * tg * candidateLanes, tg * 16 * candidateLanes,
+            tg * candidateLanes, 2)
+          baselineSamples.add sampleBatch(baselineProg, baselineKn,
+            parallelL.HD * tg, tg * 16, tg, 2)
+          serialSamples.add sampleBatch(serialProg, serialKn, serialL.HD, 4, 0, 2)
+    else:
+      for i in 0 ..< 2:
+        if i mod 2 == 0:
+          serialSamples.add sampleBatch(serialProg, serialKn, serialL.HD, 4, 0, 2)
+          baselineSamples.add sampleBatch(baselineProg, baselineKn,
+            parallelL.HD * tg, tg * 16, tg, 2)
+        else:
+          baselineSamples.add sampleBatch(baselineProg, baselineKn,
+            parallelL.HD * tg, tg * 16, tg, 2)
+          serialSamples.add sampleBatch(serialProg, serialKn, serialL.HD, 4, 0, 2)
     let serialMs = medianMs(serialSamples)
-    let parallelMs = medianMs(parallelSamples)
-    # Keep serial for near-ties: it needs much less state scratch.
-    result = if parallelMs < serialMs * 0.97: "parallel" else: "serial"
-    echo &"[prefill-scan] auto T={T}: serial={serialMs:.3f}ms parallel={parallelMs:.3f}ms -> {result}"
+    let baselineMs = medianMs(baselineSamples)
+    var bestMs = serialMs
+    result = "serial"
+    if baselineMs < bestMs * 0.97:
+      bestMs = baselineMs
+      result = "parallel"
+    if candidateAccepted:
+      let candidateMs = medianMs(candidateSamples)
+      if candidateMs < bestMs * 0.97:
+        bestMs = candidateMs
+        result = "parallel_n" & $candidateLanes
+      echo &"[prefill-scan] auto T={T}: serial={serialMs:.3f}ms " &
+        &"parallel-n1={baselineMs:.3f}ms parallel-n{candidateLanes}={candidateMs:.3f}ms " &
+        &"-> {result}"
+    else:
+      echo &"[prefill-scan] auto T={T}: serial={serialMs:.3f}ms " &
+        &"parallel-n1={baselineMs:.3f}ms -> {result}"
   except CatchableError as e:
     discard sessionRecoverQueue(be)
     result = "serial"
@@ -274,7 +415,10 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
       chooseScanMode(ctx,T,mr.numHeads,mr.headDim,mr.dState,mr.nGroups,
         mr.convKernel,mr.intermediateSize,mr.normEps,mr.nGroups,continuation)
     else:requestedScan
-  let parallel = scanMode == "parallel"
+  let parallel = scanMode.startsWith("parallel")
+  let parallelStateLanes =
+    if scanMode.startsWith("parallel_n"): parseInt(scanMode["parallel_n".len .. ^1])
+    else: 1
   let coalesced = scanMode == "coalesced"
   let L = prefixLayout(1, T, mr.numHeads, mr.headDim, mr.dState,
     mr.nGroups, mr.convKernel, mr.intermediateSize, mr.normEps, mr.nGroups, compact = not parallel)
@@ -400,8 +544,9 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
     if parallel:
       let tg=m2ScanTgSize(T)
       require(tg>0,"parallel scan unavailable")
-      (buildPrefixParallelScanProgram(L,tg,continuation),L.HD*tg,tg*16,tg,
-        "@prefix_parallel_carry_" & m2Tag(L) & "_" & $continuation)
+      (buildPrefixParallelScanProgram(L,tg,continuation,parallelStateLanes),
+        L.HD*tg*parallelStateLanes,tg*16*parallelStateLanes,tg*parallelStateLanes,
+        "@prefix_parallel_carry_" & m2Tag(L) & "_" & $continuation & "_n" & $parallelStateLanes)
     else:
       (buildCompactPrefixScanProgram(L,coalesced),L.HD,4,0,
         "@prefix_compact_" & m2Tag(L) & "_coalesced" & $coalesced)
