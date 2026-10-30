@@ -626,6 +626,16 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
         encodeVmKernel(tile.scatter,T*tile.count,tile.tg,4,output,0,c.wBuf,
           if hasLora:gLoraGpu[name].bBuf else:gDummyFor(be),hTile,0)
         inc gPrefixFusedEpilogues
+    # Vulkan's 8x2 packed microkernel is a useful fallback, but it currently
+    # gets selected before the FP4 cooperative-matrix GEMM below. On GPUs such
+    # as the Colab T4, that meant three packed dispatches per projection and
+    # zero tensor-core GEMMs even though KHR_cooperative_matrix was available.
+    # Try the single-dispatch FP4 cooperative path first on Vulkan; if the
+    # shape, shader compiler, or device does not support it, fall through to
+    # the existing 8x2 kernel. Keep Metal's tuned 8x2 route unchanged.
+    elif lin.isFp4 and be == gbVulkan and byby.sessionFp4GemmTensorCore(be, input,
+        gFp4CacheGpu[name].wBuf, gFp4CacheGpu[name].lutBuf, output, T, lin.K, lin.N):
+      inc gPrefixTensorCore
     elif name in m8x2Kns:
       let c = gFp4CacheGpu[name]
       var row = 0
