@@ -154,15 +154,17 @@ proc chooseScanMode*(ctx: Backend; T, H, D, N, G, K, C: int; eps: float32;
     return
 
   var serialSamples, parallelSamples: seq[float64]
+  let stateLanes = m2ScanStateLanes(N, tg)
   let tuneStart = getMonoTimeIfPf()
   var probe: SessionHandle
   var probeReady = false
   try:
     let serialProg = buildCompactPrefixScanProgram(serialL)
-    let parallelProg = buildPrefixParallelScanProgram(parallelL, tg, continuation)
+    let parallelProg = buildPrefixParallelScanProgram(parallelL, tg, continuation, stateLanes)
     let serialTag = "@prefix_compact_" & m2Tag(serialL) & "_coalescedfalse"
-    let parallelTag = "@prefix_parallel_carry_" & m2Tag(parallelL) & "_" & $continuation
-    checkVmScratchCapacity(ctx, tg * 4, "parallel scan autotune")
+    let parallelTag = "@prefix_parallel_carry_" & m2Tag(parallelL) & "_" &
+      $continuation & "_n" & $stateLanes
+    checkVmScratchCapacity(ctx, tg * 4 * stateLanes, "parallel scan autotune")
     let serialKn = vmKernelForBe(serialProg, serialTag, be)
     let parallelKn = vmKernelForBe(parallelProg, parallelTag, be)
     if be == byby.gbVulkan:
@@ -189,22 +191,25 @@ proc chooseScanMode*(ctx: Backend; T, H, D, N, G, K, C: int; eps: float32;
     # after every single sample.
     require(sessionBegin(be), "scan autotune warmup sessionBegin failed")
     encodeMicroVm(ctx, serialProg, probe, serialL.HD, 4, "scan_autotune_warm", 0, serialKn)
-    encodeMicroVm(ctx, parallelProg, probe, parallelL.HD * tg, tg * 16,
-      "scan_autotune_warm", tg, parallelKn)
+    encodeMicroVm(ctx, parallelProg, probe, parallelL.HD * tg * stateLanes,
+      tg * 16 * stateLanes, "scan_autotune_warm", tg * stateLanes, parallelKn)
     require(sessionEnd(be), "scan autotune warmup sessionEnd failed: " & sessionGetLastError(be))
     # Alternate candidate order; each command buffer has two repeated dispatches.
     for i in 0 ..< 2:
       if i mod 2 == 0:
         serialSamples.add sampleBatch(serialProg, serialKn, serialL.HD, 4, 0, 2)
-        parallelSamples.add sampleBatch(parallelProg, parallelKn, parallelL.HD * tg, tg * 16, tg, 2)
+        parallelSamples.add sampleBatch(parallelProg, parallelKn,
+          parallelL.HD * tg * stateLanes, tg * 16 * stateLanes, tg * stateLanes, 2)
       else:
-        parallelSamples.add sampleBatch(parallelProg, parallelKn, parallelL.HD * tg, tg * 16, tg, 2)
+        parallelSamples.add sampleBatch(parallelProg, parallelKn,
+          parallelL.HD * tg * stateLanes, tg * 16 * stateLanes, tg * stateLanes, 2)
         serialSamples.add sampleBatch(serialProg, serialKn, serialL.HD, 4, 0, 2)
     let serialMs = medianMs(serialSamples)
     let parallelMs = medianMs(parallelSamples)
     # Keep serial for near-ties: it needs much less state scratch.
     result = if parallelMs < serialMs * 0.97: "parallel" else: "serial"
-    echo &"[prefill-scan] auto T={T}: serial={serialMs:.3f}ms parallel={parallelMs:.3f}ms -> {result}"
+    echo &"[prefill-scan] auto T={T} state-lanes={stateLanes}: " &
+      &"serial={serialMs:.3f}ms parallel={parallelMs:.3f}ms -> {result}"
   except CatchableError as e:
     discard sessionRecoverQueue(be)
     result = "serial"
@@ -400,8 +405,10 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
     if parallel:
       let tg=m2ScanTgSize(T)
       require(tg>0,"parallel scan unavailable")
-      (buildPrefixParallelScanProgram(L,tg,continuation),L.HD*tg,tg*16,tg,
-        "@prefix_parallel_carry_" & m2Tag(L) & "_" & $continuation)
+      let stateLanes=m2ScanStateLanes(L.N,tg)
+      (buildPrefixParallelScanProgram(L,tg,continuation,stateLanes),
+        L.HD*tg*stateLanes,tg*16*stateLanes,tg*stateLanes,
+        "@prefix_parallel_carry_" & m2Tag(L) & "_" & $continuation & "_n" & $stateLanes)
     else:
       (buildCompactPrefixScanProgram(L,coalesced),L.HD,4,0,
         "@prefix_compact_" & m2Tag(L) & "_coalesced" & $coalesced)
@@ -626,13 +633,30 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
         encodeVmKernel(tile.scatter,T*tile.count,tile.tg,4,output,0,c.wBuf,
           if hasLora:gLoraGpu[name].bBuf else:gDummyFor(be),hTile,0)
         inc gPrefixFusedEpilogues
-    # Vulkan's 8x2 packed microkernel is a useful fallback, but it currently
-    # gets selected before the FP4 cooperative-matrix GEMM below. On GPUs such
-    # as the Colab T4, that meant three packed dispatches per projection and
-    # zero tensor-core GEMMs even though KHR_cooperative_matrix was available.
-    # Try the single-dispatch FP4 cooperative path first on Vulkan; if the
-    # shape, shader compiler, or device does not support it, fall through to
-    # the existing 8x2 kernel. Keep Metal's tuned 8x2 route unchanged.
+    # For 17..24 rows, a 16x16 cooperative matrix rounds the final 1..8 rows
+    # up to another full tensor tile, re-reading and re-decoding the same
+    # weights. Run tensor cores on complete 16-row tiles, then use one packed
+    # 4x2/8x2 tail tile. This also applies to native FP8 cooperative hardware;
+    # T4 safely chooses its supported FP16 cooperative route.
+    elif lin.isFp4 and be == gbVulkan and T >= 17 and (T mod 16) > 0 and
+        (T mod 16) <= 8 and name in m8x2Kns and
+        byby.sessionFp4GemmTensorCore(be, input, gFp4CacheGpu[name].wBuf,
+          gFp4CacheGpu[name].lutBuf, output, T - (T mod 16), lin.K, lin.N):
+      inc gPrefixTensorCore
+      let c = gFp4CacheGpu[name]
+      let row = T - (T mod 16)
+      let tailCount = T - row
+      let use4 = tailCount <= 4 and name in m4x2Kns
+      let tailRows = if use4: 4 else: 8
+      let tailKernel = if use4: m4x2Kns[name] else: m8x2Kns[name]
+      inc gPrefixPackedTiles
+      encodeVmKernel(tailKernel, (lin.N div 2) * GemvTg, GemvTg,
+        (Fp4KmLutLen + tailRows * 2 * GemvTg) * 4, output, row * lin.N,
+        c.wBuf, c.lutBuf, input, row * lin.K)
+      flushFine("tensor_tail" & $tailRows & "x2_" & $lin.N & "x" & $lin.K)
+    # Prefer one cooperative-matrix GEMM over the multiple 8x2 packed
+    # dispatches whenever the device supports the format and shape. Unsupported
+    # hardware or shader compilation safely falls through to the packed path.
     elif lin.isFp4 and be == gbVulkan and byby.sessionFp4GemmTensorCore(be, input,
         gFp4CacheGpu[name].wBuf, gFp4CacheGpu[name].lutBuf, output, T, lin.K, lin.N):
       inc gPrefixTensorCore
