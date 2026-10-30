@@ -124,7 +124,7 @@ proc encodeMicroVm*(ctx: Backend; program: VmProgram; hMem: byby.SessionHandle;
     if tg <= 0 or tg > vkDrv.vulkanMaxTgThreads():
       raise newException(CatchableError,
         "encodeMicroVm[" & tag & "]: unsupported Vulkan workgroup size " & $tg)
-    let glsl = jit_vm.lowerBytecodeToGlsl(program, kname)
+    let glsl = jit_vm.lowerBytecodeToGlslCached(program, kname)
     if not byby.sessionJitMicroVmEnc(be, kname, glsl, hMem, nThreads, tg, tgFloats):
       raise newException(CatchableError, "encodeMicroVm[" & tag & "]: Vulkan JIT dispatch failed")
     return

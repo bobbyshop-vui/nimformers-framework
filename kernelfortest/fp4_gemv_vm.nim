@@ -592,6 +592,184 @@ proc buildFp4KmGemmTunedProgram*(K, N, tg, batchRows: int): VmProgram =
   p.emitKmReduceDynamic(acc.toOpenArray(0, batchRows - 1), tg, true, N)
   p
 
+proc buildFp4KmGemmUnrollProgram*(K, N, tg, unroll, rows: int): VmProgram =
+  ## Batched FP4-KM tile that keeps `unroll` independent weight words in flight.
+  ## The tuned tile issues one u32 load -> 8 LUT loads -> rows*8 FMAs as a single
+  ## serial chain per iteration, so every iteration waits a full global-memory
+  ## latency before any FMA starts (measured 17-19 GMAC/s, i.e. 4-6% of this
+  ## iGPU's FMA peak - batching more rows does not help). Issuing several words
+  ## up front lets each word's latency hide under the previous word's FMAs:
+  ## measured 1.5x with unroll=2 (unroll=4 loses it again to register pressure).
+  ## Same math and same per-accumulator order as buildFp4KmGemmTunedProgram,
+  ## so the result is bit-identical (checked by bench_fp4_gemm_tg).
+  doAssert unroll in [2, 4] and tg in [32, 64, 128] and rows in [4, 8]
+  doAssert K > 0 and K mod (tg * 8 * unroll) == 0 and N > 0
+  const accAll = [4'u32, 6'u32, 10'u32, 11'u32, 12'u32, 13'u32, 14'u32, 15'u32]
+  const wordReg = [8'u32, 9'u32, 10'u32, 11'u32]      # U: packed weight word
+  const byteReg = [12'u32, 13'u32, 14'u32, 15'u32]    # U: group-scale byte
+  const scaleReg = [0'u32, 1'u32, 2'u32, 7'u32]       # R: decoded group scale
+  var acc: seq[uint32]
+  for r in 0 ..< rows: acc.add accAll[r]
+  var p: VmProgram
+  p.emitUTgid(0); p.emitULid(1); p.emitKmLutCopyDynamic(tg)
+  p.emitUShrK(3, 1, 2); p.emitUAndK(4, 1, 3)
+  p.emitUMulK(2, 0, uint32(K div 2))
+  p.emitUShlK(6, 3, 4); p.emitUAdd(2, 2, 6)
+  p.emitUShlK(6, 4, 2); p.emitUAdd(2, 2, 6)
+  p.emitUShlK(5, 3, 5); p.emitUAdd(5, 5, 6)
+  p.emitUMulK(3, 0, uint32(K div 32))
+  p.emitUAddK(3, 3, uint32(N * (K div 2)))
+  p.emitUShrK(6, 1, 2); p.emitUAdd(3, 3, 6)
+  for r in acc: p.emitLoadConstF32(r, 0)
+  p.emitLoadConstF32(5, float32(K div (tg * 8 * unroll)))
+  sessionVmForGpu(p, 5):
+    for u in 0 ..< unroll:
+      p.emitULoadU32(wordReg[u], 2, uint32(u * tg * 4))
+      p.emitULoadU8(byteReg[u], 3, uint32(u * (tg div 4)))
+      p.emitUToR(scaleReg[u], byteReg[u]); p.emitTgLoadF32(scaleReg[u], scaleReg[u], 16)
+    for u in 0 ..< unroll:
+      for t in 0 ..< 4:
+        for hi in 0 ..< 2:
+          p.emitUShrK(6, wordReg[u], uint32(8 * t + 4 * hi)); p.emitUAndK(6, 6, 15)
+          p.emitUToR(3, 6); p.emitTgLoadF32(3, 3, 0); p.emitMul(3, 3, scaleReg[u])
+          for row in 0 ..< rows:
+            p.emitULoadIn(8, 5, uint32(row * K + t + 16 * hi + u * (tg * 8)))
+            p.emitFma(acc[row], 3, 8, acc[row])
+    p.emitUAddK(2, 2, uint32(tg * 8 * unroll div 2))
+    p.emitUAddK(3, 3, uint32((tg div 4) * unroll))
+    p.emitUAddK(5, 5, uint32(tg * 8 * unroll))
+  p.emitKmReduceDynamic(acc.toOpenArray(0, rows - 1), tg, true, N)
+  p
+
+proc f32GemmV4TgBytes*(rows, tg: int): int = max((Fp4KmLutLen + rows * tg) * 4, 16)
+
+proc buildFp4KmGemmVecProgram*(K, N, tg, rows: int): VmProgram =
+  ## Batched FP4-KM tile whose input loads are 16-byte vector loads.
+  ## After the two-word unroll the tile is load-issue limited: every MAC costs
+  ## one scalar `inF32[...]` load, i.e. 64 loads per 8 weights for 8 rows, and
+  ## the 8 k values a lane owns sit in two aligned 4-float groups ({0..3} and
+  ## {16..19} relative to the lane base) - exactly two float4 loads per row.
+  ## That is 16 loads instead of 64 for the same 64 MACs.
+  ## The 16-float register file forces rows=6 here: 6 accumulators + 4 decoded
+  ## weights + the 4-element x group + scale + loop counter = 16. A 7th
+  ## accumulator would push the x group out of a 4-aligned register window.
+  ## Rounding differs from buildFp4KmGemmTunedProgram (weights are decoded per
+  ## 4-wide group instead of interleaved), same arithmetic, rel err < 1e-6.
+  doAssert tg in [32, 64, 128] and rows in 1 .. 6
+  doAssert K > 0 and K mod (tg * 8) == 0 and N > 0
+  const accAll = [4'u32, 6'u32, 10'u32, 11'u32, 12'u32, 13'u32]
+  const wreg = [7'u32, 8'u32, 14'u32, 15'u32]   # 4 decoded weights
+  const xreg = 0'u32                            # 4-aligned x group: R0..R3
+  var p: VmProgram
+  p.emitUTgid(0); p.emitULid(1); p.emitKmLutCopyDynamic(tg)
+  p.emitUShrK(3, 1, 2); p.emitUAndK(4, 1, 3)
+  p.emitUMulK(2, 0, uint32(K div 2))
+  p.emitUShlK(6, 3, 4); p.emitUAdd(2, 2, 6)
+  p.emitUShlK(6, 4, 2); p.emitUAdd(2, 2, 6)
+  p.emitUShlK(5, 3, 5); p.emitUAdd(5, 5, 6)
+  p.emitUMulK(3, 0, uint32(K div 32))
+  p.emitUAddK(3, 3, uint32(N * (K div 2)))
+  p.emitUShrK(6, 1, 2); p.emitUAdd(3, 3, 6)
+  for r in 0 ..< rows: p.emitLoadConstF32(accAll[r], 0)
+  p.emitLoadConstF32(5, float32(K div (tg * 8)))
+  sessionVmForGpu(p, 5):
+    p.emitULoadU32(8, 2)                             # U8 = packed weight word
+    p.emitULoadU8(9, 3)
+    p.emitUToR(9, 9); p.emitTgLoadF32(9, 9, 16)      # R9 = group scale
+    for hi in 0 ..< 2:
+      # decode the 4 weights of this k group once, reuse for all rows
+      for t in 0 ..< 4:
+        p.emitUShrK(6, 8, uint32(8 * t + 4 * hi)); p.emitUAndK(6, 6, 15)
+        p.emitUToR(wreg[t], 6); p.emitTgLoadF32(wreg[t], wreg[t], 0)
+        p.emitMul(wreg[t], wreg[t], 9)
+      for row in 0 ..< rows:
+        p.emitULoadIn4(xreg, 5, uint32(row * K + hi * 16))
+        for t in 0 ..< 4:
+          p.emitFma(accAll[row], wreg[t], xreg + uint32(t), accAll[row])
+    p.emitUAddK(2, 2, uint32(tg * 4))
+    p.emitUAddK(3, 3, uint32(tg div 4))
+    p.emitUAddK(5, 5, uint32(tg * 8))
+  p.emitKmReduceDynamic(accAll.toOpenArray(0, rows - 1), tg, true, N)
+  p
+
+proc buildFp4KmGemm2ColProgram*(K, N, tg, rows: int): VmProgram =
+  ## Batched FP4-KM tile: `rows` input rows x 2 output columns per threadgroup.
+  ## One float4 input load feeds the same 4 k values to both columns, halving
+  ## the input-load count per MAC - the dominant cost after the two-word unroll.
+  ## Register layout (needs the 32-register file):
+  ##   acc[rows][2] = R8..R(8+2*rows-1)   x float4 = R0..R3   wA = R4..R7
+  ##   wB = R(8+2*rows)..  scaleA/B, counter follow.
+  ## Same arithmetic as buildFp4KmGemmTunedProgram; rounding differs only in
+  ## the nibble decode order, so compare numerically (rel err < 1e-6).
+  doAssert tg in [32, 64, 128] and rows in [4, 8]
+  doAssert K > 0 and K mod (tg * 8) == 0 and N > 0 and N mod 2 == 0
+  let nAcc = rows * 2
+  let wB = uint32(8 + nAcc)              # 4 weight regs for column B
+  let sA = uint32(12 + nAcc)             # scale A
+  let sB = uint32(13 + nAcc)             # scale B
+  let cnt = uint32(14 + nAcc)            # loop counter
+  var p: VmProgram
+  p.emitUTgid(0); p.emitULid(1); p.emitKmLutCopyDynamic(tg)
+  p.emitUShrK(3, 1, 2); p.emitUAndK(4, 1, 3)          # U3=lane>>2, U4=lane&3
+  p.emitUMulK(12, 0, 2)                               # U12 = 2*tgid
+  p.emitUMulK(2, 0, uint32(K))                        # U2 = (2*tgid)*K/2 bytes (cột A)
+  p.emitUShlK(6, 3, 4); p.emitUAdd(2, 2, 6)
+  p.emitUShlK(6, 4, 2); p.emitUAdd(2, 2, 6)           # + (lane>>2)*16 + (lane&3)*4
+  p.emitUAddK(7, 2, uint32(K div 2))                  # U7 = cột B weight ptr
+  p.emitUShlK(5, 3, 5); p.emitUAdd(5, 5, 6)           # U5 = x offset (lane)
+  p.emitUMulK(3, 0, uint32(K div 16))                 # U3 = (2*tgid)*K/32 (scale A)
+  p.emitUAddK(3, 3, uint32(N * (K div 2)))
+  p.emitUShrK(6, 1, 2); p.emitUAdd(3, 3, 6)           # + lane>>2
+  p.emitUAddK(11, 3, uint32(K div 32))                # U11 = scale cột B ptr
+  for r in 0 ..< nAcc: p.emitLoadConstF32(uint32(8 + r), 0)
+  p.emitLoadConstF32(cnt, float32(K div (tg * 8)))
+  sessionVmForGpu(p, cnt):
+    p.emitULoadU32(8, 2); p.emitULoadU32(9, 7)        # word A, word B
+    p.emitULoadU8(10, 3)                              # scale byte A
+    p.emitUToR(sA, 10); p.emitTgLoadF32(sA, sA, 16)
+    p.emitULoadU8(10, 11)                             # scale byte B
+    p.emitUToR(sB, 10); p.emitTgLoadF32(sB, sB, 16)
+    for hi in 0 ..< 2:
+      for t in 0 ..< 4:
+        p.emitUShrK(6, 8, uint32(8 * t + 4 * hi)); p.emitUAndK(6, 6, 15)
+        p.emitUToR(4 + uint32(t), 6); p.emitTgLoadF32(4 + uint32(t), 4 + uint32(t), 0)
+        p.emitMul(4 + uint32(t), 4 + uint32(t), sA)
+        p.emitUShrK(6, 9, uint32(8 * t + 4 * hi)); p.emitUAndK(6, 6, 15)
+        p.emitUToR(wB + uint32(t), 6); p.emitTgLoadF32(wB + uint32(t), wB + uint32(t), 0)
+        p.emitMul(wB + uint32(t), wB + uint32(t), sB)
+      for row in 0 ..< rows:
+        p.emitULoadIn4(0, 5, uint32(row * K + hi * 16))
+        for t in 0 ..< 4:
+          p.emitFma(uint32(8 + row * 2), 4 + uint32(t), uint32(t), uint32(8 + row * 2))
+          p.emitFma(uint32(9 + row * 2), wB + uint32(t), uint32(t), uint32(9 + row * 2))
+    p.emitUAddK(2, 2, uint32(tg * 4)); p.emitUAddK(7, 7, uint32(tg * 4))
+    p.emitUAddK(3, 3, uint32(tg div 4)); p.emitUAddK(11, 11, uint32(tg div 4))
+    p.emitUAddK(5, 5, uint32(tg * 8))
+  # reduce nAcc accs qua tg lane, roi ghi 2 cột
+  p.emitUToR(0, 1)                                    # R0 = lane
+  for r in 0 ..< nAcc: p.emitTgStoreF32(uint32(8 + r), 0, uint32(Fp4KmLutLen + r * tg))
+  p.emitBarrierTg()
+  p.emitLoadConstF32(1, float32(fastLog2(tg)))
+  p.emitLoadConstF32(2, float32(tg div 2))
+  sessionVmForGpu(p, 1):
+    p.emitCmpLt(3, 0, 2)
+    sessionVmIfGpu(p, 3):
+      p.emitAdd(4, 0, 2)
+      for r in 0 ..< nAcc:
+        p.emitTgLoadF32(5, 0, uint32(Fp4KmLutLen + r * tg))
+        p.emitTgLoadF32(6, 4, uint32(Fp4KmLutLen + r * tg))
+        p.emitAdd(5, 5, 6); p.emitTgStoreF32(5, 0, uint32(Fp4KmLutLen + r * tg))
+    p.emitBarrierTg(); p.emitMulConst(2, 2, 0.5'f32)
+  p.emitLoadConstF32(2, 1)
+  p.emitCmpLt(3, 0, 2)
+  sessionVmIfGpu(p, 3):
+    for row in 0 ..< rows:
+      for c in 0 ..< 2:
+        p.emitTgLoadF32(5, 0, uint32(Fp4KmLutLen + (row * 2 + c) * tg))
+        p.emitUStoreF32(5, 12, uint32(row * N + c))
+  p.emitHalt()
+  result = p
+
 proc buildFp4KmGemmM4Program*(K, N: int): VmProgram =
   ## FP4-KM group-32 GEMM tile MBLOCK=4: 1 cột output / threadgroup, 4 hàng input.
   ## Weight đọc 1 lần / phần tử cột, tái dùng cho 4 token (ý tưởng matmul_q4_batched
@@ -766,6 +944,62 @@ proc buildF32GemvSmallKProgram*(K, N: int; scale: float32; accumulate: bool): Vm
     p.emitAdd(4, 4, 5)
   p.emitUStoreF32(4, 0, 0)                        # out[n] = acc
   p.emitIfEnd()
+  p.emitHalt()
+  result = p
+
+# ── 2c) FP32 batched GEMM cho PREFILL (Linear không quant: sidecar block G) ──
+proc f32GemmBatchTgBytes*(rows, tg: int): int = max(rows * tg * 4, 16)
+
+proc buildF32GemmBatchProgram*(K, N, tg, rows: int): VmProgram =
+  ## out[r*N + n] = sum_k W[n*K + k] * x[r*K + k], r = 0 ..< rows.
+  ## W ở slot constF, x ở slot Input, out ở slot MemF32 (giống buildF32Gemv).
+  ## Một threadgroup giữ 1 cột output và chỉ đọc mỗi weight MỘT lần cho cả
+  ## `rows` hàng. Trước đây prefill rơi về MPS cho các Linear fp32 này và MPS
+  ## chỉ đạt ~1.7 GFLOP/s ở M=11 trên iGPU (qkvProj 4096x12288 mất 654 ms/block),
+  ## tức chậm hơn ~100 lần so với GEMV fp32 của decode.
+  doAssert tg in [32, 64, 128, 256], "buildF32GemmBatchProgram: tg khong hop le"
+  doAssert K > 0 and K mod tg == 0, "buildF32GemmBatchProgram: K phai chia het tg"
+  doAssert rows in 1 .. 12 and N > 0, "buildF32GemmBatchProgram: rows 1..12"
+  # 8 acc đầu dùng các reg mà kernel fp4 m8 đã dùng; 4 acc cuối (rows > 8) lấy
+  # reg 0..3. Sau khi ghi acc xuống TG memory chúng chết nên phần reduce tái
+  # dùng lại chính chúng làm temp.
+  const accLo = [4'u32, 6'u32, 10'u32, 11'u32, 12'u32, 13'u32, 14'u32, 15'u32]
+  const accHi = [0'u32, 1'u32, 2'u32, 3'u32]
+  var acc: seq[uint32]
+  for i in 0 ..< min(rows, 8): acc.add accLo[i]
+  for i in 0 ..< max(0, rows - 8): acc.add accHi[i]
+  var p: VmProgram
+  p.emitUTgid(0); p.emitULid(1)
+  p.emitUMulK(2, 0, uint32(K)); p.emitUAdd(2, 2, 1)   # U2 = n*K + lane
+  p.emitUAddK(3, 1, 0)                               # U3 = lane (x)
+  for r in acc: p.emitLoadConstF32(r, 0)
+  p.emitLoadConstF32(8, float32(K div tg))
+  sessionVmForGpu(p, 8):
+    p.emitULoadConstF(5, 2, 0)                       # R5 = w
+    for i in 0 ..< rows:
+      p.emitULoadIn(7, 3, uint32(i * K))
+      p.emitFma(acc[i], 5, 7, acc[i])
+    p.emitUAddK(2, 2, uint32(tg)); p.emitUAddK(3, 3, uint32(tg))
+  p.emitUToR(9, 1)                                   # R9 = lane (index TG)
+  for i in 0 ..< rows: p.emitTgStoreF32(acc[i], 9, uint32(i * tg))
+  p.emitBarrierTg()
+  p.emitLoadConstF32(5, float32(fastLog2(tg)))
+  p.emitLoadConstF32(8, float32(tg div 2))
+  sessionVmForGpu(p, 5):
+    p.emitCmpLt(7, 9, 8)
+    sessionVmIfGpu(p, 7):
+      p.emitAdd(10, 9, 8)                            # R10 = lane + tree
+      for i in 0 ..< rows:
+        p.emitTgLoadF32(4, 9, uint32(i * tg))
+        p.emitTgLoadF32(6, 10, uint32(i * tg))
+        p.emitAdd(4, 4, 6); p.emitTgStoreF32(4, 9, uint32(i * tg))
+    p.emitBarrierTg(); p.emitMulConst(8, 8, 0.5'f32)
+  p.emitLoadConstF32(8, 1)
+  p.emitCmpLt(7, 9, 8)
+  sessionVmIfGpu(p, 7):
+    for i in 0 ..< rows:
+      p.emitTgLoadF32(4, 9, uint32(i * tg))
+      p.emitUStoreF32(4, 0, uint32(i * N))
   p.emitHalt()
   result = p
 

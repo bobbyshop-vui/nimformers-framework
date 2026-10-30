@@ -20,6 +20,7 @@ import jit_vm
 import hybrid_block_kernel
 import prefill_profile   # BYBY_PREFILL_PROFILE
 import prefill_gpu
+import inplace_lora_merge
 import mamba2_real
 import mamba2_full_vm
 import mamba2_fused_step
@@ -30,6 +31,27 @@ import hf_tokenizer      # tokenizer THAT - bat buoc doc lai neu checkpoint tu C
 import test_nimformer   # BPETokenizer: loadBPE/encodeBPE/decodeBPEStr
 import load_codestral_into_jamba   # loadCodestralQuantResidentFromNimq - tai tao base tu .nimq
 import quantize_lora_bin_4bit
+
+proc configureInferenceDefaults*() =
+  ## Apply before GPU initialization/autotuning; explicit environment wins.
+  for (name, value) in [("BYBY_INFER_BACKEND", "auto"),
+      ("BYBY_GEMV_TG", "auto"), ("BYBY_GPU_AUTOTUNE", "1"),
+      ("BYBY_DEBUG_SAMPLING", "0"), ("BYBY_PREFILL_GEMM", "auto"),
+      ("BYBY_PREFILL_MPS", "1"),
+      # Autotuned scan plus the 8-row x 2-column FP4 prefill tile.
+      ("BYBY_PREFILL_SCAN", "auto"),
+      ("BYBY_PREFILL_2COL", "1"),
+      ("BYBY_PREFILL_FP4_KERNEL", "auto"),
+      ("BYBY_PREFILL_RESIDENT", "1")]:
+    if not existsEnv(name): putEnv(name, value)
+  let mergeMode=getEnv("BYBY_MERGE_LORA","0")
+  if mergeMode notin ["0","1","inplace"]:
+    raise newException(ValueError,"BYBY_MERGE_LORA must be 0, 1 or inplace (GPU); use 0 to retain separate LoRA")
+  if mergeMode!="0" and getEnv("BYBY_MODEL_MMAP","1")=="0":
+    raise newException(ValueError,"bounded in-place merge requires BYBY_MODEL_MMAP=1")
+  if mergeMode!="0" and getEnv("BYBY_ONE_DISPATCH","0")!="0":
+    echo "[infer] In-place merge selects BYBY_ONE_DISPATCH=0 to reuse packed weight buffers."
+    putEnv("BYBY_ONE_DISPATCH","0")
 when defined(macosx):
   # QOS_CLASS_USER_INITIATED (0x19): CLI inference đang trực tiếp phục vụ
   # yêu cầu của người dùng. Đây là ưu tiên thread CPU; Metal không có API
@@ -57,17 +79,9 @@ else:
 # lam sai lech chinh du lieu dang can dieu tra). Dung de doi chieu: OOM
 # kill co phai do CHINH tien trinh nay phinh RAM dan theo thoi gian hay
 # do ap luc RAM tu ben ngoai (ung dung khac, he thong) tai 1 thoi diem.
-type Rusage {.importc: "struct rusage", header: "<sys/resource.h>", bycopy.} = object
-  ru_maxrss {.importc: "ru_maxrss".}: clong   ## macOS: don vi BYTE
-
-proc c_getrusage(who: cint, usage: ptr Rusage): cint {.importc: "getrusage", header: "<sys/resource.h>".}
-
 proc rssMB(): string =
-  var ru: Rusage
-  if c_getrusage(0.cint, addr ru) == 0:
-    result = $(int(ru.ru_maxrss) div (1024*1024)) & "MB"
-  else:
-    result = "?"
+  # getrusage reports bytes on macOS, KiB on Linux. Normalize before printing.
+  $(peakResidentBytes() div (1024*1024)) & "MiB"
 
 const
   CFG_CHECKPOINT_PATH* = "test/codestral/models/jamba_parallel_lora.bin"   # parallel Mamba+Linear++ checkpoint -
@@ -596,15 +610,8 @@ proc loadBinaryLoraForInfer*(path: string): tuple[model: NimformerModelJamba, lo
     if dropped.len > 0:
       echo &"[infer] Bo {dropped.len} LoRA adapter co A/B toan 0 (delta = 0, khong doi ket qua); " &
            &"con {lo.adapters.len} adapter co tac dung."
-  # BYBY_MERGE_LORA=1: chi merge neu sai so roundtrip duoc chung minh
-  # rat nho SO VOI delta LoRA. FP4-KM mac dinh duoc skip (giu LoRA fused),
-  # khong bao gio requant ngoai y muon va lam model sinh token sai.
-  if getEnv("BYBY_MERGE_LORA", "0") == "1":
-    echo "[infer] Safe LoRA merge: quantized weights khong duoc merge neu mat delta; " &
-         "loi thi giu adapter, tiep tuc fused one-dispatch."
-    let nMerged = mergeLoraIntoQuantBase(lo)
-    echo "[infer] Ket qua safe merge: " & $nMerged & " adapter qua guard; " &
-         $lo.adapters.len & " adapter van duoc gan nguyen ven."
+  # The optional bounded merge runs after packed upload, directly into the
+  # existing GPU buffers. Never materialize full dense FP32 weight matrices.
   # FIX IndexDefect: bind quantBase → Linear.weightQ/useQuant TRƯỚC generate.
   # (NIMBIN4 + quantResident: weight.data đã @[], phải nối weightQ trước
   # mergeInUploadStreamingJamba / uploadResident, kể cả block A linear.)
@@ -1010,11 +1017,14 @@ proc parallelPrefillFallbackReason(m: NimformerModelJamba; lora: JambaLora;
   let parMinT = (try: parseInt(getEnv("BYBY_PREFILL_PAR_MIN_T", $defaultMin)) except ValueError: defaultMin)
   if tokenIds.len < parMinT:
     return "prompt " & $tokenIds.len & " token < BYBY_PREFILL_PAR_MIN_T=" & $parMinT
-  if tokenIds.len > 64: return "sequence scan threadgroup limit is 64 tokens"
   if getEnv("BYBY_LP_SCAN_SERIAL") == "1": return "Linear++ serial override is enabled"
   if gRNormOverride != 0 or gRNormGroupsOverride == 1 or gRmsUnitGamma:
     return "the selected legacy/LayerNorm preset is not supported by the RMS scan block"
   if gSkipAttn: return "Linear++ sidecar is disabled"
+  # The resident inference path chunks long prompts and carries R/P/G states.
+  if getEnv("BYBY_PREFILL_RESIDENT", "1") != "0" and residentPrefillReason(m,ctx).len == 0:
+    return ""
+  if tokenIds.len > 64: return "legacy sequence scan threadgroup limit is 64 tokens"
   if m2ScanTgSize(tokenIds.len) == 0:
     return "Mamba2 parallel scan is unavailable for this sequence length/device"
   var hasP = false
@@ -1042,8 +1052,18 @@ proc forwardParallelPrefill(m: var NimformerModelJamba; lora: JambaLora;
     if gPfEnabled:
       pfReport(float((getMonoTime() - pfWall0).inNanoseconds) / 1e6)
   if getEnv("BYBY_PREFILL_RESIDENT", "1") != "0" and residentPrefillReason(m, ctx).len == 0:
-    forwardResidentPrefill(m, tokenIds, ctx)
-    markGpuPrefillReady()
+    let batchSize=envInt("BYBY_PREFILL_BATCH_SIZE",128)
+    if batchSize notin 2..128:
+      raise newException(ValueError,"BYBY_PREFILL_BATCH_SIZE must be 2..128")
+    var offset=0
+    while offset < tokenIds.len:
+      let count=min(batchSize,tokenIds.len-offset)
+      if count == 1:
+        discard forwardStepJambaGpuRetry(m,tokenIds[offset],tokenIds,offset,ctx,produceLogits=false)
+      else:
+        forwardResidentPrefill(m,tokenIds[offset..<offset+count],ctx,continuation=offset>0)
+        markGpuPrefillReady()
+      offset += count
     return
   pfTime("warmup+reset"):
     warmupGpuForParallelPrefill(m, ctx)
@@ -1071,7 +1091,8 @@ proc forwardPrefillBatch*(m: var NimformerModelJamba; lora: JambaLora;
                           tokenIds: seq[int]; ctx: Backend) =
   ## Prefill R/P prefixes with sequence-parallel scans, then import each
   ## terminal state into the recurrent decode buffers. Decode remains one-token
-  ## causal. Unsupported presets/blocks/long prompts use the exact old path.
+  ## causal. Unsupported presets/blocks use the existing fallback; resident R/P/G
+  ## prefixes use compact inference scans and GPU MPS tiles in chunks up to 128.
   if tokenIds.len == 0: return
   if isGpuCtx(ctx): ensureTgCap(ctx)
   let fallbackReason = parallelPrefillFallbackReason(m, lora, tokenIds, ctx)
@@ -1408,6 +1429,7 @@ proc runBisect(m: var NimformerModelJamba, tok: AnyTokenizer, vocab: int,
 proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenizer, prompt: string,
                maxNewTokens: int, ctx: Backend, temperature: float32 = 0'f32,
                seed: int64 = 1234): string =
+  configureInferenceDefaults()
   echo "[infer] 100% GPU (R=Mamba2Real fp4/int4 O(1), A=LinearPlusAttention fp4/int4 O(1))."
   mergeInUploadStreamingJamba(m, lora, ctx)
   prepareGpuModel(m, lora, ctx)
@@ -1425,6 +1447,8 @@ proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenize
     echo "[infer] Packed GPU cache ready; released " &
       $(freedPackedBytes div (1024 * 1024)) & " MiB duplicate host weights."
   GC_fullCollect()
+  if getEnv("BYBY_MERGE_LORA","0")!="0":
+    discard mergeResidentLoraInplace(m,lora,ctx)
   echo &"[infer] GPU san sang. RSS: {rssMB()}"
 
   let vocabModel = m.vocab
@@ -1529,6 +1553,12 @@ proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenize
   if ids.len > 1:
     echo &"[infer] Prefill batch qua {ids.len - 1} token prompt ..."
     forwardPrefillBatch(m, lora, ids[0 ..< ids.len-1], ctx)
+  # Decode owns independent recurrent buffers; prefix/MPS scratch is no longer needed.
+  # Keep the arena only for explicit prefill-throughput experiments.
+  if getEnv("BYBY_PREFILL_KEEP_SCRATCH", "0") != "1":
+    let released = releaseResidentPrefill()
+    if released > 0:
+      echo "[infer] Released " & $(released div (1024*1024)) & " MiB prefill scratch before native decode (MPS disabled for M=1)."
   let prefillTime = monoSecs() - prefillStart
   echo "[infer] Prefill xong - bat dau decode."
   echo &"[infer] RSS sau prefill: {rssMB()}"
@@ -1658,6 +1688,16 @@ proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenize
 
 
 when isMainModule:
+  configureInferenceDefaults()
+  echo "[infer] GEMV_TG=" & getEnv("BYBY_GEMV_TG") &
+    " autotune=" & getEnv("BYBY_GPU_AUTOTUNE") &
+    " debug_sampling=" & getEnv("BYBY_DEBUG_SAMPLING") &
+    "; prefill GEMM=" & getEnv("BYBY_PREFILL_GEMM") &
+    "; prefill scan=" & getEnv("BYBY_PREFILL_SCAN") &
+    "; FP4 2col=" & getEnv("BYBY_PREFILL_2COL") &
+    "; FP4 kernel=" & getEnv("BYBY_PREFILL_FP4_KERNEL") &
+    "; resident prefill=" & getEnv("BYBY_PREFILL_RESIDENT") &
+    "; decode=native (no MPS)"
   setInferenceThreadPriority()
   let args = commandLineParams()
   let ckptPath = if args.len >= 1: args[0] else: CFG_CHECKPOINT_PATH
