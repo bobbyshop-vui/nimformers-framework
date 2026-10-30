@@ -250,8 +250,8 @@ proc chooseScanMode*(ctx: Backend; T, H, D, N, G, K, C: int; eps: float32;
       buildPrefixParallelScanProgram(parallelL, tg, continuation, candidateLanes)
       else: baselineProg
     let serialTag = "@prefix_compact_" & m2Tag(serialL) & "_coalescedfalse"
-    let baselineTag = "@prefix_parallel_carry_" & m2Tag(parallelL) & "_" & $continuation & "_n1"
-    let candidateTag = "@prefix_parallel_carry_" & m2Tag(parallelL) & "_" & $continuation & "_n" & $candidateLanes
+    let baselineTag = "@prefix_parallel_v2_carry_" & m2Tag(parallelL) & "_" & $continuation & "_n1"
+    let candidateTag = "@prefix_parallel_v2_carry_" & m2Tag(parallelL) & "_" & $continuation & "_n" & $candidateLanes
     checkVmScratchCapacity(ctx, tg * 4 * candidateLanes, "parallel scan autotune")
     let serialKn = vmKernelForBe(serialProg, serialTag, be)
     let baselineKn = vmKernelForBe(baselineProg, baselineTag, be)
@@ -546,7 +546,7 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
       require(tg>0,"parallel scan unavailable")
       (buildPrefixParallelScanProgram(L,tg,continuation,parallelStateLanes),
         L.HD*tg*parallelStateLanes,tg*16*parallelStateLanes,tg*parallelStateLanes,
-        "@prefix_parallel_carry_" & m2Tag(L) & "_" & $continuation & "_n" & $parallelStateLanes)
+        "@prefix_parallel_v2_carry_" & m2Tag(L) & "_" & $continuation & "_n" & $parallelStateLanes)
     else:
       (buildCompactPrefixScanProgram(L,coalesced),L.HD,4,0,
         "@prefix_compact_" & m2Tag(L) & "_coalesced" & $coalesced)

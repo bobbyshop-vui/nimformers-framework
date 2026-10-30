@@ -178,6 +178,9 @@ proc buildPrefixParallelScanProgram*(L: M2Lay; tg: int; continuation = false;
   let N = L.N
   let HD = L.HD
   let cDim = L.cDim
+  # Each bank spans ALL state lanes: [a | b | next-a | next-b]. Using tg
+  # here aliases one state's a bank with the previous state's b bank.
+  let bankWidth = tg * stateLanes
   var p: VmProgram
   p.emitUTgid(0)                    # one group per (b,hd)
   p.emitULid(1)                     # local lane = stateLane*tg + timestep
@@ -231,21 +234,22 @@ proc buildPrefixParallelScanProgram*(L: M2Lay; tg: int; continuation = false;
       p.emitULoadF32(5, 11, uint32(L.conv))                   # B_t,g,n
       p.emitMul(5, 1, 5); p.emitMul(5, 5, 3)                 # b_t
     p.emitTgStoreF32(2, 14, 0)                                # bank 0: a
-    p.emitTgStoreF32(5, 14, uint32(tg))                       # bank 0: b
+    p.emitTgStoreF32(5, 14, uint32(bankWidth))                # bank 0: b
     p.emitBarrierTg()
 
     var srcA = 0
-    var srcB = tg
-    var dstA = 2 * tg
-    var dstB = 3 * tg
+    var srcB = bankWidth
+    var dstA = 2 * bankWidth
+    var dstB = 3 * bankWidth
     var stride = 1
     while stride < tg:
-      p.emitUToR(11, 4)                                       # current lane
+      p.emitAddConst(11, 14, 0'f32)                           # flat local lane
       p.emitAddConst(10, 11, -float32(stride))                # previous lane
       p.emitTgLoadF32(2, 11, uint32(srcA))
       p.emitTgLoadF32(5, 11, uint32(srcB))
       p.emitLoadConstF32(8, float32(stride))
-      p.emitCmpLt(9, 11, 8)
+      p.emitUToR(9, 4)                                       # time lane only
+      p.emitCmpLt(9, 9, 8)
       p.emitLoadConstF32(8, 1.0'f32); p.emitSub(9, 8, 9)    # lane >= stride
       sessionVmIfGpu(p, 9):
         p.emitTgLoadF32(3, 10, uint32(srcA))
@@ -264,7 +268,7 @@ proc buildPrefixParallelScanProgram*(L: M2Lay; tg: int; continuation = false;
     sessionVmIfGpu(p, 7):
       p.emitUAdd(11, 14, 13); p.emitUAdd(12, 15, 13)
       p.emitUAdd(0, 7, 13)                                    # states[t+1,hd,n]
-      p.emitUToR(11, 4)
+      p.emitAddConst(11, 14, 0'f32)
       p.emitTgLoadF32(5, 11, uint32(srcB))
       if continuation:
         p.emitTgLoadF32(2,11,uint32(srcA))
