@@ -213,10 +213,10 @@ build-finetune:
 # BYBY_PREFILL_RESIDENT=0 /
 # BYBY_GEMV_VARIANT=0 / BYBY_PREFILL_PARALLEL=0 / BYBY_MAMBA_SCAN_PARALLEL=0 /
 # BYBY_LP_SCAN_SERIAL=1 / BYBY_FP4_PAD_M=0.
-# Gop LoRA vao fp4 lam token rac -> TAT. LoRA chay rieng.
+# Optional bounded in-place FP4 merge validates delta before overwriting.
 export BYBY_MODEL_MMAP ?= 1
-export BYBY_MERGE_SCRATCH_MIB ?= 256
-export BYBY_GEMV_TG ?= max
+export BYBY_MERGE_SCRATCH_MIB ?= 64
+export BYBY_GEMV_TG ?= auto
 export BYBY_MERGE_LORA ?= 0
 export BYBY_ONE_DISPATCH ?= 0
 # Auto selects the available backend; request Vulkan explicitly when needed.
@@ -234,7 +234,7 @@ export BYBY_DISABLE_KV_RESIDENT ?= 0
 export BYBY_DECODE_PROFILE ?= 1
 export BYBY_PREFILL_PROFILE ?= 1
 export BYBY_INFER_VERBOSE ?= 1
-export BYBY_DEBUG_SAMPLING ?= 1
+export BYBY_DEBUG_SAMPLING ?= 0
 export BYBY_G_DIAGNOSTICS ?= 0
 export BYBY_TRACE_BLOCKS ?= 0
 export BYBY_MACOS_HIGH_PRIORITY ?= 1

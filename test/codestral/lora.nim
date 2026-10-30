@@ -1487,13 +1487,19 @@ proc encodeOneToken(m: var NimformerModelJamba, ctx: Backend;
         decSplitMark(be, "normF+lm_head", tSplit)
         inc gDecSplitTokens
       return
+  var tSplit = monoSecs()
   for i in 0 ..< m.blocks.len:
     encodeBlockOld(m, ctx, i)
+    if produceLogits and gDecSplitOn and gDecSplitActive:
+      decSplitMark(be, "block" & $i & "(" & $m.blocks[i].kind & ")", tSplit)
   # normF == backbone.norm_f cua HF Mamba2 = RMSNorm chi co gamma (khop ban infer
   # cu da chay dung, PATCH_MARKER_V4). KHONG con "copy thang neu norm loi": bo qua
   # normF im lang se ra logit sai ma khong ai biet.
   if produceLogits:
     encodeHeadGpu(m, ctx)
+    if gDecSplitOn and gDecSplitActive:
+      decSplitMark(be, "normF+lm_head", tSplit)
+      inc gDecSplitTokens
 
 proc warmupGpuKernelsOnce(m: var NimformerModelJamba, ctx: Backend) =
   ## Ep JIT-compile + bind PSO lan dau cho MOI loai kernel, trong 1 session
