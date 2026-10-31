@@ -2324,6 +2324,8 @@ proc forwardDecodeAllLayersMergedSession(m: LlamaModelL, xData: seq[float32], ct
 proc forwardStep*(m: LlamaModelL, ids: seq[int], ctx: Backend, cache: var KVCacheL,
                    isPrefill: bool): Tensor =
   ## isPrefill=true: ids = toàn bộ prompt (T token). isPrefill=false: ids = đúng 1 token mới.
+  ## Returns logits [1, 1, vocab] for the last token only; nothing samples
+  ## from the earlier prompt positions.
   var x = m.embed.lookupBatch(@[ids], ctx)   # [1, T, C]
   when defined(debugStates):
     let Tdbg = ids.len
@@ -2407,11 +2409,17 @@ proc forwardStep*(m: LlamaModelL, ids: seq[int], ctx: Backend, cache: var KVCach
           stderr.writeLine "[debug] after_block_0   last_token[:8] = " & $x.data[(Tdbg-1)*Cdbg ..< (Tdbg-1)*Cdbg+8]
   when defined(debugStates):
     stderr.writeLine "[debug] after_last_block last_token[:8] = " & $x.data[(Tdbg-1)*Cdbg ..< (Tdbg-1)*Cdbg+8]
+  # Final norm and lm_head (vocab x hidden, the largest GEMM of the step) for
+  # the last token only: prefill used to compute logits for every prompt row.
+  let C = m.config.hiddenSize
+  let T = x.shape[1]
+  if T > 1:
+    x.data = x.data[(T - 1) * C ..< T * C]
+    x.shape = @[x.shape[0], 1, C]
   let normed = m.finalNorm.forward(x, ctx)
   result = m.lmHead.forward(normed, ctx)
   when defined(debugStates):
-    let Vdbg = m.config.vocabSize
-    let lastRow = result.data[(Tdbg-1)*Vdbg ..< (Tdbg-1)*Vdbg+8]
+    let lastRow = result.data[0 ..< 8]
     stderr.writeLine "[debug] logits last_token[:8] = " & $lastRow
   cache.seqLen += ids.len
 
