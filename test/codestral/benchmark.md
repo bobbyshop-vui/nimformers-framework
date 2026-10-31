@@ -16,7 +16,49 @@ than Metal in these runs. Vulkan prefill was about **21% faster**, and total
 wall time was about **13% lower**. These are results from separate user runs,
 not a controlled same-binary A/B benchmark; treat the comparison as indicative.
 
-## Test machine
+## Tesla T4 prefill (Vulkan, Colab)
+
+Three user runs on a Colab Tesla T4 (Vulkan, `KHR_cooperative_matrix`
+FP16/FP32, subgroup 32), one per prefill revision. All three used the same
+prompt and greedy sampling and produced identical output text.
+
+- Prompt: `[INST] Write a Python function for Fibonacci. [/INST]` (17 tokens prefilled)
+- Generation: greedy (`T=0.0`), stopped at EOS after 233 tokens
+- Model: same checkpoint, base model and 64-block topology (60 R, 4 G) as below
+
+| Revision | Prefill, 17 tokens | Scan | `resident.group` | One-time setup* | Decode after first token |
+| --- | ---: | --- | ---: | ---: | ---: |
+| `6f09d78` (before) | 10.214 s · 1.66 tok/s | parallel_n4 | 5285 ms | 4843 ms | 13.65 tok/s · 73.3 ms/token |
+| `6e0a5d5` lane scan, tiled FP4 GEMM, leaner prewarm | **2.772 s · 6.13 tok/s** | lanes | 1124 ms | 1595 ms | 14.96 tok/s · 66.8 ms/token |
+| `226e08f` LoRA-down, Linear++ lanes, tiled FP32 GEMM | 3.041 s · 5.59 tok/s | lanes | **865 ms** | 2123 ms | 14.44 tok/s · 69.3 ms/token |
+
+\* `vulkan.prewarm` + `scan.autotune` + `gemm.verify`: glslc shader compiles
+and one-time GPU parity checks. On a fresh container they are paid once per
+process. Prewarm shrinks on later runs if `BYBY_VULKAN_JIT_DIR` points at
+persistent storage.
+
+What changed between runs, from the `[prefill-profile]` lines:
+
+- `6f09d78`: the parallel scan took 55.4 ms per layer (autotune probe), about
+  3.5 s of `resident.group` over 64 layers. Autotune timed serial, parallel n1
+  and n4 (2654 ms), and prewarm (2189 ms) compiled packed FP4 shaders that the
+  T4 never used because the cooperative-matrix route won.
+- `6e0a5d5`: the lane scan keeps states in registers and passed its parity
+  check (max error 2.42e-8). The tiled FP4 GEMM passed parity for 8192x4096 and
+  4096x18560. `resident.group` fell to 1124 ms and prefill to 2.772 s.
+- `226e08f`: LoRA A, the Linear++ sidecar and its FP32 GEMMs (4096x12288,
+  8192x4096, 4096x4096, all parity-checked) now fill the GPU. `resident.group`
+  fell another 23% to 865 ms and `enc.attn` from 340 ms to 188 ms. Total
+  prefill rose to 3.041 s because `gemm.verify` checks five shapes instead of
+  two (622 ms vs 229 ms) and prewarm took 1335 ms vs 1190 ms.
+
+Without the one-time setup, prefill work was about 5.35 s, then 1.16 s, then
+0.90 s. With only 17 prompt tokens the one-time setup dominates the wall
+time; a longer prompt, or a second prompt in the same process, would show more
+of the `resident.group` gain. Decode code did not change between these
+revisions, so the 13.65–14.96 tok/s spread is run-to-run variation.
+
+## Test machine (MacBook runs)
 
 - MacBook Pro 13-inch (2017), two Thunderbolt 3 ports
 - CPU: 2.3 GHz dual-core Intel Core i5
@@ -65,3 +107,5 @@ binary revision, warmup, and system load may affect the comparison.
   log, reporting 1.98 tok/s overall and 2.00 tok/s after the first token.
 - Metal comparison: user-supplied Metal run in the preceding combined log,
   reporting 1.77 tok/s overall.
+- Tesla T4 runs: three user-supplied Colab Vulkan logs (revisions `6f09d78`,
+  `6e0a5d5`, `226e08f`), prefill 10.214 s, 2.772 s and 3.041 s.
