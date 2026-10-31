@@ -117,6 +117,30 @@ proc beResidentUploadQ4*(ctx: Backend, wq: openArray[uint8], scales, zeros: open
   ## giữ kết quả lại (vd. trong Linear.residentW) suốt vòng đời process.
   byby.residentUploadQ4(ctx.kind.toByby(), @wq, @scales, @zeros, k, n, groupSize, nGroupsPerRow)
 
+proc beResidentUploadQ4Mapped*(ctx: Backend, wq: pointer, wqBytes: int,
+                                scales, zeros: openArray[float32],
+                                k, n, groupSize, nGroupsPerRow: int): tuple[w: ResidentWeightHandle, zeroCopy: bool] =
+  ## beResidentUploadQ4 for packed weights inside a model mmap: the GPU wraps
+  ## the mapping on unified memory, else copies straight from it.
+  byby.residentUploadQ4Mapped(ctx.kind.toByby(), wq, wqBytes, scales, zeros,
+    k, n, groupSize, nGroupsPerRow)
+
+proc beResidentWrapFp32*(ctx: Backend, data: pointer, bytes: int): tuple[h: SessionHandle, zeroCopy: bool, offsetElems: int] =
+  ## Resident fp32 weight that lives in a model mmap: wrapped in place on
+  ## unified memory (the weight starts offsetElems floats into the buffer),
+  ## else copied straight from the mapping to GPU memory.
+  let be = ctx.kind.toByby()
+  var wrapped = byby.sessionWrapHostRange(be, data, bytes)
+  result.zeroCopy = wrapped.h.metalHandle != nil or wrapped.h.vulkanHandle.buf != nil
+  if result.zeroCopy and wrapped.offset mod sizeof(float32) != 0:
+    byby.sessionFree(be, wrapped.h)
+    result.zeroCopy = false
+  if result.zeroCopy:
+    result.h = wrapped.h
+    result.offsetElems = wrapped.offset div sizeof(float32)
+  else:
+    result.h = byby.sessionUploadPrivatePtr(be, data, bytes)
+
 proc beResidentLinearQ4*(ctx: Backend, x: openArray[float32], w: ResidentWeightHandle, M: int): seq[float32] =
   ## Forward Linear dùng weight ĐÃ resident (w từ beResidentUploadQ4): mỗi
   ## lần gọi hàm này chỉ upload activation `x` (nhỏ, đổi mỗi token) - KHÔNG
