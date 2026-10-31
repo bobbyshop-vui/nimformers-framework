@@ -158,6 +158,97 @@ proc buildCompactPrefixScanProgram*(L: M2Lay; coalesced = false): VmProgram =
   p.emitHalt()
   result = p
 
+const LaneScanWidth* = 32
+
+proc laneScanStates*(N: int): int =
+  ## States per lane of the register scan, 0 when N does not split into
+  ## LaneScanWidth lanes of at most 8 registers.
+  if N mod LaneScanWidth != 0: return 0
+  let s = N div LaneScanWidth
+  if s < 1 or s > 8: 0 else: s
+
+proc laneScanChunk*(T: int): int = min(T, 1024 div LaneScanWidth)
+
+proc laneScanTgBytes*(T: int): int = laneScanChunk(T) * LaneScanWidth * 4
+
+proc buildPrefixLaneScanProgram*(L: M2Lay): VmProgram =
+  ## Inference scan on the compact layout: one 32-lane group per (b, hd), each
+  ## lane holds N/32 states in registers for the whole sequence. Only the
+  ## terminal state is written back (both compact slots, like the serial
+  ## kernel); y needs one shared-memory reduction per 32-step time chunk.
+  ## The serial/parallel kernels instead stream every state through global
+  ## memory (parallel: (T+1)*HD*N floats per layer).
+  let T = L.T; let N = L.N; let HD = L.HD; let H = L.H; let cDim = L.cDim
+  const W = LaneScanWidth
+  let S = laneScanStates(N)
+  doAssert S > 0, "lane scan needs N to be a multiple of 32 (<= 256)"
+  let chunk = laneScanChunk(T)
+  var p: VmProgram
+  p.emitUTgid(0); p.emitUToR(0, 0)
+  p.emitDecodeBHD(L)                                         # U0=b U1=hd U2=h U3=g
+  p.emitULid(4)                                              # U4 = lane
+  p.emitULoadF32(8, 2, uint32(L.aLog)); p.emitExp(8, 8); p.emitNeg(8, 8)    # R8 = A
+  p.emitULoadF32(9, 2, uint32(L.dSkip))                                     # R9 = D[h]
+  p.emitUMulK(13, 0, uint32(T * cDim))                       # U13 = conv base of b
+  p.emitUMulK(6, 0, uint32(T * H)); p.emitUAdd(6, 6, 2)      # U6 = dt[b,0,h]
+  p.emitUMulK(15, 0, uint32(T * L.C)); p.emitUAdd(15, 15, 1) # U15 = yPre[b,0,hd]
+  p.emitUMulK(8, 0, uint32(2 * HD * N)); p.emitUMulK(9, 1, uint32(N))
+  p.emitUAdd(8, 8, 9); p.emitUAdd(8, 8, 4)                   # U8 = state[b,hd,lane]
+  p.emitUMulK(11, 3, uint32(N)); p.emitUAdd(11, 11, 4)       # U11 = g*N + lane
+  p.emitUAddK(5, 13, 0)                                      # U5 = conv row of t
+  for j in 0 ..< S:
+    p.emitULoadF32(uint32(16 + j), 8, uint32(L.states + j * W))
+  p.emitUToR(10, 4)                                          # R10 = lane
+  p.emitMulConst(14, 10, float32(W))                         # R14 = lane*W
+  p.emitLoadConstF32(25, float32(W))
+  var tStart = 0
+  while tStart < T:
+    let count = min(chunk, T - tStart)
+    p.emitLoadConstF32(24, float32(count))
+    p.emitAddConst(13, 10, 0'f32)                            # R13 = tLocal*W + lane
+    sessionVmForGpu(p, 24):
+      p.emitUAdd(9, 5, 1); p.emitULoadF32(3, 9, uint32(L.conv))           # x
+      p.emitULoadF32(1, 6, uint32(L.dt))                                  # dt
+      p.emitMul(2, 1, 8); p.emitExp(2, 2)                                 # dA
+      p.emitUAdd(10, 5, 11)                                               # B/C row + lane
+      p.emitLoadConstF32(4, 0'f32)
+      for j in 0 ..< S:
+        let s = uint32(16 + j)
+        # Same operation order as the serial kernel: s*dA + (dt*B)*x.
+        p.emitULoadF32(5, 10, uint32(L.conv + L.C + j * W))               # B
+        p.emitMul(7, s, 2)
+        p.emitMul(12, 1, 5); p.emitMul(12, 12, 3); p.emitAdd(s, 7, 12)
+        p.emitULoadF32(6, 10, uint32(L.conv + L.C + L.GN + j * W))        # C
+        p.emitFma(4, 6, s, 4)
+      p.emitTgStoreF32(4, 13, 0)
+      p.emitAddConst(13, 13, float32(W))
+      p.emitUAddK(5, 5, uint32(cDim)); p.emitUAddK(6, 6, uint32(H))
+    p.emitBarrierTg()
+    # Lane i owns timestep tStart+i of this chunk: sum the W partials in lane
+    # order, then add the D skip term.
+    p.emitUToR(10, 4)
+    p.emitLoadConstF32(26, float32(count)); p.emitCmpLt(27, 10, 26)
+    sessionVmIfGpu(p, 27):
+      p.emitAddConst(15, 14, 0'f32)
+      p.emitLoadConstF32(7, 0'f32)
+      sessionVmForGpu(p, 25):
+        p.emitTgLoadF32(5, 15, 0); p.emitAdd(7, 7, 5)
+        p.emitAddConst(15, 15, 1'f32)
+      p.emitUMulK(12, 4, uint32(cDim)); p.emitUAdd(12, 12, 13)
+      p.emitUAdd(12, 12, 1)
+      p.emitULoadF32(3, 12, uint32(L.conv + tStart * cDim))               # x_t
+      p.emitFma(7, 9, 3, 7)
+      p.emitUMulK(14, 4, uint32(L.C)); p.emitUAdd(14, 14, 15)
+      p.emitUStoreF32(7, 14, uint32(L.yPre + tStart * L.C))
+    tStart += count
+    if tStart < T: p.emitBarrierTg()                         # tg reused next chunk
+  for j in 0 ..< S:
+    let s = uint32(16 + j)
+    p.emitUStoreF32(s, 8, uint32(L.states + HD * N + j * W))
+    p.emitUStoreF32(s, 8, uint32(L.states + j * W))
+  p.emitHalt()
+  result = p
+
 proc buildPrefixParallelScanProgram*(L: M2Lay; tg: int; continuation = false;
                                     stateLanes = 1): VmProgram =
   ## Inclusive affine prefix scan over time, one threadgroup per (batch, head,
