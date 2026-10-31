@@ -441,3 +441,135 @@ proc buildPrefixScatter*(N,tileN,firstCol,tg: int; rank=0; scale=1'f32;
     p.emitULoadIn(5,2,uint32(biasOffset));p.emitAdd(2,2,5)
   p.emitUStoreF32(2,1,uint32(firstCol)); p.emitHalt()
   result=p
+
+const LoraDownTg* = 256
+
+proc buildPrefixLoraDownProgram*(K, rank: int): VmProgram =
+  ## mem[t*rank + j] = sum_k in[t*K + k] * A[j*K + k] (A in the const buffer).
+  ## One 256-lane group per (t, j) with a shared tree reduction; the generic
+  ## 16x16 NT matmul ran this rank-4 product on ceil(T/16) workgroups.
+  doAssert K mod LoraDownTg == 0 and rank > 0
+  var p: VmProgram
+  p.emitUTgid(0); p.emitULid(1)
+  p.emitUToR(0, 0); p.emitLoadConstF32(1, float32(rank)); p.emitDiv(2, 0, 1)
+  p.emitRToU(2, 2)                                           # U2 = t
+  p.emitUMulK(3, 2, uint32(rank)); p.emitUToR(3, 3); p.emitSub(3, 0, 3)
+  p.emitRToU(3, 3)                                           # U3 = j
+  p.emitUMulK(5, 2, uint32(K)); p.emitUAdd(5, 5, 1)          # x[t, lane]
+  p.emitUMulK(6, 3, uint32(K)); p.emitUAdd(6, 6, 1)          # A[j, lane]
+  p.emitLoadConstF32(4, 0'f32)
+  p.emitLoadConstF32(7, float32(K div LoraDownTg))
+  sessionVmForGpu(p, 7):
+    p.emitULoadIn(5, 5); p.emitULoadConstF(6, 6); p.emitFma(4, 5, 6, 4)
+    p.emitUAddK(5, 5, uint32(LoraDownTg)); p.emitUAddK(6, 6, uint32(LoraDownTg))
+  p.emitUToR(10, 1)                                          # R10 = lane
+  p.emitTgStoreF32(4, 10, 0)
+  p.emitBarrierTg()
+  var stride = LoraDownTg div 2
+  while stride > 0:
+    p.emitLoadConstF32(8, float32(stride)); p.emitCmpLt(11, 10, 8)
+    sessionVmIfGpu(p, 11):
+      p.emitTgLoadF32(5, 10, uint32(stride)); p.emitTgLoadF32(6, 10, 0)
+      p.emitAdd(6, 6, 5); p.emitTgStoreF32(6, 10, 0)
+    p.emitBarrierTg()
+    stride = stride div 2
+  p.emitLoadConstF32(8, 1'f32); p.emitCmpLt(11, 10, 8)
+  sessionVmIfGpu(p, 11):
+    p.emitTgLoadF32(5, 10, 0); p.emitUStoreF32(5, 0)
+  p.emitHalt()
+  result = p
+
+proc lpLaneStates*(D: int): int =
+  ## Registers per lane for the Linear++ lane scan (S column and z), 0 when
+  ## D is not 32*k with k <= 4.
+  if D mod LaneScanWidth != 0: return 0
+  let s = D div LaneScanWidth
+  if s < 1 or s > 4: 0 else: s
+
+proc lpLaneChunk*(T: int): int = min(T, 1024 div (2 * LaneScanWidth))
+
+proc lpLaneTgBytes*(T: int): int = lpLaneChunk(T) * 2 * LaneScanWidth * 4
+
+proc buildLpLaneProgram*(L: LpLay): VmProgram =
+  ## Replaces buildLpDenProgram + buildLpFwdProgram for inference. One 32-lane
+  ## group per (b, h, e); lane d holds S[d, e] and z[d] (d = lane + 32*j) in
+  ## registers. Each group recomputes the per-head denominator, so invDen never
+  ## goes through memory. Terminal S columns are written to cF (each group owns
+  ## its column). Terminal z goes to zQ, not zF: every group of the head still
+  ## reads the initial zF, so e = 0 must not overwrite it in place. The serial
+  ## versions ran one thread per head (den) and per strided S column (fwd).
+  let T = L.T; let C = L.C; let D = L.D; let H = L.H
+  const W = LaneScanWidth
+  let S = lpLaneStates(D)
+  doAssert S > 0, "Linear++ lane scan needs D = 32*k <= 128"
+  let chunk = lpLaneChunk(T)
+  var p: VmProgram
+  p.emitUTgid(0); p.emitULid(4)                              # U0 = g, U4 = lane
+  p.emitUToR(0, 0); p.emitLoadConstF32(1, float32(D)); p.emitDiv(2, 0, 1)
+  p.emitRToU(7, 2)                                           # U7 = bh
+  p.emitUMulK(1, 7, uint32(D)); p.emitUToR(1, 1); p.emitSub(1, 0, 1)
+  p.emitRToU(1, 1)                                           # U1 = e
+  p.emitUToR(2, 7); p.emitLoadConstF32(3, float32(H)); p.emitDiv(2, 2, 3)
+  p.emitRToU(2, 2)                                           # U2 = b
+  p.emitUMulK(3, 2, uint32(H)); p.emitUToR(3, 3); p.emitUToR(5, 7)
+  p.emitSub(3, 5, 3); p.emitRToU(3, 3)                       # U3 = h
+  p.emitUMulK(10, 3, uint32(D))                              # U10 = h*D
+  p.emitUMulK(11, 2, uint32(T * 2 * C)); p.emitUAdd(11, 11, 10)
+  p.emitUAdd(11, 11, 4)                                      # U11 = phi[b,0,h*D+lane]
+  p.emitUMulK(5, 2, uint32(T * 3 * C)); p.emitUAdd(5, 5, 10)
+  p.emitUAdd(5, 5, 1)                                        # U5 = v[b,0,h*D+e] - 2C
+  p.emitUMulK(15, 2, uint32(T * C)); p.emitUAdd(15, 15, 10)
+  p.emitUAdd(15, 15, 1)                                      # U15 = y[b,0,h*D+e]
+  p.emitUMulK(8, 0, uint32(D)); p.emitUAdd(8, 8, 4)          # U8 = S[g, lane]
+  p.emitUMulK(9, 7, uint32(D)); p.emitUAdd(9, 9, 4)          # U9 = z[bh, lane]
+  for j in 0 ..< S:
+    p.emitULoadF32(uint32(16 + j), 8, uint32(L.cF + j * W))
+    p.emitULoadF32(uint32(20 + j), 9, uint32(L.zF + j * W))
+  p.emitUToR(10, 4)                                          # R10 = lane
+  p.emitMulConst(14, 10, float32(W))                         # R14 = lane*W
+  p.emitLoadConstF32(25, float32(W))
+  var tStart = 0
+  while tStart < T:
+    let count = min(chunk, T - tStart)
+    p.emitLoadConstF32(24, float32(count))
+    p.emitAddConst(13, 10, 0'f32)                            # R13 = tLocal*W + lane
+    sessionVmForGpu(p, 24):
+      p.emitULoadF32(3, 5, uint32(L.qkv + 2 * C))                         # v[e]
+      p.emitLoadConstF32(4, 0'f32); p.emitLoadConstF32(5, 0'f32)
+      for j in 0 ..< S:
+        let s = uint32(16 + j)
+        let z = uint32(20 + j)
+        p.emitULoadF32(6, 11, uint32(L.phi + C + j * W))                  # phi(k)
+        p.emitULoadF32(7, 11, uint32(L.phi + j * W))                      # phi(q)
+        p.emitAdd(z, z, 6)
+        p.emitFma(s, 6, 3, s)
+        p.emitFma(4, 7, s, 4)                                             # num
+        p.emitFma(5, 7, z, 5)                                             # den
+      p.emitTgStoreF32(4, 13, 0)
+      p.emitTgStoreF32(5, 13, uint32(chunk * W))
+      p.emitAddConst(13, 13, float32(W))
+      p.emitUAddK(11, 11, uint32(2 * C)); p.emitUAddK(5, 5, uint32(3 * C))
+    p.emitBarrierTg()
+    p.emitUToR(10, 4)
+    p.emitLoadConstF32(26, float32(count)); p.emitCmpLt(27, 10, 26)
+    sessionVmIfGpu(p, 27):
+      p.emitAddConst(15, 14, 0'f32)
+      p.emitLoadConstF32(7, 0'f32); p.emitLoadConstF32(8, 0'f32)
+      sessionVmForGpu(p, 25):
+        p.emitTgLoadF32(5, 15, 0); p.emitAdd(7, 7, 5)
+        p.emitTgLoadF32(5, 15, uint32(chunk * W)); p.emitAdd(8, 8, 5)
+        p.emitAddConst(15, 15, 1'f32)
+      p.emitAddConst(8, 8, LpEps)
+      p.emitLoadConstF32(9, 1'f32); p.emitDiv(8, 9, 8); p.emitMul(7, 7, 8)
+      p.emitUMulK(14, 4, uint32(C)); p.emitUAdd(14, 14, 15)
+      p.emitUStoreF32(7, 14, uint32(L.y + tStart * C))
+    tStart += count
+    if tStart < T: p.emitBarrierTg()
+  for j in 0 ..< S:
+    p.emitUStoreF32(uint32(16 + j), 8, uint32(L.cF + j * W))
+  p.emitUToR(10, 1); p.emitLoadConstF32(26, 1'f32); p.emitCmpLt(27, 10, 26)
+  sessionVmIfGpu(p, 27):                                     # e == 0 owns z
+    for j in 0 ..< S:
+      p.emitUStoreF32(uint32(20 + j), 9, uint32(L.zQ + j * W))
+  p.emitHalt()
+  result = p
