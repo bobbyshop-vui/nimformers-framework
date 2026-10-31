@@ -425,7 +425,7 @@ proc loadCodestralIntoJambaFromNimq*(m: var NimformerModelJamba, nimqPath: strin
   ## KHONG co kernel train truc tiep tren du lieu da quantize - fp4 O DAY LA
   ## DE TIET KIEM O DIA, KHONG PHAI tiet kiem RAM luc train).
   echo &"[load_codestral] Doc {nimqPath} (.nimq, da quantize) roi dequantize ve fp32 ..."
-  let (_, sd) = quant.loadQuantStateDict(nimqPath)
+  let sd = quant.loadQuantStateDict(nimqPath).sd
   var tensors: seq[RawBinTensor] = @[]
   for (name, qt) in sd:
     tensors.add(RawBinTensor(name: name, shape: qt.shape, data: quant.dequantizeTensor(qt)))

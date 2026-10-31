@@ -94,11 +94,13 @@ type
     inF*, outF*: int
     residentW*: ResidentWeightHandle  ## weight đã upload GPU 1 LẦN (xem uploadResident)
     residentReady*: bool               ## true sau uploadResident() thành công
+    residentZeroCopy*: bool            ## residentW wq wraps the model mmap in place
     residentFp32*: SessionHandle       ## FIX: resident fp32 CHUNG cho weight KHÔNG phải
                                         ## int4-asymmetric (int8/int4-symmetric/tied-embedding) -
                                         ## dequant 1 lần lúc load thay vì mỗi token (xem backend.nim)
     residentFp32Ready*: bool           ## true sau khi residentFp32 đã upload xong
     residentFp32NT*: bool              ## residentFp32 stores original [outF,inF] rows
+    residentFp32Offset*: int           ## floats before the weight in residentFp32 (mmap wrap)
     loraA*, loraB*: seq[float32]  ## THÊM (xem forward() dưới + mergeInUploadStreamingJamba
                                    ## trong lora.nim): adapter LoRA gắn rời, KHÔNG merge vật
                                    ## lý vào weight - giữ base (weightQ/useQuant) NGUYÊN VẸN
@@ -178,15 +180,35 @@ proc uploadResident*(l: var Linear, ctx: Backend, sparsityPct: float32 = 0.0'f32
       stderr.writeLine "[SPARSITY] cat " & $nPruned & "/" & $l.weightQ.scale.len &
         " khoi (nguong scale <= " & $threshold & ")"
     let nGroupsPerRow = (l.inF + l.weightQ.groupSize - 1) div l.weightQ.groupSize
-    l.residentW = beResidentUploadQ4(ctx, @(l.weightQ.bytes), l.weightQ.scale, l.weightQ.zero_point,
-                                      l.inF, l.outF, l.weightQ.groupSize, nGroupsPerRow)
+    if l.weightQ.mappedData.owner != nil and l.weightQ.mappedData.len > 0:
+      # Packed weights stay in the model mmap: wrapped in place on unified
+      # memory, otherwise copied straight from the mapping (no seq copy).
+      let up = beResidentUploadQ4Mapped(ctx, l.weightQ.mappedData.dataPtr,
+        l.weightQ.mappedData.len, l.weightQ.scale, l.weightQ.zero_point,
+        l.inF, l.outF, l.weightQ.groupSize, nGroupsPerRow)
+      l.residentW = up.w
+      l.residentZeroCopy = up.zeroCopy
+    else:
+      l.residentW = beResidentUploadQ4(ctx, @(l.weightQ.bytes), l.weightQ.scale, l.weightQ.zero_point,
+                                        l.inF, l.outF, l.weightQ.groupSize, nGroupsPerRow)
     l.residentReady = true
+  elif l.useQuant and l.weightQ.kind == qkFp32Raw and l.weightQ.mappedData.owner != nil and
+      l.weightQ.mappedData.len == l.inF * l.outF * 4:
+    # Raw fp32 [outF, inF] inside the model mmap is already the NT GEMM
+    # layout: wrap it in place (unified memory) instead of dequant+transpose.
+    let wrapped = beResidentWrapFp32(ctx, l.weightQ.mappedData.dataPtr, l.weightQ.mappedData.len)
+    l.residentFp32 = wrapped.h
+    l.residentFp32Offset = wrapped.offsetElems
+    l.residentFp32NT = true
+    l.residentFp32Ready = true
+    l.residentZeroCopy = wrapped.zeroCopy
   elif l.useQuant:
     # qkInt8 / qkInt4 (symmetric) / qkFp32Raw ... : dequant + transpose 1
     # LẦN, upload resident fp32.
     let wT = dequantizeTensorTransposed(l.weightQ)
     l.residentFp32 = beResidentUploadFp32(ctx, wT)
     l.residentFp32NT = false
+    l.residentFp32Offset = 0
     l.residentFp32Ready = true
     # TOI UU RAM: sau khi upload xong, forward() CHI dung duong residentFp32Ready
     # (xem forward() duoi day) - l.weight.data (neu co, vd sau mergeIn() ghi
@@ -203,6 +225,7 @@ proc uploadResident*(l: var Linear, ctx: Backend, sparsityPct: float32 = 0.0'f32
     let wT = transpose(l.weight).data
     l.residentFp32 = beResidentUploadFp32(ctx, wT)
     l.residentFp32NT = false
+    l.residentFp32Offset = 0
     l.residentFp32Ready = true
 
 proc residentLinearNt(l: Linear; x: seq[float32]; rows: int; ctx: Backend): seq[float32] =
@@ -214,7 +237,8 @@ proc residentLinearNt(l: Linear; x: seq[float32]; rows: int; ctx: Backend): seq[
   try:
     if not byby.sessionBegin(be): raise newException(CatchableError, "resident NT sessionBegin failed")
     opened = true
-    if not byby.sessionMatmulNT(be, hx, l.residentFp32, hy, rows, l.inF, l.outF):
+    if not byby.sessionMatmulNT(be, hx, l.residentFp32, hy, rows, l.inF, l.outF,
+        l.residentFp32Offset):
       raise newException(CatchableError, "resident NT GEMM failed")
     let ended = byby.sessionEnd(be)
     opened = false
@@ -277,9 +301,12 @@ proc forward*(l: Linear, x: Tensor, ctx: Backend): Tensor =
       fixed[i] = y[i]
     y = fixed
 
-  # Cộng bias (l.bias.data có độ dài l.outF)
-  for i in 0 ..< y.len:
-    result.data[i] = y[i] + l.bias.data[i mod l.outF]
+  # Cộng bias (l.bias.data có độ dài l.outF; rỗng = không có bias)
+  if l.bias.data.len == l.outF:
+    for i in 0 ..< y.len:
+      result.data[i] = y[i] + l.bias.data[i mod l.outF]
+  else:
+    for i in 0 ..< y.len: result.data[i] = y[i]
 
   # THÊM: LoRA CỘNG THÊM (additive), KHÔNG merge vật lý vào weight. y/result ở
   # trên luôn đi qua đường resident/quant Q4 NÉN như base gốc (weightQ/useQuant
@@ -621,8 +648,8 @@ proc lookupBatch*(e: Embedding, idsBatch: seq[seq[int]], ctx: Backend): Tensor =
       let id = idsBatch[b][t]
       let src = id * e.dim
       let dst = (b * T + t) * e.dim
-      for d in 0 ..< e.dim:
-        result.data[dst + d] = e.weight.data[src + d]
+      # floatValues: owned data or a model mmap view, read in place.
+      copyMem(addr result.data[dst], unsafeAddr e.weight.floatValues[src], e.dim * sizeof(float32))
 
 proc backward*(e: Embedding, idsBatch: seq[seq[int]], dOut: Tensor, ctx: Backend): Tensor =
   let B = idsBatch.len

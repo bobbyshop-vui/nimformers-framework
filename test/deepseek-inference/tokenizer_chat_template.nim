@@ -1,6 +1,8 @@
 ## Native, sandboxed chat-template renderer. Supports text, expressions, set,
-## if/elif/else and for with Jinja's loop scoping and whitespace control.
-## Unsupported syntax is rejected instead of replacing the model's template.
+## if/elif/else and for with Jinja's loop scoping and whitespace control, and
+## namespace() objects whose attributes `set ns.attr = ...` may change from
+## inside a loop. Unsupported syntax is rejected instead of replacing the
+## model's template.
 import std/[json, strutils, tables, unicode]
 
 type
@@ -11,6 +13,7 @@ type
   ChatTemplate* = ref object
     kind: NodeKind
     text, variable: string
+    attribute: string   ## nSet on a namespace attribute: `set variable.attribute = text`
     children: seq[ChatTemplate]
     conditions: seq[string]
     branches: seq[seq[ChatTemplate]]
@@ -20,6 +23,9 @@ type
     tokens: seq[ExprToken]
     pos: int
     env: TemplateEnvironment
+
+const NamespaceMarker = "\0namespace"
+  ## Hidden key on objects made by namespace(); only they accept `set a.b = v`.
 
 proc bad(message: string) {.noreturn.} =
   raise newException(ValueError, "[native chat template] " & message)
@@ -85,7 +91,7 @@ proc lex(expression: string): seq[ExprToken] =
       inc at
       if at < expression.len and op & expression[at] in ["==","!=","<=",">="]:
         op.add(expression[at]); inc at
-      if op notin ["==","!=","<=",">=","<",">","+","-","~","(",")","[","]",".",",","|",":","%"]:
+      if op notin ["==","!=","<=",">=","<",">","+","-","~","(",")","[","]",".",",","|",":","%","="]:
         bad("unsupported expression operator: " & op)
       result.add(ExprToken(kind: "op", value: op))
 
@@ -125,6 +131,19 @@ proc primary(p: var ExprParser): JsonNode =
     of "true", "True": result = %true
     of "false", "False": result = %false
     of "none", "None": result = newJNull()
+    of "namespace":
+      # namespace(name=value, ...): keyword arguments only, like Jinja.
+      p.expect("(")
+      result = newJObject()
+      result[NamespaceMarker] = %true
+      while p.peek() != ")":
+        let name = p.take()
+        if name.kind != "name": bad("namespace() takes keyword arguments")
+        p.expect("=")
+        result[name.value] = p.expr()
+        if p.peek() != ",": break
+        inc p.pos
+      p.expect(")")
     else:
       if p.peek() == "(":
         let args = p.arguments()
@@ -176,8 +195,7 @@ proc primary(p: var ExprParser): JsonNode =
     else: break
 
 proc unary(p: var ExprParser): JsonNode =
-  if p.peek() == "not": inc p.pos; result = %(not truth(p.unary()))
-  elif p.peek() == "-": inc p.pos; result = %(-p.unary().getInt())
+  if p.peek() == "-": inc p.pos; result = %(-p.unary().getInt())
   else: result = p.primary()
 proc sum(p: var ExprParser): JsonNode =
   result = p.unary()
@@ -226,11 +244,16 @@ proc compare(p: var ExprParser): JsonNode =
       of ">=": yes = ordering >= 0
       else: discard
     result = %yes
+proc negation(p: var ExprParser): JsonNode =
+  # Jinja binds `not` looser than comparisons and tests:
+  # `not x is defined` is `not (x is defined)`.
+  if p.peek() == "not": inc p.pos; result = %(not truth(p.negation()))
+  else: result = p.compare()
 proc conjunction(p: var ExprParser): JsonNode =
-  result = p.compare()
+  result = p.negation()
   while p.peek() == "and":
     inc p.pos
-    let right = p.compare()
+    let right = p.negation()
     if truth(result): result = right
 proc expr(p: var ExprParser): JsonNode =
   result = p.conjunction()
@@ -305,9 +328,17 @@ proc body(parts: seq[Tag], at: var int, stops: openArray[string]): seq[ChatTempl
       let assignment = tag.text[4..^1]
       let eq = assignment.find('=')
       if eq < 0: bad("set requires an assignment")
-      let variable = strutils.strip(assignment[0..<eq])
-      if variable.len == 0 or '.' in variable or '[' in variable: bad("unsupported assignment target: " & variable)
-      result.add(ChatTemplate(kind: nSet, variable: variable, text: strutils.strip(assignment[eq+1..^1])))
+      let target = strutils.strip(assignment[0..<eq])
+      let dot = target.find('.')
+      let variable = if dot < 0: target else: strutils.strip(target[0..<dot])
+      let attribute = if dot < 0: "" else: strutils.strip(target[dot+1..^1])
+      proc isName(s: string): bool =
+        s.len > 0 and s[0] in {'a'..'z', 'A'..'Z', '_'} and
+          s.allCharsInSet({'a'..'z', 'A'..'Z', '0'..'9', '_'})
+      if not variable.isName or (dot >= 0 and not attribute.isName):
+        bad("unsupported assignment target: " & target)
+      result.add(ChatTemplate(kind: nSet, variable: variable, attribute: attribute,
+        text: strutils.strip(assignment[eq+1..^1])))
     elif command == "for":
       let clause = tag.text[4..^1]
       let split = clause.find(" in ")
@@ -353,7 +384,16 @@ proc render(nodes: seq[ChatTemplate], env: var TemplateEnvironment): string =
     case node.kind
     of nText: result.add(node.text)
     of nOutput: result.add(stringValue(evaluate(node.text, env)))
-    of nSet: env[node.variable] = evaluate(node.text, env)
+    of nSet:
+      let value = evaluate(node.text, env)
+      if node.attribute.len == 0: env[node.variable] = value
+      else:
+        # Loop bodies get a cloned table, but the namespace object itself is
+        # shared, so the assignment is visible after the loop as in Jinja.
+        let target = env.getOrDefault(node.variable)
+        if target.isNil or target.kind != JObject or not target.hasKey(NamespaceMarker):
+          bad("cannot assign attribute of non-namespace: " & node.variable)
+        target[node.attribute] = value
     of nIf:
       for i, condition in node.conditions:
         if condition.len == 0 or truth(evaluate(condition, env)):

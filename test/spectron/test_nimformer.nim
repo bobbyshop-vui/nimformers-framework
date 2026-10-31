@@ -1379,7 +1379,7 @@ proc saveCheckpoint*(m: NimformerModelSpectron, path: string, step: int = 0) =
   saveQuantStateDict(path, arch, sd)
 
 proc loadCheckpoint*(path: string): tuple[model: NimformerModelSpectron, step: int] =
-  let (arch, sd) = loadQuantStateDict(path)
+  let (arch, sd, _) = loadQuantStateDict(path)
   var step = 0
   var sdModel: seq[(string, QuantTensor)] = @[]
   for (name, qt) in sd:

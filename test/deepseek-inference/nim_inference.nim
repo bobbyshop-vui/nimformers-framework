@@ -126,7 +126,7 @@ proc linearFast(l: Linear, xData: seq[float32], rows: int, ctx: Backend): seq[fl
     # resident -> rơi về đường cũ (vẫn đúng, chỉ mất phần tăng tốc resident).
     if l.useQuant and l.weightQ.kind == qkInt4Asymmetric and l.weightQ.groupSize > 0:
       let nGroupsPerRow = (l.inF + l.weightQ.groupSize - 1) div l.weightQ.groupSize
-      result = beMatmulQ4(ctx, xData, l.weightQ.data, l.weightQ.scale, l.weightQ.zero_point,
+      result = beMatmulQ4(ctx, xData, @(l.weightQ.bytes), l.weightQ.scale, l.weightQ.zero_point,
                            rows, l.inF, l.outF, l.weightQ.groupSize, nGroupsPerRow)
     else:
       # Fallback (weight không phải int4-per-group, vd lm_head tied-embedding
@@ -418,9 +418,11 @@ type
     gateProj*, upProj*, downProj*: Linear
 
 proc newSwiGLUL*(hidden, intermediate: int): SwiGLUL =
-  result.gateProj = newLinear(hidden, intermediate)
-  result.upProj = newLinear(hidden, intermediate)
-  result.downProj = newLinear(intermediate, hidden)
+  # Shapes only: weights come from the model mmap (loadLlamaWeightsL), as in
+  # Codestral. Random init here allocated ~27 GB of fp32 that was discarded.
+  result.gateProj = newLinear(hidden, intermediate, initializeWeights = false)
+  result.upProj = newLinear(hidden, intermediate, initializeWeights = false)
+  result.downProj = newLinear(intermediate, hidden, initializeWeights = false)
 
 proc forward*(ff: SwiGLUL, x: Tensor, ctx: Backend): Tensor =
   let gateRaw = ff.gateProj.forward(x, ctx)
@@ -759,10 +761,10 @@ proc newGQAAttention*(hiddenSize, nHeads, nKVHeads: int): GQAAttention =
   result.nKVHeads = nKVHeads
   result.headDim = hiddenSize div nHeads
   let kvDim = nKVHeads * result.headDim
-  result.qProj = newLinear(hiddenSize, hiddenSize)
-  result.kProj = newLinear(hiddenSize, kvDim)
-  result.vProj = newLinear(hiddenSize, kvDim)
-  result.oProj = newLinear(hiddenSize, hiddenSize)
+  result.qProj = newLinear(hiddenSize, hiddenSize, initializeWeights = false)
+  result.kProj = newLinear(hiddenSize, kvDim, initializeWeights = false)
+  result.vProj = newLinear(hiddenSize, kvDim, initializeWeights = false)
+  result.oProj = newLinear(hiddenSize, hiddenSize, initializeWeights = false)
   result.scale = 1'f32 / sqrt(float32(result.headDim))
 
 ## forwardQKVFused (dequant-fp32-then-matmul QKV fusion) đã bị XOÁ - không
@@ -1728,14 +1730,18 @@ proc fusedResidualNormFFN(norm: RMSNormL, ff: SwiGLUL, x, attnOut: Tensor, ctx: 
               else: sessionMatmul(be, hNormed, ff.gateProj.residentFp32, hGate, rows, ff.gateProj.inF, ff.gateProj.outF)
     let okU = if allResidentQ4: sessionMatmulQ4(be, hNormed, ff.upProj.residentW, hUp, rows)
               else: sessionMatmul(be, hNormed, ff.upProj.residentFp32, hUp, rows, ff.upProj.inF, ff.upProj.outF)
+    # The biased result replaces the handle; free the unbiased buffer too
+    # (it used to leak once per layer per token).
     if ff.gateProj.bias.data.len == ff.gateProj.outF:
       var hGB = sessionUpload(be, broadcastBias(ff.gateProj.bias, rows, ff.gateProj.outF))
+      var hRaw = hGate
       hGate = sVecOp(be, "add", hGate, hGB, nInter)
-      sessionFree(be, hGB)
+      sessionFree(be, hGB); sessionFree(be, hRaw)
     if ff.upProj.bias.data.len == ff.upProj.outF:
       var hUB = sessionUpload(be, broadcastBias(ff.upProj.bias, rows, ff.upProj.outF))
+      var hRaw = hUp
       hUp = sVecOp(be, "add", hUp, hUB, nInter)
-      sessionFree(be, hUB)
+      sessionFree(be, hUB); sessionFree(be, hRaw)
     let hSig = sActivation(be, "sigmoid", hGate, nInter)
     let hSilu = sVecOp(be, "mul", hGate, hSig, nInter)
     var hGated = sVecOp(be, "mul", hSilu, hUp, nInter)
@@ -1745,8 +1751,9 @@ proc fusedResidualNormFFN(norm: RMSNormL, ff: SwiGLUL, x, attnOut: Tensor, ctx: 
               else: sessionMatmul(be, hGated, ff.downProj.residentFp32, hOut, rows, ff.downProj.inF, ff.downProj.outF)
     if ff.downProj.bias.data.len == ff.downProj.outF:
       var hDB = sessionUpload(be, broadcastBias(ff.downProj.bias, rows, ff.downProj.outF))
+      var hRaw = hOut
       hOut = sVecOp(be, "add", hOut, hDB, rows * ff.downProj.outF)
-      sessionFree(be, hDB)
+      sessionFree(be, hDB); sessionFree(be, hRaw)
     usedSessionFused = sessionEnd(be)   # <-- COMMIT+WAIT DUY NHAT cho ca FFN
     if usedSessionFused and okGateUp and okD:
       ffOut = sessionRead(be, hOut, rows * ff.downProj.outF)
@@ -2226,16 +2233,17 @@ type
     finalNorm*: RMSNormL
     lmHead*: Linear
     rope*: RoPEL
+    payloadAlign*: int   ## NIMQ3 payload alignment of the mapped file (0 = NIMQ2)
 
 proc newLlamaModelL*(cfg: LlamaLConfig): LlamaModelL =
   result.config = cfg
-  result.embed = newEmbedding(cfg.vocabSize, cfg.hiddenSize)
+  result.embed = newEmbedding(cfg.vocabSize, cfg.hiddenSize, initializeWeights = false)
   result.blocks = newSeq[TransformerBlockLlama](cfg.nLayers)
   for i in 0 ..< cfg.nLayers:
     result.blocks[i] = newTransformerBlockLlama(cfg.hiddenSize, cfg.nHeads, cfg.nKVHeads,
                                                   cfg.intermediateSize, cfg.rmsNormEps)
   result.finalNorm = newRMSNormL(cfg.hiddenSize, cfg.rmsNormEps)
-  result.lmHead = newLinear(cfg.hiddenSize, cfg.vocabSize)
+  result.lmHead = newLinear(cfg.hiddenSize, cfg.vocabSize, initializeWeights = false)
   result.rope = newRoPEL(cfg.hiddenSize div cfg.nHeads, cfg.maxPositionEmbeddings, cfg.ropeTheta,
                           cfg.ropeScalingType, cfg.ropeScalingFactor)
 
@@ -2453,8 +2461,16 @@ proc loadLlamaWeightsL*(m: var LlamaModelL, path: string) =
   echo &"  đang đọc file {path} ..."
   let fileSize = getFileSize(path)
   echo &"  kích thước file: {fileSize div (1024*1024)} MB"
-  let (_, sd) = loadQuantStateDict(path)
-  echo &"  đã đọc xong {sd.len} tensor từ file, đang build model..."
+  # mmap: packed weights stay in the page cache and uploadAllResidentWeights
+  # hands that mapping to the GPU (in place on unified memory, at any payload
+  # offset; NIMQ3 files from convert_nimq_aligned are page aligned).
+  let loaded = loadQuantStateDict(path, mapped = getEnv("BYBY_MODEL_MMAP", "1") != "0")
+  let sd = loaded.sd
+  m.payloadAlign = loaded.payloadAlign
+  echo &"  đã map {sd.len} tensor từ file (" &
+    (if loaded.payloadAlign > 0: &"NIMQ3, payload align {loaded.payloadAlign}"
+     else: "NIMQ2: GPU doc payload tai offset byte bat ky trong mmap") &
+    "), đang build model..."
   var byName = initTable[string, QuantTensor]()
   for (name, qt) in sd: byName[name] = qt
 
@@ -2471,11 +2487,26 @@ proc loadLlamaWeightsL*(m: var LlamaModelL, path: string) =
     let wName = prefix & ".weight"
     if byName.hasKey(wName):
       setQuantWeight(lin, byName[wName])
+    # Zero biases (exporters write them for bias-free Llama/DeepSeek layers)
+    # would only cost an upload + add per layer per token; drop them.
     let b = get(prefix & ".bias")
-    if b.len > 0: lin.bias.data = b
+    var hasBias = false
+    for v in b:
+      if v != 0'f32: (hasBias = true; break)
+    lin.bias.data = if hasBias: b else: @[]
 
-  let embW = get("model.embed_tokens.weight")
-  if embW.len > 0: m.embed.weight.data = embW
+  # Embedding rows are read from the mmap in place when the file stores raw
+  # fp32 (lookupBatch copies only the rows of the prompt/decoded ids).
+  var embW: seq[float32]
+  let embView = if byName.hasKey("model.embed_tokens.weight"):
+                  rawFloatView(byName["model.embed_tokens.weight"])
+                else: default(MappedView[float32])
+  if embView.owner != nil and embView.len == m.config.vocabSize * m.config.hiddenSize:
+    m.embed.weight.data = @[]
+    m.embed.weight.mappedData = embView
+  else:
+    embW = get("model.embed_tokens.weight")
+    if embW.len > 0: m.embed.weight.data = embW
 
   let normW = get("model.norm.weight")
   if normW.len > 0: m.finalNorm.weight.data = normW
@@ -2504,8 +2535,10 @@ proc loadLlamaWeightsL*(m: var LlamaModelL, path: string) =
   # (chấp nhận được vì lm_head chỉ forward 1 LẦN/token, không phải 224 lần).
   if byName.hasKey("lm_head.weight"):
     setQuantWeight(m.lmHead, byName["lm_head.weight"])
-  elif embW.len > 0:
+  elif embW.len > 0 or m.embed.weight.mappedData.owner != nil:
+    # Tied embeddings: lm_head reads the same rows as the embedding.
     m.lmHead.weight.data = embW
+    m.lmHead.weight.mappedData = m.embed.weight.mappedData
     m.lmHead.useQuant = false
 
 proc uploadAllResidentWeights*(m: var LlamaModelL, ctx: Backend) =
@@ -2551,6 +2584,19 @@ proc uploadAllResidentWeights*(m: var LlamaModelL, ctx: Backend) =
     uploadResidentNorm(m.blocks[l].postAttnNorm, ctx)
   uploadResident(m.lmHead, ctx)  # no-op nếu tied-embedding (useQuant=false)
   tune(m.lmHead)
+  var zeroCopy, residentQ4 = 0
+  proc count(lin: Linear) =
+    if lin.residentReady or lin.residentFp32Ready:
+      inc residentQ4
+      if lin.residentZeroCopy: inc zeroCopy
+  for l in 0 ..< m.config.nLayers:
+    count(m.blocks[l].attn.qProj); count(m.blocks[l].attn.kProj)
+    count(m.blocks[l].attn.vProj); count(m.blocks[l].attn.oProj)
+    count(m.blocks[l].ff.gateProj); count(m.blocks[l].ff.upProj)
+    count(m.blocks[l].ff.downProj)
+  count(m.lmHead)
+  echo &"  weight (Q4 + lm_head): {zeroCopy}/{residentQ4} GPU doc thang tu mmap (zero-copy), " &
+    &"{residentQ4 - zeroCopy} copy tu mmap vao buffer GPU."
   uploadResidentNorm(m.finalNorm, ctx)
   # TOI UU: gamma cua CA 32*2+1 RMSNorm (input+postAttn moi layer + final)
   # gio duoc upload 1 LAN DUY NHAT o day, thay vi sessionUpload() lai TU
@@ -2827,7 +2873,10 @@ when isMainModule:
   let maxNewTokens = parseInt(argOr(4, "100"))
   let temperature = parseFloat(argOr(5, "0.7")).float32
   let topP = parseFloat(argOr(6, "0.9")).float32
-  let systemText = argOr(7, "You are an AI programming assistant.")
+  # No system message by default: the checkpoint's template then emits its own
+  # standard DeepSeek system prompt. (Its found_item flag never leaves the for
+  # loop, so a system message is printed after that prompt, not instead of it.)
+  let systemText = argOr(7, "")
 
   echo "Loading config..."
   let cfg = newLlamaLConfig(modelPath)

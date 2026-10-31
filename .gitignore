@@ -14,6 +14,7 @@ bench_ffn_fused_full
 bench_ffn_matmul
 bench_fp4_gemv
 bench_gemv_variants
+convert_nimq_aligned
 finetune_lora_bin
 graft_attention_bin
 infer_lora_bin
