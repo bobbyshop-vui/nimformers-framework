@@ -613,6 +613,16 @@ proc dequantizeTensorTransposed*(qt: QuantTensor): seq[float32] =
 
 const MagicStr = "NIMQ2"   ## THÊM: bump tu NIMQ1 -> NIMQ2 vi them field groupSize (per-group int4).
                             ## File .nimq cu (NIMQ1) phai export lai bang export_to_nimq.py moi.
+const MagicAligned* = "NIMQ3"
+  ## NIMQ2 plus an int32 payload alignment after the magic, padding up to that
+  ## alignment before the arch fields, and each tensor's packed payload
+  ## starting at a multiple of it. Lets a GPU on unified memory wrap each
+  ## payload of the mmap in place. The header padding also guarantees every
+  ## NIMQ2 byte moves forward by >= align - 9 bytes when a file is converted
+  ## in place (convert_nimq_aligned).
+const NimqPayloadAlign* = 65536
+  ## Default for NIMQ3: covers 4 KiB (x86) and 16 KiB (Apple Silicon) pages and
+  ## Vulkan host-pointer import alignments.
 
 proc writeString(f: File, s: string) =
   var n = int32(s.len)
@@ -625,7 +635,7 @@ proc readString(f: File): string =
   result = newString(n)
   if n > 0: discard f.readBuffer(addr result[0], n)
 
-proc writeQuantTensor(f: File, qt: QuantTensor) =
+proc writeQuantTensor(f: File, qt: QuantTensor; payloadAlign = 0) =
   var kindByte = uint8(ord(qt.kind))
   discard f.writeBuffer(addr kindByte, 1)
   var ndims = int32(qt.shape.len)
@@ -647,6 +657,11 @@ proc writeQuantTensor(f: File, qt: QuantTensor) =
   discard f.writeBuffer(addr mb, 4)
   var dlen = int32(qt.bytes.len)
   discard f.writeBuffer(addr dlen, 4)
+  if payloadAlign > 1:
+    let pad = (payloadAlign - int(f.getFilePos() mod payloadAlign)) mod payloadAlign
+    if pad > 0:
+      var zeros = newSeq[uint8](pad)
+      discard f.writeBuffer(addr zeros[0], pad)
   if qt.bytes.len > 0:
     discard f.writeBuffer(unsafeAddr qt.bytes[0], qt.bytes.len)
 
@@ -682,7 +697,16 @@ proc readQuantTensor(f: File): QuantTensor =
   if dlen > 0:
     discard f.readBuffer(addr result.data[0], dlen)
 
-proc readMappedQuantTensor*(c: var WeightCursor; mapped = true): QuantTensor =
+proc rawFloatView*(qt: QuantTensor): MappedView[float32] =
+  ## The float32 payload of a mapped qkFp32Raw tensor, read in place (NIMQ2
+  ## payloads may be unaligned; callers copy rows with copyMem).
+  ## owner == nil when the tensor is not mapped raw fp32.
+  if qt.kind == qkFp32Raw and qt.mappedData.owner != nil and qt.mappedData.len mod 4 == 0:
+    result = mappedView[float32](qt.mappedData.owner, qt.mappedData.offset,
+      qt.mappedData.len div 4)
+
+proc readMappedQuantTensor*(c: var WeightCursor; mapped = true;
+                            payloadAlign = 0): QuantTensor =
   let kind = readValue[uint8](c)
   if kind > uint8(high(QuantKind)): raise newException(IOError, "Invalid quant kind")
   result.kind = QuantKind(kind)
@@ -702,16 +726,32 @@ proc readMappedQuantTensor*(c: var WeightCursor; mapped = true): QuantTensor =
     raise newException(IOError, "Invalid custom float format")
   result.cf = newCustomFloat(eb, mb)
   let n = c.readCount()
+  if payloadAlign > 1:
+    c.pos += (payloadAlign - c.pos mod payloadAlign) mod payloadAlign
+    c.owner.checkRange(c.pos, n)
   if mapped:
     result.mappedData = mappedView[uint8](c.owner, c.pos, n)
     c.pos += n
   else:
     result.data = readSeq[uint8](c, n)
 
-proc saveQuantStateDict*(path: string, arch: array[5, int], sd: seq[(string, QuantTensor)]) =
+proc saveQuantStateDict*(path: string, arch: array[5, int], sd: seq[(string, QuantTensor)];
+                         payloadAlign = 0) =
+  ## payloadAlign > 0 writes NIMQ3 (payloads aligned for in-place GPU use);
+  ## 0 keeps the NIMQ2 layout that export_to_nimq.py produces.
+  if payloadAlign < 0 or payloadAlign > (1 shl 24) or
+      (payloadAlign > 0 and (payloadAlign < 64 or (payloadAlign and (payloadAlign - 1)) != 0)):
+    raise newException(ValueError, "Invalid NIMQ payload alignment")
   var f = open(path, fmWrite)
   defer: f.close()
-  writeString(f, MagicStr)
+  if payloadAlign > 0:
+    writeString(f, MagicAligned)
+    var a = int32(payloadAlign)
+    discard f.writeBuffer(addr a, 4)
+    var headerPad = newSeq[uint8](payloadAlign - int(f.getFilePos() mod payloadAlign))
+    discard f.writeBuffer(addr headerPad[0], headerPad.len)
+  else:
+    writeString(f, MagicStr)
   var archI32: array[5, int32]
   for i, v in arch: archI32[i] = int32(v)
   discard f.writeBuffer(addr archI32[0], sizeof(archI32))
@@ -719,14 +759,29 @@ proc saveQuantStateDict*(path: string, arch: array[5, int], sd: seq[(string, Qua
   discard f.writeBuffer(addr n, 4)
   for (name, qt) in sd:
     writeString(f, name)
-    writeQuantTensor(f, qt)
+    writeQuantTensor(f, qt, payloadAlign)
+  if payloadAlign > 1:
+    # GPUs wrap each payload rounded up to their page/import alignment; the
+    # last one must not run past the end of the mapped file.
+    let pad = (payloadAlign - int(f.getFilePos() mod payloadAlign)) mod payloadAlign
+    if pad > 0:
+      var zeros = newSeq[uint8](pad)
+      discard f.writeBuffer(addr zeros[0], pad)
 
-proc loadQuantStateDict*(path: string; mapped = false): tuple[arch: array[5, int], sd: seq[(string, QuantTensor)]] =
+proc loadQuantStateDict*(path: string; mapped = false): tuple[arch: array[5, int],
+    sd: seq[(string, QuantTensor)], payloadAlign: int] =
+  ## Reads NIMQ2 and NIMQ3. payloadAlign is 0 for NIMQ2.
   var c = WeightCursor(owner: mapWeights(path))
-  if c.readString() != MagicStr:
+  let magic = c.readString()
+  if magic == MagicAligned:
+    result.payloadAlign = int(readValue[int32](c))
+    if result.payloadAlign <= 13 or result.payloadAlign > (1 shl 24):
+      raise newException(IOError, "Invalid NIMQ payload alignment: " & path)
+    c.pos = result.payloadAlign
+  elif magic != MagicStr:
     raise newException(IOError, "Invalid NIMQ checkpoint: " & path)
   for i in 0 ..< 5: result.arch[i] = int(readValue[int32](c))
   let n = c.readCount()
   for i in 0 ..< n:
     let name = c.readString()
-    result.sd.add((name, readMappedQuantTensor(c, mapped)))
+    result.sd.add((name, readMappedQuantTensor(c, mapped, result.payloadAlign)))

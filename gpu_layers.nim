@@ -503,6 +503,7 @@ proc prepareGpuLinForLinear*(ctx: Backend; name: string; lin: var Linear): GpuLi
     lin.residentFp32 = result.wF32
     lin.residentFp32Ready = true
     lin.residentFp32NT = true
+    lin.residentFp32Offset = 0
     lin.weight.data = @[]
     lin.weight.mappedData = default(MappedView[float32])
     result.biasH = byby.sessionUploadPrivate(be, uploadBiasOrRaise(name, lin.bias.data, N))
