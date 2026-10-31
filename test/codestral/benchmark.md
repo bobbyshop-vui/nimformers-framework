@@ -2,19 +2,34 @@
 
 ## Result
 
-On the MacBook Pro below, the latest supplied Vulkan run decoded **60 tokens
-at 1.98 tok/s overall**. Excluding the first token, the log reports **2.00
-tok/s**. The latest supplied Metal run reports **1.77 tok/s** for 60 tokens.
+Latest MacBook Pro runs (Intel Iris Plus 640, revision `226e08f` with the lane
+scan, LoRA-down and Linear++ lanes). With warm shader caches, Vulkan prefilled
+the 11-token prompt in **6.821 s** and decoded **1.75 tok/s** after the first
+token; Metal took 7.910 s and decoded 1.57 tok/s.
 
-| Backend | Decode, 60 tokens | Steady decode after first token | Prompt prefill, 11 tokens | Total, 71 tokens |
+| Backend | Prefill, 11 tokens | Decode, 60 tokens | Steady decode after first token | Total, 71 tokens |
 | --- | ---: | ---: | ---: | ---: |
-| Vulkan | 30.313 s · **1.98 tok/s** · 505.2 ms/token | **2.00 tok/s** · 499.5 ms/token | 8.629 s · 1.27 tok/s | 38.943 s |
-| Metal | 33.809 s · **1.77 tok/s** · 563.5 ms/token | 1.77 tok/s · 564.0 ms/token | 10.991 s · 1.00 tok/s | 44.800 s |
+| Vulkan, warm caches | **6.821 s · 1.61 tok/s** | 34.471 s · **1.74 tok/s** · 574.5 ms/token | **1.75 tok/s** · 572.4 ms/token | **41.292 s** |
+| Vulkan, cold caches (first run after new kernels) | 15.870 s · 0.69 tok/s | 42.008 s · 1.43 tok/s · 700.1 ms/token | 1.43 tok/s · 697.9 ms/token | 57.878 s |
+| Metal | 7.910 s · 1.39 tok/s | 38.174 s · 1.57 tok/s · 636.2 ms/token | 1.57 tok/s · 637.6 ms/token | 46.083 s |
 
-The supplied logs show Vulkan decoding about **12% more tokens per second**
-than Metal in these runs. Vulkan prefill was about **21% faster**, and total
-wall time was about **13% lower**. These are results from separate user runs,
-not a controlled same-binary A/B benchmark; treat the comparison as indicative.
+With warm caches, Vulkan prefill was about **14% faster** than Metal and steady
+decode about **11% faster**. The cold Vulkan run was the first one after the
+kernels changed, so glslc and MoltenVK had to compile every shader; see
+[Vulkan device path](#vulkan-device-path). All three runs produced the same
+text. They are separate user runs, not a controlled A/B benchmark.
+
+Earlier runs (before the lane scan) for reference:
+
+| Backend | Prefill, 11 tokens | Decode, 60 tokens | Steady decode | Total |
+| --- | ---: | ---: | ---: | ---: |
+| Vulkan | 8.629 s · 1.27 tok/s | 30.313 s · 1.98 tok/s · 505.2 ms/token | 2.00 tok/s · 499.5 ms/token | 38.943 s |
+| Metal | 10.991 s · 1.00 tok/s | 33.809 s · 1.77 tok/s · 563.5 ms/token | 1.77 tok/s · 564.0 ms/token | 44.800 s |
+
+Prefill improved on both backends (Vulkan 8.629 → 6.821 s, Metal 10.991 →
+7.910 s). The prefill work did not touch the decode path, so the lower decode
+rate in the latest runs (1.75 vs 2.00 tok/s on Vulkan) is not explained by
+these changes; system load and thermal state differ between sessions.
 
 ## Tesla T4 prefill (Vulkan, Colab)
 
@@ -73,7 +88,7 @@ revisions, so the 13.65–14.96 tok/s spread is run-to-run variation.
 - Prompt: `[INST] Xin chao[/INST]` (11 prompt tokens after trailing whitespace is removed)
 - Generation: 60 tokens, temperature 0.7
 - Model topology reported by inference: 64 blocks (60 R, 4 G), 128 LoRA adapters
-- Both runs used resident prefill and native decode; MPS was disabled on this
+- All runs used resident prefill and native decode; MPS was disabled on this
   Intel Mac (`Apple Silicon=false`).
 
 Commands used:
@@ -86,26 +101,54 @@ make infer-lora BYBY_INFER_BACKEND=metal
 ## Vulkan device path
 
 The Vulkan log identifies MoltenVK running on the Intel Iris Plus 640 and
-reports `residentWeights=host-visible/shared` and `matrix=scalar`. No Vulkan
-cooperative-matrix/tensor-core path was active in this run. The model still
-used the packed FP4 VM kernels (`packed tiles=256`); tensor-core GEMMs were 0.
-The automatic scan selected serial (`12.327 ms`) over parallel (`40.326 ms`).
+reports `residentWeights=host-visible/shared` and `matrix=scalar`. There is no
+cooperative-matrix path on this GPU, so prefill uses the packed FP4 VM kernels
+(`packed tiles=256`) and the batched FP32 sidecar kernel (`batched=12`). The
+scan auto mode picked the register lane scan on both backends.
 
-The measured Vulkan prefill profile was 8.586 s total: resident groups took
-7.920 s across 8 groups, scan autotuning 425 ms, and Vulkan shader prewarm 124
-ms. Decode was 30.313 s for 60 tokens; the steady-state profile was about 496
-ms/token.
+Prefill profile of the latest runs:
 
-Metal's supplied run used the same Intel GPU. It also reported no tensor-core
-GEMMs and no MPS tiles, with 256 packed tiles; its prefill took 10.991 s and
-decode took 33.809 s. Since the runs were captured separately, differences in
-binary revision, warmup, and system load may affect the comparison.
+| Stage | Vulkan, cold | Vulkan, warm | Metal |
+| --- | ---: | ---: | ---: |
+| `resident.group` | 11242 ms (8 groups) | 6604 ms (8 groups) | 6380 ms (16 groups) |
+| `vulkan.prewarm` (glslc) | 2256 ms | 22 ms | — |
+| `scan.autotune` (lane parity check) | 2152 ms | 62 ms | 1202 ms |
+| `enc.inproj` + `enc.outproj` + `enc.attn` (host) | 1126 ms | 331 ms | 10 ms |
+
+The cold Vulkan run paid for shader compilation three times: glslc for
+GLSL → SPIR-V (`vulkan.prewarm`), the lane-scan kernel compiled during its
+parity check, and MoltenVK converting SPIR-V → MSL and compiling a Metal
+pipeline at the first dispatch of each kernel inside `resident.group`. Metal
+compiles its kernels before the prefill loop and keeps them in
+`metal-jit.binarchive`. Once the SPIR-V files and the macOS shader cache are
+warm, Vulkan's `resident.group` is within 4% of Metal's.
+
+Kernel-level measurements on the same GPU with synthetic data (T=11, one
+dispatch each) show the Vulkan kernels are not slower:
+
+| Kernel | Metal | Vulkan |
+| --- | ---: | ---: |
+| FP4 2-column m8, 4096x18560 | 22.1 ms | 19.6 ms |
+| FP4 2-column m4 tail, 4096x18560 | 13.5 ms | 12.0 ms |
+| FP4 2-column m8, 8192x4096 | 13.0 ms | 7.3 ms |
+| FP32 batch, 4096x12288 | 27.1 ms | 17.0 ms |
+| Lane scan, 128 heads x 64 x 128 | 2.9 ms | 1.4 ms |
+
+Replaying the command sequence of 64 R blocks (distinct weights, about 3.4 GB,
+copies included) took about 2.7 s on both backends once warm. With freshly
+named kernels the first Vulkan group took 2546 ms against 413 ms on Metal, and
+424 ms on a second Vulkan run. Buffer copies (blit encoders on MoltenVK,
+compute copies on Metal) cost about 10% on both.
 
 ## Source logs
 
-- Latest Vulkan run: user-supplied `make infer-lora BYBY_INFER_BACKEND=vulkan`
-  log, reporting 1.98 tok/s overall and 2.00 tok/s after the first token.
-- Metal comparison: user-supplied Metal run in the preceding combined log,
-  reporting 1.77 tok/s overall.
+- MacBook runs: user-supplied `make infer-lora` logs at revision `226e08f`
+  (Vulkan run twice: cold 15.870 s and warm 6.821 s prefill; Metal 7.910 s).
+  The warm Vulkan run also included the fix that skips the tiled GEMM check on
+  GPUs without cooperative matrices.
+- Earlier MacBook runs: Vulkan 1.98 tok/s and Metal 1.77 tok/s decode, before
+  the lane scan.
 - Tesla T4 runs: three user-supplied Colab Vulkan logs (revisions `6f09d78`,
   `6e0a5d5`, `226e08f`), prefill 10.214 s, 2.772 s and 3.041 s.
+- Kernel and replay measurements: synthetic benchmarks on the MacBook GPU,
+  not checked into the repository.

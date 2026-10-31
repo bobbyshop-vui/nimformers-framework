@@ -1111,7 +1111,9 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
   # Tiled cooperative GEMMs (FP4-KM Mamba projections, FP32 Linear++ sidecar):
   # check once per (format, K, N) against the generic cooperative kernel, then
   # let the session GEMM entry points prefer them.
-  if be == gbVulkan and T >= 8:
+  # No cooperative route (MoltenVK, scalar GPUs): neither kernel can run, so
+  # there is nothing to check.
+  if be == gbVulkan and T >= 8 and byby.sessionCooperativeGemmEnabled(be):
     for fp4 in [true, false]:
       let kind = if fp4: "FP4" else: "FP32"
       if getEnv("BYBY_PREFILL_" & kind & "_TILED", "1") == "0": continue
