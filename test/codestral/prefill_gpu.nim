@@ -28,7 +28,7 @@ var gPrefixAllocs, gPrefixHits: int
 var gPrefixMps, gPrefixTensorCore, gPrefixPackedTiles, gPrefixFusedEpilogues: int
 var gScanTuneCache = initTable[string, string]()
 var gF32MpsTuneCache = initTable[string, bool]()
-var gFp4TiledChecked = initTable[string, bool]()
+var gTiledGemmChecked = initTable[string, bool]()
 
 proc prefillExecutionStats*(): tuple[mps,tensorCore,packedTiles,fusedEpilogues:int] =
   (gPrefixMps,gPrefixTensorCore,gPrefixPackedTiles,gPrefixFusedEpilogues)
@@ -277,11 +277,12 @@ proc verifyLaneScan(ctx: Backend; L: M2Lay; arenaElems: int): tuple[ok: bool, ma
     sessionFree(be, readback)
     sessionFree(be, probe)
 
-proc verifyTiledFp4Gemm(be: byby.GpuBackend; name: string; T, K, N: int): tuple[ok: bool, maxError, tolerance: float32] =
-  ## Real weights, synthetic activations: the tiled FP4 kernel against the
-  ## generic cooperative kernel. Both use FP16 inputs and FP32 accumulation,
-  ## so only summation order differs; an indexing bug is an O(1) error.
-  let c = gFp4CacheGpu[name]
+proc verifyTiledGemm(be: byby.GpuBackend; name: string; T, K, N: int;
+                     fp4: bool): tuple[ok: bool, maxError, tolerance: float32] =
+  ## Real weights, synthetic activations: a tiled kernel (FP4-KM or FP32
+  ## weights) against the generic cooperative kernel. Both use FP16 inputs and
+  ## FP32 accumulation, so only summation order differs; an indexing bug is an
+  ## O(1) error.
   var x = newSeq[float32](T * K)
   for i in 0 ..< x.len: x[i] = sin(float32(i mod 1009) * 0.37'f32) * 0.5'f32
   var hx = sessionUpload(be, x)
@@ -291,9 +292,16 @@ proc verifyTiledFp4Gemm(be: byby.GpuBackend; name: string; T, K, N: int): tuple[
   try:
     require(sessionBegin(be), "tiled GEMM parity sessionBegin failed")
     sessionOpen = true
-    if not sessionFp4GemmTiledEnc(be, hx, c.wBuf, c.lutBuf, tiled, T, K, N) or
-        not sessionFp4GemmTensorCore(be, hx, c.wBuf, c.lutBuf, generic, T, K, N):
-      return (false, 0'f32, 0'f32)
+    let ran =
+      if fp4:
+        let c = gFp4CacheGpu[name]
+        sessionFp4GemmTiledEnc(be, hx, c.wBuf, c.lutBuf, tiled, T, K, N) and
+          sessionFp4GemmTensorCore(be, hx, c.wBuf, c.lutBuf, generic, T, K, N)
+      else:
+        let w = gLinCache[name].wF32
+        sessionMatmulNTTiledEnc(be, hx, w, tiled, T, K, N) and
+          sessionMatmulNTFp16Coop(be, hx, w, generic, T, K, N)
+    if not ran: return (false, 0'f32, 0'f32)
     let ended = sessionEnd(be)
     sessionOpen = false
     require(ended, "tiled GEMM parity sessionEnd failed: " & sessionGetLastError(be))
@@ -694,6 +702,7 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
   for st in steps: stepNames.add kernelNameFor(ctx, st.prog, st.tag)
   var biasKns = initTable[int, string]()
   var loraKns = initTable[string, string]()
+  var loraDownKns = initTable[string, string]()
   var m8Kns = initTable[string, string]()
   var m4Kns = initTable[string, string]()
   var m8x2Kns = initTable[string, string]()
@@ -719,6 +728,10 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
       let ad = gLoraGpu[name]
       loraKns[name] = vmKernelForBe(loraRows(lin.N, ad.r, ad.scale),
         "prefix_lora_" & $lin.N & "_" & $ad.r & "_" & $ad.scale, be)
+      if lin.K mod LoraDownTg == 0 and LoraDownTg <= gTgCap and
+          getEnv("BYBY_PREFILL_LORA_DOWN", "1") != "0":
+        loraDownKns[name] = vmKernelForBe(buildPrefixLoraDownProgram(lin.K, ad.r),
+          "prefix_lora_down_" & $lin.K & "_" & $ad.r, be)
     if lin.isFp4 and expandFp4:
       let rank=if name in gLoraGpu and not gDisableLora:gLoraGpu[name].r else:0
       let scale=if rank>0:gLoraGpu[name].scale else:1'f32
@@ -883,7 +896,12 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
     let hasLora=name in gLoraGpu and not gDisableLora
     if hasLora:
       let ad=gLoraGpu[name]
-      require(matmul(input,ad.aBuf,hLora,T,lin.K,ad.r),"LoRA A " & name)
+      if name in loraDownKns:
+        # One 256-lane reduction group per (token, rank) output.
+        encodeVmKernel(loraDownKns[name], T * ad.r * LoraDownTg, LoraDownTg,
+          LoraDownTg * 4, hLora, 0, gDummyFor(be), ad.aBuf, input, 0)
+      else:
+        require(matmul(input,ad.aBuf,hLora,T,lin.K,ad.r),"LoRA A " & name)
     if name in expandKns:
       let c=gFp4CacheGpu[name]
       for tile in expandKns[name]:
@@ -1009,6 +1027,7 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
   var lpPrograms = initTable[string, seq[MvmStep]]()
   var lpNames = initTable[string, seq[string]]()
   var transposeKns = initTable[string, string]()
+  var lpLanes = initTable[string, bool]()
   for i, blk in m.blocks:
     if blk.kind notin {bkMambaRealPlusAttn, bkMambaRealGated}: continue
     let al = gAttnLayers[i]
@@ -1021,10 +1040,17 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
       # large per-timestep state scan are needed to compute 15 prefix tokens.
       let phiTg = lpPhiTg(lay)
       let tag = $T & "_" & key & "_" & $phiTg
+      lpLanes[key] = lpLaneStates(lay.D) > 0 and getEnv("BYBY_PREFILL_LP_LANES", "1") != "0"
       lpPrograms[key] = @[
-        (buildLpPhiProgram(lay), T * 2 * hidden, phiTg * 4, phiTg, "@prefix_lp_phi_" & tag),
-        (buildLpDenProgram(lay), lay.H, 4, 0, "@prefix_lp_den_" & tag),
-        (buildLpFwdProgram(lay), hidden, 4, 0, "@prefix_lp_fwd_" & tag)]
+        (buildLpPhiProgram(lay), T * 2 * hidden, phiTg * 4, phiTg, "@prefix_lp_phi_" & tag)]
+      if lpLanes[key]:
+        # Den + fwd in one register scan: H*D groups of 32 lanes instead of
+        # H threads (den) and H*D strided threads (fwd).
+        lpPrograms[key].add((buildLpLaneProgram(lay), lay.C * LaneScanWidth,
+          lpLaneTgBytes(T), LaneScanWidth, "@prefix_lp_lanes_" & tag))
+      else:
+        lpPrograms[key].add((buildLpDenProgram(lay), lay.H, 4, 0, "@prefix_lp_den_" & tag))
+        lpPrograms[key].add((buildLpFwdProgram(lay), hidden, 4, 0, "@prefix_lp_fwd_" & tag))
       for st in lpPrograms[key]: lpNames.mgetOrPut(key, @[]).add kernelNameFor(ctx, st.prog, st.tag)
       transposeKns[key] = vmKernelForBe(transposeState(lay.H, lay.D), "prefix_lp_state_" & key, be)
   var hQkv = alloc(padded * 3 * hidden)
@@ -1077,48 +1103,58 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
       for _, kn in m4x2Kns: addNamed(kn)
     for _, kn in biasKns: addNamed(kn)
     for _, kn in loraKns: addNamed(kn)
+    for _, kn in loraDownKns: addNamed(kn)
     let prewarmStart = getMonoTimeIfPf()
     byby.sessionJitPrewarm(be, jobs)
     pfAddIf("vulkan.prewarm", prewarmStart)
 
-  # Tiled FP4 cooperative GEMM: check once per (K, N) against the generic
-  # cooperative kernel, then let sessionFp4GemmTensorCore prefer it.
-  if be == gbVulkan and T >= 8 and getEnv("BYBY_PREFILL_FP4_TILED", "1") != "0":
-    var shapes: seq[tuple[name: string, K, N: int]]
-    var seen = initTable[string, bool]()
-    for name, lin in gLinCache:
-      if not name.startsWith("block") or not lin.isFp4 or lin.K mod 64 != 0: continue
-      let key = $lin.K & "x" & $lin.N
-      if key notin seen:
-        seen[key] = true
-        shapes.add((name, lin.K, lin.N))
-    var allOk = shapes.len > 0
-    var pending = false
-    for sh in shapes:
-      let key = $sh.K & "x" & $sh.N
-      if key notin gFp4TiledChecked: pending = true
-      elif not gFp4TiledChecked[key]: allOk = false
-    if pending and allOk:
-      let verifyStart = getMonoTimeIfPf()
-      byby.sessionSetFp4GemmTiled(be, false)   # reference must be the generic kernel
+  # Tiled cooperative GEMMs (FP4-KM Mamba projections, FP32 Linear++ sidecar):
+  # check once per (format, K, N) against the generic cooperative kernel, then
+  # let the session GEMM entry points prefer them.
+  if be == gbVulkan and T >= 8:
+    for fp4 in [true, false]:
+      let kind = if fp4: "FP4" else: "FP32"
+      if getEnv("BYBY_PREFILL_" & kind & "_TILED", "1") == "0": continue
+      var shapes: seq[tuple[name: string, K, N: int]]
+      var seen = initTable[string, bool]()
+      for name, lin in gLinCache:
+        if not name.startsWith("block") or lin.isFp4 != fp4 or lin.isInt4 or
+            lin.K mod 64 != 0: continue
+        if not fp4 and (lin.wF32.vulkanHandle.buf == nil or
+            not (".attn." in name or ".fuseGate." in name)): continue
+        let key = kind & "_" & $lin.K & "x" & $lin.N
+        if key notin seen:
+          seen[key] = true
+          shapes.add((name, lin.K, lin.N))
+      var allOk = shapes.len > 0
+      var pending = false
       for sh in shapes:
-        let key = $sh.K & "x" & $sh.N
-        if key in gFp4TiledChecked: continue
-        var parity: tuple[ok: bool, maxError, tolerance: float32]
-        try:
-          parity = verifyTiledFp4Gemm(be, sh.name, T, sh.K, sh.N)
-        except CatchableError as e:
-          discard sessionRecoverQueue(be)
-          echo "[prefill-gemm] tiled FP4 check failed: " & e.msg
-        gFp4TiledChecked[key] = parity.ok
-        echo &"[prefill-gemm] tiled FP4 {sh.K}x{sh.N} M={T}: " &
-          (if parity.ok: "parity passed" else: "rejected") &
-          &" (max-error={parity.maxError:.3g} tolerance={parity.tolerance:.3g})"
-        if not parity.ok:
-          allOk = false
-          break
-      pfAddIf("gemm.verify", verifyStart)
-    byby.sessionSetFp4GemmTiled(be, allOk)
+        let key = kind & "_" & $sh.K & "x" & $sh.N
+        if key notin gTiledGemmChecked: pending = true
+        elif not gTiledGemmChecked[key]: allOk = false
+      proc setTiled(on: bool) =
+        if fp4: byby.sessionSetFp4GemmTiled(be, on) else: byby.sessionSetF32GemmTiled(be, on)
+      if pending and allOk:
+        let verifyStart = getMonoTimeIfPf()
+        setTiled(false)   # reference must be the generic kernel
+        for sh in shapes:
+          let key = kind & "_" & $sh.K & "x" & $sh.N
+          if key in gTiledGemmChecked: continue
+          var parity: tuple[ok: bool, maxError, tolerance: float32]
+          try:
+            parity = verifyTiledGemm(be, sh.name, T, sh.K, sh.N, fp4)
+          except CatchableError as e:
+            discard sessionRecoverQueue(be)
+            echo &"[prefill-gemm] tiled {kind} check failed: " & e.msg
+          gTiledGemmChecked[key] = parity.ok
+          echo &"[prefill-gemm] tiled {kind} {sh.K}x{sh.N} M={T}: " &
+            (if parity.ok: "parity passed" else: "rejected") &
+            &" (max-error={parity.maxError:.3g} tolerance={parity.tolerance:.3g})"
+          if not parity.ok:
+            allOk = false
+            break
+        pfAddIf("gemm.verify", verifyStart)
+      setTiled(allOk)
 
   var groupStart = getMonoTimeIfPf()
   for i, blk in m.blocks:
@@ -1184,7 +1220,8 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
         var hAttnState = al.hWork
         encodeVmKernel(transposeKns[key], hidden * lay.D, 64, 4,
           hAttnState, al.lay.offS, gDummyFor(be), gDummyFor(be), hLpState, 0)
-        copy(hLp, hAttnState, lay.zF, al.lay.offZ, hidden)
+        # The lane scan leaves zF as the initial state and writes z_T to zQ.
+        copy(hLp, hAttnState, if lpLanes[key]: lay.zQ else: lay.zF, al.lay.offZ, hidden)
         flushFine("lp.state")
         if blk.kind == bkMambaRealGated:
           encodeVmKernel(gateInKn, T * hidden, 64, 4, hGateIn, 0, gDummyFor(be), hMix, hAttnOut, 0)
