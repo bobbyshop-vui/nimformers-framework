@@ -1,7 +1,7 @@
 ## Resident R/P/G prefix: reuse device scratch and import terminal states by
 ## device-to-device copies. No host activations, transposed FP32 weights, or
 ## backward caches between layers. The caller owns state reset/recovery.
-import std/[tables, strformat, os, strutils, algorithm, times]
+import std/[tables, strformat, os, strutils, algorithm, times, math]
 import backend, nimformer, jamba_hybrid, mamba2_full_vm, mamba2_ssm_gpu
 import mamba2_fused_step, gpu_layers, fp4_gemv_gpu, session_vm, jit_vm
 import fp4_gemv_vm
@@ -28,6 +28,7 @@ var gPrefixAllocs, gPrefixHits: int
 var gPrefixMps, gPrefixTensorCore, gPrefixPackedTiles, gPrefixFusedEpilogues: int
 var gScanTuneCache = initTable[string, string]()
 var gF32MpsTuneCache = initTable[string, bool]()
+var gFp4TiledChecked = initTable[string, bool]()
 
 proc prefillExecutionStats*(): tuple[mps,tensorCore,packedTiles,fusedEpilogues:int] =
   (gPrefixMps,gPrefixTensorCore,gPrefixPackedTiles,gPrefixFusedEpilogues)
@@ -209,6 +210,110 @@ proc verifyScanStateLanes(ctx: Backend; L: M2Lay; tg, candidateLanes: int;
     if sessionOpen: discard sessionEnd(be)
     sessionFree(be, readback)
 
+proc laneScanTag(L: M2Lay): string = "@prefix_lanes_" & m2Tag(L)
+
+proc verifyLaneScan(ctx: Backend; L: M2Lay; arenaElems: int): tuple[ok: bool, maxError, tolerance: float32] =
+  ## One GPU run of the register lane scan against a host recurrence on a
+  ## spread of channels (both ends, head/group boundaries). It is cheap enough
+  ## to replace timing the serial/parallel kernels, which stream every state
+  ## through global memory and are always slower than this one.
+  let be = ctx.kind.toByby()
+  let prog = buildPrefixLaneScanProgram(L)
+  let tag = laneScanTag(L)
+  let kn = kernelNameFor(ctx, prog, tag)
+  let seed = scanProbeSeed(L, arenaElems)
+  let span = L.yPre + L.T * L.C - L.states   # compact: both state slots, then y
+  var probe = sessionUpload(be, seed)
+  var readback = sessionAllocScratch(be, span)
+  var sessionOpen = false
+  try:
+    for h in [probe, readback]:
+      require(if be == byby.gbVulkan: h.vulkanHandle.buf != nil else: h.metalHandle != nil,
+        "lane scan parity allocation failed")
+    require(sessionBegin(be), "lane scan parity sessionBegin failed")
+    sessionOpen = true
+    encodeMicroVm(ctx, prog, probe, L.HD * LaneScanWidth, laneScanTgBytes(L.T),
+      tag, LaneScanWidth, kn)
+    require(sessionCopyInto(be, probe, readback, L.states, 0, span),
+      "lane scan parity copy failed")
+    let ended = sessionEnd(be)
+    sessionOpen = false
+    require(ended, "lane scan parity sessionEnd failed: " & sessionGetLastError(be))
+    let got = sessionRead(be, readback, span)
+    if got.len < span: return (false, 1.0e30'f32, 0'f32)
+    var channels = @[0, 1, L.D - 1, L.D, L.HD div 2 + 3, L.HD - L.D, L.HD - 1]
+    for k in 1 .. 9: channels.add (k * 7919 + k * k * 131) mod L.HD
+    var maxAbs, maxValue = 0'f32
+    proc check(gpu, cpu: float32) =
+      if gpu != gpu or abs(gpu) > 1e20'f32:
+        maxAbs = 1.0e30'f32
+      else:
+        maxAbs = max(maxAbs, abs(gpu - cpu))
+        maxValue = max(maxValue, max(abs(gpu), abs(cpu)))
+    for hd in channels:
+      let h = hd div L.D
+      let g = h div (L.H div L.G)
+      let A = -exp(seed[L.aLog + h])
+      var s = newSeq[float32](L.N)
+      for n in 0 ..< L.N: s[n] = seed[L.states + hd * L.N + n]
+      for t in 0 ..< L.T:
+        let row = L.conv + t * L.cDim
+        let dt = seed[L.dt + t * L.H + h]
+        let dA = exp(dt * A)
+        let x = seed[row + hd]
+        var y = 0'f32
+        for n in 0 ..< L.N:
+          s[n] = s[n] * dA + dt * seed[row + L.C + g * L.N + n] * x
+          y += seed[row + L.C + L.GN + g * L.N + n] * s[n]
+        check(got[L.yPre - L.states + t * L.C + hd], y + seed[L.dSkip + h] * x)
+      for n in 0 ..< L.N:
+        check(got[hd * L.N + n], s[n])
+        check(got[L.HD * L.N + hd * L.N + n], s[n])
+    result.maxError = maxAbs
+    result.tolerance = max(2e-5'f32, maxValue * 1e-4'f32)
+    result.ok = maxAbs <= result.tolerance
+  finally:
+    if sessionOpen: discard sessionEnd(be)
+    sessionFree(be, readback)
+    sessionFree(be, probe)
+
+proc verifyTiledFp4Gemm(be: byby.GpuBackend; name: string; T, K, N: int): tuple[ok: bool, maxError, tolerance: float32] =
+  ## Real weights, synthetic activations: the tiled FP4 kernel against the
+  ## generic cooperative kernel. Both use FP16 inputs and FP32 accumulation,
+  ## so only summation order differs; an indexing bug is an O(1) error.
+  let c = gFp4CacheGpu[name]
+  var x = newSeq[float32](T * K)
+  for i in 0 ..< x.len: x[i] = sin(float32(i mod 1009) * 0.37'f32) * 0.5'f32
+  var hx = sessionUpload(be, x)
+  var tiled = sessionAllocScratch(be, T * N)
+  var generic = sessionAllocScratch(be, T * N)
+  var sessionOpen = false
+  try:
+    require(sessionBegin(be), "tiled GEMM parity sessionBegin failed")
+    sessionOpen = true
+    if not sessionFp4GemmTiledEnc(be, hx, c.wBuf, c.lutBuf, tiled, T, K, N) or
+        not sessionFp4GemmTensorCore(be, hx, c.wBuf, c.lutBuf, generic, T, K, N):
+      return (false, 0'f32, 0'f32)
+    let ended = sessionEnd(be)
+    sessionOpen = false
+    require(ended, "tiled GEMM parity sessionEnd failed: " & sessionGetLastError(be))
+    let a = sessionRead(be, tiled, T * N)
+    let b = sessionRead(be, generic, T * N)
+    if a.len < T * N or b.len < T * N: return (false, 1.0e30'f32, 0'f32)
+    var maxAbs, maxValue = 0'f32
+    for i in 0 ..< T * N:
+      if a[i] != a[i] or b[i] != b[i]: return (false, 1.0e30'f32, 0'f32)
+      maxAbs = max(maxAbs, abs(a[i] - b[i]))
+      maxValue = max(maxValue, max(abs(a[i]), abs(b[i])))
+    result.maxError = maxAbs
+    result.tolerance = max(1e-4'f32, maxValue * 1e-3'f32)
+    result.ok = maxValue > 0 and maxAbs <= result.tolerance
+  finally:
+    if sessionOpen: discard sessionEnd(be)
+    sessionFree(be, generic)
+    sessionFree(be, tiled)
+    sessionFree(be, hx)
+
 proc chooseScanMode*(ctx: Backend; T, H, D, N, G, K, C: int; eps: float32;
                      groups: int; continuation: bool): string =
   ## Compare the real GPU kernels once per backend/shape. The parallel probe
@@ -219,6 +324,24 @@ proc chooseScanMode*(ctx: Backend; T, H, D, N, G, K, C: int; eps: float32;
   let cacheKey = $be & "_" & $T & "_" & $H & "_" & $D & "_" & $N & "_" &
     $G & "_" & $K & "_" & $C & "_" & $groups & "_" & $continuation
   if cacheKey in gScanTuneCache: return gScanTuneCache[cacheKey]
+
+  if laneScanStates(N) > 0 and getEnv("BYBY_PREFILL_SCAN_LANES", "1") != "0":
+    let laneL = prefixLayout(1, T, H, D, N, G, K, C, eps, groups, compact = true)
+    let laneStart = getMonoTimeIfPf()
+    try:
+      let parity = verifyLaneScan(ctx, laneL, laneL.fwdEnd + laneL.cDim * (laneL.K - 1))
+      if parity.ok:
+        echo &"[prefill-scan] auto T={T}: lanes parity passed " &
+          &"(max-error={parity.maxError:.3g} tolerance={parity.tolerance:.3g}) -> lanes"
+        gScanTuneCache[cacheKey] = "lanes"
+        return "lanes"
+      echo &"[prefill-scan] auto T={T}: lanes rejected (max-error={parity.maxError:.3g} " &
+        &"tolerance={parity.tolerance:.3g}); benchmarking serial/parallel"
+    except CatchableError as e:
+      discard sessionRecoverQueue(be)
+      echo "[prefill-scan] lane scan check failed; benchmarking serial/parallel: " & e.msg
+    finally:
+      pfAddIf("scan.autotune", laneStart)
 
   result = "serial"
   let tg = m2ScanTgSize(T)
@@ -410,7 +533,7 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
     else:
       discard
   let requestedScan = getEnv("BYBY_PREFILL_SCAN","auto")
-  require(requestedScan in ["auto","serial","coalesced","parallel"], "invalid BYBY_PREFILL_SCAN")
+  require(requestedScan in ["auto","serial","coalesced","parallel","lanes"], "invalid BYBY_PREFILL_SCAN")
   let scanMode=if requestedScan=="auto":
       chooseScanMode(ctx,T,mr.numHeads,mr.headDim,mr.dState,mr.nGroups,
         mr.convKernel,mr.intermediateSize,mr.normEps,mr.nGroups,continuation)
@@ -420,6 +543,8 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
     if scanMode.startsWith("parallel_n"): parseInt(scanMode["parallel_n".len .. ^1])
     else: 1
   let coalesced = scanMode == "coalesced"
+  let lanes = scanMode == "lanes"
+  require(not lanes or laneScanStates(mr.dState) > 0, "lane scan needs dState = 32*k <= 256")
   let L = prefixLayout(1, T, mr.numHeads, mr.headDim, mr.dState,
     mr.nGroups, mr.convKernel, mr.intermediateSize, mr.normEps, mr.nGroups, compact = not parallel)
   let historyOff = L.fwdEnd
@@ -547,6 +672,9 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
       (buildPrefixParallelScanProgram(L,tg,continuation,parallelStateLanes),
         L.HD*tg*parallelStateLanes,tg*16*parallelStateLanes,tg*parallelStateLanes,
         "@prefix_parallel_v2_carry_" & m2Tag(L) & "_" & $continuation & "_n" & $parallelStateLanes)
+    elif lanes:
+      (buildPrefixLaneScanProgram(L),L.HD*LaneScanWidth,laneScanTgBytes(T),LaneScanWidth,
+        laneScanTag(L))
     else:
       (buildCompactPrefixScanProgram(L,coalesced),L.HD,4,0,
         "@prefix_compact_" & m2Tag(L) & "_coalesced" & $coalesced)
@@ -914,28 +1042,83 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
   # concurrently before the hot loop instead of on each first dispatch.
   if be == gbVulkan:
     var jobs: seq[tuple[name, source: string]]
+    # Kernel tables are keyed by linear name, so the same shape-named shader
+    # appears once per block; concurrent glslc runs of one name are wasted.
+    var queued = initTable[string, bool]()
     proc addProg(name: string; prog: VmProgram) =
-      if name.len > 0:
+      if name.len > 0 and name notin queued:
+        queued[name] = true
         jobs.add((name, jit_vm.lowerBytecodeToGlslCached(prog, name)))
     proc addNamed(name: string) =
-      if name.len == 0: return
+      if name.len == 0 or name in queued: return
       let src = jit_vm.cachedGlslSource(gJitV2, name)
-      if src.len > 0: jobs.add((name, src))
+      if src.len > 0:
+        queued[name] = true
+        jobs.add((name, src))
+    # FP4 and FP32 prefill GEMMs try the cooperative-matrix shaders first.
+    # When that route exists (T4: KHR_cooperative_matrix), the packed FP4
+    # tiles below are only a per-dispatch fallback, compiled lazily if used.
+    let coopGemm = byby.sessionCooperativeGemmEnabled(be) and
+      getEnv("BYBY_PREFILL_PREWARM_PACKED", "0") == "0"
+    for job in byby.sessionCooperativeGemmJobs(be):
+      if job.name notin queued:
+        queued[job.name] = true
+        jobs.add(job)
     addProg(historyKn, historyProg)
     for s, st in steps: addProg(stepNames[s], st.prog)
     for key, progs in lpPrograms:
       for s, st in progs: addProg(lpNames[key][s], st.prog)
     addProg(gateInKn, gateInput(hidden))
     addProg(gateMixKn, gateMix())
-    for _, kn in m8Kns: addNamed(kn)
-    for _, kn in m4Kns: addNamed(kn)
-    for _, kn in m8x2Kns: addNamed(kn)
-    for _, kn in m4x2Kns: addNamed(kn)
+    if not coopGemm:
+      for _, kn in m8Kns: addNamed(kn)
+      for _, kn in m4Kns: addNamed(kn)
+      for _, kn in m8x2Kns: addNamed(kn)
+      for _, kn in m4x2Kns: addNamed(kn)
     for _, kn in biasKns: addNamed(kn)
     for _, kn in loraKns: addNamed(kn)
     let prewarmStart = getMonoTimeIfPf()
     byby.sessionJitPrewarm(be, jobs)
     pfAddIf("vulkan.prewarm", prewarmStart)
+
+  # Tiled FP4 cooperative GEMM: check once per (K, N) against the generic
+  # cooperative kernel, then let sessionFp4GemmTensorCore prefer it.
+  if be == gbVulkan and T >= 8 and getEnv("BYBY_PREFILL_FP4_TILED", "1") != "0":
+    var shapes: seq[tuple[name: string, K, N: int]]
+    var seen = initTable[string, bool]()
+    for name, lin in gLinCache:
+      if not name.startsWith("block") or not lin.isFp4 or lin.K mod 64 != 0: continue
+      let key = $lin.K & "x" & $lin.N
+      if key notin seen:
+        seen[key] = true
+        shapes.add((name, lin.K, lin.N))
+    var allOk = shapes.len > 0
+    var pending = false
+    for sh in shapes:
+      let key = $sh.K & "x" & $sh.N
+      if key notin gFp4TiledChecked: pending = true
+      elif not gFp4TiledChecked[key]: allOk = false
+    if pending and allOk:
+      let verifyStart = getMonoTimeIfPf()
+      byby.sessionSetFp4GemmTiled(be, false)   # reference must be the generic kernel
+      for sh in shapes:
+        let key = $sh.K & "x" & $sh.N
+        if key in gFp4TiledChecked: continue
+        var parity: tuple[ok: bool, maxError, tolerance: float32]
+        try:
+          parity = verifyTiledFp4Gemm(be, sh.name, T, sh.K, sh.N)
+        except CatchableError as e:
+          discard sessionRecoverQueue(be)
+          echo "[prefill-gemm] tiled FP4 check failed: " & e.msg
+        gFp4TiledChecked[key] = parity.ok
+        echo &"[prefill-gemm] tiled FP4 {sh.K}x{sh.N} M={T}: " &
+          (if parity.ok: "parity passed" else: "rejected") &
+          &" (max-error={parity.maxError:.3g} tolerance={parity.tolerance:.3g})"
+        if not parity.ok:
+          allOk = false
+          break
+      pfAddIf("gemm.verify", verifyStart)
+    byby.sessionSetFp4GemmTiled(be, allOk)
 
   var groupStart = getMonoTimeIfPf()
   for i, blk in m.blocks:
