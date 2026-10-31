@@ -2616,7 +2616,7 @@ proc uploadAllResidentWeights*(m: var LlamaModelL, ctx: Backend) =
 
 
 proc sampleTopP(ctx: Backend, logits: seq[float32], temperature: float32 = 0.7'f32, topP: float32 = 0.9'f32,
-                 recentIds: openArray[int] = [], repeatPenalty: float32 = 1.3'f32,
+                 recentIds: openArray[int] = [], repeatPenalty: float32 = 1.0'f32,
                  noPenaltyIds: openArray[int] = []): int =
   # SỬA: thêm repetition penalty (kiểu llama.cpp) - không có cái này model
   # dễ rơi vào vòng lặp token kiểu "),),),),)" vì mỗi bước cứ chọn lại đúng
@@ -2633,6 +2633,9 @@ proc sampleTopP(ctx: Backend, logits: seq[float32], temperature: float32 = 0.7'f
   # (\n, space, tab) không nên bị coi là "lặp lại nội dung" như token
   # thường. Fix: nhận thêm noPenaltyIds (id của \n/space/tab/thụt lề lấy
   # từ tokenizer), bỏ qua các id này khi áp penalty.
+  # Default 1.0 (off, like current llama.cpp): code has to repeat n, fib,
+  # parentheses and keywords, and 1.3 over the last 64 ids pushed greedy
+  # decoding into "1== n", throwaway names a..h and runs of blank lines.
   var adjLogits = logits
   if repeatPenalty != 1.0'f32:
     for id in recentIds:
