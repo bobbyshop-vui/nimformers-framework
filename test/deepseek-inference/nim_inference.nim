@@ -3,6 +3,7 @@
 ## + tokenizer HF thuần Nim + vòng lặp sinh văn bản.
 
 import std/[math, random, sequtils, tables, algorithm, os, strformat, strutils, times, json, sets, heapqueue, terminal]
+when defined(posix): import std/posix
 import nimformers  # Tensor, Linear, newLinear, flatten2D, transpose, Embedding, addT...
 import native_hf_tokenizer
 export native_hf_tokenizer
@@ -2715,8 +2716,16 @@ proc sampleTopP(ctx: Backend, logits: seq[float32], temperature: float32 = 0.7'f
     if acc >= r: return idx[i]
   return idx[cutoff - 1]
 
+## Ctrl+C during generate() only sets gStopRequested: the loop ends after the
+## current token and prints the statistics. Leaving from the signal handler
+## instead ran exit procs while the main thread was inside the Vulkan driver
+## (SIGSEGV on Colab T4).
+var gStopRequested = false
+var gGenerating = false
+
 proc generate*(m: LlamaModelL, tok: HFTokenizer, ctx: Backend, promptIds: seq[int],
-               maxNewTokens: int = 128, temperature: float32 = 0.7'f32, topP: float32 = 0.9'f32): string =
+               maxNewTokens: int = 128, temperature: float32 = 0.7'f32, topP: float32 = 0.9'f32,
+               showProgress = true): string =
   echo "[inference] optimized paths: all-layers-session=" & $gMergeAllLayersSession &
     ", merged-QKV-attention=" & $gMergeQkvAttnSession &
     ", resident-KV=" & $(getEnv("BYBY_DISABLE_KV_RESIDENT", "0") != "1")
@@ -2763,8 +2772,12 @@ proc generate*(m: LlamaModelL, tok: HFTokenizer, ctx: Backend, promptIds: seq[in
   var tokenStream = initTokenStream(tok)
   stdout.write(tokenStream.pushTokens(promptIds))
   stdout.flushFile()
-  let liveProgress = getEnv("BYBY_PROGRESS", "auto") != "0" and
-                     isatty(stdout) and isatty(stderr) and getEnv("TERM", "") != "dumb"
+  # Colab's cell output keeps the text of ANSI cursor codes ("71;1H[...]8"),
+  # so the pinned tok/s line is off there unless BYBY_PROGRESS=1 forces it.
+  let progressEnv = getEnv("BYBY_PROGRESS", "auto")
+  let liveProgress = showProgress and progressEnv != "0" and
+                     isatty(stdout) and isatty(stderr) and getEnv("TERM", "") != "dumb" and
+                     (progressEnv == "1" or not existsEnv("COLAB_RELEASE_TAG"))
 
   # ---- ĐO TOK/S: tách riêng prefill (xử lý cả prompt 1 lần, số liệu
   # "prompt tokens/s") và decode (sinh từng token 1, số liệu "tok/s" thật sự
@@ -2803,8 +2816,9 @@ proc generate*(m: LlamaModelL, tok: HFTokenizer, ctx: Backend, promptIds: seq[in
     stdout.write(tokenStream.pushTokens(@[nextId]))
     stdout.flushFile()
 
+  gGenerating = true
   while generated < maxNewTokens:
-    if nextId == tok.eosId: break
+    if nextId == tok.eosId or gStopRequested: break
 
     let stepStart = epochTime()
     let stepLogits = m.forwardStep(@[nextId], ctx, cache, isPrefill = false)
@@ -2824,9 +2838,12 @@ proc generate*(m: LlamaModelL, tok: HFTokenizer, ctx: Backend, promptIds: seq[in
     if nextId == tok.eosId: break
     stdout.write(tokenStream.pushTokens(@[nextId]))
     stdout.flushFile()
+  gGenerating = false
   stdout.write(tokenStream.pushTokens([], final = true))
   stdout.flushFile()
   let decodeTime = epochTime() - decodeStart
+  if gStopRequested:
+    stderr.write("\n[Đã dừng - Ctrl+C]\n")
   let decodedCount = generated - 1   # không tính token đầu (sinh trong lúc prefill)
   stdout.write("\n")
   stderr.write("\n== Thống kê tốc độ ==\n")
@@ -2857,12 +2874,20 @@ when isMainModule:
   # nhau: cái trước là TA tự đè lên nhau, cái này là RUNTIME NIM tự in
   # không xuống dòng. Fix: tự đăng ký hook riêng - luôn xuống dòng + flush
   # stdout xong mới in thông báo ngắt, để không bao giờ dính chữ.
+  # During generate() the first Ctrl+C only asks the loop to stop (see
+  # gStopRequested). Otherwise, and on a second Ctrl+C, the process leaves
+  # through _exit: quit() ran exit procs and driver teardown on the signal
+  # handler while the main thread was still inside a Vulkan call (SIGSEGV).
   proc onCtrlC() {.noconv.} =
-    stdout.write("\n")
-    stdout.flushFile()
-    stderr.write("\n[Đã dừng - Ctrl+C]\n")
-    stderr.flushFile()
-    quit(130)  # quy ước exit code chuẩn shell cho lệnh bị SIGINT (128+2)
+    if gGenerating and not gStopRequested:
+      gStopRequested = true
+      return
+    const msg = "\n[Đã dừng - Ctrl+C]\n"
+    when defined(posix):
+      discard posix.write(2, cstring(msg), msg.len)
+      exitnow(130)   # 128 + SIGINT, without exit procs
+    else:
+      quit(130)
   setControlCHook(onCtrlC)
 
   setForbidCpuFallback(true)
@@ -2870,7 +2895,20 @@ when isMainModule:
   # ── Đối số dòng lệnh (đều có mặc định = giá trị cũ trước đây,
   #    không set gì thì hành vi y hệt bản gốc) ──
   #   ./nim_inference [modelPath] [nimqPath] [backend] [prompt] [maxNewTokens] [temperature] [topP] [systemText]
-  let args = commandLineParams()
+  # Options may appear anywhere among them:
+  #   --no-progress   no pinned "[N/M tok | tok/s | ms/tok]" line (same as
+  #                   BYBY_PROGRESS=0); the summary at the end is still printed
+  var args: seq[string]
+  var showProgress = true
+  for a in commandLineParams():
+    case a
+    of "--no-progress", "--no-tok-s": showProgress = false
+    of "--progress": showProgress = true
+    else:
+      if a.startsWith("--"):
+        stderr.writeLine "[nim_inference] unknown option: " & a
+        quit(2)
+      args.add a
   proc argOr(i: int, default: string): string =
     if args.len > i and args[i].len > 0: args[i] else: default
 
@@ -2914,4 +2952,4 @@ when isMainModule:
   # template thật của model -> dùng applyChatTemplate (tokenizer_config.json
   # của chính model) để token hoá đúng định dạng nó được train.
   discard generate(model, tok, ctx, promptIds, maxNewTokens = maxNewTokens,
-                    temperature = temperature, topP = topP)
+                    temperature = temperature, topP = topP, showProgress = showProgress)
