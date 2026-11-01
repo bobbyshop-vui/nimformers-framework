@@ -36,6 +36,11 @@ cấp chọn backend, tensor sở hữu bộ nhớ, kernel toán/neural network,
 lượng tử hóa int8/int4/fp8/fp4/CustomFloat, state dict NIMQ, tạo/dispatch
 bytecode micro-VM, resident weights, tokenizer và inference Llama.
 
+Backend `cpu` chạy cùng API, session, resident weights và micro-kernel mà
+không cần GPU. Nó dùng kernel SSE4/AVX2/AVX-512/NEON chọn lúc chạy, chính
+sách SSE cho op nhỏ (tránh hạ xung AVX) và chia block matmul theo L3; xem
+[`docs/cpu-backend.vi.md`](docs/cpu-backend.vi.md).
+
 Build và chạy test Python:
 
 ```sh
@@ -62,6 +67,15 @@ Compiler BybyLang vendored cũng có thể import cùng ABI:
 
 ```sh
 make bybylang-test     # test/bybylang_test/*.bybylang
+```
+
+Đo GFLOPS matmul FP32 trên CPU, Metal và Vulkan:
+
+```sh
+python3 benchmarks/bench_gflops.py --backends cpu,metal,vulkan
+
+# chế độ tile 8096^3 (tránh watchdog iGPU với một dispatch quá lớn)
+python3 benchmarks/bench_gflops.py --gpu-8096
 ```
 
 
@@ -96,6 +110,18 @@ Các repository chứa file model dùng bởi target inference:
 | [DeepSeek Coder 6.7B NimQ](https://huggingface.co/bobbydeveloper2014/deepseek-coder-6.7b-nimq) | `model.nimq`, `config.json` và tokenizer cho `test/deepseek-inference/nim_inference.nim` | `infer-deepseek`, `formers` |
 | [Codestral v0.1 7B NimQ](https://huggingface.co/bobbydeveloper2014/codestral-v0.1-7b-nimq) | trọng số base Codestral, config và tokenizer Tekken/HF | base của `infer-lora`, `formers` |
 | [Codestral v0.1 QLoRA LinearAttention](https://huggingface.co/bobbydeveloper2014/codestral-v0.1-nimq-qlora-linearattention) | checkpoint adapter `jamba_parallel_lora.bin`, dùng base Codestral NimQ trên | adapter của `infer-lora`, `formers` |
+
+
+### Benchmark inference
+
+Tok/s prefill và decode của từng model trên Colab Tesla T4 (Vulkan) và
+MacBook Pro Intel Iris Plus 640 (Metal và Vulkan/MoltenVK), kèm máy test và
+lệnh đã chạy:
+
+| Model | Benchmark |
+| --- | --- |
+| DeepSeek Coder 6.7B (`nim_inference`) | [`test/deepseek-inference/benchmark.md`](test/deepseek-inference/benchmark.md) |
+| Codestral Mamba + QLoRA (`infer_lora`) | [`test/codestral/benchmark.md`](test/codestral/benchmark.md) |
 
 
 ### Tải model
@@ -144,6 +170,9 @@ tiếp vocabulary BPE byte-level, merge, added token và chat template
 DeepSeek cục bộ. Không cần Nimpy, Transformers hay gói tokenizer Python.
 Build riêng bằng `make build-nim-inference`.
 
+Thêm `--no-progress` để ẩn dòng tok/s trực tiếp. Tốc độ:
+[`test/deepseek-inference/benchmark.md`](test/deepseek-inference/benchmark.md).
+
 
 ### Chạy Codestral với adapter QLoRA
 
@@ -153,8 +182,15 @@ sidecar tokenizer mặc định. Chạy từ thư mục gốc:
 
 ```sh
 make infer-lora \
-  ARGS='test/codestral/models/jamba_parallel_lora.bin "[INST] Write a Python function for Fibonacci.[/INST]" 0.7 test/codestral/models/hf test/codestral/models/codestral_mamba_only.nimq'
+  ARGS='test/codestral/models/jamba_parallel_lora.bin "Write a Python function to check if a string is a palindrome" 0.7 test/codestral/models/hf test/codestral/models/codestral_mamba_only.nimq'
 ```
+
+Prompt mặc định được bọc trong template instruct Mistral v3:
+`Write a Python function to check if a string is a palindrome` được gửi thành
+`[INST] Write a Python function to check if a string is a palindrome[/INST]`
+(đúng định dạng adapter đã train). Prompt đã bắt đầu bằng `[INST]` được gửi
+nguyên văn; `BYBY_RAW_PROMPT=1` tắt việc bọc. Không truyền prompt thì dùng
+prompt palindrome này.
 
 `infer-lora` nhận `<checkpoint.bin> <prompt> <temperature> [hfDir]
 [nimqPath]`. Metadata binary chọn base `.nimq`; sidecar trỏ thư mục
@@ -163,6 +199,127 @@ tokenizer model. Hai đối số cuối cấu hình nhánh base-Mamba fallback.
 macOS và hệ khác. Theo loại thiết bị, dGPU dùng VRAM device-local, iGPU
 dùng host-visible/shared memory. Ghi đè backend bằng
 `make infer-lora BYBY_INFER_BACKEND=metal` hoặc `BYBY_INFER_BACKEND=vulkan`.
+
+Tốc độ: [`test/codestral/benchmark.md`](test/codestral/benchmark.md).
+
+#### Flag inference (`infer_lora`)
+
+Mọi flag là biến môi trường, đặt trên dòng `make infer-lora` hoặc trước binary
+(`BYBY_INFER_BACKEND=vulkan ./test/codestral/infer_lora_bin ...`). Giá trị đặt
+tay luôn thắng mặc định. Chi tiết các nhánh prefill:
+[`test/codestral/INFERENCE.md`](test/codestral/INFERENCE.md).
+
+Prompt, sampling và output:
+
+| Flag | Mặc định | Ý nghĩa |
+| --- | --- | --- |
+| `BYBY_RAW_PROMPT` | `0` | `1` gửi prompt nguyên văn, không bọc `[INST] ...[/INST]` |
+| `BYBY_KEEP_TRAILING_WS` | `0` | `1` giữ khoảng trắng cuối prompt (mặc định bị cắt: nó tạo token `▁` lẻ) |
+| `BYBY_MAX_NEW_TOKENS` | `60` | số token sinh |
+| `BYBY_TOP_P` | `0.9` | nucleus sampling |
+| `BYBY_MIN_P` | `0.05` | min-p sampling |
+| `BYBY_REPEAT_PENALTY` | `1.1` | phạt lặp |
+| `BYBY_REPEAT_WINDOW` | `64` | số token phạt lặp nhìn lại |
+| `BYBY_ALLOW_SPECIAL` | `0` | `1` cho sampler chọn token điều khiển/đặc biệt |
+| `BYBY_PROGRESS` | `auto` | `0` tắt dòng tok/s trực tiếp (chỉ bật khi stdout/stderr là TTY) |
+| `BYBY_MACOS_HIGH_PRIORITY` | `1` | macOS: chạy thread inference ở QoS user-interactive; `0` giữ QoS kế thừa |
+
+Backend và bộ nhớ:
+
+| Flag | Mặc định | Ý nghĩa |
+| --- | --- | --- |
+| `BYBY_INFER_BACKEND` | `auto` | `auto`, `metal`, `vulkan` |
+| `BYBY_MODEL_MMAP` | `1` | map `.nimq` thay vì đọc vào RAM (merge in-place cần) |
+| `BYBY_MERGE_LORA` | `inplace` | merge LoRA vào trọng số FP4 trên GPU; `1` = `inplace`, `0` giữ adapter tách rời |
+| `BYBY_MERGE_LORA_TRY_FP4` | `0` | `1` cho merge có guard thử lượng tử lại về 4-bit (chỉ giữ khi sai số delta RMS ≤ 0,1%) |
+| `BYBY_MERGE_SCRATCH_MIB` | `64` | scratch GPU của merge in-place (tối đa 64) |
+| `BYBY_MEMORY_LIMIT_MB` | `7000` | ngưỡng RSS tiến trình của merge in-place |
+| `BYBY_KEEP_ZERO_LORA` | `0` | `1` giữ adapter toàn số 0 (mặc định bỏ: delta đúng bằng 0) |
+| `BYBY_APPLY_LMHEAD_LORA` | tắt | `1` áp adapter LoRA lên `lm_head` |
+| `BYBY_ONE_DISPATCH` | `0` | `1` chạy decode bằng một mega-kernel thường trú (thử nghiệm Metal) |
+| `BYBY_OD_TG` | `16` | số threadgroup của kernel one-dispatch (phải cùng thường trú) |
+| `BYBY_MVM_MAX_SCRATCH_MB` | tự động | Metal: giới hạn một buffer scratch micro-VM |
+| `BYBY_VM_GROUPS` | `1` | `0` upload/đọc từng nhóm micro-VM riêng (nhánh cũ) |
+| `BYBY_RMS_TG` | `256` | kích thước threadgroup của kernel RMSNorm |
+| `BYBY_METAL_JIT_ARCHIVE` | `~/Library/Caches/nimformers/metal-jit.binarchive` | binary archive pipeline Metal |
+| `BYBY_VULKAN_DEVICE` | GPU tốt nhất (dGPU, NVIDIA trước) | chỉ số thiết bị Vulkan |
+| `BYBY_VULKAN_DEVICE_LOCAL` | `auto` | trọng số trong VRAM trên dGPU (`auto`/`1`), `0` để host-visible; iGPU luôn dùng bộ nhớ chung |
+| `BYBY_VULKAN_SCRATCH` | `auto` | buffer scratch: `auto` (VRAM trên dGPU), `device`, `host` |
+| `BYBY_VULKAN_MMAP_IMPORT` | `1` | iGPU: import trọng số đã mmap không copy (`VK_EXT_external_memory_host`) |
+| `BYBY_VULKAN_POOL_MB` | `2048` | giới hạn buffer Vulkan trong pool |
+| `BYBY_VULKAN_TENSOR_CORES` | `1` | `0` tắt `KHR_cooperative_matrix` (tensor core FP16/FP8) |
+| `BYBY_VULKAN_SPLIT_K` | `auto` | số lát split-K của GEMM tensor core (`1` = tắt) |
+| `BYBY_VULKAN_MAX_TG` | max của thiết bị (≤1024) | giới hạn kích thước workgroup Vulkan |
+| `BYBY_VULKAN_JIT_DIR` | thư mục tạm | thư mục cache SPIR-V (trỏ vào nơi lưu lâu dài) |
+| `BYBY_VULKAN_DISPATCH_CACHE` | `1` | `0` biên dịch lại shader mỗi dispatch (chẩn đoán) |
+| `BYBY_VULKAN_STRICT` | `0` | `1` báo lỗi khi offset buffer vượt phạm vi thay vì kẹp lại |
+
+Prefill:
+
+| Flag | Mặc định | Ý nghĩa |
+| --- | --- | --- |
+| `BYBY_PREFILL_RESIDENT` | `1` | prefill thường trú trên GPU (mọi layer trên GPU, state chuyển GPU sang GPU) |
+| `BYBY_PREFILL_PARALLEL` | `1` | `0` tắt prefill song song theo chuỗi (từng token một) |
+| `BYBY_PREFILL_PAR_MIN_T` | `2` (resident), `32` | prompt ngắn nhất đi prefill song song |
+| `BYBY_PREFILL_BATCH_SIZE` | `128` | số token prompt mỗi chunk prefill (`2..128`) |
+| `BYBY_PREFILL_LAYERS_PER_COMMIT` | `8` Vulkan, `4` Metal | số layer mỗi command buffer |
+| `BYBY_SSD` | `auto` | scan Mamba2 bằng pass SSD/FLA theo chunk: tensor core, không có thì tile FP32; `scalar` bỏ tensor core, `0` dùng kernel scan (Vulkan) |
+| `BYBY_SSD_CHUNK` | `64` | độ dài chunk SSD (lũy thừa 2, 16..256) |
+| `BYBY_SSD_MIN_T` | `0` | prompt ngắn hơn giá trị này dùng scan thay vì SSD |
+| `BYBY_SSD_STATE_MB` | `1024` | giới hạn scratch state các chunk SSD; chunk tăng gấp đôi đến khi vừa |
+| `BYBY_PREFILL_SCAN` | `auto` | nhánh scan khi tắt SSD: `auto` (đo rồi chọn), `serial`, `parallel`, `lanes`, `coalesced` |
+| `BYBY_PREFILL_SCAN_LANES` | `1` | `0` bỏ lane scan dùng thanh ghi khỏi ứng viên của `auto` |
+| `BYBY_PREFILL_SCAN_AUTOTUNE_MAX_MIB` | `512` | arena thử lớn nhất mà autotune scan cấp phát |
+| `BYBY_MAMBA_SCAN_PARALLEL` | `1` Metal, `0` Vulkan | scan song song ở nhánh không thường trú |
+| `BYBY_LP_SCAN_SERIAL` | tắt | `1` ép scan Linear++ tuần tự |
+| `BYBY_PREFILL_LP_LANES` | `1` | `0` tắt lane scan Linear++ |
+| `BYBY_PREFILL_GEMM` | `auto` | `auto`, `m8` (tile FP4 đóng gói), `mps` (FP32 giải nén + MPS, Apple Silicon) |
+| `BYBY_PREFILL_MPS` | `1` | `0` không bao giờ xét MPS |
+| `BYBY_PREFILL_FP4_KERNEL` | `auto` | `m4` ép tile FP4 4 hàng |
+| `BYBY_PREFILL_2COL` | `1` | `0` chọn tile FP4 một cột |
+| `BYBY_PREFILL_TAIL4` | `1` | `0` đệm các hàng cuối lên 8 thay vì tile đuôi 4 hàng |
+| `BYBY_PREFILL_UNROLL` | `2` | `1` nạp một word trọng số mỗi vòng trong tile FP4 |
+| `BYBY_FP4_PAD_M` | `1` | `0` tắt đệm số hàng lẻ lên tile FP4 |
+| `BYBY_PREFILL_FP4_TILED`, `BYBY_PREFILL_FP32_TILED` | `1` | `0` bỏ GEMM tensor core dạng tile (được kiểm parity trước) |
+| `BYBY_PREFILL_PREWARM_PACKED` | `0` | `1` biên dịch sẵn cả tile FP4 đóng gói khi dùng tensor core |
+| `BYBY_PREFILL_LORA_DOWN` | `1` | `0` tắt kernel fuse phép chiếu xuống LoRA |
+| `BYBY_PREFILL_SPARSE` | `1` | `0` tắt prefill sparse trong hybrid block |
+| `BYBY_PREFILL_KEEP_SCRATCH` | `0` | `1` giữ arena prefill sau prefill (thử nghiệm throughput) |
+| `BYBY_SCAN_NCHUNK` | `16` | số command buffer chia scan backward (tránh watchdog) |
+
+Decode và tuning:
+
+| Flag | Mặc định | Ý nghĩa |
+| --- | --- | --- |
+| `BYBY_GEMV_TG` | `auto` | độ rộng threadgroup GEMV (`auto` = đã tune, `max` hoặc một số) |
+| `BYBY_GEMV_VARIANT` | `auto` | `0` 2 hàng, `1` nạp 32-bit, `2` 4 hàng mỗi threadgroup |
+| `BYBY_GPU_AUTOTUNE` | `1` | `0` bỏ tune kernel FP4 (khởi động lạnh nhanh hơn) |
+| `BYBY_NORM_PRESET` | theo checkpoint | preset gated-RMSNorm (mặc định `rms-fin-gn`) |
+| `BYBY_NORM_AUTO` | `1` | `0` bỏ qua preset do norm sweep gợi ý |
+| `BYBY_MAMBA_NORM_GROUPS` | `n_groups` của model | số nhóm gated-RMSNorm (`1` = kiểu cũ full width) |
+
+Chẩn đoán (chậm hơn, không phải nhánh nhanh):
+
+| Flag | Mặc định | Ý nghĩa |
+| --- | --- | --- |
+| `BYBY_PREFILL_PROFILE` | `1` | thời gian từng giai đoạn prefill |
+| `BYBY_PREFILL_DIAG` | `0` | `1` commit sau mỗi giai đoạn prefill (thời gian GPU thật mỗi giai đoạn), `2`/`3` chi tiết hơn |
+| `BYBY_DECODE_PROFILE` | `0` | thời gian decode mỗi token |
+| `BYBY_DECODE_SPLIT` | `0` | chia mỗi token thành nhiều command buffer để đo từng phần |
+| `BYBY_DEBUG_SAMPLING` | `0` | log trạng thái sampler; `BYBY_DEBUG_SAMPLING_ALL=1` mọi bước, `BYBY_DEBUG_SAMPLING_STEPS` (5) N bước đầu |
+| `BYBY_DEBUG_TOP5` | `0` | log top-5 logit |
+| `BYBY_TRACE_TOKENS` | `0` | trace N token sinh đầu tiên |
+| `BYBY_TRACE_BLOCKS` | `0` | trace activation từng block |
+| `BYBY_DUMP_LOGITS` | tắt | đường dẫn file để dump logit |
+| `BYBY_G_DIAGNOSTICS` | `0` | thống kê các block G (gated) |
+| `BYBY_OD_CHECK`, `BYBY_OD_VERBOSE` | `0` | kiểm lỗi và log của one-dispatch |
+| `BYBY_LPCHECK` | `0` | so kernel bước Linear++ với công thức đóng |
+| `BYBY_NORM_SWEEP` | `0` | chia đôi tìm preset norm (`BYBY_NORM_SWEEP_LIST`, `BYBY_NORM_SWEEP_TOKENS` = 12) |
+| `BYBY_INFER_VERBOSE` | tắt | thêm log inference |
+| `BYBY_LORA_VERBOSE` | `0` | log adapter thiếu trên GPU |
+| `BYBY_JIT_DUMP_SOURCE` | `0` | in mã nguồn kernel sinh ra |
+| `BYBY_VULKAN_JIT_VERBOSE` | `0` | log mỗi lần biên dịch shader Vulkan |
+| `BYBY_VULKAN_SPLIT_K_VERBOSE` | `0` | log lựa chọn split-K |
 
 
 ### Chạy DeepSeek hoặc Codestral bằng formers.n (`formers-cli`)
