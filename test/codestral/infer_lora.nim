@@ -1762,7 +1762,13 @@ when isMainModule:
   #
   # Without the space the prompt ends at "]" and the model generates "▁Hello" itself -
   # EXACTLY matching training.
-  var prompt = if args.len >= 2: args[1] else: "[INST] Xin chao[/INST]"
+  var prompt = if args.len >= 2: args[1]
+               else: "Write a Python function to check if a string is a palindrome"
+  # Codestral is a Mistral v3 instruct model: a plain prompt is wrapped as
+  # "[INST] prompt[/INST]" (the training format). A prompt that already starts
+  # with "[INST]" is kept as is; BYBY_RAW_PROMPT=1 disables the wrapping.
+  if getEnv("BYBY_RAW_PROMPT", "0") != "1" and not prompt.strip().startsWith("[INST]"):
+    prompt = "[INST] " & prompt.strip() & "[/INST]"
   if prompt.len > 0 and prompt[^1] in {' ', '\t', '\n'}:
     let trimmed = prompt.strip(leading = false, trailing = true)
     stderr.writeLine "[infer] WARNING: the prompt ends with whitespace -> " &

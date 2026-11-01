@@ -8,7 +8,9 @@ có ABI C ổn định: `libnimformers.dylib`, `libnimformers.so` hoặc
 `nimformers.dll`. Package Python `nimformers/` là lớp `ctypes`/NumPy mỏng
 trên ABI đó. Các symbol cũng dùng được từ C, C++, Rust, Go hoặc FFI gọi C.
 
-Phiên bản ABI là **2**, được trả bởi `nimf_abi_version()`.
+Phiên bản ABI là **2**, được trả bởi `nimf_abi_version()`. Lựa chọn backend
+có cả `"cpu"`, backend SIMD chọn lúc chạy (SSE4/AVX2/AVX-512/NEON) không cần
+GPU; xem [Backend CPU](cpu-backend.vi.md).
 
 Xem [hướng dẫn Python](python-guide.vi.md) cho cài đặt, ví dụ hoàn chỉnh, xem
 checkpoint và xử lý lỗi. [Hướng dẫn lệnh Make](make-commands.vi.md) mô tả input
@@ -62,7 +64,7 @@ Loader Python tìm theo thứ tự:
 import numpy as np
 from nimformers import Context
 
-with Context() as ctx:                     # auto -> Metal or Vulkan
+with Context() as ctx:                     # auto -> Metal/Vulkan, hoặc CPU nếu không có GPU
     a = np.random.randn(4, 8).astype(np.float32)
     b = np.random.randn(8, 16).astype(np.float32)
 
@@ -75,13 +77,14 @@ with Context() as ctx:                     # auto -> Metal or Vulkan
 ```
 
 `Context` có alias `Nimformers` và `nimformers.capi.Nimformers` để tương
-thích wrapper ban đầu.
+thích wrapper ban đầu. `nimformers.cpu_info()` báo ISA/tính năng/tile cache
+CPU dò được mà không cần tạo context.
 
 ## Context
 
 | Thành phần | Ý nghĩa |
 | --- | --- |
-| `Context(backend="auto", library=None, forbid_cpu_fallback=None)` | Tạo context; backend: `auto`, `metal`, `vulkan`, `cuda`/`opencl` (alias Vulkan cũ). |
+| `Context(backend="auto", library=None, forbid_cpu_fallback=None)` | Tạo context; backend: `auto`, `metal`, `vulkan`, `cpu`, `cuda`/`opencl` (alias Vulkan cũ). |
 | `ctx.backend` / `ctx.backend_id` | Tên và ID backend. |
 | `ctx.abi_version`, `ctx.version` | Phiên bản ABI và thư viện. |
 | `ctx.sync()` | Đồng bộ thiết bị theo mức backend hỗ trợ. |

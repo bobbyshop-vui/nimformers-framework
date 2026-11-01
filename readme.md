@@ -166,12 +166,138 @@ The adapter file does not contain the base Mamba weights. `infer_lora` reads the
 
 ```sh
 make infer-lora \
-  ARGS='test/codestral/models/jamba_parallel_lora.bin "[INST] Write a Python function for Fibonacci.[/INST]" 0.7 test/codestral/models/hf test/codestral/models/codestral_mamba_only.nimq'
+  ARGS='test/codestral/models/jamba_parallel_lora.bin "Write a Python function to check if a string is a palindrome" 0.7 test/codestral/models/hf test/codestral/models/codestral_mamba_only.nimq'
 ```
+
+The prompt is wrapped in the Mistral v3 instruct template by default:
+`Write a Python function to check if a string is a palindrome` is sent as
+`[INST] Write a Python function to check if a string is a palindrome[/INST]`
+(the format the adapter was trained on). A prompt that already starts with
+`[INST]` is sent unchanged; `BYBY_RAW_PROMPT=1` turns the wrapping off. Without
+a prompt argument, that palindrome prompt is the default.
 
 `infer-lora` accepts `<checkpoint.bin> <prompt> <temperature> [hfDir] [nimqPath]`. The binary metadata selects the base `.nimq`; the sidecar points the tokenizer loader at the current base-model directory. The last two CLI arguments configure the base-Mamba fallback path. `infer-mamba` is an alias for `infer-lora`. `make infer-lora` defaults to `auto`, preserving automatic backend selection on macOS and other platforms. It checks the selected device type: dGPU weights go to device-local VRAM; iGPU weights use host-visible/shared memory. To override the backend explicitly, use `make infer-lora BYBY_INFER_BACKEND=metal` or `make infer-lora BYBY_INFER_BACKEND=vulkan`.
 
 Speeds: [`test/codestral/benchmark.md`](test/codestral/benchmark.md).
+
+#### Inference flags (`infer_lora`)
+
+Every flag is an environment variable, set on the `make infer-lora` line or
+before the binary (`BYBY_INFER_BACKEND=vulkan ./test/codestral/infer_lora_bin ...`).
+An explicit value always wins over the default. Background on the prefill
+routes: [`test/codestral/INFERENCE.md`](test/codestral/INFERENCE.md).
+
+Prompt, sampling and output:
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `BYBY_RAW_PROMPT` | `0` | `1` sends the prompt as is, without the `[INST] ...[/INST]` template |
+| `BYBY_KEEP_TRAILING_WS` | `0` | `1` keeps trailing whitespace of the prompt (otherwise stripped: it would add a lone `▁` token) |
+| `BYBY_MAX_NEW_TOKENS` | `60` | tokens to generate |
+| `BYBY_TOP_P` | `0.9` | nucleus sampling |
+| `BYBY_MIN_P` | `0.05` | min-p sampling |
+| `BYBY_REPEAT_PENALTY` | `1.1` | repetition penalty |
+| `BYBY_REPEAT_WINDOW` | `64` | tokens the repetition penalty looks back over |
+| `BYBY_ALLOW_SPECIAL` | `0` | `1` lets the sampler pick control/special tokens |
+| `BYBY_PROGRESS` | `auto` | `0` turns off the live tok/s line (on only when stdout/stderr are a TTY) |
+| `BYBY_MACOS_HIGH_PRIORITY` | `1` | macOS: run the inference thread at user-interactive QoS; `0` keeps the inherited QoS |
+
+Backend and memory:
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `BYBY_INFER_BACKEND` | `auto` | `auto`, `metal`, `vulkan` |
+| `BYBY_MODEL_MMAP` | `1` | map the `.nimq` instead of reading it into RAM (needed by the in-place merge) |
+| `BYBY_MERGE_LORA` | `inplace` | merge LoRA into the FP4 weights on the GPU; `1` = `inplace`, `0` keeps separate adapters |
+| `BYBY_MERGE_LORA_TRY_FP4` | `0` | `1` lets the guarded merge try requantizing into 4-bit (kept only within 0.1% RMS delta error) |
+| `BYBY_MERGE_SCRATCH_MIB` | `64` | GPU scratch of the in-place merge (at most 64) |
+| `BYBY_MEMORY_LIMIT_MB` | `7000` | process RSS guard of the in-place merge |
+| `BYBY_KEEP_ZERO_LORA` | `0` | `1` keeps all-zero adapters (dropped by default: exact zero delta) |
+| `BYBY_APPLY_LMHEAD_LORA` | off | `1` applies a LoRA adapter on `lm_head` |
+| `BYBY_ONE_DISPATCH` | `0` | `1` runs decode as one persistent mega-kernel (Metal experiment) |
+| `BYBY_OD_TG` | `16` | threadgroups of the one-dispatch kernel (must all be resident) |
+| `BYBY_MVM_MAX_SCRATCH_MB` | auto | Metal: cap on one micro-VM scratch buffer |
+| `BYBY_VM_GROUPS` | `1` | `0` uploads/reads each micro-VM group separately (old path) |
+| `BYBY_RMS_TG` | `256` | threadgroup size of the RMSNorm kernels |
+| `BYBY_METAL_JIT_ARCHIVE` | `~/Library/Caches/nimformers/metal-jit.binarchive` | Metal pipeline binary archive |
+| `BYBY_VULKAN_DEVICE` | best GPU (dGPU, NVIDIA first) | Vulkan device index |
+| `BYBY_VULKAN_DEVICE_LOCAL` | `auto` | weights in VRAM on a dGPU (`auto`/`1`), `0` keeps them host-visible; an iGPU always uses shared memory |
+| `BYBY_VULKAN_SCRATCH` | `auto` | scratch buffers: `auto` (VRAM on a dGPU), `device`, `host` |
+| `BYBY_VULKAN_MMAP_IMPORT` | `1` | iGPU: import the mmap'ed weights zero-copy (`VK_EXT_external_memory_host`) |
+| `BYBY_VULKAN_POOL_MB` | `2048` | cap on the pooled Vulkan buffers |
+| `BYBY_VULKAN_TENSOR_CORES` | `1` | `0` disables `KHR_cooperative_matrix` (FP16/FP8 tensor cores) |
+| `BYBY_VULKAN_SPLIT_K` | `auto` | split-K slices of the tensor-core GEMM (`1` = off) |
+| `BYBY_VULKAN_MAX_TG` | device max (≤1024) | cap on Vulkan workgroup size |
+| `BYBY_VULKAN_JIT_DIR` | temp dir | SPIR-V cache directory (point it at persistent storage) |
+| `BYBY_VULKAN_DISPATCH_CACHE` | `1` | `0` recompiles shaders on every dispatch (diagnostics) |
+| `BYBY_VULKAN_STRICT` | `0` | `1` fails on an out-of-range buffer offset instead of clamping |
+
+Prefill:
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `BYBY_PREFILL_RESIDENT` | `1` | the GPU-resident prefill (all layers on the GPU, states carried GPU-to-GPU) |
+| `BYBY_PREFILL_PARALLEL` | `1` | `0` disables the sequence-parallel prefill (token by token) |
+| `BYBY_PREFILL_PAR_MIN_T` | `2` (resident), `32` | shortest prompt that takes the parallel prefill |
+| `BYBY_PREFILL_BATCH_SIZE` | `128` | prompt tokens per prefill chunk (`2..128`) |
+| `BYBY_PREFILL_LAYERS_PER_COMMIT` | `8` Vulkan, `4` Metal | layers per command buffer |
+| `BYBY_SSD` | `auto` | Mamba2 scan as the chunked SSD/FLA pass: tensor cores, else FP32 tiles; `scalar` skips tensor cores, `0` uses the scan kernels (Vulkan) |
+| `BYBY_SSD_CHUNK` | `64` | SSD chunk length (power of two, 16..256) |
+| `BYBY_SSD_MIN_T` | `0` | prompts shorter than this use the scan instead of SSD |
+| `BYBY_SSD_STATE_MB` | `1024` | cap on the SSD chunk-state scratch; the chunk doubles until it fits |
+| `BYBY_PREFILL_SCAN` | `auto` | scan route when SSD is off: `auto` (benchmarked), `serial`, `parallel`, `lanes`, `coalesced` |
+| `BYBY_PREFILL_SCAN_LANES` | `1` | `0` drops the register lane scan from the `auto` candidates |
+| `BYBY_PREFILL_SCAN_AUTOTUNE_MAX_MIB` | `512` | largest probe arena the scan autotuner allocates |
+| `BYBY_MAMBA_SCAN_PARALLEL` | `1` Metal, `0` Vulkan | parallel scan in the non-resident path |
+| `BYBY_LP_SCAN_SERIAL` | off | `1` forces the serial Linear++ scan |
+| `BYBY_PREFILL_LP_LANES` | `1` | `0` disables the Linear++ lane scan |
+| `BYBY_PREFILL_GEMM` | `auto` | `auto`, `m8` (packed FP4 tiles), `mps` (expanded FP32 + MPS, Apple Silicon) |
+| `BYBY_PREFILL_MPS` | `1` | `0` never considers MPS |
+| `BYBY_PREFILL_FP4_KERNEL` | `auto` | `m4` forces the 4-row FP4 tile |
+| `BYBY_PREFILL_2COL` | `1` | `0` selects the one-column FP4 tile |
+| `BYBY_PREFILL_TAIL4` | `1` | `0` pads the last rows to 8 instead of a 4-row tail tile |
+| `BYBY_PREFILL_UNROLL` | `2` | `1` loads one weight word per iteration in the FP4 tile |
+| `BYBY_FP4_PAD_M` | `1` | `0` turns off padding odd row counts to the FP4 tile |
+| `BYBY_PREFILL_FP4_TILED`, `BYBY_PREFILL_FP32_TILED` | `1` | `0` skips the tiled tensor-core GEMM (parity-checked first) |
+| `BYBY_PREFILL_PREWARM_PACKED` | `0` | `1` also precompiles the packed FP4 tiles when tensor cores are used |
+| `BYBY_PREFILL_LORA_DOWN` | `1` | `0` disables the fused LoRA down-projection kernel |
+| `BYBY_PREFILL_SPARSE` | `1` | `0` disables the sparse prefill in the hybrid block |
+| `BYBY_PREFILL_KEEP_SCRATCH` | `0` | `1` keeps the prefill arena after prefill (throughput experiments) |
+| `BYBY_SCAN_NCHUNK` | `16` | command buffers the backward scan is split into (watchdog) |
+
+Decode and tuning:
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `BYBY_GEMV_TG` | `auto` | GEMV threadgroup width (`auto` = tuned, `max`, or a number) |
+| `BYBY_GEMV_VARIANT` | `auto` | `0` 2 rows, `1` 32-bit loads, `2` 4 rows per threadgroup |
+| `BYBY_GPU_AUTOTUNE` | `1` | `0` skips the FP4 kernel tuner (faster cold start) |
+| `BYBY_NORM_PRESET` | from checkpoint | gated-RMSNorm preset (default `rms-fin-gn`) |
+| `BYBY_NORM_AUTO` | `1` | `0` ignores the preset suggested by the norm sweep |
+| `BYBY_MAMBA_NORM_GROUPS` | model `n_groups` | gated-RMSNorm group count (`1` = legacy full width) |
+
+Diagnostics (slower, not fast paths):
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `BYBY_PREFILL_PROFILE` | `1` | per-stage prefill timings |
+| `BYBY_PREFILL_DIAG` | `0` | `1` commits after every prefill stage (real GPU time per stage), `2`/`3` finer |
+| `BYBY_DECODE_PROFILE` | `0` | per-token decode timings |
+| `BYBY_DECODE_SPLIT` | `0` | splits each token into several command buffers to time each part |
+| `BYBY_DEBUG_SAMPLING` | `0` | logs the sampler state; `BYBY_DEBUG_SAMPLING_ALL=1` every step, `BYBY_DEBUG_SAMPLING_STEPS` (5) the first N |
+| `BYBY_DEBUG_TOP5` | `0` | logs the top-5 logits |
+| `BYBY_TRACE_TOKENS` | `0` | traces the first N generated tokens |
+| `BYBY_TRACE_BLOCKS` | `0` | traces per-block activations |
+| `BYBY_DUMP_LOGITS` | off | file path to dump the logits |
+| `BYBY_G_DIAGNOSTICS` | `0` | statistics of the G (gated) blocks |
+| `BYBY_OD_CHECK`, `BYBY_OD_VERBOSE` | `0` | one-dispatch error check and logs |
+| `BYBY_LPCHECK` | `0` | checks the Linear++ step kernel against its closed form |
+| `BYBY_NORM_SWEEP` | `0` | bisects norm presets (`BYBY_NORM_SWEEP_LIST`, `BYBY_NORM_SWEEP_TOKENS` = 12) |
+| `BYBY_INFER_VERBOSE` | off | extra inference logs |
+| `BYBY_LORA_VERBOSE` | `0` | logs adapters missing on the GPU |
+| `BYBY_JIT_DUMP_SOURCE` | `0` | prints the generated kernel source |
+| `BYBY_VULKAN_JIT_VERBOSE` | `0` | logs each Vulkan shader compile |
+| `BYBY_VULKAN_SPLIT_K_VERBOSE` | `0` | logs the split-K choice |
 
 
 ### Run DeepSeek or Codestral with formers.n (`formers-cli`)

@@ -553,11 +553,34 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
   let coalesced = scanMode == "coalesced"
   let lanes = scanMode == "lanes"
   require(not lanes or laneScanStates(mr.dState) > 0, "lane scan needs dState = 32*k <= 256")
+  # Every prompt takes the chunked SSD/FLA pass (matmuls on tensor cores, or
+  # FP32 tiles without them) when its Vulkan pipelines pass parity; the scan
+  # kernels stay the fallback. BYBY_SSD_MIN_T sends shorter prompts back to
+  # the scan. The chunk length doubles until the state scratch fits
+  # BYBY_SSD_STATE_MB, so the pass never outgrows VRAM.
+  var ssdQ = parseInt(getEnv("BYBY_SSD_CHUNK", "64"))
+  var ssd = false
+  if be == gbVulkan and getEnv("BYBY_SSD", "auto") != "0" and
+      T >= parseInt(getEnv("BYBY_SSD_MIN_T", "0")):
+    let budget = parseInt(getEnv("BYBY_SSD_STATE_MB", "1024")) * 1024 * 1024
+    proc ssdScratchBytes(q: int): int =
+      ((T + q - 1) div q) * mr.numHeads * mr.dState * mr.headDim * 4
+    while ssdQ < 256 and ssdScratchBytes(ssdQ) > budget: ssdQ *= 2
+    if ssdScratchBytes(ssdQ) <= budget:
+      ssd = sessionMamba2SsdPrepare(be, mr.dState, mr.headDim, ssdQ).len > 0
   let L = prefixLayout(1, T, mr.numHeads, mr.headDim, mr.dState,
-    mr.nGroups, mr.convKernel, mr.intermediateSize, mr.normEps, mr.nGroups, compact = not parallel)
+    mr.nGroups, mr.convKernel, mr.intermediateSize, mr.normEps, mr.nGroups,
+    compact = ssd or not parallel)
   let historyOff = L.fwdEnd
-  let arenaSize = historyOff + L.cDim*(L.K-1)
-  let terminalOff = L.states + (if coalesced: 0 elif parallel: T else: 1)*L.HD*L.N
+  var arenaSize = historyOff + L.cDim*(L.K-1)
+  var ssdCumOff, ssdSlocOff = 0
+  if ssd:
+    let nC = (T + ssdQ - 1) div ssdQ
+    ssdCumOff = arenaSize
+    ssdSlocOff = ssdCumOff + T * L.H
+    arenaSize = ssdSlocOff + nC * L.H * L.N * L.D
+  let terminalOff = L.states +
+    (if ssd: 1 elif coalesced: 0 elif parallel: T else: 1)*L.HD*L.N
   checkVmScratchCapacity(ctx, arenaSize, "resident prefill")
   var maxRank = 1
   for _, adapter in gLoraGpu: maxRank = max(maxRank, adapter.r)
@@ -673,31 +696,34 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
   let historyProg = convHistory(L, if continuation: gLayersV2[0].off.offConvSt else: -1)
   let historyKn = vmKernelForBe(historyProg,
     "prefix_conv_" & m2Tag(L) & "_carry" & $continuation, be)
-  let scanStep: MvmStep =
-    if parallel:
-      let tg=m2ScanTgSize(T)
-      require(tg>0,"parallel scan unavailable")
-      (buildPrefixParallelScanProgram(L,tg,continuation,parallelStateLanes),
-        L.HD*tg*parallelStateLanes,tg*16*parallelStateLanes,tg*parallelStateLanes,
-        "@prefix_parallel_v2_carry_" & m2Tag(L) & "_" & $continuation & "_n" & $parallelStateLanes)
-    elif lanes:
-      (buildPrefixLaneScanProgram(L),L.HD*LaneScanWidth,laneScanTgBytes(T),LaneScanWidth,
-        laneScanTag(L))
-    else:
-      (buildCompactPrefixScanProgram(L,coalesced),L.HD,4,0,
-        "@prefix_compact_" & m2Tag(L) & "_coalesced" & $coalesced)
   var steps: seq[MvmStep] = @[
     (buildPrefixConvDtProgram(L,if continuation: historyOff else: -1),T*M2Tg,4,M2Tg,
-      "@prefix_conv_dt_carry_" & m2Tag(L) & "_" & $continuation)]
-  if coalesced:
-    steps.add((buildPrefixStateTransposeProgram(L,true),L.HD*L.N,4,256,
-      "@prefix_state_in_" & m2Tag(L)))
-  steps.add(scanStep)
-  if coalesced:
-    steps.add((buildPrefixStateTransposeProgram(L,false),L.HD*L.N,4,256,
-      "@prefix_state_out_" & m2Tag(L)))
+      "@prefix_conv_dt_carry_" & m2Tag(L) & "_" & $continuation & "_ssd" & $ssd)]
+  if not ssd:
+    # The SSD pass replaces the scan step (it is encoded natively right after
+    # the conv/dt step); every scan flavour below stays the small-T path.
+    let scanStep: MvmStep =
+      if parallel:
+        let tg=m2ScanTgSize(T)
+        require(tg>0,"parallel scan unavailable")
+        (buildPrefixParallelScanProgram(L,tg,continuation,parallelStateLanes),
+          L.HD*tg*parallelStateLanes,tg*16*parallelStateLanes,tg*parallelStateLanes,
+          "@prefix_parallel_v2_carry_" & m2Tag(L) & "_" & $continuation & "_n" & $parallelStateLanes)
+      elif lanes:
+        (buildPrefixLaneScanProgram(L),L.HD*LaneScanWidth,laneScanTgBytes(T),LaneScanWidth,
+          laneScanTag(L))
+      else:
+        (buildCompactPrefixScanProgram(L,coalesced),L.HD,4,0,
+          "@prefix_compact_" & m2Tag(L) & "_coalesced" & $coalesced)
+    if coalesced:
+      steps.add((buildPrefixStateTransposeProgram(L,true),L.HD*L.N,4,256,
+        "@prefix_state_in_" & m2Tag(L)))
+    steps.add(scanStep)
+    if coalesced:
+      steps.add((buildPrefixStateTransposeProgram(L,false),L.HD*L.N,4,256,
+        "@prefix_state_out_" & m2Tag(L)))
   steps.add((buildM2RmsFwdProgram(L),T*L.normGroups*rmsTg(L),rmsTg(L)*4,rmsTg(L),
-    "@prefix_rms_" & m2Tag(L) & "_compact" & $(not parallel)))
+    "@prefix_rms_" & m2Tag(L) & "_compact" & $(ssd or not parallel)))
   var stepNames: seq[string]
   for st in steps: stepNames.add kernelNameFor(ctx, st.prog, st.tag)
   var biasKns = initTable[int, string]()
@@ -1189,6 +1215,12 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
     pfTime("enc.scan"):
       for s, st in steps:
         encodeMicroVm(ctx, st.prog, hMamba, st.nThreads, st.tgBytes, st.tag, st.tgSize, stepNames[s])
+        if ssd and s == 0:
+          # Chunked SSD/FLA pass (five native dispatches) in place of the scan
+          # step, right after conv/dt filled the arena.
+          require(sessionMamba2SsdPrefillEnc(be, hMamba, T, L.H, L.G, L.N, L.D,
+            ssdQ, L.C, L.cDim, L.conv, L.dt, ssdCumOff, L.aLog, L.dSkip,
+            L.yPre, L.states, ssdSlocOff, continuation), "SSD scan dispatch failed")
     flushStage("scan")
     copy(hMamba, hInner, L.normedOut, 0, T * L.C)
     pfTime("enc.outproj"): linear(root & ".mambaReal.outProj.weight", hInner, hMix, false)
@@ -1243,6 +1275,7 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
   complete = true
   echo &"[infer] Optimized resident prefill OK: T={T}, blocks={m.blocks.len}; " &
     &"GPU scratch cache reused {gPrefixHits - hitsBefore}/{nextBuffer} buffers; terminal states copied GPU-to-GPU."
-  echo &"[infer] prefill scan={scanMode}; MPS tiles={gPrefixMps}, tensor-core GEMMs={gPrefixTensorCore}, " &
+  echo &"[infer] prefill scan={(if ssd: \"ssd_q\" & $ssdQ else: scanMode)}; " &
+    &"MPS tiles={gPrefixMps}, tensor-core GEMMs={gPrefixTensorCore}, " &
     &"packed tiles={gPrefixPackedTiles}, fused epilogues={gPrefixFusedEpilogues}; " &
     &"f32 matmul MPS={f32Mps} fallback={f32Fallback} batched={f32Batch}."

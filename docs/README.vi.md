@@ -22,6 +22,8 @@ lượng tử hóa, backend, session và micro-VM.
 - [Python và C ABI](python-api.vi.md): binding ctypes/NumPy, header C,
   lượng tử hóa, state dict NIMQ, micro-VM, tokenizer và sinh Llama.
 - [API backend](backend-api.vi.md): khởi tạo backend và phép GPU `be*`.
+- [Backend CPU](cpu-backend.vi.md): dispatch ISA SIMD (SSE4/AVX2/AVX-512/NEON),
+  chính sách AVX offset, chia block matmul theo L3, session CPU và micro-VM.
 - [API tensor](tensor-ops-api.vi.md): view, shape, giảm chiều, so sánh, scan, dropout.
 - [API model cơ bản](base-model-api.vi.md): tensor, layer, transformer block,
   forward/backward và APF Adam.
@@ -71,7 +73,8 @@ lượng tử hóa, backend, session và micro-VM.
 - `nimformers.nim`: [bắt đầu](getting-started.vi.md), [backend](backend-api.vi.md),
   [tensor](tensor-ops-api.vi.md), [model](base-model-api.vi.md),
   [lượng tử hóa](quantization-nimq.vi.md), [micro-VM](microkernel-api.vi.md).
-- `backend.nim`: [backend](backend-api.vi.md), [session GPU](gpu-session-api.vi.md).
+- `backend.nim`: [backend](backend-api.vi.md), [session GPU](gpu-session-api.vi.md),
+  [backend CPU](cpu-backend.vi.md).
 - `tensor_ops.nim`: [API tensor](tensor-ops-api.vi.md).
 - `nimformer.nim`: [API model cơ bản](base-model-api.vi.md).
 - `test/deepseek-inference/nim_inference.nim`:
