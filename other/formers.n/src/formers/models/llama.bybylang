@@ -31,6 +31,7 @@ type
     text*: string                 ## chat-template text of ids + pending
     messages*: JsonNode
     sampler*: FmSampler
+    flashFailed*: bool            ## a continued prefill failed once: decode later turns
   FmLlamaReply* = object
     text*: string
     tokens*: int
@@ -63,9 +64,10 @@ function fmLlamaPromptIds(tok: native_hf_tokenizer.HFTokenizer, opts: FmOptions)
         result = fmLlamaWithBos(tok, tok.applyChatTemplate(opts.prompt, opts.systemText))
 
 function fmLlamaKvMiB(m: LlamaModelL, capacity: int): int
-    ## GPU: per-head + combined K/V buffers; host: the K/V arrays of KVCacheL.
+    ## GPU: per-head + combined K/V buffers (the host copy of KVCacheL is
+    ## allocated only by the fallback paths that use it).
     let perCopy = m.config.nLayers * m.config.nKVHeads * capacity * (m.config.hiddenSize div m.config.nHeads) * 4 * 2
-    result = 3 * perCopy div (1024 * 1024)
+    result = 2 * perCopy div (1024 * 1024)
 
 function fmLlamaNewChat(m: LlamaModelL, tok: native_hf_tokenizer.HFTokenizer, ctx: Backend, opts: FmOptions, capacity: int): FmLlamaChat
     ## KV cache + resident KV for every layer, allocated before the first
@@ -99,8 +101,9 @@ function fmLlamaReset(chat: var FmLlamaChat)
 
 function fmLlamaFeed(m: LlamaModelL, ctx: Backend, chat: var FmLlamaChat, newIds: seq[int]): seq[float32]
     ## Appends pending + newIds; returns the logits of the last token. An
-    ## empty cache takes the whole input in one prefill; later input goes
-    ## through decode steps (the prefill attends only within its own chunk).
+    ## empty cache takes the whole input in one prefill. Later input is
+    ## prefilled too when the flash prefill is on (it attends to the cached
+    ## turns); otherwise, or if it fails, it goes through decode steps.
     let input = chat.pending & newIds
     chat.pending.setLen(0)
     if chat.ids.len + input.len > chat.capacity:
@@ -108,8 +111,17 @@ function fmLlamaFeed(m: LlamaModelL, ctx: Backend, chat: var FmLlamaChat, newIds
     if chat.ids.len == 0:
         result = m.forwardStep(input, ctx, chat.cache, true).data
     else:
-        for id in input:
-            result = m.forwardStep(@[id], ctx, chat.cache, false).data
+        var done = false
+        if input.len > 1 and nim_inference.gFlashPrefill and not chat.flashFailed:
+            try:
+                result = m.forwardStep(input, ctx, chat.cache, true).data
+                done = true
+            except CatchableError as e:
+                chat.flashFailed = true
+                fmSay("[formers.n] continued prefill failed, decoding the turn instead: " & e.msg)
+        if not done:
+            for id in input:
+                result = m.forwardStep(@[id], ctx, chat.cache, false).data
     chat.ids.add(input)
 
 function fmLlamaWarmup(m: LlamaModelL, tok: native_hf_tokenizer.HFTokenizer, ctx: Backend, chat: var FmLlamaChat, opts: FmOptions)

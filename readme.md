@@ -259,6 +259,26 @@ state in), and the warmup compiles the 16-token kernels; every prefill GEMM then
 the tensor cores, never on a scalar kernel. `BYBY_VULKAN_TENSOR_CORES=tune` lets the
 scalar kernels compete again, `0` turns the tensor cores off.
 
+A Llama/DeepSeek prompt prefills every layer on the GPU in one chain of dispatches
+(RMSNorm, QKV, RoPE, KV-cache append, **flash attention**, oProj, FFN), reading back only
+the last row. Flash attention streams the cached keys through on-chip memory with an
+online softmax and reads the KV cache, so later chat turns prefill too instead of
+decoding token by token. It runs on the Vulkan tensor cores when the GPU has them
+(KHR_cooperative_matrix, with FlashAttention-4's lazy rescale of the output), otherwise
+on a scalar FP32 kernel on Vulkan and Metal; `--verbose` shows
+`[prefill] flash attention (coop|scalar)`. Each kernel is checked against a reference at
+load time and skipped if it fails. `BYBY_FLASH_ATTENTION=scalar` skips the tensor-core
+kernel, `BYBY_FLASH_PREFILL=0` goes back to the old prefill, and `make flash-attention-test`
+checks the kernels on Metal and Vulkan.
+
+On Metal, prefill GEMMs (M >= 8) run a tiled Q4 kernel (64 x 128 output tile per
+threadgroup, weights decoded once per 64 rows, 8 x 8 FP32 register tile), about 5x the
+previous batched kernel on Intel Iris; `BYBY_METAL_Q4_GEMM=0` restores the old one and
+`make q4-gemm-test` checks and times it. On Intel/AMD Macs and Vulkan, prefill and decode
+work is split into command buffers of about `BYBY_PREFILL_CB_MS` (default 300) from the
+measured speed, so the macOS GPU watchdog never kills a long one; Apple Silicon keeps its
+command buffers whole.
+
 #### LoRA merge
 
 A Mamba-2 LoRA is merged into the resident FP4-KM weights on the GPU at startup

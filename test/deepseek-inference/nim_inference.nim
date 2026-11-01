@@ -521,8 +521,9 @@ proc newKVCacheL*(nLayers, nKVHeads, headDim, maxSeqLen: int): KVCacheL =
   result.seqLen = 0
   result.layers = newSeq[LayerKVCache](nLayers)
   for l in 0 ..< nLayers:
-    result.layers[l].k = newSeq[float32](nKVHeads * maxSeqLen * headDim)
-    result.layers[l].v = newSeq[float32](nKVHeads * maxSeqLen * headDim)
+    # The host copy (k, v) is allocated by ensureCpuKv on first use: the
+    # resident GPU paths never touch it, and at -c 2048 it is 2 GiB of RAM
+    # that an iGPU sharing the memory needs for the weights.
     result.layers[l].filled = 0
     result.layers[l].residentReady = false
     result.layers[l].kResident = @[]
@@ -604,6 +605,12 @@ var gKvResidentDisabled = false   ## NEW: if any sessionCopyInto
   ## Declared BEFORE appendKV (not after like the previous version) because appendKV needs to
   ## set this flag as soon as a copy fails, not only during verify.
 
+proc ensureCpuKv(cache: var KVCacheL, layer: int) =
+  let n = cache.nKVHeads * cache.maxSeqLen * cache.headDim
+  if cache.layers[layer].k.len < n:
+    cache.layers[layer].k = newSeq[float32](n)
+    cache.layers[layer].v = newSeq[float32](n)
+
 proc appendKVCpuOnly(cache: var KVCacheL, layer: int, kNew, vNew: seq[float32], nTok: int) =
   ## NEW: separates the CPU write (always runs, independent of the GPU) from
   ## the GPU sync - so forwardDecode can control WHEN the GPU work is
@@ -612,6 +619,7 @@ proc appendKVCpuOnly(cache: var KVCacheL, layer: int, kNew, vNew: seq[float32], 
   let D = cache.headDim
   let H = cache.nKVHeads
   doAssert cache.seqLen + nTok <= cache.maxSeqLen, "KV cache overflow"
+  ensureCpuKv(cache, layer)
   for t in 0 ..< nTok:
     for h in 0 ..< H:
       let srcOff = (t * H + h) * D
@@ -1278,6 +1286,7 @@ proc forwardDecode*(attn: GQAAttention, norm: RMSNormL, x: Tensor, rope: RoPEL, 
   var kBlocks = newSeq[seq[float32]](HKV)
   var vBlocks = newSeq[seq[float32]](HKV)
   var qGroups = newSeq[seq[float32]](HKV)
+  if needCpuKvBlocks: ensureCpuKv(cache, layerIdx)
   for hkv in 0 ..< HKV:
     let headBase = hkv * maxS * D
     # K, V: cache layout [nKVHeads, maxSeqLen, headDim] -> for a fixed hkv, the first S
@@ -2281,6 +2290,17 @@ var gMode3Attempts = 0
 var gMode3Success = 0
 var gMode3FirstFailMsg = ""
 
+## Command-buffer pacing shared by the flash prefill and Mode 3 decode (see
+## forwardPrefillFlash below for the BYBY_PREFILL_* variables).
+let gFlashPrefill* = getEnv("BYBY_FLASH_PREFILL", "1") != "0"
+proc envNum(name: string, fallback: int): int =
+  try: parseInt(getEnv(name, $fallback)) except ValueError: fallback
+let gPrefillCbMs = float(max(10, envNum("BYBY_PREFILL_CB_MS", 300)))
+let gPrefillMaxRows = max(16, envNum("BYBY_PREFILL_MAX_ROWS", 512))
+let gPrefillSessionMb = max(16, envNum("BYBY_PREFILL_SESSION_MB", 1024))
+var gPrefillMsPerLayerRow = -1.0   ## measured GPU ms per layer per prompt row
+var gDecodeMsPerLayer = -1.0       ## measured GPU ms per layer of one decode token
+
 proc forwardDecodeAllLayersMergedSession(m: LlamaModelL, xData: seq[float32], ctx: Backend,
     cache: var KVCacheL): Tensor =
   let be = ctx.kind.toByby()
@@ -2294,6 +2314,20 @@ proc forwardDecodeAllLayersMergedSession(m: LlamaModelL, xData: seq[float32], ct
     if not precheckLayerResident(m.blocks[idx].attn, m.blocks[idx].ff, idx, failMsg):
       raise newException(CatchableError, "[MODE3] " & failMsg)
 
+  # A command buffer that runs for seconds is killed by the macOS GPU watchdog
+  # (and every later submission is then ignored): on a slow iGPU, or when the
+  # weights are paged out, one token of 32 layers can take that long. The token
+  # is split into command buffers of about BYBY_PREFILL_CB_MS each, committed
+  # without waiting (sessionCommitContinue), from the measured ms per layer.
+  # Apple Silicon keeps one command buffer per token (sessionPacesCommandBuffers).
+  # A token normally fits one command buffer (as before pacing): it is split
+  # only once a measured token takes longer than BYBY_DECODE_CB_MS (default
+  # 1500), since every extra commit slows the decode down on Intel Metal.
+  let decodeCbMs = float(max(100, envNum("BYBY_DECODE_CB_MS", 1500)))
+  let layersPerCb = if not sessionPacesCommandBuffers(be) or gDecodeMsPerLayer <= 0 or
+                       gDecodeMsPerLayer * float(m.blocks.len) <= decodeCbMs: m.blocks.len
+                    else: max(1, int(decodeCbMs / gDecodeMsPerLayer))
+  let t0 = epochTime()
   if not sessionBegin(be):
     raise newException(CatchableError, "[MODE3] sessionBegin failed")
   var pending = newSeq[SessionHandle]()
@@ -2301,6 +2335,8 @@ proc forwardDecodeAllLayersMergedSession(m: LlamaModelL, xData: seq[float32], ct
   try:
     var hX = sessionUpload(be, xData); pending.add(hX)
     for idx in 0 ..< m.blocks.len:
+      if idx > 0 and idx mod layersPerCb == 0 and not sessionCommitContinue(be):
+        raise newException(CatchableError, "[MODE3] sessionCommitContinue failed")
       hX = encodeDecodeLayerIntoOpenSession(m.blocks[idx].attn, m.blocks[idx].inputNorm,
              m.blocks[idx].postAttnNorm, m.blocks[idx].ff, hX, m.rope, be, cache, idx, pending)
       # NOTE: do NOT sessionFree the previous layer's hX here - the session is still
@@ -2311,6 +2347,9 @@ proc forwardDecodeAllLayersMergedSession(m: LlamaModelL, xData: seq[float32], ct
     let sessionOk = sessionEnd(be)
     if not sessionOk:
       raise newException(CatchableError, "[MODE3] sessionEnd failed: " & sessionGetLastError(be))
+    let perLayer = (epochTime() - t0) * 1000.0 / float(m.blocks.len)
+    gDecodeMsPerLayer = if gDecodeMsPerLayer <= 0: perLayer
+                        else: 0.8 * gDecodeMsPerLayer + 0.2 * perLayer
     result = newTensor(@[1, 1, C])
     result.data = sessionRead(be, hX, C)
   except CatchableError:
@@ -2321,6 +2360,229 @@ proc forwardDecodeAllLayersMergedSession(m: LlamaModelL, xData: seq[float32], ct
       discard sessionEnd(be)
     for h in pending.mitems:
       sessionFree(be, h)
+
+## ---- Flash prefill: every layer of a prompt on the GPU, attention included ----
+## The old prefill (forwardPrefill + fusedResidualNormFFN) reads Q/K/V back to the
+## CPU every layer, appends the KV cache, expands K/V per head, transposes,
+## runs attention_fused in its own session and uploads again for oProj and the
+## FFN. Here a layer is one chain of dispatches on the T rows: RMSNorm -> QKV ->
+## RoPE -> KV cache scatter -> flash attention (tensor cores on a Vulkan GPU that
+## has them) -> oProj -> residual -> RMSNorm -> FFN -> residual. The hidden state
+## stays on the GPU between layers; only the last row is read back. Attention
+## reads the resident cache, so a prompt continued at cache.seqLen > 0 attends
+## to the earlier tokens as well.
+## BYBY_FLASH_PREFILL=0 keeps the old path. BYBY_PREFILL_CB_MS (default 300) is the
+## GPU time aimed at per command buffer, BYBY_PREFILL_MAX_ROWS (default 512) the
+## largest row chunk, BYBY_PREFILL_SESSION_MB (default 1024) the activations of
+## the layers encoded into one command buffer.
+var gFlashPrefillWarned = false
+var gFlashPrefillLogged = false
+
+proc encodePrefillLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSNormL,
+    ff: SwiGLUL, hXIn: SessionHandle, hCos, hSin: SessionHandle, be: GpuBackend,
+    cache: var KVCacheL, layerIdx, T, pos: int, pending: var seq[SessionHandle]): SessionHandle =
+  ## One prefill layer on T rows inside the caller's open session. Every handle it
+  ## allocates goes to `pending` (freed after sessionEnd) except the result.
+  let C = attn.qProj.inF
+  let H = attn.nHeads
+  let HKV = attn.nKVHeads
+  let D = attn.headDim
+  var failMsg: string
+  if not precheckLayerResident(attn, ff, layerIdx, failMsg):
+    raise newException(CatchableError, "[FLASH_PREFILL] " & failMsg)
+  template step(cond: bool, msg: string) =
+    if not cond:
+      raise newException(CatchableError, "[FLASH_PREFILL] " & msg & " (layer " & $layerIdx & ")")
+  template linear(l: Linear, a: SessionHandle, rows: int, what: string): SessionHandle =
+    var c = sessionAllocScratch(be, rows * l.outF)
+    pending.add(c)
+    if l.residentReady:
+      step(sessionMatmulQ4(be, a, l.residentW, c, rows), what & " matmul failed")
+    else:
+      step(sessionMatmul(be, a, l.residentFp32, c, rows, l.inF, l.outF), what & " matmul(fp32) failed")
+    var y = c
+    if l.bias.data.len == l.outF:
+      let hBias = sessionUpload(be, broadcastBias(l.bias, rows, l.outF))
+      pending.add(hBias)
+      y = sVecOp(be, "add", c, hBias, rows * l.outF)
+      pending.add(y)
+    y
+
+  # ---- RMSNorm (input) + QKV + RoPE ----
+  let hGamma = (if normQKV.residentGammaReady: normQKV.residentGamma
+                else: (let h = sessionUpload(be, normQKV.weight.data); pending.add(h); h))
+  var hNormed = sessionAllocScratch(be, T * C); pending.add(hNormed)
+  step(sessionRmsnormEnc(be, hXIn, hGamma, hNormed, T, C, normQKV.eps), "RMSNorm input failed")
+  let hQ = linear(attn.qProj, hNormed, T, "Q")
+  let hK = linear(attn.kProj, hNormed, T, "K")
+  let hV = linear(attn.vProj, hNormed, T, "V")
+  step(sessionRope(be, hQ, hCos, hSin, T, H, D), "RoPE(Q) failed/not supported")
+  step(sessionRope(be, hK, hCos, hSin, T, HKV, D), "RoPE(K) failed/not supported")
+
+  # ---- KV cache: merged [HKV, maxSeqLen, D] buffers, then the per-head copies ----
+  ensureKvResident(cache.layers[layerIdx], be, HKV, cache.maxSeqLen, D)
+  step(kvResidentUsable(cache, layerIdx), "KV resident is not ready for this layer")
+  step(sessionKvScatterEnc(be, hK, cache.layers[layerIdx].kResidentCombined, T, HKV, D, pos,
+                           cache.maxSeqLen), "K cache scatter failed")
+  step(sessionKvScatterEnc(be, hV, cache.layers[layerIdx].vResidentCombined, T, HKV, D, pos,
+                           cache.maxSeqLen), "V cache scatter failed")
+  for h in 0 ..< HKV:
+    let off = h * cache.maxSeqLen * D + pos * D
+    step(sessionCopyInto(be, cache.layers[layerIdx].kResidentCombined,
+                         cache.layers[layerIdx].kResident[h], off, pos * D, T * D),
+         "copyInto K resident failed (head " & $h & ")")
+    step(sessionCopyInto(be, cache.layers[layerIdx].vResidentCombined,
+                         cache.layers[layerIdx].vResident[h], off, pos * D, T * D),
+         "copyInto V resident failed (head " & $h & ")")
+  cache.layers[layerIdx].filled = pos + T
+
+  # ---- Flash attention -> oProj -> residual ----
+  var hAttn = sessionAllocScratch(be, T * H * D); pending.add(hAttn)
+  step(sessionFlashAttentionPrefillEnc(be, hQ, cache.layers[layerIdx].kResidentCombined,
+         cache.layers[layerIdx].vResidentCombined, hAttn, T, H, HKV, D, pos, cache.maxSeqLen,
+         attn.scale), "flash attention failed")
+  let hO = linear(attn.oProj, hAttn, T, "oProj")
+  let hX2 = sVecOp(be, "add", hXIn, hO, T * C); pending.add(hX2)
+
+  # ---- RMSNorm (post-attn) + SwiGLU FFN -> residual ----
+  let hGammaFfn = (if normFFN.residentGammaReady: normFFN.residentGamma
+                   else: (let h = sessionUpload(be, normFFN.weight.data); pending.add(h); h))
+  var hNormedFfn = sessionAllocScratch(be, T * C); pending.add(hNormedFfn)
+  step(sessionRmsnormEnc(be, hX2, hGammaFfn, hNormedFfn, T, C, normFFN.eps), "RMSNorm FFN failed")
+  let interF = ff.gateProj.outF
+  let hGate = linear(ff.gateProj, hNormedFfn, T, "gateProj")
+  let hUp = linear(ff.upProj, hNormedFfn, T, "upProj")
+  let hSig = sActivation(be, "sigmoid", hGate, T * interF); pending.add(hSig)
+  let hSilu = sVecOp(be, "mul", hGate, hSig, T * interF); pending.add(hSilu)
+  let hGated = sVecOp(be, "mul", hSilu, hUp, T * interF); pending.add(hGated)
+  let hDown = linear(ff.downProj, hGated, T, "downProj")
+  result = sVecOp(be, "add", hX2, hDown, T * C)
+
+proc tileRows(rows: int): int =
+  ## The prefill GEMMs work in 64-row tiles (Metal matmul_q4_gemm, Vulkan
+  ## tiled tensor cores), so 16 rows cost about as much as 64: the speed is
+  ## measured per row of whole tiles.
+  (rows + 63) div 64 * 64
+
+proc prefillFlashChunk(m: LlamaModelL, xData: seq[float32], T, pos: int, ctx: Backend,
+                       cache: var KVCacheL): Tensor =
+  ## All layers on rows pos .. pos + T - 1, in command buffers of at most
+  ## BYBY_PREFILL_CB_MS each (from the measured ms per layer-row) and
+  ## BYBY_PREFILL_SESSION_MB of activations. Returns the last row [1, 1, C].
+  let be = ctx.kind.toByby()
+  let C = m.config.hiddenSize
+  let H = m.config.nHeads
+  let D = C div H
+  let ff0 = m.blocks[0].ff
+  let a0 = m.blocks[0].attn
+  let layerFloats = T * (4 * C + a0.qProj.outF + a0.kProj.outF + a0.vProj.outF + H * D +
+                         a0.oProj.outF + 5 * ff0.gateProj.outF + ff0.downProj.outF)
+  let memLayers = max(1, (gPrefillSessionMb * 1024 * 1024) div max(1, layerFloats * 4))
+  let paced = sessionPacesCommandBuffers(be)
+
+  # RoPE tables of the T positions, shared by every layer.
+  let halfD = D div 2
+  var cosSlice = newSeq[float32](T * halfD)
+  var sinSlice = newSeq[float32](T * halfD)
+  for t in 0 ..< T:
+    let p = pos + t
+    doAssert p < m.rope.maxSeqLen, "RoPE: position exceeds the precomputed max_seq_len"
+    for i in 0 ..< halfD:
+      cosSlice[t * halfD + i] = m.rope.cosT[p * halfD + i]
+      sinSlice[t * halfD + i] = m.rope.sinT[p * halfD + i]
+
+  var keep: seq[SessionHandle]       # live across command buffers
+  var pending: seq[SessionHandle]    # freed after the command buffer that used them
+  var hX: SessionHandle
+  var hLast: SessionHandle
+  var open = false
+  try:
+    var idx = 0
+    while idx < m.blocks.len:
+      # Unknown speed: one layer, then as many as fit the time budget
+      # (no time budget on Apple Silicon: only the activation memory bound).
+      let timeLayers = if not paced: m.blocks.len
+                       elif gPrefillMsPerLayerRow <= 0: 1
+                       else: int(gPrefillCbMs / (gPrefillMsPerLayerRow * float(tileRows(T))))
+      let nLayers = clamp(min(timeLayers, memLayers), 1, m.blocks.len - idx)
+      let t0 = epochTime()
+      if not sessionBegin(be):
+        raise newException(CatchableError, "[FLASH_PREFILL] sessionBegin failed")
+      open = true
+      if idx == 0:
+        hX = sessionUpload(be, xData)
+        keep.add sessionUpload(be, cosSlice)
+        keep.add sessionUpload(be, sinSlice)
+      let stop = idx + nLayers
+      while idx < stop:
+        let blk = m.blocks[idx]
+        let hNext = encodePrefillLayerIntoOpenSession(blk.attn, blk.inputNorm, blk.postAttnNorm,
+          blk.ff, hX, keep[0], keep[1], be, cache, idx, T, pos, pending)
+        pending.add hX
+        hX = hNext
+        inc idx
+      if idx == m.blocks.len:
+        hLast = sessionAllocScratch(be, C)
+        if not sessionCopyInto(be, hX, hLast, (T - 1) * C, 0, C):
+          raise newException(CatchableError, "[FLASH_PREFILL] reading the last row failed")
+      open = false
+      if not sessionEnd(be):
+        raise newException(CatchableError, "[FLASH_PREFILL] sessionEnd failed: " & sessionGetLastError(be))
+      for h in pending.mitems: sessionFree(be, h)
+      pending.setLen(0)
+      let perLayerRow = (epochTime() - t0) * 1000.0 / float(nLayers * tileRows(T))
+      gPrefillMsPerLayerRow = if gPrefillMsPerLayerRow <= 0: perLayerRow
+                              else: 0.5 * gPrefillMsPerLayerRow + 0.5 * perLayerRow
+    result = newTensor(@[1, 1, C])
+    result.data = sessionRead(be, hLast, C)
+  finally:
+    if open: discard sessionEnd(be)
+    for h in pending.mitems: sessionFree(be, h)
+    for h in keep.mitems: sessionFree(be, h)
+    sessionFree(be, hX)
+    sessionFree(be, hLast)
+
+proc forwardPrefillFlash(m: LlamaModelL, xData: seq[float32], T: int, ctx: Backend,
+                         cache: var KVCacheL): Tensor =
+  ## Runs every layer on the T prompt rows (see the comment above) and returns
+  ## the last row's hidden state [1, 1, C]. Raises when a step is not available;
+  ## nothing has been read back by then, so the caller can rerun the old path.
+  ## A GPU watchdog (macOS kills a command buffer that runs for seconds on an
+  ## Intel/AMD Mac) caps the work per command buffer: the prompt goes through in
+  ## row chunks sized from the measured speed, each chunk continuing the KV
+  ## cache of the last. Apple Silicon is not paced (sessionPacesCommandBuffers).
+  let be = ctx.kind.toByby()
+  let C = m.config.hiddenSize
+  let D = C div m.config.nHeads
+  let pos = cache.seqLen
+  if pos + T > cache.maxSeqLen:
+    raise newException(CatchableError, "[FLASH_PREFILL] the prompt does not fit the KV cache")
+  for idx in 0 ..< m.blocks.len:
+    var failMsg: string
+    if not precheckLayerResident(m.blocks[idx].attn, m.blocks[idx].ff, idx, failMsg):
+      raise newException(CatchableError, "[FLASH_PREFILL] " & failMsg)
+  let kind = sessionFlashAttentionPrepare(be, D)
+  if kind.len == 0:
+    raise newException(CatchableError, "[FLASH_PREFILL] no flash-attention kernel for head_dim " & $D)
+  if not gFlashPrefillLogged:
+    gFlashPrefillLogged = true
+    stderr.writeLine "[prefill] flash attention (" & kind & "), all layers on the GPU" &
+      (if sessionPacesCommandBuffers(be): ", command buffers of ~" & $int(gPrefillCbMs) & " ms"
+       else: "")
+  var start = 0
+  while start < T:
+    # Rows per chunk: one 64-row GEMM tile until the speed is known, then what
+    # one layer runs in the time budget (whole tiles, 16 .. BYBY_PREFILL_MAX_ROWS).
+    # Apple Silicon (no pacing) takes the whole prompt in one chunk.
+    var rows = T
+    if sessionPacesCommandBuffers(be):
+      rows = 64
+      if gPrefillMsPerLayerRow > 0:
+        let fit = int(gPrefillCbMs / gPrefillMsPerLayerRow)
+        rows = clamp(if fit >= 64: fit div 64 * 64 else: fit div 16 * 16, 16, gPrefillMaxRows)
+    rows = min(rows, T - start)
+    result = prefillFlashChunk(m, xData[start * C ..< (start + rows) * C], rows, pos + start, ctx, cache)
+    start += rows
 
 proc forwardStep*(m: LlamaModelL, ids: seq[int], ctx: Backend, cache: var KVCacheL,
                    isPrefill: bool): Tensor =
@@ -2339,6 +2601,17 @@ proc forwardStep*(m: LlamaModelL, ids: seq[int], ctx: Backend, cache: var KVCach
   # for the whole thing, falling STRAIGHT back to the old per-layer loop FOR THIS TOKEN (that loop
   # retries Mode 2 then Mode 1 for each layer as before - nothing changes).
   var mode3Done = false
+  if isPrefill and gFlashPrefill and ids.len > 1:
+    let t0 = epochTime()
+    try:
+      x = forwardPrefillFlash(m, x.data, ids.len, ctx, cache)
+      mode3Done = true
+      gAttnTime += epochTime() - t0
+    except CatchableError as e:
+      if cache.seqLen > 0: raise   # the old prefill only starts at position 0
+      if not gFlashPrefillWarned:
+        gFlashPrefillWarned = true
+        stderr.writeLine "[prefill] flash path unavailable, using the old prefill: " & e.msg
   if gMergeAllLayersSession and not isPrefill:
     inc gMode3Attempts
     try:
@@ -2612,6 +2885,10 @@ proc uploadAllResidentWeights*(m: var LlamaModelL, ctx: Backend) =
   # SCRATCH in EVERY layer EVERY token in forwardPrefill/forwardDecode - saving
   # exactly 1 unnecessary small buffer upload (~dim*4 bytes) every decode step
   # (see the 3 places changed in fusedNormQKVRoPE/fusedResidualNormFFN(Continue)).
+  # Picks and checks the prefill flash-attention kernel now, so its parity
+  # test and shader compile are not counted in the first prefill.
+  if gFlashPrefill:
+    discard sessionFlashAttentionPrepare(ctx.kind.toByby(), m.config.hiddenSize div m.config.nHeads)
   echo "  done - weights resident on the GPU, not uploaded again every token."
 
 

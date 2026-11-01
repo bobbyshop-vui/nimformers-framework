@@ -92,13 +92,14 @@ quits.
 
 - Llama: the KV cache holds `-c` tokens (default 1024) and is resident on the GPU for every
   layer, **allocated once before prefill** like `nim_inference.generate`. It takes about
-  3 × layers × kv_heads × ctx × head_dim × 8 bytes (GPU + RAM): about 3 GiB per 1024 tokens
+  2 × layers × kv_heads × ctx × head_dim × 8 bytes (GPU + RAM): about 2 GiB per 1024 tokens
   for DeepSeek 6.7B. On a 16 GB machine whose iGPU shares the RAM, a large `-c` pushes the
   mmapped weights out and tok/s drops sharply. Each turn tokenizes and feeds only the new
   chat-template text (end of the previous reply + the user message + assistant header),
-  like llama.cpp's `common_chat_format_single`. The first turn is a prefill; later turns go
-  through `forwardStep` decode, because the prefill attends only within its own chunk. A
-  full context is reported and the chat stops.
+  like llama.cpp's `common_chat_format_single`. Every turn is a prefill: the flash prefill
+  attends to the cached turns too (with `BYBY_FLASH_PREFILL=0`, or if it fails once, later
+  turns go through `forwardStep` decode instead). A full context is reported and the chat
+  stops.
 - Mamba-2: the recurrent state lives on the GPU, there is no context limit. Each turn feeds
   `</s>` (when the previous reply was cut short) + `[INST] ...[/INST]`.
 
@@ -163,9 +164,7 @@ Flags: `--models`, `-m/--model`, `--lora`, `--no-lora`, `--no-merge-lora`, `--co
   because `nim_inference.generate` takes only temp/top-p; they apply in `-cnv`. Mistral's
   sliding window is not emulated. `head_dim` ≠ hidden/heads, attention bias and
   rope_scaling other than linear/dynamic are rejected.
-- Llama chat: turns after the first are fed one token at a time through decode (slower than
-  a batched prefill for long messages). A faster path needs a prefill block that starts at a
-  non-zero position and attends to the cached KV. No `/reset` or context shifting when full.
+- Llama chat: no `/reset` or context shifting when full.
 - Mamba-2: sizes come from the config, but the GPU kernels have only been run at the
   Codestral 7B size. Kernel settings come from `infer_lora.configureInferenceDefaults`.
   No norm-preset bisect yet.

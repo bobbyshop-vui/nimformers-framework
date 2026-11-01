@@ -83,7 +83,7 @@ CLEAN_BINS      := $(TEST_BIN) $(GRAFT_BIN) $(FINETUNE_BIN) $(INFER_LORA_BIN) $(
         build-migrate-lora build-nim-inference build-spectron build-for-python \
         python-test python-example c-example bybylang-test bench-gflops \
         graft finetune-mamba infer-lora infer-mamba infer-deepseek run-spectron mamba-pipeline \
-        build-formers formers-cli formers formers-test formers-smoke formers-clean
+        build-formers formers-cli formers flash-attention-test q4-gemm-test formers-test formers-smoke formers-clean
 
 all: build run
 
@@ -414,6 +414,16 @@ ifeq ($(strip $(ARGS)),)
 else
 	$(FORMERS_CLI) $(ARGS)
 endif
+
+flash-attention-test:
+	nim c -d:release --hints:off --path:vendor/bybylang --nimcache:nimcache/test-flash \
+	  -o:nimcache/test-flash/test_flash_attention test/deepseek-inference/test_flash_attention.nim
+	nimcache/test-flash/test_flash_attention $(ARGS)
+
+q4-gemm-test:
+	nim c -d:release --hints:off --path:. --path:vendor/bybylang --path:kernelfortest --nimcache:nimcache/test-q4gemm \
+	  -o:nimcache/test-q4gemm/test_q4_gemm test/deepseek-inference/test_q4_gemm.nim
+	nimcache/test-q4gemm/test_q4_gemm $(ARGS)
 
 formers-test:
 	$(MAKE) -C other/formers.n test
