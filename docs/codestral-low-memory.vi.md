@@ -113,6 +113,23 @@ prompt theo chunk 16 token, và các lượt sau tiếp tục recurrent state qu
 | `tune` | đo tensor core cùng kernel scalar, cái nhanh nhất thắng |
 | `0` | tắt tensor core |
 
+Log thiết bị còn ghi số SM/CU của GPU, đọc từ `VK_NV_shader_sm_builtins` (NVIDIA)
+hoặc `VK_AMD_shader_core_properties(2)` (AMD), ví dụ
+`units=40 (NV_shader_sm_builtins, 32 subgroups/unit)` trên T4; `units=unknown` khi driver
+không có extension nào. Kernel tiled cho mỗi workgroup 64x64 output nên prompt ngắn chỉ
+ra ít workgroup (projection 4096x4096 ở M=16 có 64): khi đó nó chia K ra nhiều workgroup
+(split-K) cho tới khi có khoảng bốn workgroup mỗi SM/CU, mỗi lát giữ ít nhất 256 giá trị K,
+rồi một pass reduce cộng các lát lại. Các shape đầu tiên được log dạng
+`[vulkan] tiled tensor-core GEMM KxN M=..: W workgroups x split-K S = .. on U SM/CU`.
+Kernel tiled chạy bốn subgroup mỗi workgroup nên chạy được cả AMD wave64 (256 thread)
+lẫn subgroup 32 (NVIDIA, AMD wave32, Intel).
+
+| Biến | Tác dụng |
+| --- | --- |
+| `BYBY_VULKAN_SPLIT_K=auto` (mặc định) | số lát K tính theo số SM/CU |
+| `BYBY_VULKAN_SPLIT_K=<n>` | cố định số lát (`1` tắt split-K, tối đa 16) |
+| `BYBY_VULKAN_SPLIT_K_VERBOSE=1` | log mọi shape GEMM tiled, không chỉ 8 shape đầu |
+
 
 ## Kiểm tra
 

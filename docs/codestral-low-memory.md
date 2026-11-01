@@ -121,6 +121,23 @@ through the prefill.
 | `tune` | tensor cores timed against the scalar kernels, the fastest wins |
 | `0` | tensor cores off |
 
+The device log also reports how many SMs/CUs the GPU has, read from
+`VK_NV_shader_sm_builtins` (NVIDIA) or `VK_AMD_shader_core_properties(2)` (AMD), e.g.
+`units=40 (NV_shader_sm_builtins, 32 subgroups/unit)` on a T4; `units=unknown` when the
+driver exposes neither. The tiled kernel gives each workgroup 64x64 outputs, so a short
+prompt yields few workgroups (a 4096x4096 projection at M=16 has 64): it then splits K
+across workgroups (split-K) until there are about four per SM/CU, every slice keeping at
+least 256 values of K, and one reduce pass sums the slices. The first shapes are logged as
+`[vulkan] tiled tensor-core GEMM KxN M=..: W workgroups x split-K S = .. on U SM/CU`.
+The tiled kernel runs four subgroups per workgroup, so it also works on AMD wave64
+(256 threads) as well as 32-wide subgroups (NVIDIA, AMD wave32, Intel).
+
+| Variable | Effect |
+| --- | --- |
+| `BYBY_VULKAN_SPLIT_K=auto` (default) | K slices sized from the SM/CU count |
+| `BYBY_VULKAN_SPLIT_K=<n>` | fixed slice count (`1` turns split-K off, max 16) |
+| `BYBY_VULKAN_SPLIT_K_VERBOSE=1` | log every tiled GEMM shape, not only the first 8 |
+
 
 ## Verification
 
