@@ -72,6 +72,15 @@ proc forwardStep*(m: LlamaModelL, ids: seq[int], ctx: Backend, cache: var KVCach
 ```
 `isPrefill=true`: `ids` = the full prompt (T tokens). `isPrefill=false`: `ids` = exactly 1 new token (decode).
 
+With `isPrefill=true` and a resident model, `forwardStep` runs `forwardPrefillFlash`: all
+layers on the T rows inside GPU command buffers (RMSNorm, QKV, RoPE, `sessionKvScatterEnc`
+into the KV cache, `sessionFlashAttentionPrefillEnc`, oProj, FFN), reading back only the last
+row. The attention covers cache positions `0 .. cache.seqLen + T - 1`, so a prompt can
+continue a cache that already holds earlier tokens. If a step is not available on the
+backend it falls back to `forwardPrefill` (only from an empty cache). `BYBY_FLASH_PREFILL=0`
+turns it off; `BYBY_PREFILL_SESSION_MB` (default 1024) bounds the activations of the layers
+encoded into one command buffer.
+
 
 ### 6.7. Loading config & weights from Hugging Face / GPTQ
 

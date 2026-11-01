@@ -91,6 +91,14 @@ proc forwardStep*(m: LlamaModelL, ids: seq[int], ctx: Backend, cache: var KVCach
 `isPrefill=true`: `ids` là toàn prompt T token. `isPrefill=false`: `ids`
 chứa đúng một token mới để decode.
 
+Với `isPrefill=true` và model đã resident, `forwardStep` chạy `forwardPrefillFlash`: mọi layer
+trên T hàng nằm trong command buffer GPU (RMSNorm, QKV, RoPE, `sessionKvScatterEnc` ghi vào KV
+cache, `sessionFlashAttentionPrefillEnc`, oProj, FFN) và chỉ đọc về hàng cuối. Attention phủ
+các vị trí cache `0 .. cache.seqLen + T - 1`, nên prompt có thể nối tiếp một cache đã chứa
+token trước đó. Nếu backend thiếu một bước, nó quay về `forwardPrefill` (chỉ khi cache rỗng).
+`BYBY_FLASH_PREFILL=0` tắt nó; `BYBY_PREFILL_SESSION_MB` (mặc định 1024) giới hạn activation
+của các layer encode chung một command buffer.
+
 
 ### 6.7. Load config và trọng số Hugging Face/GPTQ
 

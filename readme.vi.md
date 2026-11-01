@@ -246,6 +246,25 @@ recurrent state), và warmup biên dịch sẵn kernel 16 token; mọi GEMM pref
 trên tensor core, không bao giờ trên kernel scalar. `BYBY_VULKAN_TENSOR_CORES=tune` cho
 kernel scalar cạnh tranh lại, `0` tắt tensor core.
 
+Prompt Llama/DeepSeek prefill mọi layer trên GPU trong một chuỗi dispatch (RMSNorm, QKV,
+RoPE, ghi KV cache, **flash attention**, oProj, FFN) và chỉ đọc về hàng cuối. Flash
+attention đưa các key trong cache qua bộ nhớ on-chip với softmax online và đọc thẳng KV
+cache, nên các lượt chat sau cũng prefill thay vì decode từng token. Nó chạy trên tensor
+core Vulkan khi GPU có (KHR_cooperative_matrix, với lazy rescale output của
+FlashAttention-4), nếu không thì chạy kernel scalar FP32 trên Vulkan và Metal; `--verbose`
+in `[prefill] flash attention (coop|scalar)`. Mỗi kernel được so với kết quả tham chiếu
+lúc nạp model và bị bỏ qua nếu sai. `BYBY_FLASH_ATTENTION=scalar` bỏ kernel tensor core,
+`BYBY_FLASH_PREFILL=0` quay về prefill cũ, `make flash-attention-test` kiểm tra kernel trên
+Metal và Vulkan.
+
+Trên Metal, GEMM prefill (M >= 8) chạy kernel Q4 dạng tile (tile output 64 x 128 mỗi
+threadgroup, trọng số giải nén một lần cho 64 hàng, tile thanh ghi FP32 8 x 8), nhanh khoảng
+5 lần kernel batched cũ trên Intel Iris; `BYBY_METAL_Q4_GEMM=0` quay về kernel cũ, `make
+q4-gemm-test` kiểm tra và đo nó. Trên Mac Intel/AMD và Vulkan, việc prefill và decode được
+chia thành command buffer khoảng `BYBY_PREFILL_CB_MS` (mặc định 300) theo tốc độ đo được,
+để watchdog GPU của macOS không giết command buffer dài; Apple Silicon giữ nguyên command
+buffer.
+
 #### Merge LoRA
 
 LoRA của Mamba-2 được merge vào trọng số FP4-KM nằm sẵn trên GPU lúc khởi động

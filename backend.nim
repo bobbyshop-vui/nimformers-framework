@@ -16,7 +16,9 @@ export byby.GpuBackend, byby.SessionHandle, byby.sessionBegin, byby.sessionUploa
        byby.sessionAttentionDecodeGqaEnc, byby.cpuAttentionDecodeGqa,
        byby.gpuGather, byby.gpuArgmaxIndex, byby.gpuCompare, byby.gpuDropoutMask,
        byby.gpuPermute, byby.gpuSplitSlice, byby.gpuConcat, byby.sessionGetLastError,
-       byby.sessionAttentionDecodeAllHeadsEnc, byby.sessionRecoverQueue, byby.sessionCommitContinue
+       byby.sessionAttentionDecodeAllHeadsEnc, byby.sessionRecoverQueue, byby.sessionCommitContinue,
+       byby.sessionFlashAttentionPrepare, byby.sessionFlashAttentionPrefillEnc, byby.sessionKvScatterEnc,
+       byby.sessionPacesCommandBuffers
 
 # -d:backend=cpu|metal|cuda|opencl|vulkan|auto — default "auto" (detected at run time).
 const backend* {.strdefine.} = "auto"
