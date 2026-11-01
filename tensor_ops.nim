@@ -1,47 +1,47 @@
 ## tensor_ops.nim
-## Bổ sung các phép toán low-level còn thiếu so với torch (xem danh sách yêu
-## cầu): exp/log/sqrt/pow, view/permute, reduction (sum/mean/max/argmax),
-## concat/split/stack, dropout, comparison (gt/lt/eq).
+## Adds the low-level operations still missing compared with torch (see the requested
+## list): exp/log/sqrt/pow, view/permute, reductions (sum/mean/max/argmax),
+## concat/split/stack, dropout, comparisons (gt/lt/eq).
 ##
-## CẬP NHẬT GPU: exp/log/sqrt/pow (mục 1) và cumsum/cumprod/affine-scan
-## (mục 8, dùng cho Mamba/SSM) giờ dùng `ctx: Backend` để chạy GPU THẬT -
-## exp/log/sqrt qua byby.gpuExp/gpuLog/gpuSqrt (kernel Metal + OpenCL biên
-## dịch từ source lúc runtime nên chạy ngay; CUDA cần nvcc build lại 1 lần
-## từ backends/cuda/kernels/vecop_ext.cu, xem comment trong file đó - trước
-## khi build xong thì tự fallback CPU đúng cơ chế handleGpuFailure chung của
-## codebase, không âm thầm sai kết quả). Scan (cumsum/cumprod/affine) chạy
-## từng bước Hillis-Steele qua beAdd/beMul thật trên GPU (xem mục 8).
+## GPU UPDATE: exp/log/sqrt/pow (section 1) and cumsum/cumprod/affine-scan
+## (section 8, used by Mamba/SSM) now take `ctx: Backend` to run on a REAL GPU -
+## exp/log/sqrt through byby.gpuExp/gpuLog/gpuSqrt (Metal + OpenCL kernels compiled
+## from source at run time, so they run right away; CUDA needs one nvcc rebuild
+## of backends/cuda/kernels/vecop_ext.cu, see the comment in that file - until
+## then it falls back to the CPU through the codebase-wide handleGpuFailure
+## mechanism, no silently wrong results). The scans (cumsum/cumprod/affine) run
+## Hillis-Steele step by step through real beAdd/beMul on the GPU (see section 8).
 ##
 ## view/permute/reduction(sum/mean/max/argmax)/concat/split/stack/dropout/
-## comparison (mục 2-7) vẫn là CPU: đây là các phép đánh chỉ số/reduction
-## nhỏ (không phải nút thắt FLOPs như scan/activation), giữ CPU cho đơn giản
-## và đúng ngay; nếu cần tăng tốc phép cụ thể nào trong nhóm này sau, thêm
-## kernel riêng theo đúng pattern sessionRmsnormEnc/sessionRope đã có trong
+## comparison (sections 2-7) are still on the CPU: these are small indexing/reduction
+## ops (not FLOP bottlenecks like the scans/activations), kept on the CPU for simplicity
+## and immediate correctness; to speed up a specific op of this group later, add
+## a dedicated kernel following the sessionRmsnormEnc/sessionRope pattern already in
 ## gpubackend.nim.
 
 import std/[math, sequtils]
 import backend
 import nimformer  # Tensor, numel-style helpers (flatten2D, newTensor, ...)
 
-## GHI CHÚ GPU HOÁ VÒNG 2 (permute/concat/split/stack/argmax-index/
-## comparison/dropout): backend.nim giờ export thêm beGatherGpu/
-## beArgmaxIndexGpu/beCompareGpuOp/beDropoutMaskGpu (xem gpubackend_additions.nim
-## + cuda/vulkan/metal driver additions kèm theo) - các phép GATHER (đọc
-## theo mảng chỉ số), ARGMAX-INDEX, so sánh ra bitmask, và sinh dropout mask
-## đều chạy kernel GPU thật (gather_kernel.cu/.comp/.metal, argmax_kernel...,
-## compare_kernel..., dropout_rng_kernel...) thay vì vòng lặp/RNG CPU như
-## trước. `ctx: Backend` giờ là tham số BẮT BUỘC cho toàn bộ nhóm hàm này.
+## GPU PORT ROUND 2 NOTE (permute/concat/split/stack/argmax-index/
+## comparison/dropout): backend.nim now also exports beGatherGpu/
+## beArgmaxIndexGpu/beCompareGpuOp/beDropoutMaskGpu (see gpubackend_additions.nim
+## + the accompanying cuda/vulkan/metal driver additions) - GATHER ops (reading
+## through an index array), ARGMAX-INDEX, comparisons producing bitmasks, and dropout mask generation
+## all run real GPU kernels (gather_kernel.cu/.comp/.metal, argmax_kernel...,
+## compare_kernel..., dropout_rng_kernel...) instead of CPU loops/RNG as
+## before. `ctx: Backend` is now a REQUIRED parameter for this whole group of functions.
 
 # ─────────────────────────────────────────────────────────────
-# 1. EXP / LOG / SQRT / POW (element-wise, bắt buộc cho Mamba/RMSNorm/Loss)
+# 1. EXP / LOG / SQRT / POW (element-wise, required for Mamba/RMSNorm/Loss)
 # ─────────────────────────────────────────────────────────────
 
-## beExp/beLog/beSqrt/bePow: định nghĩa THẬT nằm ở backend.nim (dispatch qua
-## byby.gpuExp/gpuLog/gpuSqrt - chạy kernel GPU thật trên Metal/OpenCL ngay,
-## CUDA cần nvcc build lại 1 lần từ vecop_ext.cu rồi mới có kernel, trước đó
-## tự fallback CPU đúng cơ chế handleGpuFailure chung của toàn bộ codebase).
-## KHÔNG định nghĩa lại ở đây - `import backend` phía trên đã đưa các proc
-## này vào scope.
+## beExp/beLog/beSqrt/bePow: the REAL definitions live in backend.nim (dispatched through
+## byby.gpuExp/gpuLog/gpuSqrt - real GPU kernels on Metal/OpenCL right away,
+## CUDA needs one nvcc rebuild of vecop_ext.cu before the kernel exists, until then
+## it falls back to the CPU through the codebase-wide handleGpuFailure mechanism).
+## NOT redefined here - the `import backend` above brings these procs
+## into scope.
 
 proc expT*(ctx: Backend, x: Tensor): Tensor =
   result.shape = x.shape
@@ -60,9 +60,9 @@ proc powT*(ctx: Backend, x: Tensor, p: float32): Tensor =
   result.data = bePow(ctx, x.data, p)
 
 # ─────────────────────────────────────────────────────────────
-# 2. VIEW / RESHAPE - không copy data (chia sẻ seq qua ref-semantics của Nim
-#    khi có thể; seq[float32] trong Nim là copy-on-write nên "view" thật sự
-#    không sao chép cho tới khi bên nhận GHI vào nó - đủ để tránh copy đọc).
+# 2. VIEW / RESHAPE - no data copy (shares the seq through Nim's ref semantics
+#    when possible; a Nim seq[float32] is copy-on-write, so a "view" really
+#    does not copy until the receiver WRITES to it - enough to avoid read copies).
 # ─────────────────────────────────────────────────────────────
 
 proc numelShape(shape: seq[int]): int =
@@ -70,32 +70,32 @@ proc numelShape(shape: seq[int]): int =
   for s in shape: result *= s
 
 proc view*(x: Tensor, newShape: seq[int]): Tensor =
-  ## Reshape thuần (không copy) - hỗ trợ 1 chiều "-1" (tự suy ra) giống torch.
+  ## A plain reshape (no copy) - supports one "-1" dimension (inferred) like torch.
   var shape = newShape
   var inferIdx = -1
   var known = 1
   for i, s in shape:
     if s == -1:
-      doAssert inferIdx == -1, "view: chỉ được dùng -1 ở MỘT chiều"
+      doAssert inferIdx == -1, "view: -1 may be used in only ONE dimension"
       inferIdx = i
     else:
       known *= s
   if inferIdx >= 0:
     doAssert known != 0 and x.data.len mod known == 0,
-      "view: không thể suy ra chiều -1 từ shape " & $x.shape & " -> " & $newShape
+      "view: cannot infer the -1 dimension from shape " & $x.shape & " -> " & $newShape
     shape[inferIdx] = x.data.len div known
   doAssert numelShape(shape) == x.data.len,
-    "view: tổng số phần tử không khớp (" & $x.data.len & " vs " & $numelShape(shape) & ")"
+    "view: element count mismatch (" & $x.data.len & " vs " & $numelShape(shape) & ")"
   result.shape = shape
-  result.data = x.data   # Nim seq = copy-on-write: đọc không tốn copy.
+  result.data = x.data   # Nim seq = copy-on-write: reading costs no copy.
 
 proc reshape*(x: Tensor, newShape: seq[int]): Tensor = view(x, newShape)
 
 # ─────────────────────────────────────────────────────────────
-# 3. PERMUTE - đổi thứ tự chiều (VD attention [B,T,H,D] -> [B,H,T,D]).
-#    Đây LÀ COPY thật sự (khác view) vì layout bộ nhớ đổi - giống torch:
-#    .permute() trả về view "logic" nhưng không contiguous; ở đây ta luôn
-#    trả contiguous để mọi phép sau (matmul, ...) dùng thẳng được ngay.
+# 3. PERMUTE - reorders dimensions (e.g. attention [B,T,H,D] -> [B,H,T,D]).
+#    This IS a real copy (unlike view) because the memory layout changes - like torch,
+#    .permute() returns a "logical" view that is not contiguous; here we always
+#    return a contiguous tensor so every later op (matmul, ...) can use it right away.
 # ─────────────────────────────────────────────────────────────
 
 proc strides(shape: seq[int]): seq[int] =
@@ -106,12 +106,12 @@ proc strides(shape: seq[int]): seq[int] =
     acc *= shape[i]
 
 proc permute*(ctx: Backend, x: Tensor, dims: seq[int]): Tensor =
-  ## GIỐNG TORCH: chỉ tính strides (O(rank), rank<=8, KHÔNG phụ thuộc n) trên
-  ## CPU rồi gửi cho kernel permute_strided (CUDA/Vulkan/Metal) - mỗi GPU
-  ## thread tự giải mã chỉ số nguồn của riêng nó ngay trên device. Không còn
-  ## vòng lặp CPU O(n) build mảng chỉ số như bản trước.
-  doAssert dims.len == x.shape.len, "permute: số chiều dims phải khớp shape"
-  doAssert dims.len <= 8, "permute: rank > 8 chưa hỗ trợ (bảng push-constant/kernel cố định 8)"
+  ## LIKE TORCH: only the strides are computed (O(rank), rank<=8, independent of n) on
+  ## the CPU and sent to the permute_strided kernel (CUDA/Vulkan/Metal) - each GPU
+  ## thread decodes its own source index right on the device. No more
+  ## O(n) CPU loop building an index array like the previous version.
+  doAssert dims.len == x.shape.len, "permute: the number of dims must match the shape"
+  doAssert dims.len <= 8, "permute: rank > 8 not supported (fixed 8-entry push-constant table/kernel)"
   var newShape = newSeq[int](dims.len)
   for i, d in dims: newShape[i] = x.shape[d]
   let oldStrides = strides(x.shape)
@@ -127,9 +127,9 @@ proc permute*(ctx: Backend, x: Tensor, dims: seq[int]): Tensor =
   result.data = bePermuteGpu(ctx, x.data, newStridesI32, oldStridesI32, dimsMapI32, x.data.len)
 
 # ─────────────────────────────────────────────────────────────
-# 4. REDUCTION: sum / mean / max / argmax theo 1 chiều (dim cuối phổ biến
-#    nhất cho LayerNorm/Loss/Sampling nên hỗ trợ tổng quát mọi dim qua
-#    flatten [outer, dimSize, inner]).
+# 4. REDUCTION: sum / mean / max / argmax along one dimension (the last dim is the most
+#    common for LayerNorm/Loss/Sampling, so every dim is supported generally through
+#    the flatten [outer, dimSize, inner]).
 # ─────────────────────────────────────────────────────────────
 
 proc reduceShapes(shape: seq[int], dim: int): tuple[outer, dimSize, inner: int] =
@@ -140,19 +140,19 @@ proc reduceShapes(shape: seq[int], dim: int): tuple[outer, dimSize, inner: int] 
   for i in dim + 1 ..< shape.len: inner *= shape[i]
   (outer, dimSize, inner)
 
-## GPU HOÁ TOÀN BỘ reduction (sum/mean/max/argmax): mọi phép CỘNG/NHÂN/MAX
-## per-element giờ đi qua beAdd/beSub/beRelu (kernel GPU thật) thay vì vòng
-## lặp CPU. Kỹ thuật: tree-reduction log-depth (giống Hillis-Steele ở mục 8)
-## - mỗi bước gộp cặp phần tử liền kề bằng 1 lệnh GPU trên CẢ KHỐI cùng lúc.
-## max(a,b) = b + relu(a-b) -> biểu diễn thuần bằng beSub/beRelu/beAdd, không
-## cần kernel max riêng. Việc gather/scatter chỉ số (KHÔNG phải phép toán số
-## học) vẫn phải đi qua CPU vì backend.nim chưa có gather/scatter kernel -
-## đây là giới hạn phần cứng kernel hiện có, không phải lựa chọn ở file này.
+## WHOLE reduction on the GPU (sum/mean/max/argmax): every per-element ADD/MUL/MAX
+## now goes through beAdd/beSub/beRelu (real GPU kernels) instead of a CPU
+## loop. Technique: a log-depth tree reduction (like Hillis-Steele in section 8)
+## - each step combines adjacent pairs with one GPU command over the WHOLE BLOCK at once.
+## max(a,b) = b + relu(a-b) -> expressed purely with beSub/beRelu/beAdd, no
+## separate max kernel needed. The index gather/scatter (NOT arithmetic)
+## still goes through the CPU because backend.nim has no gather/scatter kernel yet -
+## a limit of the available kernels, not a choice of this file.
 
 proc gpuTreeReduce(ctx: Backend, data: openArray[float32], outer, dimSize, inner: int,
                     combine: proc(ctx: Backend, a, b: openArray[float32]): seq[float32] {.nimcall.}): seq[float32] =
-  ## Gộp toàn bộ `dimSize` phần tử theo cặp liền kề, log2(dimSize) bước, mỗi
-  ## bước 1 lệnh GPU trên cả khối (không lặp CPU cộng/max từng phần tử).
+  ## Combines all `dimSize` elements in adjacent pairs, log2(dimSize) steps, each
+  ## step one GPU command over the whole block (no CPU loop adding/maxing per element).
   var cur = newSeq[float32](outer * dimSize * inner)
   for i in 0 ..< cur.len: cur[i] = data[i]
   var curDim = dimSize
@@ -179,10 +179,10 @@ proc gpuTreeReduce(ctx: Backend, data: openArray[float32], outer, dimSize, inner
           next[(o * newDim + half) * inner + i] = cur[(o * curDim + curDim - 1) * inner + i]
     cur = next
     curDim = newDim
-  result = cur  # curDim == 1: outer*inner phần tử
+  result = cur  # curDim == 1: outer*inner elements
 
 proc gpuMaxCombine(ctx: Backend, a, b: openArray[float32]): seq[float32] =
-  ## max(a,b) = b + relu(a-b): thuần beSub + beRelu + beAdd, chạy GPU thật.
+  ## max(a,b) = b + relu(a-b): purely beSub + beRelu + beAdd, on a real GPU.
   let diff = beSub(ctx, a, b)
   let reluDiff = beRelu(ctx, diff)
   result = beAdd(ctx, reluDiff, b)
@@ -194,7 +194,7 @@ proc beSum*(ctx: Backend, x: openArray[float32], shape: seq[int], dim: int): seq
 proc beMean*(ctx: Backend, x: openArray[float32], shape: seq[int], dim: int): seq[float32] =
   let (outer, dimSize, inner) = reduceShapes(shape, dim)
   let summed = gpuTreeReduce(ctx, x, outer, dimSize, inner, beAdd)
-  # Chia đều bằng 1 lệnh GPU (beMul với hệ số 1/d) thay vì vòng lặp chia CPU.
+  # Divides with one GPU command (beMul by 1/d) instead of a CPU division loop.
   let invD = newSeq[float32](summed.len).mapIt(1'f32 / float32(dimSize))
   result = beMul(ctx, summed, invD)
 
@@ -203,18 +203,18 @@ proc beMax*(ctx: Backend, x: openArray[float32], shape: seq[int], dim: int): seq
   result = gpuTreeReduce(ctx, x, outer, dimSize, inner, gpuMaxCombine)
 
 proc beArgMax*(ctx: Backend, x: openArray[float32], shape: seq[int], dim: int): seq[int] =
-  ## GPU HOÁ THẬT: cả giá trị VÀ chỉ số cùng tính trên GPU trong 1 lệnh qua
-  ## beArgmaxIndexGpu (argmax_kernel.cu/.comp/.metal - tree-reduce giữ cặp
-  ## (giá trị, chỉ số) bằng shared/threadgroup memory ngay trên device),
-  ## không còn bước "tính max GPU rồi đọc lại CPU để dò index" như trước.
+  ## REAL GPU PORT: both the value AND the index computed on the GPU in one command through
+  ## beArgmaxIndexGpu (argmax_kernel.cu/.comp/.metal - a tree reduce keeping the
+  ## (value, index) pair in shared/threadgroup memory right on the device),
+  ## no more "GPU max then read back to the CPU to find the index" step as before.
   let (outer, dimSize, inner) = reduceShapes(shape, dim)
   let (_, idx) = beArgmaxIndexGpu(ctx, @x, outer, dimSize, inner)
   result = newSeq[int](idx.len)
   for i in 0 ..< idx.len: result[i] = int(idx[i])
 
 proc beArgMax*(ctx: Backend, x: openArray[float32]): int =
-  ## Tiện ích: argmax phẳng trên toàn bộ mảng 1D (VD logits 1 token, greedy
-  ## sampling) - giá trị + chỉ số cùng tính trên GPU (xem ghi chú ở trên).
+  ## Utility: flat argmax over a whole 1D array (e.g. the logits of one token, greedy
+  ## sampling) - value + index computed together on the GPU (see the note above).
   doAssert x.len > 0
   let (_, idx) = beArgmaxIndexGpu(ctx, @x, 1, x.len, 1)
   result = int(idx[0])
@@ -224,16 +224,16 @@ proc beArgMax*(ctx: Backend, x: openArray[float32]): int =
 # ─────────────────────────────────────────────────────────────
 
 proc concat*(ctx: Backend, tensors: openArray[Tensor], dim: int): Tensor =
-  ## GIỐNG TORCH: host chỉ nối phẳng dữ liệu (memcpy nối tiếp - KHÔNG tính
-  ## chỉ số per-element) + chuẩn bị bảng nhỏ O(numTensors) (base offset
-  ## trong buffer phẳng, kích thước theo dim, offset lũy kế theo dim) rồi
-  ## để kernel concat_gather (CUDA/Vulkan/Metal) tự chọn đúng nguồn cho
-  ## từng phần tử ngay trên GPU.
-  doAssert tensors.len > 0, "concat: cần ít nhất 1 tensor"
+  ## LIKE TORCH: the host only concatenates the data flat (sequential memcpy - NO
+  ## per-element index computation) + prepares a small O(numTensors) table (base offset
+  ## in the flat buffer, size along dim, prefix offset along dim) and
+  ## lets the concat_gather kernel (CUDA/Vulkan/Metal) pick the right source for
+  ## each element right on the GPU.
+  doAssert tensors.len > 0, "concat: needs at least 1 tensor"
   let baseShape = tensors[0].shape
   for t in tensors:
     for i, s in t.shape:
-      if i != dim: doAssert s == baseShape[i], "concat: shape không khớp ngoài chiều dim"
+      if i != dim: doAssert s == baseShape[i], "concat: shapes differ outside dimension dim"
   var newShape = baseShape
   var totalDim = 0
   for t in tensors: totalDim += t.shape[dim]
@@ -257,10 +257,10 @@ proc concat*(ctx: Backend, tensors: openArray[Tensor], dim: int): Tensor =
   result.data = beConcatGpu(ctx, flatSrc, srcBase, srcDimSize, srcDimOffset, totalDim, inner, numelShape(newShape))
 
 proc stack*(ctx: Backend, tensors: openArray[Tensor], dim: int = 0): Tensor =
-  ## stack thêm 1 chiều MỚI ở vị trí `dim` (khác concat - không ghép vào
-  ## chiều có sẵn). Cài bằng cách reshape mỗi tensor thêm chiều 1 rồi concat
-  ## (đường concat đã GPU hoá thật ở trên).
-  doAssert tensors.len > 0, "stack: cần ít nhất 1 tensor"
+  ## stack adds a NEW dimension at position `dim` (unlike concat - it does not join along an
+  ## existing dimension). Implemented by reshaping each tensor with an extra dimension of 1, then concat
+  ## (the concat path is really on the GPU, see above).
+  doAssert tensors.len > 0, "stack: needs at least 1 tensor"
   var reshaped = newSeq[Tensor](tensors.len)
   for i, t in tensors:
     var s = t.shape
@@ -269,9 +269,9 @@ proc stack*(ctx: Backend, tensors: openArray[Tensor], dim: int = 0): Tensor =
   result = concat(ctx, reshaped, dim)
 
 proc split*(ctx: Backend, x: Tensor, splitSize: int, dim: int): seq[Tensor] =
-  ## GIỐNG TORCH: mỗi mảnh là 1 lát cắt liên tục - host chỉ truyền 5 số
-  ## nguyên (dimTotal/thisSize/offset/inner/n), kernel split_slice tự tính
-  ## chỉ số nguồn ngay trên GPU cho từng phần tử, không có vòng lặp CPU.
+  ## LIKE TORCH: each piece is a contiguous slice - the host passes only 5
+  ## integers (dimTotal/thisSize/offset/inner/n), the split_slice kernel computes
+  ## each element's source index right on the GPU, no CPU loop.
   let dimTotal = x.shape[dim]
   var outer = 1
   for i in 0 ..< dim: outer *= x.shape[i]
@@ -289,30 +289,30 @@ proc split*(ctx: Backend, x: Tensor, splitSize: int, dim: int): seq[Tensor] =
     offset += thisSize
 
 # ─────────────────────────────────────────────────────────────
-# 6. DROPOUT - GPU HOÁ THẬT (vòng 2): RNG giờ chạy counter-based xorshift32
-#    NGAY TRÊN GPU (dropout_rng_kernel.cu/.comp/.metal qua beDropoutMaskGpu)
-#    thay vì std/random trên host - seed (uint32, người gọi tự tăng mỗi lần
-#    train step để mỗi lần dropout khác nhau) là input duy nhất, không cần
-#    `var Rand` nữa.
+# 6. DROPOUT - REAL GPU PORT (round 2): the RNG now runs a counter-based xorshift32
+#    RIGHT ON THE GPU (dropout_rng_kernel.cu/.comp/.metal through beDropoutMaskGpu)
+#    instead of std/random on the host - the seed (uint32, incremented by the caller every
+#    training step so each dropout differs) is the only input, no
+#    `var Rand` needed any more.
 # ─────────────────────────────────────────────────────────────
 
 proc beDropout*(ctx: Backend, x: openArray[float32], p: float32, training: bool,
                  seed: uint32): seq[float32] =
-  ## Inverted dropout (giống torch.nn.Dropout): lúc eval trả nguyên x, lúc
-  ## train nhân với mask sinh trên GPU (0 hoặc 1/(1-p)) qua beMul (GPU).
+  ## Inverted dropout (like torch.nn.Dropout): returns x unchanged in eval, in
+  ## training multiplies by a mask generated on the GPU (0 or 1/(1-p)) through beMul (GPU).
   if not training or p <= 0'f32:
     result = newSeq[float32](x.len)
     for i in 0 ..< x.len: result[i] = x[i]
     return
-  doAssert p < 1'f32, "dropout: p phải < 1"
+  doAssert p < 1'f32, "dropout: p must be < 1"
   let mask = beDropoutMaskGpu(ctx, x.len, p, seed)
   result = beMul(ctx, @x, mask)
 
 proc dropoutMask*(ctx: Backend, n: int, p: float32, seed: uint32): seq[float32] =
-  ## Trả mask (0 hoặc 1/(1-p)), sinh thẳng trên GPU (beDropoutMaskGpu), để
-  ## dùng lại CHO CẢ forward và backward (nhân lại đúng mask khi lan truyền
-  ## ngược, thay vì random lại lần 2 - bắt buộc với training đúng: cùng seed
-  ## -> cùng mask, vì kernel là counter-based deterministic theo (seed, i)).
+  ## Returns the mask (0 or 1/(1-p)), generated directly on the GPU (beDropoutMaskGpu), so
+  ## it is reused for BOTH forward and backward (multiplying by the same mask during
+  ## backprop instead of drawing again - required for correct training: same seed
+  ## -> same mask, because the kernel is counter-based and deterministic in (seed, i)).
   if p <= 0'f32:
     result = newSeq[float32](n)
     for i in 0 ..< n: result[i] = 1'f32
@@ -320,19 +320,19 @@ proc dropoutMask*(ctx: Backend, n: int, p: float32, seed: uint32): seq[float32] 
   result = beDropoutMaskGpu(ctx, n, p, seed)
 
 # ─────────────────────────────────────────────────────────────
-# 7. COMPARISON (gt/lt/eq/ge/le) - dùng cho top-p sampling, masking
+# 7. COMPARISON (gt/lt/eq/ge/le) - used for top-p sampling, masking
 # ─────────────────────────────────────────────────────────────
 
-## GPU HOÁ COMPARISON: phần TÍNH TOÁN (hiệu a-b, và relu để tách dấu) chạy
-## qua beSub/beRelu (GPU thật). Việc materialize kết quả thành seq[bool] chỉ
-## là đọc lại 1 giá trị float đã tính xong (so với 0) - không phải compute,
-## backend.nim không có kernel xuất bitmask trực tiếp nên bước đọc cuối này
-## là bắt buộc bất kể cách viết.
+## COMPARISONS ON THE GPU: the COMPUTATION (the difference a-b, and relu to separate the sign) runs
+## through beSub/beRelu (real GPU). Materialising the result as a seq[bool] is only
+## reading back an already computed float (compared with 0) - not compute;
+## backend.nim has no kernel producing a bitmask directly, so this final read
+## is required whatever the implementation.
 
-## GPU HOÁ THẬT (vòng 2): so sánh giờ chạy 1 lệnh compare_kernel trên GPU
+## REAL GPU PORT (round 2): comparisons now run one compare_kernel command on the GPU
 ## (beCompareGpuOp - CUDA/Vulkan/Metal, opcode 0=gt 1=lt 2=eq 3=ge 4=le,
-## xem compare_kernel.cu/.comp/.metal) xuất thẳng bitmask, không còn bước
-## trung gian sub/relu + đọc lại host như bản trước.
+## see compare_kernel.cu/.comp/.metal) producing the bitmask directly, no more
+## intermediate sub/relu + host readback as in the previous version.
 
 proc beGt*(ctx: Backend, a, b: openArray[float32]): seq[bool] =
   doAssert a.len == b.len
@@ -369,26 +369,26 @@ proc whereT*(cond: openArray[bool], a, b: Tensor): Tensor =
     result.data[i] = if cond[i]: a.data[i] else: b.data[i]
 
 # ─────────────────────────────────────────────────────────────
-# 8. PARALLEL SCAN (Hillis-Steele, log-depth) - torch.cumsum/cumprod theo 1
-#    chiều bất kỳ, và scan tổng quát với toán tử kết hợp (associative) tuỳ
-#    ý - cần cho Mamba/SSM (selective-scan recurrence h_t = a_t*h_{t-1}+b_t
-#    chính là 1 "affine scan": kết hợp (a1,b1) và (a2,b2) -> (a1*a2,
-#    a2*b1+b2), rồi quét parallel-prefix qua đó).
+# 8. PARALLEL SCAN (Hillis-Steele, log-depth) - torch.cumsum/cumprod along any
+#    dimension, and a general scan with any associative operator
+#    - needed for Mamba/SSM (the selective-scan recurrence h_t = a_t*h_{t-1}+b_t
+#    is an "affine scan": combining (a1,b1) and (a2,b2) -> (a1*a2,
+#    a2*b1+b2), then a parallel prefix over it).
 #
-#    GPU THẬT: mỗi bước Hillis-Steele (offset = 1,2,4,8,...) đưa TOÀN BỘ
-#    phần tử tham gia bước đó vào 1 lệnh GPU thật (beAdd/beMul - đã có kernel
-#    Metal/CUDA/OpenCL/Vulkan chạy thật, không phải mô phỏng) thay vì vòng lặp
-#    CPU per-element. Việc "gather" chỉ số cur/prev vẫn làm trên CPU (đây là
-#    bước đánh chỉ số/reshape, không phải phép tính toán học), nhưng phép
-#    CỘNG/NHÂN thật sự - phần chiếm hầu hết FLOPs khi dimSize lớn - chạy trên
-#    GPU giống hệt beAdd/beMul dùng ở mọi nơi khác trong codebase này.
+#    REAL GPU: each Hillis-Steele step (offset = 1,2,4,8,...) puts ALL the
+#    elements of that step into one real GPU command (beAdd/beMul - kernels running for
+#    real on Metal/CUDA/OpenCL/Vulkan, not emulated) instead of a per-element
+#    CPU loop. The cur/prev index "gather" is still done on the CPU (an
+#    indexing/reshape step, not arithmetic), but the actual
+#    ADDS/MULS - most of the FLOPs when dimSize is large - run on the
+#    GPU exactly like the beAdd/beMul used everywhere else in this codebase.
 # ─────────────────────────────────────────────────────────────
 
 proc scanStepIndices(outer, dimSize, inner, offset: int): tuple[cur, prev: seq[int]] =
-  ## Chỉ số phẳng (cur, prev) của TẤT CẢ vị trí tham gia 1 bước Hillis-Steele
-  ## với `offset` cho trước - đây chính là tập vị trí ĐỘC LẬP nhau trong bước
-  ## này (đọc từ snapshot, không ghi đè lẫn nhau), nên gộp thành 1 cặp mảng
-  ## phẳng rồi đưa nguyên khối vào 1 lệnh GPU (beAdd/beMul) là hợp lệ.
+  ## Flat indices (cur, prev) of ALL positions taking part in one Hillis-Steele step
+  ## with the given `offset` - exactly the set of MUTUALLY INDEPENDENT positions of this step
+  ## (read from a snapshot, not overwriting each other), so gathering them into one pair of
+  ## flat arrays and feeding the whole block to one GPU command (beAdd/beMul) is valid.
   var cur = newSeq[int]()
   var prev = newSeq[int]()
   for o in 0 ..< outer:
@@ -399,12 +399,12 @@ proc scanStepIndices(outer, dimSize, inner, offset: int): tuple[cur, prev: seq[i
   (cur, prev)
 
 proc applyHillisSteeleGpu(ctx: Backend, data: var seq[float32], outer, dimSize, inner: int, useMul: bool) =
-  ## In-place, inclusive prefix-sum (useMul=false) hoặc prefix-product
-  ## (useMul=true) dọc chiều `dimSize`. Mỗi bước offset=1,2,4,... gather
-  ## snapshot của các vị trí tham gia thành 2 mảng phẳng (cur, prev) rồi gọi
-  ## THẲNG beAdd/beMul (GPU thật qua ctx) trên CẢ KHỐI cùng lúc, sau đó
-  ## scatter kết quả ngược lại `data` - không còn vòng lặp CPU cộng/nhân
-  ## từng phần tử một.
+  ## In-place, inclusive prefix sum (useMul=false) or prefix product
+  ## (useMul=true) along `dimSize`. Each step offset=1,2,4,... gathers
+  ## a snapshot of the participating positions into 2 flat arrays (cur, prev) and calls
+  ## beAdd/beMul DIRECTLY (real GPU through ctx) on the WHOLE BLOCK at once, then
+  ## scatters the result back into `data` - no more CPU loop adding/multiplying
+  ## element by element.
   var offset = 1
   while offset < dimSize:
     let snapshot = data
@@ -421,8 +421,8 @@ proc applyHillisSteeleGpu(ctx: Backend, data: var seq[float32], outer, dimSize, 
     offset = offset shl 1
 
 proc beCumsum*(ctx: Backend, x: openArray[float32], shape: seq[int], dim: int): seq[float32] =
-  ## Tương đương torch.cumsum(x, dim): prefix-sum CÓ TÍNH LUỸ (inclusive),
-  ## giữ nguyên shape. Mỗi bước Hillis-Steele chạy qua beAdd (GPU thật).
+  ## Equivalent to torch.cumsum(x, dim): an INCLUSIVE prefix sum,
+  ## keeping the shape. Each Hillis-Steele step runs through beAdd (real GPU).
   let (outer, dimSize, inner) = reduceShapes(shape, dim)
   result = newSeq[float32](x.len)
   for i in 0 ..< x.len: result[i] = x[i]
@@ -433,11 +433,11 @@ proc cumsumT*(ctx: Backend, x: Tensor, dim: int): Tensor =
   result.data = beCumsum(ctx, x.data, x.shape, dim)
 
 proc beCumprod*(ctx: Backend, x: openArray[float32], shape: seq[int], dim: int): seq[float32] =
-  ## torch.cumprod(x, dim). Cùng cấu trúc Hillis-Steele như cumsum nhưng
-  ## kết hợp bằng phép nhân (vẫn kết hợp/associative -> scan song song hợp
-  ## lệ), chạy qua beMul (GPU thật). Dùng riêng thay vì "exp(cumsum(log(x)))"
-  ## để ĐÚNG với giá trị âm/0 giống torch (log(số âm) = NaN, torch.cumprod
-  ## thì không).
+  ## torch.cumprod(x, dim). The same Hillis-Steele structure as cumsum but
+  ## combining with multiplication (still associative -> a valid parallel
+  ## scan), through beMul (real GPU). Kept separate instead of "exp(cumsum(log(x)))"
+  ## to be CORRECT for negative/zero values like torch (log(negative) = NaN, torch.cumprod
+  ## is not).
   let (outer, dimSize, inner) = reduceShapes(shape, dim)
   result = newSeq[float32](x.len)
   for i in 0 ..< x.len: result[i] = x[i]
@@ -449,30 +449,30 @@ proc cumprodT*(ctx: Backend, x: Tensor, dim: int): Tensor =
 
 type
   ScanPair* = tuple[a, b: float32]
-    ## Cặp (a,b) cho affine scan h_t = a_t * h_{t-1} + b_t (đúng dạng
-    ## recurrence của Mamba/SSM selective-scan sau khi rời rạc hoá).
+    ## An (a,b) pair for the affine scan h_t = a_t * h_{t-1} + b_t (exactly the
+    ## Mamba/SSM selective-scan recurrence after discretisation).
 
 proc combineAffine(l, r: ScanPair): ScanPair =
-  ## Kết hợp 2 bước affine liên tiếp: áp l TRƯỚC, r SAU (h -> l(h) -> r(l(h))).
+  ## Combines 2 consecutive affine steps: l applied FIRST, r AFTER (h -> l(h) -> r(l(h))).
   ## r(l(h)) = r.a*(l.a*h + l.b) + r.b = (r.a*l.a)*h + (r.a*l.b + r.b)
-  ## (giữ lại bản CPU-scalar này để testops.nim đối chiếu tuần tự - xem
-  ## sequentialAffine trong testops.nim; đường THẬT chạy GPU nằm ở beAffineScan
-  ## dưới đây, dùng đúng công thức kết hợp y hệt nhưng bằng beMul/beAdd trên
-  ## CẢ KHỐI thay vì 1 cặp float scalar.)
+  ## (this CPU-scalar version is kept so testops.nim can compare sequentially - see
+  ## sequentialAffine in testops.nim; the REAL GPU path is beAffineScan
+  ## below, using exactly the same combination formula but with beMul/beAdd over the
+  ## WHOLE BLOCK instead of one scalar float pair.)
   (a: r.a * l.a, b: r.a * l.b + r.b)
 
 proc beAffineScan*(ctx: Backend, aCoef, bCoef: openArray[float32],
                     shape: seq[int], dim: int): seq[float32] =
-  ## Parallel scan TỔNG QUÁT cho recurrence affine h_t = a_t*h_{t-1} + b_t
-  ## (state-space/SSM/Mamba selective-scan, GRU-tuyến-tính, ...) dọc chiều
-  ## `dim`. Trả về h_t (INCLUSIVE, h_{-1} = 0) cho MỌI t cùng lúc. Mỗi bước
-  ## Hillis-Steele áp CÔNG THỨC combineAffine (r.a*l.a, r.a*l.b + r.b) cho
-  ## TOÀN BỘ vị trí tham gia bước đó CÙNG LÚC bằng 3 lệnh GPU thật
-  ## (beMul, beMul, beAdd) - không còn vòng lặp CPU tính từng cặp (a,b) một.
+  ## GENERAL parallel scan for the affine recurrence h_t = a_t*h_{t-1} + b_t
+  ## (state space/SSM/Mamba selective scan, linear GRU, ...) along
+  ## `dim`. Returns h_t (INCLUSIVE, h_{-1} = 0) for EVERY t at once. Each
+  ## Hillis-Steele step applies the combineAffine FORMULA (r.a*l.a, r.a*l.b + r.b) to
+  ## ALL positions of that step AT ONCE with 3 real GPU commands
+  ## (beMul, beMul, beAdd) - no more CPU loop computing each (a,b) pair.
   doAssert aCoef.len == bCoef.len
   let (outer, dimSize, inner) = reduceShapes(shape, dim)
-  doAssert inner == 1, "beAffineScan: hiện chỉ hỗ trợ dim cuối cùng (inner=1); " &
-    "gọi permute() trước nếu cần scan theo chiều khác"
+  doAssert inner == 1, "beAffineScan: currently supports only the last dimension (inner=1); " &
+    "call permute() first to scan along another dimension"
   var a = newSeq[float32](aCoef.len)
   var b = newSeq[float32](bCoef.len)
   for i in 0 ..< aCoef.len: (a[i] = aCoef[i]; b[i] = bCoef[i])
@@ -498,4 +498,4 @@ proc beAffineScan*(ctx: Backend, aCoef, bCoef: openArray[float32],
         a[curIdx[j]] = combinedA[j]
         b[curIdx[j]] = combinedB[j]
     offset = offset shl 1
-  result = b  # h_t với h_{-1}=0 chính là thành phần b sau khi scan xong
+  result = b  # h_t with h_{-1}=0 is exactly the b component after the scan

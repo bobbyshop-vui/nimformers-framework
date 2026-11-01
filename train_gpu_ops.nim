@@ -1,5 +1,5 @@
-## train_gpu_ops.nim — host wrapper chạy kernel train_gpu_vm trên GPU (Metal/CUDA/Vulkan).
-## Mỗi hàm = 1 session: upload 1 lần, chạy chuỗi kernel, đọc 1 lần (giống mamba2_real.nim).
+## train_gpu_ops.nim — host wrappers running the train_gpu_vm kernels on the GPU (Metal/CUDA/Vulkan).
+## Each function = one session: upload once, run the kernel chain, read once (like mamba2_real.nim).
 import backend
 import nimformer
 import customfloat
@@ -23,7 +23,7 @@ proc rmsNormForwardGpu*(ctx: Backend; x, gamma: seq[float32]; rows, C: int;
 proc rmsNormBackwardGpu*(ctx: Backend; x, gamma, dOut: seq[float32]; rows, C: int;
                          eps: float32): tuple[dX, dGamma: seq[float32]] =
   let L = rmsLayout(rows, C, eps)
-  var buf = newSeq[float32](L.total)          # vùng dGamma = 0 cho atomic
+  var buf = newSeq[float32](L.total)          # dGamma region = 0 for the atomics
   buf.blit(L.x, x, 0, rows * C); buf.blit(L.gamma, gamma, 0, C)
   buf.blit(L.dy, dOut, 0, rows * C)
   let tg = rmsRowTg(C)
@@ -32,7 +32,7 @@ proc rmsNormBackwardGpu*(ctx: Backend; x, gamma, dOut: seq[float32]; rows, C: in
   result = (buf[L.dx ..< L.dx + rows * C], buf[L.dGamma ..< L.dGamma + C])
 
 proc linearPlusForwardGpu*(ctx: Backend; qkv: seq[float32]; B, T, H, D: int): seq[float32] =
-  ## qkv: [B*T, 3C] (q|k|v mỗi token). Trả y [B*T, C].
+  ## qkv: [B*T, 3C] (q|k|v per token). Returns y [B*T, C].
   let L = lpLayout(B, T, H, D)
   var buf = newSeq[float32](L.total)
   buf.blit(L.qkv, qkv, 0, L.BT * 3 * L.C)
@@ -44,10 +44,10 @@ proc linearPlusForwardGpu*(ctx: Backend; qkv: seq[float32]; B, T, H, D: int): se
   result = buf[L.y ..< L.y + L.BT * L.C]
 
 proc linearPlusBackwardGpu*(ctx: Backend; qkv, dY: seq[float32]; B, T, H, D: int): seq[float32] =
-  ## Dựng lại forward trong cùng session rồi backward 2 pass. Trả dQKV [B*T, 3C]
-  ## (đúng layout dProj cho qkvProj.backward).
+  ## Rebuilds the forward in the same session, then a 2-pass backward. Returns dQKV [B*T, 3C]
+  ## (exactly the dProj layout for qkvProj.backward).
   let L = lpLayout(B, T, H, D)
-  var buf = newSeq[float32](L.total)          # vùng trạng thái scan = 0; dQKV được ghi đè
+  var buf = newSeq[float32](L.total)          # scan state region = 0; dQKV is overwritten
   buf.blit(L.qkv, qkv, 0, L.BT * 3 * L.C)
   buf.blit(L.dY, dY, 0, L.BT * L.C)
   let tg = lpPhiTg(L)
@@ -63,7 +63,7 @@ proc linearPlusBackwardGpu*(ctx: Backend; qkv, dY: seq[float32]; B, T, H, D: int
 
 proc softmaxCrossEntropyGpu*(ctx: Backend; logits: seq[float32]; targets: seq[float32];
                              rows, V, nValid: int): tuple[loss: float32, dLogits: seq[float32]] =
-  ## targets[r] < 0 => bỏ qua. nValid = số hàng hợp lệ (chia loss/gradient cho nValid).
+  ## targets[r] < 0 => skipped. nValid = number of valid rows (loss/gradient divided by nValid).
   if nValid == 0: return (0'f32, newSeq[float32](rows * V))
   let L = ceLayout(rows, V)
   var buf = newSeq[float32](L.total)
@@ -75,13 +75,13 @@ proc softmaxCrossEntropyGpu*(ctx: Backend; logits: seq[float32]; targets: seq[fl
     (buildCeSumProgram(L), 1, 4, 1, "ce_sum")], buf)
   result = (buf[L.sum], buf[L.dLogits ..< L.dLogits + rows * V])
 
-const AdamChunk = 8 * 1024 * 1024     ## phần tử / lần dispatch (chia hết AdamTg)
+const AdamChunk = 8 * 1024 * 1024     ## elements per dispatch (a multiple of AdamTg)
 
 proc adamStepFusedGpu*(ctx: Backend; param: var seq[float32]; grad: seq[float32];
                        m, v: var seq[float32]; step: int; lr: float32;
                        b1: float32 = 0.9'f32; b2: float32 = 0.999'f32;
                        eps: float32 = 1e-8'f32) =
-  ## Adam 1 kernel / chunk (thay ~14 phép be* rời). `step` đã tăng (>=1) trước khi gọi.
+  ## Adam, 1 kernel per chunk (replacing ~14 separate be* ops). `step` is already incremented (>=1) before the call.
   let n = param.len
   let ibc1 = 1'f32 / (1'f32 - pow(b1, float32(step)))
   let ibc2 = 1'f32 / (1'f32 - pow(b2, float32(step)))
@@ -103,8 +103,8 @@ proc adamStepFusedGpu*(ctx: Backend; param: var seq[float32]; grad: seq[float32]
 proc apfAdamStepFused*(ctx: Backend; param: var Tensor; grad: Tensor; state: var ApfAdamState;
                        lr: float32 = 1e-3'f32; b1: float32 = 0.9'f32; b2: float32 = 0.999'f32;
                        eps: float32 = 1e-8'f32; requantizeEvery: int = 1): CustomFloat =
-  ## Drop-in cho apfAdamStepGpu: Adam 1 micro-kernel. Nếu requantizeEvery hữu hạn (APF
-  ## requantize CustomFloat) thì giữ đường cũ vì bước requantize nằm ngoài kernel này.
+  ## Drop-in for apfAdamStepGpu: Adam as one micro-kernel. With a finite requantizeEvery (APF
+  ## CustomFloat requantization) the old path is kept because requantization is outside this kernel.
   if requantizeEvery > 0 and requantizeEvery != int.high:
     return apfAdamStepGpu(ctx, param, grad, state, lr, b1, b2, eps, requantizeEvery)
   inc state.step

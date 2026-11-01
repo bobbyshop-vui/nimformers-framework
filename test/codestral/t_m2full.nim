@@ -1,6 +1,6 @@
-## Kiểm tra pipeline kernel toàn lớp Mamba2 (mamba2_full_vm) trên interpreter tham chiếu:
-##  - forward  so với tham chiếu double viết thẳng từ công thức gốc (mamba2_real.nim cũ)
-##  - backward so với gradient sai phân số (FD) của loss = sum(dNormedOut * normedOut)
+## Checks the whole-layer Mamba2 kernel pipeline (mamba2_full_vm) on the reference interpreter:
+##  - forward against a double reference written straight from the original formulas (old mamba2_real.nim)
+##  - backward against finite-difference (FD) gradients of loss = sum(dNormedOut * normedOut)
 import std/[math, strutils]
 import session_vm, vm_interp, mamba2_full_vm
 import std/strutils as su2
@@ -24,7 +24,7 @@ fill(L.aLog, H, 0.5); fill(L.dSkip, H, 0.7); fill(L.dtBias, H, 0.3); fill(L.norm
 for i in 0 ..< C: buf[L.normW + i] += 1.0'f32
 fill(L.dNormedOut, BT * C, 1.0)
 
-# ── tham chiếu double: forward đầy đủ, trả về các tensor trung gian ──
+# ── double reference: full forward, returns the intermediate tensors ──
 type Ref = object
   pre, conv, dt, states, yPre, gated, rms, normedPre, normedOut: seq[float64]
 proc fwd(pm: seq[float32]): Ref =
@@ -78,7 +78,7 @@ proc cmpRef(name: string; off: int; want: seq[float64]; tol = 2e-4) =
   var worst = 0.0
   for i in 0 ..< want.len:
     worst = max(worst, abs(want[i] - float64(buf[off + i])) / max(1.0, abs(want[i])))
-  echo (if worst < tol: "OK   " else: "LECH "), name, ": sai so ", formatFloat(worst, ffScientific, 2)
+  echo (if worst < tol: "OK   " else: "DIFF "), name, ": error ", formatFloat(worst, ffScientific, 2)
   if worst >= tol: inc fails
 
 let tgR = rmsTg(L)
@@ -112,9 +112,9 @@ proc chk(name: string; off, n, anOff: int) =
   for i in 0 ..< n:
     let f = fd(off + i); let an = float64(buf[anOff + i])
     worst = max(worst, abs(f - an) / max(1.0, abs(f)))
-  echo (if worst < 1e-2: "OK   " else: "LECH "), "bwd ", name, ": sai so ", formatFloat(worst, ffScientific, 2)
+  echo (if worst < 1e-2: "OK   " else: "DIFF "), "bwd ", name, ": error ", formatFloat(worst, ffScientific, 2)
   if worst >= 1e-2: inc fails
-# dProj gồm 3 vùng: z | xBC | dt trên mỗi hàng -> so từng phần tử proj
+# dProj has 3 regions: z | xBC | dt per row -> compared per proj element
 chk("dProj (z, xBC, dt)", L.proj, BT * P, L.dProj)
 chk("dNormW", L.normW, C, L.dNormW)
 chk("dALog", L.aLog, H, L.dALog); chk("dDSkip", L.dSkip, H, L.dDSkip)
@@ -127,7 +127,7 @@ block:
   runGrid(buildAxpyProgram(0, 3, 0.5'f32), m, 3, 3)
   doAssert m[0] == 6.0'f32 and m[1] == 12.0'f32 and m[2] == 18.0'f32
   echo "OK   axpy"
-# ── kernel train: RMSNorm / Linear++ / softmax-CE / Adam gộp ──
+# ── training kernels: RMSNorm / Linear++ / softmax-CE / fused Adam ──
 block:
   var seed2 = 777'u32
   proc rnd2(s = 1.0): float64 =
@@ -139,8 +139,8 @@ block:
     for i in 0 ..< want.len:
       let e = abs(float64(got[i]) - float64(want[i])) / (1.0 + abs(float64(want[i])))
       if e > worst: worst = e
-    if worst < tol: echo "OK   ", name, ": sai so ", worst.formatFloat(ffScientific, 2)
-    else: echo "FAIL ", name, ": sai so ", worst.formatFloat(ffScientific, 2); inc bad2
+    if worst < tol: echo "OK   ", name, ": error ", worst.formatFloat(ffScientific, 2)
+    else: echo "FAIL ", name, ": error ", worst.formatFloat(ffScientific, 2); inc bad2
 
   # ───────── RMSNorm ─────────
   block:
@@ -189,7 +189,7 @@ block:
     runGrid(buildLpBwdQProgram(L), buf, BHD, BHD)
     runGrid(buildLpBwdKProgram(L), buf, BHD, BHD)
     runGrid(buildLpBwdVProgram(L), buf, BHD, BHD)
-    # tham chiếu double
+    # double reference
     proc elu1(x: float64): float64 = (if x > 0: x + 1 else: exp(x))
     proc eluG(x: float64): float64 = (if x > 0: 1.0 else: exp(x))
     let qkv0 = buf[L.qkv ..< L.qkv + L.BT * 3 * C]
@@ -213,7 +213,7 @@ block:
     var iRef = newSeq[float32](invr.len); for i in 0 ..< invr.len: iRef[i] = float32(invr[i])
     chk2("lp fwd y", buf[L.y ..< L.y + L.BT * C], yRef)
     chk2("lp fwd invDen", buf[L.invDen ..< L.invDen + L.BT * H], iRef, 1e-3)
-    # FD: loss = Σ dY * y ; kiểm dQKV
+    # FD: loss = Σ dY * y ; checks dQKV
     let dY = buf[L.dY ..< L.dY + L.BT * C]
     proc loss(qkv: seq[float32]): float64 =
       let r = fwdRef(qkv)
@@ -233,7 +233,7 @@ block:
         gv.add buf[L.dQKV + t*3*C + 2*C + c]; fv.add fd[t*3*C + 2*C + c]
     chk2("lp bwd dQ (FD)", gq, fq, 2e-3); chk2("lp bwd dK (FD)", gk, fk, 2e-3); chk2("lp bwd dV (FD)", gv, fv, 2e-3)
 
-  # ───────── Cross-entropy có mask ─────────
+  # ───────── Masked cross-entropy ─────────
   block:
     let (rows, V) = (5, 48)
     let L = ceLayout(rows, V)
@@ -262,7 +262,7 @@ block:
     chk2("ce dLogits", buf[L.dLogits ..< L.dLogits + rows*V], dRef)
     chk2("ce loss", @[buf[L.sum]], @[float32(lossRef)], 1e-5)
 
-  # ───────── Adam gộp ─────────
+  # ───────── Fused Adam ─────────
   block:
     let n = 512
     let L = adamLayout(n)
@@ -286,7 +286,7 @@ block:
     chk2("adam m", buf[L.m ..< L.m + n], mRef, 1e-5)
     chk2("adam v", buf[L.v ..< L.v + n], vRef, 1e-5)
 
-  # lặp lại RMS + CE với giới hạn threadgroup nhỏ (GPU Intel chỉ 256; ở đây ép 4) -> nhiều phần tử / lane
+  # RMS + CE again with a small threadgroup limit (Intel GPUs allow only 256; forced to 4 here) -> several elements / lane
   gTgCap = 4
   block:
     let (rows, C) = (5, 24)
@@ -320,5 +320,5 @@ block:
     chk2("ce tg=4 rowLoss", b1[L.rowLoss ..< L.rowLoss + rows], b0[L.rowLoss ..< L.rowLoss + rows], 1e-5)
   gTgCap = 1024
   fails += bad2
-doAssert fails == 0, $fails & " kiem tra LECH"
+doAssert fails == 0, $fails & " checks DIFFER"
 echo "ALL OK"

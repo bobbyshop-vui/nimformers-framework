@@ -1,0 +1,237 @@
+# formers.n — architecture detection test.
+#
+# Builds fake model directories (config.json + header-only .nimq whose
+# tensors have real shapes but no payload + LoRA .bin metadata) and checks
+# what fmDetect / fmCheckRun decide. No weights are loaded, no GPU is used.
+# When the real DeepSeek/Codestral directories exist, their headers are
+# checked too (a few hundred KB read, payloads skipped).
+
+import nim "std/[os, json, strutils]"
+import nim "quant"
+import "../src/formers/cli/options.bybylang"
+import "../src/formers/arch/detect.bybylang"
+
+function tWriteI32(f: File, v: int)
+    var x = int32(v)
+    discard f.writeBuffer(addr x, 4)
+
+function tWriteStr(f: File, s: string)
+    tWriteI32(f, s.len)
+    f.write(s)
+
+function tWriteNimq(path: string, tensors: seq[(string, seq[int])])
+    ## Real header layout (quant.saveQuantStateDict), empty payloads.
+    var sd: seq[(string, QuantTensor)]
+    for (name, shape) in tensors:
+        var qt = QuantTensor(kind: qkFp32Raw, shape: shape)
+        if name.endsWith("_proj.weight"):
+            qt.kind = qkInt4Asymmetric
+            qt.groupSize = 128
+        sd.add((name, qt))
+    var arch: array[5, int]
+    saveQuantStateDict(path, arch, sd)
+
+function tLlamaTensors(vocab, hidden, inter, layers, heads, kvHeads: int): seq[(string, seq[int])]
+    let hd = hidden div heads
+    result.add(("model.embed_tokens.weight", @[vocab, hidden]))
+    result.add(("model.norm.weight", @[hidden]))
+    result.add(("lm_head.weight", @[vocab, hidden]))
+    for l in 0 ..< layers:
+        let p = "model.layers." & $l & "."
+        result.add((p & "input_layernorm.weight", @[hidden]))
+        result.add((p & "post_attention_layernorm.weight", @[hidden]))
+        result.add((p & "self_attn.q_proj.weight", @[heads * hd, hidden]))
+        result.add((p & "self_attn.k_proj.weight", @[kvHeads * hd, hidden]))
+        result.add((p & "self_attn.v_proj.weight", @[kvHeads * hd, hidden]))
+        result.add((p & "self_attn.o_proj.weight", @[hidden, heads * hd]))
+        result.add((p & "mlp.gate_proj.weight", @[inter, hidden]))
+        result.add((p & "mlp.up_proj.weight", @[inter, hidden]))
+        result.add((p & "mlp.down_proj.weight", @[hidden, inter]))
+
+function tLlamaConfig(modelType: string, vocab, hidden, inter, layers, heads, kvHeads: int): JsonNode
+    result = %*{"model_type": modelType, "architectures": ["LlamaForCausalLM"], "vocab_size": vocab, "hidden_size": hidden, "intermediate_size": inter, "num_hidden_layers": layers, "num_attention_heads": heads, "num_key_value_heads": kvHeads, "max_position_embeddings": 2048, "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "hidden_act": "silu"}
+
+function tMamba2Tensors(vocab, hidden, layers, heads, state, groups, conv, expand: int): seq[(string, seq[int])]
+    let dInner = expand * hidden
+    result.add(("backbone.embeddings.weight", @[vocab, hidden]))
+    result.add(("backbone.norm_f.weight", @[hidden]))
+    result.add(("lm_head.weight", @[vocab, hidden]))
+    for l in 0 ..< layers:
+        let p = "backbone.layers." & $l & "."
+        result.add((p & "norm.weight", @[hidden]))
+        result.add((p & "mixer.A_log", @[heads]))
+        result.add((p & "mixer.D", @[heads]))
+        result.add((p & "mixer.dt_bias", @[heads]))
+        result.add((p & "mixer.conv1d.weight", @[dInner + 2 * groups * state, 1, conv]))
+        result.add((p & "mixer.conv1d.bias", @[dInner + 2 * groups * state]))
+        result.add((p & "mixer.in_proj.weight", @[2 * dInner + 2 * groups * state + heads, hidden]))
+        result.add((p & "mixer.norm.weight", @[dInner]))
+        result.add((p & "mixer.out_proj.weight", @[hidden, dInner]))
+
+function tMamba2Config(vocab, hidden, layers, heads, state, groups, conv, expand: int): JsonNode
+    result = %*{"model_type": "mamba2", "architectures": ["Mamba2ForCausalLM"], "vocab_size": vocab, "hidden_size": hidden, "num_hidden_layers": layers, "num_heads": heads, "head_dim": expand * hidden div heads, "state_size": state, "n_groups": groups, "conv_kernel": conv, "expand": expand, "rms_norm": true}
+
+function tWriteLoraBin(path, pattern, nimqName: string, hidden, vocab, heads: int, withLinearPP: bool)
+    var meta: seq[(string, string)]
+    meta.add(("format", "nimformers-lora-v1-qlora4"))
+    meta.add(("pattern", pattern))
+    meta.add(("nimqPath", nimqName))
+    meta.add(("hidden", $hidden))
+    meta.add(("vocab", $vocab))
+    meta.add(("nHeads", $heads))
+    meta.add(("ffMult", "4"))
+    meta.add(("normPreset", "rms-fin-gn"))
+    meta.add(("mambaNormImpl", "mamba-ssm-postgate-grouped-v1"))
+    for i, ch in pattern:
+        meta.add(("adapter.block" & $i & ".mambaReal.inProj.weight.r", "4"))
+        if withLinearPP and ch == 'G':
+            meta.add(("newBlock.block" & $i & ".attn.qkvProj.weight.shape", $(@[3 * hidden, hidden])))
+            meta.add(("newBlock.block" & $i & ".fuseGate.weight.shape", $(@[hidden, 2 * hidden])))
+    var f = open(path, fmWrite)
+    f.write("NIMBIN4\0")
+    tWriteI32(f, meta.len)
+    for (k, v) in meta:
+        tWriteStr(f, k)
+        tWriteStr(f, v)
+    tWriteI32(f, 0)
+    tWriteI32(f, 0)
+    f.close()
+
+function tModelDir(root, name: string, cfg: JsonNode, tensors: seq[(string, seq[int])], sub: string): string
+    result = root / name
+    createDir(result)
+    let metaDir = if sub.len > 0: result / sub else: result
+    createDir(metaDir)
+    writeFile(metaDir / "config.json", $cfg)
+    writeFile(metaDir / "tokenizer.json", "{\"model\": {\"type\": \"BPE\"}}")
+    tWriteNimq(result / "model.nimq", tensors)
+
+function tOpts(dir: string): FmOptions
+    result = fmDefaultOptions()
+    result.modelsDir = dir
+
+function tCheck(name: string, det: FmDetection, arch: FmArch, supported: bool): bool
+    let firstError = if det.errors.len > 0: det.errors[0] else: ""
+    if det.arch != arch or det.supported != supported:
+        echo "FAIL " & name & ": arch=" & $det.arch & " supported=" & $det.supported & " errors=" & det.errors.join("; ")
+        return false
+    echo "PASS " & name & " -> " & $det.arch & " / " & $det.route & (if firstError.len > 0: " [" & firstError & "]" else: "")
+    result = true
+
+root = getTempDir() / ("formers_n_detect_" & $getCurrentProcessId())
+removeDir(root)
+createDir(root)
+failures = 0
+codestralPattern = "RRRRRRRGRRRRRRRRRRRRRRRGRRRRRRRRRRRRRRRGRRRRRRRRRRRRRRRGRRRRRRRR"
+
+# 1. DeepSeek-coder 6.7B shape (MHA, 32 layers)
+dir = tModelDir(root, "deepseek", tLlamaConfig("llama", 32256, 4096, 11008, 32, 32, 32), tLlamaTensors(32256, 4096, 11008, 32, 32, 32), "")
+det = fmDetect(tOpts(dir))
+if not tCheck("deepseek-6.7b", det, faLlama, true) or det.llama.nLayers != 32:
+    inc failures
+
+# 2. TinyLlama 1.1B shape (GQA 32/4, 22 layers): same route, sizes from config
+dir = tModelDir(root, "tinyllama", tLlamaConfig("llama", 32000, 2048, 5632, 22, 32, 4), tLlamaTensors(32000, 2048, 5632, 22, 32, 4), "")
+det = fmDetect(tOpts(dir))
+if not tCheck("tinyllama-1.1b", det, faLlama, true) or det.llama.nKVHeads != 4 or det.llama.headDim != 64 or det.nLayers != 22:
+    inc failures
+
+# 3. config says 24 layers, tensors have 22
+dir = tModelDir(root, "llama-mismatch", tLlamaConfig("llama", 32000, 2048, 5632, 24, 32, 4), tLlamaTensors(32000, 2048, 5632, 22, 32, 4), "")
+if not tCheck("llama-layer-mismatch", fmDetect(tOpts(dir)), faUnknown, false):
+    inc failures
+
+# 3b. tokenizer.json replaced by the simplified export_to_nimq.py schema
+dir = tModelDir(root, "llama-bad-tokenizer", tLlamaConfig("llama", 32000, 2048, 5632, 22, 32, 4), tLlamaTensors(32000, 2048, 5632, 22, 32, 4), "")
+writeFile(dir / "tokenizer.json", "{\"vocab_size\": 1, \"vocab\": {\"a\": 0}, \"merges\": []}")
+if not tCheck("llama-overwritten-tokenizer", fmDetect(tOpts(dir)), faUnknown, false):
+    inc failures
+
+# 4. Llama tensor names but another architecture (gemma)
+dir = tModelDir(root, "gemma", tLlamaConfig("gemma", 32000, 2048, 5632, 2, 8, 1), tLlamaTensors(32000, 2048, 5632, 2, 8, 1), "")
+if not tCheck("gemma-names", fmDetect(tOpts(dir)), faUnknown, false):
+    inc failures
+
+# 5. Codestral Mamba-2 base (config in hf/, like test/codestral/models)
+mcfg = tMamba2Config(32768, 4096, 64, 128, 128, 8, 4, 2)
+mtensors = tMamba2Tensors(32768, 4096, 64, 128, 128, 8, 4, 2)
+dir = tModelDir(root, "codestral", mcfg, mtensors, "hf")
+det = fmDetect(tOpts(dir))
+if not tCheck("codestral-base", det, faMamba2, true) or det.files.tokenizerDir != dir / "hf":
+    inc failures
+
+# 6. + LoRA with Linear++ attention (60 R + 4 G) -> infer_lora checkpoint path
+tWriteLoraBin(dir / "jamba_parallel_lora.bin", codestralPattern, "model.nimq", 4096, 32768, 128, true)
+det = fmDetect(tOpts(dir))
+if not tCheck("codestral-linear++", det, faMamba2LinearPP, true) or det.route != frMamba2Lora or det.lora.linearPPBlocks != @[7, 23, 39, 55]:
+    inc failures
+
+# 7. --no-lora keeps the base path
+noLora = tOpts(dir)
+noLora.noLora = true
+if not tCheck("codestral-no-lora", fmDetect(noLora), faMamba2, true):
+    inc failures
+
+# 8. LoRA adapters only (all R)
+dir = tModelDir(root, "codestral-lora", mcfg, mtensors, "hf")
+tWriteLoraBin(dir / "adapters.bin", "R".repeat(64), "model.nimq", 4096, 32768, 128, false)
+if not tCheck("codestral-lora-only", fmDetect(tOpts(dir)), faMamba2Lora, true):
+    inc failures
+
+# 9. LoRA trained for another size
+dir = tModelDir(root, "codestral-badlora", mcfg, mtensors, "hf")
+tWriteLoraBin(dir / "adapters.bin", "R".repeat(48), "model.nimq", 2560, 32768, 80, false)
+if not tCheck("codestral-wrong-lora", fmDetect(tOpts(dir)), faMamba2, false):
+    inc failures
+
+# 10. Another Mamba-2 size: dimensions come from config.json
+dir = tModelDir(root, "mamba2-2.7b", tMamba2Config(50288, 2560, 64, 80, 128, 1, 4, 2), tMamba2Tensors(50288, 2560, 64, 80, 128, 1, 4, 2), "")
+det = fmDetect(tOpts(dir))
+if not tCheck("mamba2-2.7b", det, faMamba2, true) or det.mamba.inProjRows != 2 * 5120 + 2 * 128 + 80:
+    inc failures
+
+# 11. Mamba-1 and an unknown architecture
+dir = tModelDir(root, "mamba1", %*{"model_type": "mamba", "vocab_size": 10, "hidden_size": 8, "num_hidden_layers": 1}, @[("backbone.embeddings.weight", @[10, 8]), ("backbone.layers.0.mixer.x_proj.weight", @[4, 16])], "")
+if not tCheck("mamba1", fmDetect(tOpts(dir)), faUnknown, false):
+    inc failures
+dir = tModelDir(root, "gpt2", %*{"model_type": "gpt2", "vocab_size": 10, "n_embd": 8}, @[("transformer.wte.weight", @[10, 8]), ("transformer.h.0.attn.c_attn.weight", @[8, 24])], "")
+if not tCheck("gpt2", fmDetect(tOpts(dir)), faUnknown, false):
+    inc failures
+
+# 12. fmCheckRun: --ngl and unsupported architectures
+det = fmDetect(tOpts(root / "tinyllama"))
+reason = ""
+nglOpts = tOpts(root / "tinyllama")
+nglOpts.ngl = 99
+okAll = fmCheckRun(det, nglOpts, reason)
+nglOpts.ngl = 10
+okPart = fmCheckRun(det, nglOpts, reason)
+okGpt2 = fmCheckRun(fmDetect(tOpts(root / "gpt2")), tOpts(root / "gpt2"), reason)
+if okAll and not okPart and not okGpt2:
+    print "PASS fmCheckRun: ngl 99 ok, ngl 10/22 rejected, unknown arch -> false"
+else:
+    print "FAIL fmCheckRun: " & $okAll & " " & $okPart & " " & $okGpt2
+    inc failures
+
+# 13. Real checkpoints, headers only (skipped when not downloaded)
+if fileExists("test/deepseek-inference/models/model.nimq") and fileExists("test/deepseek-inference/models/config.json"):
+    det = fmDetect(tOpts("test/deepseek-inference/models"))
+    if not tCheck("real deepseek-coder-6.7b", det, faLlama, true):
+        inc failures
+else:
+    print "SKIP real deepseek: test/deepseek-inference/models not downloaded"
+if fileExists("test/codestral/models/codestral_mamba_only.nimq") and fileExists("test/codestral/models/hf/config.json"):
+    det = fmDetect(tOpts("test/codestral/models"))
+    if fileExists("test/codestral/models/jamba_parallel_lora.bin"):
+        if not tCheck("real codestral + jamba_parallel_lora.bin", det, faMamba2LinearPP, true):
+            inc failures
+    elif not tCheck("real codestral base", det, faMamba2, true):
+        inc failures
+else:
+    print "SKIP real codestral: test/codestral/models not downloaded"
+
+removeDir(root)
+if failures > 0:
+    print "formers.n detect test: " & $failures & " FAIL"
+    quit(1)
+print "formers.n detect test PASSED"

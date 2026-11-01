@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-export_to_nimq.py - Hỗ trợ asymmetric int4 (Q4_K_M) với MPS acceleration
+export_to_nimq.py - asymmetric int4 (Q4_K_M) support with MPS acceleration
 
-FIX (2026-07-17): Bỏ dòng transpose thừa (weight_f32.T) sau khi gọi
-dequantize_gptq_linear() trong export_to_nimq(). Hàm dequantize_gptq_linear
-đã tự transpose 1 lần để trả về đúng layout [out_features, in_features]
-(convention của nn.Linear/HF). Transpose thêm lần nữa ở nơi gọi làm layout
-bị lật ngược thành [in_features, out_features], khiến mọi Linear layer nạp
-từ GPTQ (q/k/v/o_proj, gate/up/down_proj) bị load sai hoàn toàn phía Nim,
-vì loadLinear() bên generate.nim gán thẳng .data mà không transpose (đúng
-theo giả định layout [outF, inF]).
+FIX (2026-07-17): removed the extra transpose (weight_f32.T) after calling
+dequantize_gptq_linear() in export_to_nimq(). dequantize_gptq_linear
+already transposes once to return the right layout [out_features, in_features]
+(the nn.Linear/HF convention). Transposing again at the call site flipped the layout
+into [in_features, out_features], so every Linear layer loaded
+from GPTQ (q/k/v/o_proj, gate/up/down_proj) was loaded completely wrong on the Nim side,
+because loadLinear() in generate.nim assigns .data directly without transposing (as
+it assumes the [outF, inF] layout).
 """
 
 import os
@@ -26,18 +26,18 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
 # ============================================================
-# Kiểm tra MPS - FIX: force FP16
+# MPS check - FIX: force FP16
 # ============================================================
 USE_MPS = False
 if torch.backends.mps.is_available():
     USE_MPS = True
-    # === FIX: force FP16 để tránh lỗi BFloat16 ===
+    # === FIX: force FP16 to avoid the BFloat16 error ===
     torch.set_default_dtype(torch.float16)
-    print("🔹 MPS (Metal) available - sẽ dùng GPU cho quantize (FP16)")
+    print("🔹 MPS (Metal) available - using the GPU for quantization (FP16)")
     os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
     os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
 else:
-    print("🔹 MPS not available - dùng CPU")
+    print("🔹 MPS not available - using the CPU")
 
 # ============================================================
 # QuantKind
@@ -49,29 +49,29 @@ QK_INT4_ASYMMETRIC = 3
 
 
 # ============================================================
-# 1. Load model - FIX: force dtype cho MPS
+# 1. Load model - FIX: force the dtype for MPS
 # ============================================================
 
 def load_model(model_name: str, is_gptq: bool = False) -> Tuple[Any, Any, Dict]:
     print(f"Loading model: {model_name}")
 
-    # FIX: LUÔN load lên CPU dù USE_MPS=True. accelerate.load_checkpoint_in_model
-    # cố set_module_tensor_to_device thẳng lên MPS với dtype gốc trong
-    # checkpoint (thường là bfloat16) TRƯỚC KHI kịp ép sang float16 ->
-    # "TypeError: Trying to convert BFloat16 to the MPS backend" vì MPS
-    # không hỗ trợ bfloat16. Load CPU trước (ổn định, đã test nhiều lần),
-    # sau đó dequantize_gptq_module() sẽ tự .to("mps") RIÊNG từng module 1
-    # (lúc đó tensor đã là float16 rồi, MPS nhận bình thường).
+    # FIX: ALWAYS load on the CPU even with USE_MPS=True. accelerate.load_checkpoint_in_model
+    # tries set_module_tensor_to_device straight onto MPS with the original dtype of the
+    # checkpoint (usually bfloat16) BEFORE it can be cast to float16 ->
+    # "TypeError: Trying to convert BFloat16 to the MPS backend" because MPS
+    # has no bfloat16. Loading on the CPU first (stable, tested many times),
+    # then dequantize_gptq_module() moves each module .to("mps") SEPARATELY
+    # (by then the tensors are float16, which MPS accepts).
     device = "cpu"
-    print(f"   Using device: {device} (module GPTQ sẽ tự chuyển MPS lúc dequantize nếu USE_MPS)")
+    print(f"   Using device: {device} (GPTQ modules move to MPS themselves while dequantizing if USE_MPS)")
 
-    # === FIX: force FP16 cho MPS ===
+    # === FIX: force FP16 for MPS ===
     torch_dtype = torch.float16
 
     if is_gptq:
         try:
             from auto_gptq import AutoGPTQForCausalLM
-            # === FIX: thêm torch_dtype vào from_quantized ===
+            # === FIX: torch_dtype added to from_quantized ===
             model = AutoGPTQForCausalLM.from_quantized(
                 model_name,
                 device=device,
@@ -123,27 +123,27 @@ def dequantize_gptq_torch_mps(qweight_t: torch.Tensor, qzeros_t: torch.Tensor,
                                scales_t: torch.Tensor, g_idx_t: torch.Tensor,
                                device: str, bits: int = 4) -> torch.Tensor:
     """
-    NGHIÊM CẤM numpy - toàn bộ bằng torch theo yêu cầu. Dùng MPS thật cho
-    phần compute nặng.
+    numpy is FORBIDDEN - everything in torch as requested. Real MPS is used for the
+    heavy compute.
 
-    Lý do KHÔNG gọi module.forward(eye) trực tiếp trên MPS (đã thử, luôn
-    hỏng): auto_gptq's QuantLinear.forward() tự gọi `self.g_idx.long()` và
-    bitwise_right_shift NGAY TRÊN MPS device - 2 op này PyTorch MPS backend
-    (đặc biệt trên GPU Intel tích hợp, không phải Apple Silicon) xử lý sai,
-    làm hỏng dữ liệu int64 ngay cả sau khi đã ép int32 trước đó (vì
-    forward() tự ép lại .long() = int64 bên trong, không kiểm soát được từ
-    ngoài nếu gọi qua module.forward()).
+    Why module.forward(eye) is NOT called directly on MPS (tried, always
+    broken): auto_gptq's QuantLinear.forward() calls `self.g_idx.long()` and
+    bitwise_right_shift RIGHT ON the MPS device - the PyTorch MPS backend handles these 2 ops
+    wrongly (especially on integrated Intel GPUs, not Apple Silicon),
+    corrupting int64 data even after an earlier cast to int32 (because
+    forward() casts back to .long() = int64 inside, uncontrollable from
+    outside when calling module.forward()).
 
-    Fix: KHÔNG gọi module.forward(). Tự làm 2 bước bằng torch trần:
-    1) Unpack bit (bitwise_right_shift, g_idx indexing) - làm trên CPU vì
-       đây là 2 op MPS không hỗ trợ đúng, nhưng cũng RẺ (không phải phần
-       tốn thời gian).
-    2) Phép tính nặng thật sự - (weight - zero) * scale trên toàn ma trận
-       hàng triệu phần tử - chuyển sang MPS chạy thật bằng torch (đây là
-       chỗ MPS giúp ích thật, không phải bitwise/indexing).
+    Fix: module.forward() is NOT called. The 2 steps are done with plain torch:
+    1) Bit unpacking (bitwise_right_shift, g_idx indexing) - on the CPU because
+       these are the 2 ops MPS gets wrong, and they are CHEAP (not the
+       time-consuming part).
+    2) The really heavy computation - (weight - zero) * scale over a matrix of
+       millions of elements - moved to MPS and run for real with torch (where
+       MPS really helps, unlike bitwise/indexing).
     """
-    assert bits == 4, "Chỉ hỗ trợ GPTQ 4-bit."
-    qweight_t = qweight_t.cpu().to(torch.int64)   # bitwise + shift cần CPU
+    assert bits == 4, "Only 4-bit GPTQ is supported."
+    qweight_t = qweight_t.cpu().to(torch.int64)   # bitwise + shift need the CPU
     qzeros_t = qzeros_t.cpu().to(torch.int64)
     g_idx_t = g_idx_t.cpu().to(torch.int64)
     scales_t = scales_t.cpu().to(torch.float32)
@@ -159,13 +159,13 @@ def dequantize_gptq_torch_mps(qweight_t: torch.Tensor, qzeros_t: torch.Tensor,
     zeros_int4 = torch.zeros((n_groups, out_features), dtype=torch.int64)
     for k in range(8):
         zeros_int4[:, k::8] = (qzeros_t >> (4 * k)) & 0xF
-    # Khớp đúng công thức thật auto_gptq: +1 rồi mask lại mod 16 (wraparound)
+    # Matches the real auto_gptq formula exactly: +1 then masked again mod 16 (wraparound)
     zeros_int4 = (zeros_int4 + 1) & 0xF
 
-    zeros_per_row = zeros_int4[g_idx_t, :]   # index trên CPU - an toàn
+    zeros_per_row = zeros_int4[g_idx_t, :]   # indexing on the CPU - safe
     scales_per_row = scales_t[g_idx_t, :]
 
-    # === Phần compute nặng: chuyển sang MPS chạy thật bằng torch ===
+    # === The heavy compute: moved to MPS and run for real with torch ===
     w_f = w_int4.to(torch.float32)
     z_f = zeros_per_row.to(torch.float32)
     if device != "cpu":
@@ -174,9 +174,9 @@ def dequantize_gptq_torch_mps(qweight_t: torch.Tensor, qzeros_t: torch.Tensor,
             z_f = z_f.to(device)
             scales_per_row = scales_per_row.to(device)
         except Exception as e:
-            print(f"  ⚠️ Không chuyển được sang {device} ({e}), tính trên CPU")
+            print(f"  ⚠️ Cannot move to {device} ({e}), computing on the CPU")
 
-    weight = (w_f - z_f) * scales_per_row   # torch thật trên MPS (nếu device=mps)
+    weight = (w_f - z_f) * scales_per_row   # real torch on MPS (if device=mps)
     weight = weight.t().contiguous().to(torch.float32).cpu()  # [out_features, in_features]
     return weight
 
@@ -185,19 +185,19 @@ def dequantize_gptq_linear(qweight: np.ndarray, qzeros: np.ndarray,
                             scales: np.ndarray, g_idx: np.ndarray,
                             bits: int = 4) -> np.ndarray:
     """
-    FIX (v2): khớp CHÍNH XÁC theo source thật của auto_gptq
-    QuantLinear.forward (qlinear_cuda_old.py, nhánh bits=4):
+    FIX (v2): matches EXACTLY the real auto_gptq source
+    QuantLinear.forward (qlinear_cuda_old.py, the bits=4 branch):
 
         zeros = ((qzeros >> shift) & 0xF)
         zeros = zeros + 1
-        zeros = zeros & 0xF        # <-- QUAN TRỌNG: mask LẠI sau khi +1
+        zeros = zeros & 0xF        # <-- IMPORTANT: masked AGAIN after +1
 
-    Bug ở bản trước: cộng 1 xong KHÔNG mask lại. Khi zero_point gốc = 15
-    (0b1111), +1 phải wrap về 0 (mod 16) nhưng bản cũ giữ nguyên 16 -> toàn
-    bộ group rơi vào case này bị lệch offset -> weight sai -> model sinh
-    token loạn xạ dù mọi thứ khác (loading, RoPE, attention...) đều đúng.
+    The bug in the previous version: +1 WITHOUT masking again. When the original zero_point = 15
+    (0b1111), +1 must wrap to 0 (mod 16) but the old version kept 16 -> every
+    group in this case got a shifted offset -> wrong weights -> the model generated
+    chaotic tokens although everything else (loading, RoPE, attention...) was right.
     """
-    assert bits == 4, "Chỉ hỗ trợ GPTQ 4-bit."
+    assert bits == 4, "Only 4-bit GPTQ is supported."
 
     in_features = qweight.shape[0] * 8
     out_features = qweight.shape[1]
@@ -213,7 +213,7 @@ def dequantize_gptq_linear(qweight: np.ndarray, qzeros: np.ndarray,
     for k in range(8):
         zeros_int4[:, k::8] = (qzeros_u32 >> (4 * k)) & 0xF
 
-    # FIX: +1 rồi mask lại mod 16 (đúng theo auto_gptq thật), KHÔNG để tràn thành 16
+    # FIX: +1 then masked again mod 16 (as the real auto_gptq does), NO overflow to 16
     zeros_int4 = (zeros_int4 + 1) & 0xF
 
     scales_f32 = scales.astype(np.float32)
@@ -222,21 +222,21 @@ def dequantize_gptq_linear(qweight: np.ndarray, qzeros: np.ndarray,
     scales_per_row = scales_f32[group_for_row, :]
 
     weight = (w_int4.astype(np.float32) - zeros_per_row.astype(np.float32)) * scales_per_row
-    # weight hiện có shape [in_features, out_features]; transpose 1 lần duy nhất
-    # ở đây để trả về đúng convention nn.Linear: [out_features, in_features].
+    # weight currently has shape [in_features, out_features]; transposed exactly once
+    # here to return the nn.Linear convention: [out_features, in_features].
     return weight.T.astype(np.float32)
 
 
 def dequantize_gptq_module(module, device: str) -> np.ndarray:
     """
-    Dùng ĐÚNG module QuantLinear thật (auto_gptq) để lấy dequantized weight,
-    thay vì tự giải mã bit-unpacking - đảm bảo khớp 100% với phép tính
-    auto_gptq dùng khi infer thật, tránh mọi rủi ro sai order/convention.
-    Module hiện đang ở CPU (float16, do load_model() luôn load CPU để tránh
-    lỗi accelerate+MPS+BFloat16 lúc load checkpoint) - tự chuyển RIÊNG module
-    này sang device (mps) ngay trước khi tính (lúc này đã là float16 nên MPS
-    nhận được), rồi chuyển về lại CPU sau để giải phóng bộ nhớ MPS dần thay
-    vì giữ nguyên 224 module cùng lúc trên GPU.
+    Uses the REAL QuantLinear module (auto_gptq) to get the dequantized weight,
+    instead of decoding the bit unpacking itself - guaranteed to match 100% the computation
+    auto_gptq uses at real inference, avoiding any order/convention risk.
+    The module is currently on the CPU (float16, because load_model() always loads on the CPU to avoid
+    the accelerate+MPS+BFloat16 error while loading the checkpoint) - this
+    module alone is moved to the device (mps) right before computing (it is float16 by then, so MPS
+    accepts it), then moved back to the CPU afterwards to release MPS memory gradually instead
+    of keeping all 224 modules on the GPU at once.
     """
     in_features = getattr(module, "infeatures", None) or module.in_features
     out_features = getattr(module, "outfeatures", None) or module.out_features
@@ -244,14 +244,14 @@ def dequantize_gptq_module(module, device: str) -> np.ndarray:
     moved = False
     if device != "cpu":
         try:
-            # FIX: PyTorch MPS có bug đã biết với tensor int64 - .to("mps")
-            # có thể làm hỏng dữ liệu (đây là nguyên nhân g_idx bị hỏng
-            # thành giá trị rác như 1087250403 quan sát được). Ép về int32
-            # TRƯỚC khi chuyển device - int32 được MPS hỗ trợ ổn định, và
-            # giá trị thật của g_idx/qweight/qzeros đều nằm gọn trong phạm
-            # vi int32 (g_idx: 0..n_groups~86, qweight/qzeros: packed 4-bit
-            # trong uint32 nhưng giá trị thực tế luôn < 2^31) nên không mất
-            # thông tin khi ép kiểu.
+            # FIX: PyTorch MPS has a known bug with int64 tensors - .to("mps")
+            # may corrupt the data (the cause of g_idx turning into
+            # garbage values such as the observed 1087250403). Cast to int32
+            # BEFORE moving to the device - int32 is well supported by MPS, and
+            # the real values of g_idx/qweight/qzeros all fit within
+            # int32 (g_idx: 0..n_groups~86, qweight/qzeros: 4-bit packed
+            # in uint32 but the real values are always < 2^31), so no
+            # information is lost by the cast.
             for attr_name in ("g_idx", "qweight", "qzeros"):
                 if hasattr(module, attr_name):
                     buf = getattr(module, attr_name)
@@ -260,7 +260,7 @@ def dequantize_gptq_module(module, device: str) -> np.ndarray:
             module.to(device)
             moved = True
         except Exception as e:
-            print(f"  ⚠️ Không chuyển được module sang {device} ({e}), tính trên CPU")
+            print(f"  ⚠️ Cannot move the module to {device} ({e}), computing on the CPU")
             device = "cpu"
 
     eye = torch.eye(in_features, dtype=torch.float16, device=device)
@@ -272,22 +272,22 @@ def dequantize_gptq_module(module, device: str) -> np.ndarray:
         module.bias.data.zero_()
 
     with torch.no_grad():
-        out = module(eye)  # [in_features, out_features] = W^T (vì y = x @ W^T, x=I)
+        out = module(eye)  # [in_features, out_features] = W^T (because y = x @ W^T, x=I)
 
     if had_bias:
         module.bias.data = saved_bias
 
     weight = out.t().contiguous().to(torch.float32).cpu().numpy()  # -> [out_features, in_features]
-    assert weight.shape == (out_features, in_features), f"shape lệch: {weight.shape} != {(out_features, in_features)}"
+    assert weight.shape == (out_features, in_features), f"shape mismatch: {weight.shape} != {(out_features, in_features)}"
 
-    # FIX: nếu MPS command buffer bị driver âm thầm "ignore" (như log lỗi
-    # "command buffer exited with error status" ở layer cuối), kết quả đọc
-    # về thường là NaN hoặc toàn 0 (buffer chưa từng được ghi). Phát hiện
-    # -> tính LẠI layer này bằng CPU (chậm hơn nhưng chắc chắn đúng) thay vì
-    # âm thầm ghi weight rác vào file.
+    # FIX: if the driver silently "ignores" an MPS command buffer (like the
+    # "command buffer exited with error status" log at the last layer), the result read
+    # back is usually NaN or all 0 (the buffer was never written). Detected
+    # -> this layer is recomputed on the CPU (slower but surely right) instead of
+    # silently writing garbage weights to the file.
     bad = (not np.isfinite(weight).all()) or (np.abs(weight).max() < 1e-12)
     if bad and moved:
-        print(f"  ⚠️ Nghi ngờ MPS command buffer lỗi (NaN/toàn-0) - tính lại CPU cho layer này")
+        print(f"  ⚠️ Suspected MPS command buffer error (NaN/all zeros) - recomputing this layer on the CPU")
         module.to("cpu")
         moved = False
         eye_cpu = torch.eye(in_features, dtype=torch.float16, device="cpu")
@@ -304,22 +304,22 @@ def dequantize_gptq_module(module, device: str) -> np.ndarray:
         del eye_cpu
 
     if moved:
-        # FIX: sync + giải phóng cache GPU NGAY sau mỗi module, TRƯỚC khi
-        # chuyển module về CPU. Không làm việc này -> command buffer của
-        # module sau chồng lên module trước trong hàng đợi MPS, driver
-        # Intel Iris (yếu, không phải Apple Silicon) quá tải sau ~200 lần
-        # dồn liên tục -> "command buffer exited with error status" / GPU
-        # errors bị driver âm thầm ignore ở các layer cuối -> weight rác.
+        # FIX: sync + free the GPU cache RIGHT after each module, BEFORE
+        # moving the module back to the CPU. Without this -> the command buffers of
+        # the next module pile up on the previous one in the MPS queue, the
+        # Intel Iris driver (weak, not Apple Silicon) is overloaded after ~200
+        # consecutive submissions -> "command buffer exited with error status" / GPU
+        # errors silently ignored by the driver at the last layers -> garbage weights.
         torch.mps.synchronize()
         del eye, out
         torch.mps.empty_cache()
-        module.to("cpu")  # giải phóng bộ nhớ MPS, không giữ hết 224 module cùng lúc
+        module.to("cpu")  # releases MPS memory, not keeping all 224 modules at once
 
     return weight
 
 
 def find_gptq_modules(model):
-    """Trả về list (dotted_name, module) cho mọi QuantLinear GPTQ trong model."""
+    """Returns a list of (dotted_name, module) for every GPTQ QuantLinear in the model."""
     result = []
     for name, module in model.named_modules():
         if hasattr(module, "qweight") and hasattr(module, "qzeros") and hasattr(module, "scales"):
@@ -330,13 +330,13 @@ def find_gptq_modules(model):
 def normalize_key_prefix(name: str) -> str:
     if name.startswith("model.model."):
         return name[len("model."):]
-    # FIX: lm_head nằm NGOÀI submodule .model trong LlamaForCausalLM gốc,
-    # nên qua AutoGPTQForCausalLM wrapper (self.model = LlamaForCausalLM)
-    # nó chỉ bị thêm ĐÚNG 1 lớp "model." (thành "model.lm_head.weight"),
-    # không phải 2 lớp như các tensor khác -> không match điều kiện trên,
-    # không được strip -> nim_inference.nim tìm "lm_head.weight" không
-    # thấy -> âm thầm fallback dùng tied embedding SAI (model này không
-    # tie embedding) -> toàn bộ logits cuối sai -> sinh token rác.
+    # FIX: lm_head sits OUTSIDE the .model submodule in the original LlamaForCausalLM,
+    # so through the AutoGPTQForCausalLM wrapper (self.model = LlamaForCausalLM)
+    # it gets only ONE extra "model." prefix (becoming "model.lm_head.weight"),
+    # not 2 like the other tensors -> it does not match the condition above,
+    # is not stripped -> nim_inference.nim does not find "lm_head.weight"
+    # -> silently falls back to the WRONG tied embedding (this model does not
+    # tie embeddings) -> all final logits wrong -> garbage tokens.
     if name.startswith("model.lm_head."):
         return name[len("model."):]
     return name
@@ -358,12 +358,12 @@ def quantize_int8_vectorized(arr: np.ndarray) -> Tuple[np.ndarray, float]:
 
 def quantize_int4_asymmetric_per_group(arr: np.ndarray, group_size: int = 128) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Asymmetric int4 quantization, per-GROUP thay vì per-ROW: mỗi group_size cột
-    trong 1 hàng dùng 1 scale/zero_point riêng, thay vì 1 scale cho CẢ hàng
-    (per-row cũ). Với group_size=128 (giống độ mịn phổ biến của GPTQ gốc),
-    sai số double-quantization (GPTQ 4-bit/group -> float32 -> int4 lai) giảm
-    mạnh so với per-row (1 scale/4096 cột) - đó là nguyên nhân chính gây lệch
-    hidden state ở after_block_0 khi dùng --q4km trước đây.
+    Asymmetric int4 quantization, per GROUP instead of per ROW: each group_size columns
+    of a row use their own scale/zero_point, instead of one scale for the WHOLE row
+    (the old per-row). With group_size=128 (the usual granularity of the original GPTQ),
+    the double-quantization error (GPTQ 4-bit/group -> float32 -> int4 again) drops
+    sharply compared with per-row (1 scale/4096 columns) - the main cause of the drifting
+    hidden state at after_block_0 with the earlier --q4km.
     """
     assert arr.ndim == 2
     nRows, nCols = arr.shape
@@ -398,16 +398,16 @@ def quantize_int4_asymmetric_per_group(arr: np.ndarray, group_size: int = 128) -
 
 def quantize_int4_asymmetric_per_row(arr: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Per-row (per output channel) asymmetric int4 - mỗi hàng (arr.shape[0])
-    có scale/zero_point RIÊNG thay vì 1 giá trị chung cho cả tensor.
-    Weight sau GPTQ-dequant có range rất khác nhau giữa các hàng (mỗi hàng
-    GPTQ vốn đã có scale/group riêng) -> quantize per-tensor (1 scale chung)
-    kéo giãn range, sai số cộng dồn nặng khi double-quant. Per-row giữ độ
-    chính xác gần với per-group gốc của GPTQ, vẫn ra int4 (~4GB).
-    Trả về: packed data [nRows, ceil(nCols/2)] uint8, scales[nRows], zeros[nRows]
+    Per-row (per output channel) asymmetric int4 - each row (arr.shape[0])
+    has its OWN scale/zero_point instead of one value for the whole tensor.
+    Weights after GPTQ dequant have very different ranges between rows (each GPTQ row
+    already had its own scale/group) -> per-tensor quantization (one shared scale)
+    stretches the range, and the error accumulates badly with double quantization. Per-row keeps the
+    precision close to GPTQ's original per-group, still int4 (~4GB).
+    Returns: packed data [nRows, ceil(nCols/2)] uint8, scales[nRows], zeros[nRows]
     """
     if arr.ndim != 2:
-        # fallback: tensor 1D (hiếm khi rơi vào nhánh int4, nhưng an toàn)
+        # fallback: a 1D tensor (rarely takes the int4 branch, but safe)
         packed, scale, zp = quantize_int4_asymmetric(arr)
         return packed, np.array([scale], dtype=np.float32), np.array([zp], dtype=np.float32)
 
@@ -449,7 +449,7 @@ def quantize_int4_asymmetric(arr: np.ndarray) -> Tuple[np.ndarray, float, float]
     zero_point = -min_val / scale
     quantized = np.clip(np.round(flat / scale + zero_point), 0, 15).astype(np.uint8)
 
-    # Pack 2 giá trị 4-bit vào 1 byte - VECTORIZED
+    # Pack 2 4-bit values into 1 byte - VECTORIZED
     n = len(quantized)
     packed = np.zeros((n + 1) // 2, dtype=np.uint8)
     even = quantized[0::2]
@@ -468,7 +468,7 @@ def quantize_int4_symmetric(arr: np.ndarray) -> Tuple[np.ndarray, float]:
     scale = max_val / 7.0
     quantized = np.clip(np.round(flat / scale), -7, 7).astype(np.int8)
 
-    # Pack 2 giá trị 4-bit vào 1 byte - VECTORIZED
+    # Pack 2 4-bit values into 1 byte - VECTORIZED
     n = len(quantized)
     packed = np.zeros((n + 1) // 2, dtype=np.uint8)
     quantized_u8 = (quantized & 0x0F).astype(np.uint8)
@@ -482,10 +482,10 @@ def quantize_int4_symmetric(arr: np.ndarray) -> Tuple[np.ndarray, float]:
 
 def quantize_with_mps(arr: np.ndarray, quant_kind: int) -> Tuple[np.ndarray, float, float]:
     """
-    Dùng MPS (Metal) để quantize nếu có GPU - nhanh hơn 10-50x
+    Uses MPS (Metal) to quantize when a GPU is present - 10-50x faster
     """
     if not USE_MPS:
-        # Fallback về CPU vectorized
+        # Fall back to the vectorized CPU version
         if quant_kind == QK_INT8:
             quantized, scale = quantize_int8_vectorized(arr)
             return quantized, scale, 0.0
@@ -499,7 +499,7 @@ def quantize_with_mps(arr: np.ndarray, quant_kind: int) -> Tuple[np.ndarray, flo
             return arr.flatten().astype(np.float32), 1.0, 0.0
 
     try:
-        # === FIX: chuyển sang FP16 trước khi lên MPS ===
+        # === FIX: converted to FP16 before going to MPS ===
         arr_tensor = torch.from_numpy(arr.flatten()).float().to("mps")
         max_val = torch.max(torch.abs(arr_tensor)).item()
 
@@ -550,16 +550,16 @@ def quantize_with_mps(arr: np.ndarray, quant_kind: int) -> Tuple[np.ndarray, flo
             return arr.flatten().astype(np.float32), 1.0, 0.0
 
 
-INT4_ASYMMETRIC_GROUP_SIZE = 128  ## THÊM: mac dinh group=128 (gan voi granularity GPTQ goc).
-                                   ## Doi so nay neu can nen nhe hon nua (group lon hon) hoac
-                                   ## chinh xac hon (group nho hon), danh doi voi dung luong.
+INT4_ASYMMETRIC_GROUP_SIZE = 128  ## ADDED: default group=128 (close to the original GPTQ granularity).
+                                   ## Change it for a lighter compression (larger groups) or
+                                   ## more precision (smaller groups), trading off size.
 
 def pack_tensor_for_nim(arr: np.ndarray, quant_kind: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int, int, int]:
     """
-    Pack tensor - dùng MPS nếu có. scales/zeros luôn trả về dạng mảng
-    (len=1 cho các kind cũ per-tensor, len=nRows cho int4-asymmetric 2D
-    per-row, len=nRows*nGroupsPerRow cho per-group). Tra ve them group_size
-    (0 = per-tensor/per-row, >0 = per-group voi group_size do).
+    Packs a tensor - with MPS if available. scales/zeros are always returned as arrays
+    (len=1 for the old per-tensor kinds, len=nRows for 2D int4-asymmetric
+    per-row, len=nRows*nGroupsPerRow for per-group). Also returns group_size
+    (0 = per-tensor/per-row, >0 = per-group with that group_size).
     """
     if quant_kind == QK_FP32_RAW:
         return arr.flatten().astype(np.float32), np.array([1.0], dtype=np.float32), np.array([0.0], dtype=np.float32), 0, 0, 0
@@ -574,10 +574,10 @@ def pack_tensor_for_nim(arr: np.ndarray, quant_kind: int) -> Tuple[np.ndarray, n
 
     elif quant_kind == QK_INT4_ASYMMETRIC:
         if arr.ndim == 2:
-            # SUA: per-group (mac dinh 128) thay vi per-row - per-row (1 scale/
-            # 4096 cot) qua tho so voi GPTQ goc (per-group ~128 cot/scale) ->
-            # double-quantization mat qua nhieu do chinh xac -> hidden state
-            # lech ro sau block 0 du dequant GPTQ va cong thuc forward deu dung.
+            # CHANGED: per-group (default 128) instead of per-row - per-row (1 scale/
+            # 4096 columns) is too coarse compared with the original GPTQ (per-group ~128 columns/scale) ->
+            # double quantization loses too much precision -> the hidden state
+            # drifts visibly after block 0 even though the GPTQ dequant and the forward formulas are right.
             group_size = min(INT4_ASYMMETRIC_GROUP_SIZE, arr.shape[1])
             packed, scales, zeros = quantize_int4_asymmetric_per_group(arr, group_size)
             return packed, scales, zeros, 0, 0, group_size
@@ -599,7 +599,7 @@ def write_string(f, s: str):
 
 
 def write_quant_tensor(f, name: str, arr: np.ndarray, kind: int = QK_FP32_RAW):
-    """Ghi 1 QuantTensor - hỗ trợ per-row/per-group scale/zero_point (mảng, không phải 1 float)"""
+    """Writes one QuantTensor - supports per-row/per-group scale/zero_point (arrays, not a single float)"""
     data, scales, zeros, eb, mb, group_size = pack_tensor_for_nim(arr, kind)
 
     actual_kind = {QK_FP32_RAW: 0, QK_INT8: 1, QK_INT4: 2, QK_INT4_ASYMMETRIC: 3}.get(kind, 0)
@@ -667,7 +667,7 @@ def export_to_nimq(
 
     device = "mps" if USE_MPS else "cpu"
     if is_gptq_model:
-        print(f"🔍 Found {len(gptq_bases)} GPTQ layers (torch + {device}, KHÔNG dùng numpy để tính)")
+        print(f"🔍 Found {len(gptq_bases)} GPTQ layers (torch + {device}, NO numpy for the computation)")
 
     normal_tensors = []
     for name, tensor in state_dict.items():
@@ -677,18 +677,18 @@ def export_to_nimq(
             continue
         if any(name.endswith(suf) for suf in (".qweight", ".qzeros", ".scales", ".g_idx")):
             continue
-        # FIX: bias của các base GPTQ (vd model.layers.0.self_attn.q_proj.bias)
-        # LÀ 1 tensor bình thường trong state_dict (không có suffix qweight/
-        # qzeros/scales/g_idx) nên trước đây lọt qua các điều kiện loại trừ ở
-        # trên, bị ghi vào file Ở ĐÂY với kind=quant_kind (bias bị quantize
-        # int4 THEO Ý MUỐN --q4km, dù bias đáng lẽ luôn phải fp32) - RỒI ghi
-        # LẠI LẦN NỮA đúng cách (QK_FP32_RAW) trong loop GPTQ bên dưới. Tensor
-        # bị ghi 2 lần trùng tên trong file - lãng phí thời gian quantize +
-        # dung lượng, và việc load ra ĐÚNG hay không phụ thuộc hoàn toàn vào
-        # thứ tự 2 loop này (byName[name]=qt ở phía Nim ghi đè theo thứ tự
-        # đọc file - đúng MAY MẮN vì loop GPTQ chạy sau, không phải vì được
-        # thiết kế đảm bảo vậy). Bỏ qua hẳn ở đây, để riêng loop GPTQ ghi 1
-        # lần duy nhất, đúng ngay từ đầu.
+        # FIX: the bias of GPTQ bases (e.g. model.layers.0.self_attn.q_proj.bias)
+        # IS a normal tensor in the state_dict (no qweight/
+        # qzeros/scales/g_idx suffix), so it used to pass the exclusion conditions
+        # above and get written HERE with kind=quant_kind (the bias quantized to
+        # int4 PER --q4km, although biases should always be fp32) - THEN written
+        # AGAIN correctly (QK_FP32_RAW) in the GPTQ loop below. The tensor
+        # was written twice with the same name - wasting quantization time +
+        # space, and whether it loads CORRECTLY depended entirely on the
+        # order of these 2 loops (byName[name]=qt on the Nim side overwrites in
+        # file order - correct BY LUCK because the GPTQ loop runs later, not by
+        # design). Skipped entirely here, so only the GPTQ loop writes it once,
+        # right from the start.
         if is_gptq_model and any(name == base + ".bias" for base in gptq_bases):
             continue
         normal_tensors.append(name)
@@ -703,12 +703,12 @@ def export_to_nimq(
     print(f"Total tensors: {total_tensors}")
 
     with open(output_path, 'wb') as f:
-        write_string(f, "NIMQ2")  # THÊM: bump tu NIMQ1 -> NIMQ2 (them field groupSize, xem quant.nim)
+        write_string(f, "NIMQ2")  # bumped from NIMQ1 -> NIMQ2 (adds the groupSize field, see quant.nim)
         for v in arch:
             f.write(struct.pack('<i', v))
         f.write(struct.pack('<i', total_tensors))
 
-        # Xử lý tensor thường
+        # Normal tensors
         tensor_count = 0
         for name in normal_tensors:
             tensor = state_dict[name]
@@ -729,10 +729,10 @@ def export_to_nimq(
             write_quant_tensor(f, norm_name, arr, kind)
             del arr
 
-        # Xử lý GPTQ: torch thuần (KHÔNG numpy) - unpack bit (bitwise/int64
-        # index, MPS lỗi) trên CPU, phần compute nặng (trừ+nhân toàn ma
-        # trận) chạy THẬT trên MPS bằng torch. Công thức khớp đúng auto_gptq
-        # thật (zero+1 rồi mask lại mod 16).
+        # GPTQ: plain torch (NO numpy) - bit unpacking (bitwise/int64
+        # indexing, broken on MPS) on the CPU, the heavy compute (subtract+multiply over the whole
+        # matrix) REALLY on MPS with torch. The formula matches the real auto_gptq
+        # (zero+1 then masked again mod 16).
         if is_gptq_model:
             print(f"  Processing {len(gptq_bases)} GPTQ layers (torch + {device})...")
             for base in gptq_bases:
@@ -750,7 +750,7 @@ def export_to_nimq(
                 g_idx_t = state_dict[gi_key].detach()
 
                 weight_t = dequantize_gptq_torch_mps(qweight_t, qzeros_t, scales_t, g_idx_t, device, bits=4)
-                weight_f32 = weight_t.numpy()  # chỉ convert numpy ở bước ghi file (write_quant_tensor cần numpy để pack binary)
+                weight_f32 = weight_t.numpy()  # converted to numpy only for writing the file (write_quant_tensor needs numpy to pack the binary)
 
                 norm_name = normalize_key_prefix(base + ".weight")
                 write_string(f, norm_name)
@@ -774,24 +774,36 @@ def export_to_nimq(
     print(f"   File size: {file_size:.2f} GB")
     print(f"   Time: {elapsed:.1f}s")
 
-    # === FIX (trước đây): export tokenizer.json là 1 bảng byte-identity GIẢ
-    # {"vocab_size": 256, "bytes": [0..255]} - hoàn toàn không phải tokenizer
-    # thật của model (model thật dùng subword BPE hàng chục nghìn token, có
-    # merges hẳn hoi). Giờ xuất ĐÚNG vocab + merges thật từ chính
-    # AutoTokenizer đã load, theo cùng schema với BPETokenizer bên
+    # === FIX (earlier): tokenizer.json used to be exported as a FAKE byte-identity table
+    # {"vocab_size": 256, "bytes": [0..255]} - not the model's real
+    # tokenizer at all (the real model uses subword BPE with tens of thousands of tokens and
+    # real merges). Now the REAL vocab + merges come from the loaded
+    # AutoTokenizer, with the same schema as BPETokenizer in
     # test_nimformer.nim: {"vocab_size", "vocab": {token_str: id}, "merges":
-    # ["a b", ...]} - để 2 bên đọc/ghi qua lại được, không còn giả byte-map.
+    # ["a b", ...]} - so both sides can read/write each other, no more fake byte map.
     tokenizer_path = os.path.join(os.path.dirname(output_path) or ".", "tokenizer.json")
     exported = False
-    if getattr(tokenizer, "is_fast", False):
+    # Exporting next to a Hugging Face checkout must not replace its
+    # tokenizer.json: nim_inference / formers.n read that file (it has a
+    # "model" block), the simplified schema below is only for test_nimformer.
+    if os.path.exists(tokenizer_path):
+        try:
+            with open(tokenizer_path) as g:
+                existing = json.load(g)
+            if isinstance(existing, dict) and "model" in existing:
+                print(f"   Tokenizer: keeping the Hugging Face {tokenizer_path}")
+                exported = True
+        except Exception:
+            pass
+    if not exported and getattr(tokenizer, "is_fast", False):
         try:
             backend_json = json.loads(tokenizer.backend_tokenizer.to_str())
             model_block = backend_json.get("model", {})
             vocab = model_block.get("vocab")
             merges_raw = model_block.get("merges")
             if vocab is not None and merges_raw is not None:
-                # merges trong tokenizers lib có thể là list[str] "a b" hoặc
-                # list[list[str]] [a, b] tuỳ phiên bản - chuẩn hoá về "a b".
+                # merges in the tokenizers lib may be list[str] "a b" or
+                # list[list[str]] [a, b] depending on the version - normalised to "a b".
                 merges = []
                 for m in merges_raw:
                     if isinstance(m, (list, tuple)):
@@ -804,17 +816,17 @@ def export_to_nimq(
                         "vocab": vocab,
                         "merges": merges,
                     }, g)
-                print(f"   Tokenizer (BPE thật, {len(vocab)} token, {len(merges)} merge) saved to {tokenizer_path}")
+                print(f"   Tokenizer (real BPE, {len(vocab)} tokens, {len(merges)} merges) saved to {tokenizer_path}")
                 exported = True
         except Exception as e:
-            print(f"   ⚠️  Không lấy được vocab/merges từ backend_tokenizer ({e}), sẽ fallback")
+            print(f"   ⚠️  Could not get vocab/merges from backend_tokenizer ({e}), falling back")
 
     if not exported:
-        # Fallback: tokenizer không phải BPE dạng "fast" chuẩn (vd SentencePiece
-        # unigram thuần) - vẫn xuất vocab thật (id -> token string) qua
-        # get_vocab(), KHÔNG còn xuất bảng byte giả nữa. merges để rỗng
-        # (model phía Nim khi thấy merges rỗng sẽ tokenize ở mức "vocab
-        # lookup toàn từ" thay vì BPE-merge, vẫn đúng semantics tối thiểu).
+        # Fallback: a tokenizer that is not a standard "fast" BPE (e.g. plain SentencePiece
+        # unigram) - still exports the real vocab (id -> token string) through
+        # get_vocab(), NO more fake byte table. merges stays empty
+        # (on the Nim side empty merges mean tokenizing by "whole-word vocab
+        # lookup" instead of BPE merges, still the minimal correct semantics).
         try:
             vocab = tokenizer.get_vocab()
             with open(tokenizer_path, 'w') as g:
@@ -823,12 +835,12 @@ def export_to_nimq(
                     "vocab": vocab,
                     "merges": [],
                 }, g)
-            print(f"   ⚠️  Tokenizer không phải fast-BPE chuẩn: xuất vocab thật ({len(vocab)} token, "
-                  f"không có merges) tới {tokenizer_path}")
+            print(f"   ⚠️  The tokenizer is not a standard fast BPE: exporting the real vocab ({len(vocab)} tokens, "
+                  f"no merges) to {tokenizer_path}")
         except Exception as e:
             raise RuntimeError(
-                f"Không thể xuất tokenizer thật cho model này ({e}). "
-                f"Từ chối fallback về bảng byte giả vì sẽ làm sai lệch tokenization khi infer."
+                f"Cannot export the real tokenizer for this model ({e}). "
+                f"Refusing to fall back to a fake byte table because it would break tokenization at inference."
             )
 
     config_path = os.path.join(os.path.dirname(output_path) or ".", "config.nim.json")
@@ -851,8 +863,8 @@ def main():
     parser.add_argument("--int4", action="store_true", help="Quantize to int4 (symmetric)")
     parser.add_argument("--q4km", action="store_true", help="Quantize to int4 asymmetric (Q4_K_M style, better quality)")
     parser.add_argument("--group-size", type=int, default=128,
-                         help="Group size cho --q4km (mac dinh 128, giong granularity GPTQ goc). "
-                              "Nho hon -> chinh xac hon nhung file to hon; lon hon -> nguoc lai.")
+                         help="Group size for --q4km (default 128, like the original GPTQ granularity). "
+                              "Smaller -> more precise but a larger file; larger -> the opposite.")
     parser.add_argument("--no-mps", action="store_true", help="Disable MPS (use CPU only)")
 
     args = parser.parse_args()

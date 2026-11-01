@@ -1,17 +1,17 @@
 ## graft_attention.nim
-## Cấy (graft) thêm block LinearPlusAttention/Spectron MỚI vào 1 checkpoint
-## Jamba hiện có (thường là checkpoint chỉ toàn Mamba2SSD, pattern kiểu
-## "MMMM..."), giữ nguyên trọng số Mamba đã train, chỉ chèn thêm layer
-## Attention xen vào theo vị trí bạn muốn.
+## Grafts NEW LinearPlusAttention/Spectron blocks into an existing Jamba
+## checkpoint (usually an all-Mamba2SSD checkpoint, a pattern like
+## "MMMM..."), keeping the trained Mamba weights and only inserting
+## Attention layers at the positions you choose.
 ##
-## QUAN TRỌNG: hàm `graftBlocks` THẬT nằm ở `lora.nim` (nhận `ctx: Backend`
-## để CHỌN GPU TƯỜNG MINH, dù bản thân việc copy trọng số ở đây chỉ là gán
-## con trỏ/mảng - không có phép nhân ma trận nào - ctx được giữ lại CHỦ ĐÍCH
-## để graftBlocks() luôn đi kèm 1 Backend đã xác nhận GPU, tránh trường hợp
-## ai đó gọi hàm không kèm ctx rồi vô tình có 1 code path "quên" GPU sau
-## này). File này CHỈ là entrypoint CLI, không định nghĩa graftBlocks riêng
-## nữa (trước đây có 1 bản trùng lặp không dùng ctx ở đây - ĐÃ XÓA, đó là
-## bug: 2 hàm cùng tên khác chữ ký, dễ gọi nhầm bản không ép GPU).
+## IMPORTANT: the REAL `graftBlocks` lives in `lora.nim` (it takes `ctx: Backend`
+## to choose the GPU EXPLICITLY, even though copying weights here is only
+## pointer/array assignment - no matrix multiply - ctx is kept DELIBERATELY
+## so graftBlocks() always comes with a Backend confirmed to be a GPU, preventing
+## a call without ctx from accidentally creating a code path that "forgets" the GPU
+## later). This file is ONLY the CLI entry point and no longer defines its own graftBlocks
+## (there used to be a duplicate without ctx here - REMOVED, that was
+## a bug: 2 functions with the same name and different signatures, easy to call the one not forcing the GPU).
 
 import std/[strformat, strutils, os]
 import nimformer
@@ -20,20 +20,20 @@ import jamba_hybrid   # NimformerModelJamba, newNimformerModelJamba, loadMambaOn
 import lora           # graftBlocks*(old, newPattern, ctx: Backend) - BẢN DUY NHẤT, xem lora.nim
 
 when isMainModule:
-  # cach dung (1) - graft tu 1 checkpoint Jamba .bin da co san (do jamba_hybrid
-  # xuat ra tu 1 lan chay truoc):
+  # usage (1) - graft from an existing Jamba .bin checkpoint (written by jamba_hybrid
+  # in an earlier run):
   #   ./graft_attention <old.bin> <newPattern vd MMAMMSM> <out.bin>
   #
-  # cach dung (2) - graft TRUC TIEP tu pytorch_model.bin GOC cua HF, KHONG can
-  # buoc export/xuat file trung gian nao truoc (tranh nhan doi dung luong dia
-  # voi checkpoint HF thuong nang vai GB):
+  # usage (2) - graft DIRECTLY from the ORIGINAL HF pytorch_model.bin, NO
+  # export/intermediate file step first (avoids doubling the disk usage
+  # of HF checkpoints that are usually several GB):
   #   ./graft_attention --from-hf <hf.bin> <vocab> <embedDim> <nHeads> <ffMult> \
   #       <nLayers> <newPattern vd MMAMMSM> <out.bin>
-  #   (newPattern phai co dung <nLayers> ky tu 'M', xen them 'A'/'S' cho block moi)
+  #   (newPattern must have exactly <nLayers> 'M' characters, with 'A'/'S' inserted for new blocks)
   #
-  # ctx = newBackend() o duoi mac dinh "auto": neu may KHONG co GPU (CUDA/
-  # Metal/OpenCL/Vulkan), backend.nim se RAISE loi ngay o day (gForbidCpuFallback
-  # = true mac dinh) thay vi am tham chay CPU - dung y "phai 100% GPU".
+  # ctx = newBackend() below defaults to "auto": if the machine has NO GPU (CUDA/
+  # Metal/OpenCL/Vulkan), backend.nim RAISES right here (gForbidCpuFallback
+  # = true by default) instead of silently running on the CPU - "must be 100% GPU".
   let args = commandLineParams()
   let ctx = newBackend()
 
@@ -50,12 +50,12 @@ when isMainModule:
     let nLayers = parseInt(args[6])
     let newPattern = args[7]
     let outPath = args[8]
-    echo &"[graft] Doc TRUC TIEP tu {hfBinPath} (khong ghi file trung gian) ..."
+    echo &"[graft] Reading DIRECTLY from {hfBinPath} (no intermediate file) ..."
     var (old, matched, total) = loadMambaOnlyFromHFBin(hfBinPath, vocab, embedDim, nHeads, ffMult, nLayers)
-    echo &"[graft] Da nap {matched}/{total} tham so tu HF, cay '{newPattern}' ..."
+    echo &"[graft] Loaded {matched}/{total} parameters from HF, grafting '{newPattern}' ..."
     var grafted = graftBlocks(old, newPattern, ctx)
     jamba_hybrid.saveCheckpoint(grafted, outPath, 0)
-    echo &"[graft] Da luu model da cay ghep -> {outPath}"
+    echo &"[graft] Saved the grafted model -> {outPath}"
   else:
     if args.len < 3:
       echo "usage: graft_attention <old.bin> <newPattern vd MMAMMSM> <out.bin>"
@@ -63,18 +63,18 @@ when isMainModule:
            "<ffMult> <nLayers> <newPattern> <out.bin>"
       quit(1)
     if args[0].toLowerAscii().endsWith(".nimq"):
-      echo &"[graft] LOI: '{args[0]}' co duoi .nimq (dinh dang quantize cua " &
-           "quant.nim), KHONG phai .bin tho (rawbin.nim) ma graft_attention " &
-           "can. Theo quy uoc du an, .nimq CHI dung cho inference (nim_inference.nim, " &
-           "test_nimformer.nim), khong dung trong pipeline graft/finetune/infer-lora."
-      echo "[graft] Ban co the dang muon finetune truc tiep tu file .nimq nay - " &
-           "finetune_lora.nim doc duoc .nimq thang qua CFG_HF_SOURCE=\"nimq\" " &
-           "(mac dinh), khong can graft truoc. Chay:"
+      echo &"[graft] ERROR: '{args[0]}' has the .nimq extension (the quantized format of " &
+           "quant.nim), NOT the raw .bin (rawbin.nim) graft_attention " &
+           "needs. By project convention .nimq is ONLY for inference (nim_inference.nim, " &
+           "test_nimformer.nim), not for the graft/finetune/infer-lora pipeline."
+      echo "[graft] You may want to finetune directly from this .nimq file - " &
+           "finetune_lora.nim reads .nimq directly through CFG_HF_SOURCE=\"nimq\" " &
+           "(the default), no graft needed first. Run:"
       echo &"[graft]   make finetune-mamba"
-      echo &"[graft]   (hoac: make finetune-mamba ARGS=\"codestral - - nimq {args[0]} <out.bin>\")"
+      echo &"[graft]   (or: make finetune-mamba ARGS=\"codestral - - nimq {args[0]} <out.bin>\")"
       quit(1)
     var (old, oldStep) = jamba_hybrid.loadCheckpoint(args[0])
-    echo &"[graft] Model cu: pattern='{old.pattern}', {old.blocks.len} block, step da train={oldStep}"
+    echo &"[graft] Old model: pattern='{old.pattern}', {old.blocks.len} blocks, trained step={oldStep}"
     var grafted = graftBlocks(old, args[1], ctx)
     jamba_hybrid.saveCheckpoint(grafted, args[2], oldStep)
-    echo &"[graft] Da luu model da cay ghep -> {args[2]}"
+    echo &"[graft] Saved the grafted model -> {args[2]}"

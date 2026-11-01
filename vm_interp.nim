@@ -1,4 +1,4 @@
-## Interpreter THAM CHIẾU cho bytecode micro-VM (CHỈ dùng trong test).
+## REFERENCE interpreter for micro-VM bytecode (used ONLY in tests).
 import std/math
 import session_vm
 
@@ -86,7 +86,7 @@ proc stepUntilBarrier(t: var Th; p: VmProgram; mem: var seq[float32];
     of OP_U_LOAD_U8: U[a] = uint32(gU8[int(U[b] + k)])
     of OP_U_LOAD_U32:
       let ad = int(U[b] + k)
-      doAssert ad mod 4 == 0, "OP_U_LOAD_U32: dia chi khong chia het 4"
+      doAssert ad mod 4 == 0, "OP_U_LOAD_U32: address not a multiple of 4"
       U[a] = uint32(gU8[ad]) or (uint32(gU8[ad + 1]) shl 8) or (uint32(gU8[ad + 2]) shl 16) or (uint32(gU8[ad + 3]) shl 24)
     of OP_U_LOAD_CONSTF: R[a] = gLut[int(U[b] + k)]
     of OP_U_LOAD_IN: R[a] = gIn[int(U[b] + k)]
@@ -94,7 +94,7 @@ proc stepUntilBarrier(t: var Th; p: VmProgram; mem: var seq[float32];
     of OP_U_ATOMIC_ADD: mem[int(U[b] + k)] += R[a]
     of OP_U_TO_R: R[a] = float32(U[b])
     of OP_R_TO_U: U[a] = uint32(R[b])
-    else: doAssert false, "op chua ho tro trong interpreter test: " & $op
+    else: doAssert false, "op not supported by the test interpreter: " & $op
 
 proc runGrid*(p: VmProgram; mem: var seq[float32]; nThreads, tgSize: int; tgFloats = 4096) =
   let nTg = nThreads div tgSize

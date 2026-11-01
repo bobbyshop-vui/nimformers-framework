@@ -1,8 +1,8 @@
 ## session_low.nim
-## Session DƯỚI CHÂN — map 1:1 Metal MTLComputeCommandEncoder.
-## Dev KHÔNG viết kernel encode C mới: chỉ pipeline + bind + dispatch.
+## LOW-LEVEL session — maps 1:1 to Metal's MTLComputeCommandEncoder.
+## Devs do NOT write new C encode kernels: only pipeline + bind + dispatch.
 ##
-## Yêu cầu: đã dán metal_enc_lowlevel.inc.h/.m vào metal_shim.
+## Requires: metal_enc_lowlevel.inc.h/.m pasted into metal_shim.
 ##
 ##   import session_low
 ##   discard sessionBegin(be)
@@ -16,7 +16,7 @@ import std/[strformat]
 import bybylang / gpubackend
 import bybylang / backends / metal / metal_backend
 
-# ── importc encoder thô ──────────────────────────────────────
+# ── raw importc encoder ──────────────────────────────────────
 when defined(macosx):
   proc metal_enc_pipeline(kernelName: cstring): cint
     {.importc: "metal_enc_pipeline", header: "metal_shim.h".}
@@ -39,14 +39,14 @@ when defined(macosx):
   proc metal_enc_max_tg_threads(): cint
     {.importc: "metal_enc_max_tg_threads", header: "metal_shim.h".}
 
-# ── Biến = MTLBuffer (reuse upload/alloc đã có) ──────────────
+# ── Variables = MTLBuffers (reusing the existing upload/alloc) ──────────────
 
 proc sessionVarF32*(be: GpuBackend; data: openArray[float32]): SessionHandle =
-  ## newBuffer từ float32 host (Shared) — activation / LUT nhỏ.
+  ## newBuffer from host float32 (Shared) — activations / small LUTs.
   sessionUpload(be, @data)
 
 proc sessionVarF32Private*(be: GpuBackend; data: openArray[float32]): SessionHandle =
-  ## Private/upload weight resident — ít traffic CPU.
+  ## Private/upload for resident weights — little CPU traffic.
   result.kind = be
   when defined(macosx):
     result.metalHandle = metalUploadPrivate(@data)
@@ -74,7 +74,7 @@ proc sessionVarAlloc*(be: GpuBackend; nFloats: int): SessionHandle =
 # ── Encoder: pipeline / bind / dispatch / barrier ────────────
 
 proc sessionPipeline*(be: GpuBackend; kernelName: string): bool =
-  ## setComputePipelineState — kernel PHẢI đã có trong library Metal.
+  ## setComputePipelineState — the kernel MUST already be in the Metal library.
   when defined(macosx):
     if be == gbMetal or be == gbAuto:
       return metal_enc_pipeline(kernelName.cstring) != 0
@@ -105,7 +105,7 @@ proc sessionBindBytes*(be: GpuBackend; index: int; data: pointer; nBytes: int): 
 proc sessionDispatch*(be: GpuBackend;
                       gridX: int; gridY = 1; gridZ = 1;
                       tgX = 0; tgY = 1; tgZ = 1): bool =
-  ## dispatchThreadgroups. tgX=0 → simd width của pipeline hiện tại.
+  ## dispatchThreadgroups. tgX=0 → simd width of the current pipeline.
   when defined(macosx):
     return metal_enc_dispatch(cint(gridX), cint(gridY), cint(gridZ),
                               cint(tgX), cint(tgY), cint(tgZ)) != 0
@@ -134,13 +134,13 @@ proc sessionMaxTgThreads*(be: GpuBackend): int =
     return int(metal_enc_max_tg_threads())
   return 256
 
-# ── Helper: gọi 1 kernel quant 1-byte + LUT (ví dụ fp4 Codestral) ─
+# ── Helper: calls one 1-byte quant + LUT kernel (e.g. Codestral fp4) ─
 
 proc sessionCallFp4LutMatmul*(be: GpuBackend;
                               hA, hWq, hLut, hC: SessionHandle;
                               M, K, N: int): bool =
-  ## Không phải API “cao” — chỉ là mẫu ghép session dưới chân.
-  ## Kernel: matmul_fp4_lut_kernel_ndst2_paired (đã có trong vecop_matmul.metal)
+  ## Not a "high-level" API — just a sample of composing a low-level session.
+  ## Kernel: matmul_fp4_lut_kernel_ndst2_paired (already in vecop_matmul.metal)
   ## Layout: a[M,K] f32, wq[N,K] u8, lut[256] f32, c[M,N] f32
   if not sessionPipeline(be, "matmul_fp4_lut_kernel_ndst2_paired"):
     return false
@@ -153,7 +153,7 @@ proc sessionCallFp4LutMatmul*(be: GpuBackend;
   if not sessionBindInt(be, 6, N): return false
   let sw = sessionSimdWidth(be)
   if not sessionBindInt(be, 7, sw): return false
-  # NDST=2 trong kernel → grid.x = ceil(N/2), grid.y = M
+  # NDST=2 in the kernel → grid.x = ceil(N/2), grid.y = M
   let gx = (N + 1) div 2
   if not sessionDispatch(be, gridX = gx, gridY = M, tgX = sw):
     return false

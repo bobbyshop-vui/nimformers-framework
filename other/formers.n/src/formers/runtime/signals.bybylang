@@ -1,0 +1,52 @@
+# formers.n — Ctrl+C handling shared by the generation loops.
+#
+# While a loop is generating, the first Ctrl+C only asks it to stop after the
+# current token (it then prints its statistics). Otherwise, or on a second
+# Ctrl+C, the process leaves through _exit: running exit procs from the
+# signal handler while the main thread is inside the GPU driver crashes.
+
+import nim "std/[os, terminal]"
+import nim "std/posix"
+import "../cli/options.bybylang"
+import "console.bybylang"
+
+function fmStopFlag(): ptr bool
+    var flag {.global.}: bool
+    result = addr flag
+
+function fmGeneratingFlag(): ptr bool
+    var flag {.global.}: bool
+    result = addr flag
+
+function fmStopRequested(): bool
+    result = fmStopFlag()[]
+
+function fmSetGenerating(on: bool)
+    fmGeneratingFlag()[] = on
+
+function fmClearStop()
+    fmStopFlag()[] = false
+
+function fmOnCtrlC() {.noconv.}
+    if fmGeneratingFlag()[] and not fmStopFlag()[]:
+        fmStopFlag()[] = true
+        return
+    const msg = "\n[formers.n] Stopped - Ctrl+C\n"
+    discard posix.write(fmErrFd(), cstring(msg), msg.len)
+    exitnow(130)
+
+function fmLiveProgress(opts: FmOptions): bool
+    ## Live tok/s in the terminal window title: interactive terminals only.
+    let env = getEnv("BYBY_PROGRESS", "auto")
+    result = opts.showProgress and env != "0" and fmOutIsTty() and fmErrIsTty() and getEnv("TERM", "") != "dumb" and (env == "1" or not existsEnv("COLAB_RELEASE_TAG"))
+
+function fmShowProgress(done, total: int, stepSec: float)
+    ## Written to the window title (OSC 0), never into the scrollback: a line
+    ## pinned with cursor moves overwrote whatever had scrolled into its row.
+    let tokS = if stepSec > 0: 1.0 / stepSec else: 0.0
+    fmErr().write("\e]0;formers.n " & $done & "/" & $total & " tok | " & formatFloat(tokS, ffDecimal, 2) & " tok/s | " & $int(stepSec * 1000 + 0.5) & " ms/tok\a")
+    fmErr().flushFile()
+
+function fmEndProgress()
+    fmErr().write("\e]0;formers.n\a")
+    fmErr().flushFile()

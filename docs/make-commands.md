@@ -223,6 +223,26 @@ JSON checkpoints to binary. Use a separate output as shown to retain the
 original. See [checkpoint formats](checkpoint-formats.md).
 
 
+## formers.n
+
+```sh
+make formers-cli
+make formers
+make formers FORMERS_MODELS=test/deepseek-inference/models
+make formers ARGS='--models test/codestral/models -p "Write quicksort in Python." -n 200'
+make formers-test
+make formers-smoke
+```
+
+`formers-cli` (alias `build-formers`) compiles `other/formers.n/` with BybyLang into
+`other/formers.n/formers-cli` and does not run a model. `formers` builds, then starts a
+chat with `--models $(FORMERS_MODELS)` (default `test/codestral/models`); a non-empty
+`ARGS` replaces every argument. `formers-test` checks the architecture detection without
+loading weights; `formers-smoke` runs a tiny random Llama on the GPU. `formers-clean`
+removes the formers.n build. Usage and flags: the
+[formers.n section of the readme](../readme.md#run-deepseek-or-codestral-with-formersn-formers-cli).
+
+
 ## Python, C, and BybyLang
 
 ```sh
@@ -284,7 +304,7 @@ make clean
 ```
 
 This removes binaries listed in `CLEAN_BINS`, the shared library,
-`nimcache/`, and root-level `model_*.nimq`. The current list does not include
+`nimcache/`, root-level `model_*.nimq`, and the formers.n build. The current list does not include
 `test/spectron/test_nimformer`, whose binary is next to its source, and it
 does not reset `test/spectron/models/finetune.nimq` or the tokenizer. To
 start fresh Spectron training, see the checkpoint section of the

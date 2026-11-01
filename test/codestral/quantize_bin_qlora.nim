@@ -29,15 +29,15 @@ proc shouldQuantize(name: string, shape: seq[int]): bool =
 
 proc convertInPlace(path: string, groupSize: int = DefaultGroupSize) =
   if isQLoraBin(path):
-    echo &"[qlora] {path} da la NIMQLR1; khong can convert."
+    echo &"[qlora] {path} is already NIMQLR1; nothing to convert."
     return
 
   var reader = openRawBinReader(path)
   var meta = reader.meta
   if meta.getOrDefault("format") == "nimformers-lora-v1":
     raise newException(ValueError,
-      "File nay la LoRA-only checkpoint cu, base weight nam ngoai .bin. " &
-      "Hay convert checkpoint base FP32 NIMBIN1 truoc, hoac dung --merge-base.")
+      "This file is an old LoRA-only checkpoint, the base weights live outside the .bin. " &
+      "Convert an FP32 NIMBIN1 base checkpoint first, or use --merge-base.")
 
   meta["format"] = "nimformers-qlora-v1"
   meta["quantization"] = "int4-asymmetric-per-group"

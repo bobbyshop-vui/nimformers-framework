@@ -1,0 +1,443 @@
+# formers.n — Mamba-2 runner (Codestral Mamba base, LoRA, Linear++ hybrid).
+#
+# Building blocks come from test/codestral: the Mamba2Real / Linear++ block
+# model (jamba_hybrid), the .nimq base loader (load_codestral_into_jamba), the
+# GPU block kernels and recurrent state (lora: prepareGpuModel,
+# forwardStepJambaGpuRetry, norm presets), the resident R/P/G prefill
+# (infer_lora.forwardPrefillBatch), the LoRA .bin readers (rawbin,
+# quantize_lora_bin_4bit) and the SentencePiece tokenizer (hf_tokenizer).
+# Sizes come from the detected FmMamba2Config instead of fixed Codestral
+# constants; checkpoint loading, sampling and the generation loop are
+# formers.n's own. LoRA checkpoints keep the norm preset recorded at training
+# (meta normPreset), as infer_lora.nim does.
+
+import nim "std/[os, tables, times, strutils]"
+import nim "nimformer"
+import nim "backend"
+import nim "quant"
+import nim "rawbin"
+import nim "jamba_hybrid"
+import nim "lora"
+import nim "load_codestral_into_jamba"
+import nim "quantize_lora_bin_4bit"
+import nim "prefill_gpu"
+import nim "fp4_gemv_gpu"
+import nim "hf_tokenizer"
+import nim "infer_lora"
+import "../cli/options.bybylang"
+import "../arch/detect.bybylang"
+import "../sampling/sampler.bybylang"
+import "../runtime/signals.bybylang"
+import "../runtime/console.bybylang"
+
+type
+  FmMambaModel* = object
+    model*: NimformerModelJamba
+    lora*: JambaLora
+    normPreset*: string
+  FmMambaChat* = object
+    ## One sequence: the recurrent Mamba-2/Linear++ state lives on the GPU;
+    ## ids is every token already consumed, kept across chat turns.
+    ids*: seq[int]
+    pending*: seq[int]            ## last sampled token (or stop token), fed with the next input
+    sampler*: FmSampler
+  FmMambaReply* = object
+    text*: string
+    tokens*: int
+    seconds*: float
+    stoppedByEos*: bool
+
+const FmDefaultNormPreset = "rms-fin-gn"
+
+function fmMambaNew(c: FmMamba2Config, pattern: string, ffMult: int): NimformerModelJamba
+    result = newNimformerModelJamba(c.vocabSize, c.hiddenSize, c.nHeads, ffMult, pattern, true, c.stateSize, c.nGroups, c.convKernel, c.expand, true, false)
+
+function fmMambaLoadBase(c: FmMamba2Config, nimqPath: string): FmMambaModel
+    ## Pure Mamba-2: one Mamba2Real ('R') block per layer, no adapters.
+    result.model = fmMambaNew(c, "R".repeat(c.nLayers), 4)
+    result.lora.adapters = initTable[string, LoraAdapter]()
+    result.lora.backup = initTable[string, seq[float32]]()
+    result.lora.quantBase = loadCodestralQuantResidentFromNimq(result.model, nimqPath)
+    bindQuantBaseToLinears(result.model, result.lora)
+    result.normPreset = FmDefaultNormPreset
+    stderr.writeLine("[formers.n] base Mamba-2: " & $c.nLayers & " block R, " & $result.lora.quantBase.len & " tensor quant-resident")
+
+function fmMambaFail(msg: string)
+    raise newException(ValueError, "[formers.n] LoRA: " & msg)
+
+function fmMambaLoadLora(c: FmMamba2Config, info: FmLoraInfo, nimqPath: string): FmMambaModel
+    ## LoRA .bin (NIMBIN1 fp32 / NIMBIN4 QLoRA): adapters for the Mamba2Real
+    ## projections plus the trained new blocks (Linear++ attention, fuse gates).
+    let path = info.path
+    let mapped = getEnv("BYBY_MODEL_MMAP", "1") != "0"
+    var meta: Table[string, string]
+    var tensors: seq[RawBinTensor]
+    var newBlockQuant = initTable[string, QuantTensor]()
+    if isQLora4Bin(path):
+        if mapped:
+            let q = loadMappedQLora4Bin(path)
+            meta = q.meta
+            tensors = q.fp32Tensors
+            newBlockQuant = q.quantWeights
+        else:
+            let q = loadQLora4Bin(path)
+            meta = q.meta
+            tensors = q.fp32Tensors
+            newBlockQuant = q.quantWeights
+    elif mapped:
+        let r = loadMappedRawBin(path)
+        meta = r.meta
+        tensors = r.tensors
+    else:
+        let r = loadRawBin(path)
+        meta = r.meta
+        tensors = r.tensors
+    let normImpl = meta.getOrDefault("mambaNormImpl", "")
+    if normImpl.len > 0 and normImpl != TRAIN_MAMBA_NORM_IMPL:
+        fmMambaFail("mambaNormImpl '" & normImpl & "' differs from the runtime's '" & TRAIN_MAMBA_NORM_IMPL & "'")
+    let pattern = info.pattern
+    result.model = fmMambaNew(c, pattern, max(info.ffMult, 1))
+    var quant = loadCodestralQuantResidentFromNimq(result.model, nimqPath)
+    for name, qt in newBlockQuant:
+        quant[name] = qt
+    var byName = initTable[string, ptr Tensor]()
+    for (name, t) in paramList(result.model):
+        byName[name] = t
+    # Manifest "newBlock.<param>.shape": every trained new-block parameter.
+    var expected = initTable[string, bool]()
+    for key, value in meta:
+        if key.startsWith("newBlock.") and key.endsWith(".shape"):
+            let name = key["newBlock.".len ..< key.len - ".shape".len]
+            if name notin byName:
+                fmMambaFail("manifest lists " & name & ", which is not in the model/pattern")
+            if value != $byName[name][].shape:
+                fmMambaFail("manifest " & name & " shape " & value & ", the model expects " & $byName[name][].shape)
+            expected[name] = true
+    # The pattern decides which parameters must have been trained.
+    var requiredAdapters = initTable[string, bool]()
+    for i, ch in pattern:
+        let prefix = "block" & $i & "."
+        let kind = ch.toUpperAscii()
+        if kind in {'R', 'P', 'G'}:
+            requiredAdapters[prefix & "mambaReal.inProj.weight"] = true
+            requiredAdapters[prefix & "mambaReal.outProj.weight"] = true
+        if kind in {'P', 'G', 'A'}:
+            for (name, _) in paramList(result.model):
+                let isAttn = name.startsWith(prefix & "attn.")
+                let isGate = kind == 'G' and name.startsWith(prefix & "fuseGate.")
+                if name.startsWith(prefix) and (kind == 'A' or isAttn or isGate) and name notin expected:
+                    fmMambaFail("manifest lacks the required newBlock " & name)
+    var seen = initTable[string, bool]()
+    for name, qt in newBlockQuant:
+        if name notin expected or qt.shape != byName[name][].shape or qt.bytes.len == 0:
+            fmMambaFail("newBlock quant tensor with a wrong shape/data: " & name)
+        seen[name] = true
+    result.lora.adapters = initTable[string, LoraAdapter]()
+    result.lora.backup = initTable[string, seq[float32]]()
+    var seenA = initTable[string, bool]()
+    var seenB = initTable[string, bool]()
+    for tensor in tensors:
+        if tensor.name.startsWith("newBlock::"):
+            let name = tensor.name["newBlock::".len .. ^1]
+            if name notin expected or name in seen or tensor.shape != byName[name][].shape:
+                fmMambaFail("newBlock raw tensor wrong or duplicated: " & name)
+            byName[name][].data = tensor.data
+            byName[name][].mappedData = tensor.mappedData
+            seen[name] = true
+        elif tensor.name.startsWith("adapter::"):
+            let rest = tensor.name["adapter::".len .. ^1]
+            let cut = rest.rfind("::")
+            if cut < 0:
+                fmMambaFail("unknown adapter tensor name: " & tensor.name)
+            let adName = rest[0 ..< cut]
+            let part = rest[cut + 2 .. ^1]
+            if adName notin requiredAdapters:
+                fmMambaFail("adapter outside the pattern: " & adName)
+            if adName notin result.lora.adapters:
+                var ad: LoraAdapter
+                try:
+                    ad.inF = parseInt(meta["adapter." & adName & ".inF"])
+                    ad.outF = parseInt(meta["adapter." & adName & ".outF"])
+                    ad.r = parseInt(meta["adapter." & adName & ".r"])
+                    ad.alpha = parseFloat(meta["adapter." & adName & ".alpha"]).float32
+                except KeyError, ValueError:
+                    fmMambaFail("metadata inF/outF/r/alpha missing or invalid: " & adName)
+                if ad.inF <= 0 or ad.outF <= 0 or ad.r <= 0:
+                    fmMambaFail("invalid inF/outF/r: " & adName)
+                ad.scale = ad.alpha / float32(ad.r)
+                ad.A = Tensor(shape: @[ad.r, ad.inF])
+                ad.B = Tensor(shape: @[ad.outF, ad.r])
+                result.lora.adapters[adName] = ad
+            if part == "A":
+                if adName in seenA or tensor.shape != result.lora.adapters[adName].A.shape:
+                    fmMambaFail("LoRA A wrong or duplicated: " & adName)
+                result.lora.adapters[adName].A.data = tensor.data
+                result.lora.adapters[adName].mappedA = tensor.mappedData
+                seenA[adName] = true
+            elif part == "B":
+                if adName in seenB or tensor.shape != result.lora.adapters[adName].B.shape:
+                    fmMambaFail("LoRA B wrong or duplicated: " & adName)
+                result.lora.adapters[adName].B.data = tensor.data
+                result.lora.adapters[adName].mappedB = tensor.mappedData
+                seenB[adName] = true
+            else:
+                fmMambaFail("unknown LoRA part '" & part & "': " & adName)
+    for name, _ in expected:
+        if name notin seen:
+            fmMambaFail("missing newBlock weight " & name)
+    for name, _ in requiredAdapters:
+        if name notin seenA or name notin seenB:
+            fmMambaFail("missing adapter A/B " & name)
+    result.lora.quantBase = quant
+    if getEnv("BYBY_KEEP_ZERO_LORA", "0") == "0":
+        let dropped = dropZeroLoraAdapters(result.lora)
+        if dropped.len > 0:
+            stderr.writeLine("[formers.n] dropped " & $dropped.len & " all-zero LoRA adapters")
+    bindQuantBaseToLinears(result.model, result.lora)
+    result.normPreset = meta.getOrDefault("normPreset", FmDefaultNormPreset)
+    stderr.writeLine("[formers.n] LoRA: pattern " & pattern & ", " & $result.lora.adapters.len & " adapters, " & $expected.len & " newBlock parameters, linear++ blocks " & $info.linearPPBlocks)
+
+function fmMambaTurnText(opts: FmOptions, user: string, first: bool): string
+    ## Mistral v3 instruct: "[INST] u1[/INST] a1</s>[INST] u2[/INST]". The
+    ## system prompt goes before the first user message. Trailing whitespace
+    ## would leave a lone "▁" token the model never saw after "[/INST]".
+    if opts.rawPrompt or user.startsWith("[INST]"):
+        result = user
+    elif first and opts.systemText.len > 0:
+        result = "[INST] " & opts.systemText & "\n\n" & user & "[/INST]"
+    else:
+        result = "[INST] " & user & "[/INST]"
+    result = result.strip(leading = false, trailing = true)
+
+function fmMambaPrepareGpu(mm: var FmMambaModel, ctx: Backend)
+    mergeInUploadStreamingJamba(mm.model, mm.lora, ctx)
+    prepareGpuModel(mm.model, mm.lora, ctx)
+    # The GPU now owns packed copies; drop the loader's host copy.
+    var freed = 0
+    let be = ctx.kind.toByby()
+    for name, qt in mm.lora.quantBase.mpairs:
+        if name in gFp4CacheGpu and gFp4CacheGpu[name].residentReady:
+            let onMetal = be == gbMetal and gFp4CacheGpu[name].wBuf.metalHandle != nil
+            let onVulkan = be == gbVulkan and gFp4CacheGpu[name].wBuf.vulkanHandle.buf != nil
+            if onMetal or onVulkan:
+                freed += qt.bytes.len
+                qt.clearPayload()
+    GC_fullCollect()
+    # The physical merge, as infer_lora.generate does it: the packed FP4-KM
+    # weight resident on the GPU absorbs B@A, so the decode kernels drop the
+    # LoRA fusion. On by default; --no-merge-lora keeps the adapters separate.
+    let merged = mergeResidentLoraIfEnabled(mm.model, mm.lora, ctx)
+    if merged > 0:
+        stderr.writeLine("[formers.n] merged " & $merged & " LoRA adapters into the resident base")
+    stderr.writeLine("[formers.n] GPU ready, released " & $(freed div (1024 * 1024)) & " MiB of duplicate host weights")
+
+function fmMambaNewChat(mm: FmMambaModel, tok: hf_tokenizer.HfTokenizer, opts: FmOptions): FmMambaChat
+    let vocab = mm.model.vocab
+    result.sampler = fmNewSampler(opts, vocab)
+    # Control/placeholder tokens are noise in lm_head; stop tokens stay allowed.
+    if tok.special.len == vocab:
+        for i in 0 ..< vocab:
+            result.sampler.banned[i] = tok.special[i]
+    for id in tok.stopIds:
+        if id >= 0 and id < vocab:
+            result.sampler.banned[id] = false
+    for ws in ["\n", "\n\n", " ", "  ", "    ", "\t", "\n    ", "\n\t", "\r\n"]:
+        for id in encodeHf(tok, ws, false, false):
+            if id >= 0 and id < vocab:
+                result.sampler.noPenalty[id] = true
+    stderr.writeLine("[formers.n] sampler: " & fmSamplerSummary(result.sampler))
+
+function fmMambaSetNorm(mm: FmMambaModel)
+    let preset = getEnv("BYBY_NORM_PRESET", mm.normPreset)
+    if not setGpuNormPreset(preset):
+        raise newException(ValueError, "[formers.n] invalid norm preset: " & preset)
+    stderr.writeLine("[formers.n] norm preset " & preset)
+
+function fmMambaPrefillChunk(): int
+    ## The resident prefill runs in chunks of BYBY_PREFILL_BATCH_SIZE tokens
+    ## and JIT-compiles its scan kernels for each chunk length.
+    result = 128
+    try:
+        result = parseInt(getEnv("BYBY_PREFILL_BATCH_SIZE", "128"))
+    except ValueError:
+        discard
+    result = max(2, min(result, 128))
+
+function fmMambaFeed(mm: var FmMambaModel, ctx: Backend, chat: var FmMambaChat, newIds: seq[int]): seq[float32]
+    ## Consumes pending + newIds; returns the logits after the last one.
+    ## The first input starts the state. Only whole prefill chunks go through
+    ## the resident parallel prefill, so its kernels are compiled for one
+    ## chunk length, once; the rest (and every later turn) continues the state
+    ## token by token with the decode kernels the warmup already compiled
+    ## (state is O(1), there is no context limit).
+    let input = chat.pending & newIds
+    chat.pending.setLen(0)
+    if input.len == 0:
+        raise newException(ValueError, "[formers.n] empty input")
+    for id in input:
+        if id < 0 or id >= mm.model.vocab:
+            raise newException(ValueError, "[formers.n] token id " & $id & " outside vocab " & $mm.model.vocab)
+    var start = 0
+    if chat.ids.len == 0:
+        resetGpuGenState(mm.model, ctx)
+        let chunk = fmMambaPrefillChunk()
+        let nPrefill = ((input.len - 1) div chunk) * chunk
+        if nPrefill > 0:
+            forwardPrefillBatch(mm.model, mm.lora, input[0 ..< nPrefill], ctx)
+            chat.ids.add(input[0 ..< nPrefill])
+            if getEnv("BYBY_PREFILL_KEEP_SCRATCH", "0") != "1":
+                discard releaseResidentPrefill()
+        start = nPrefill
+    for k in start ..< input.len:
+        chat.ids.add(input[k])
+        let last = k == input.len - 1
+        let res = forwardStepJambaGpuRetry(mm.model, input[k], chat.ids, chat.ids.len - 1, ctx, last)
+        if last:
+            result = res.data
+
+function fmMambaWarmup(mm: var FmMambaModel, tok: hf_tokenizer.HfTokenizer, ctx: Backend, opts: FmOptions)
+    ## Before the first prompt: decode steps until the step time settles
+    ## (kernel JIT, autotuning, first-use buffers). Prompts shorter than a
+    ## prefill chunk run on these same kernels, so nothing is compiled after
+    ## the "ready" line. The next real input starts from a reset state.
+    if opts.noWarmup:
+        return
+    var chat: FmMambaChat
+    let ids = encodeHf(tok, "[INST] hi[/INST]")
+    stderr.writeLine("[formers.n] warmup: decode until steady ...")
+    let t0 = epochTime()
+    discard fmMambaFeed(mm, ctx, chat, ids)
+    let firstTime = epochTime() - t0
+    var last = 0.0
+    var steps = 0
+    while steps < 8:
+        let s0 = epochTime()
+        discard fmMambaFeed(mm, ctx, chat, @[ids[^1]])
+        let dt = epochTime() - s0
+        inc steps
+        if steps >= 3 and last > 0 and dt < last * 1.1 and dt > last * 0.9:
+            last = dt
+            break
+        last = dt
+    fmSay("[formers.n] ready: warmup " & formatFloat(epochTime() - t0, ffDecimal, 1) & " s (first " & $ids.len & " tok " & formatFloat(firstTime, ffDecimal, 1) & " s, then " & $steps & " steps, steady ~" & $int(last * 1000 + 0.5) & " ms/tok)")
+
+function fmMambaReplyTo(mm: var FmMambaModel, tok: hf_tokenizer.HfTokenizer, ctx: Backend, chat: var FmMambaChat, firstLogits: seq[float32], maxNew: int, opts: FmOptions): FmMambaReply
+    ## Samples and streams up to maxNew tokens; the last sampled token (also a
+    ## stop token, "</s>" closes the turn) waits in chat.pending.
+    var logits = firstLogits
+    var gen: seq[int]
+    var printed = ""
+    let live = fmLiveProgress(opts)
+    let t0 = epochTime()
+    fmSetGenerating(true)
+    while gen.len < maxNew and not fmStopRequested():
+        let stepStart = epochTime()
+        let id = fmSample(chat.sampler, logits, chat.ids)
+        if isStopIdHf(tok, id):
+            chat.pending = @[id]
+            result.stoppedByEos = true
+            break
+        gen.add(id)
+        # Print the new text once its UTF-8 is complete.
+        let text = decodeHf(tok, gen)
+        if text.len > printed.len and text.startsWith(printed) and not text.endsWith("\uFFFD"):
+            fmOut().write(text[printed.len .. ^1])
+            fmOut().flushFile()
+            printed = text
+        if gen.len >= maxNew:
+            chat.pending = @[id]
+            break
+        logits = fmMambaFeed(mm, ctx, chat, @[id])
+        if live:
+            fmShowProgress(gen.len, maxNew, epochTime() - stepStart)
+    fmSetGenerating(false)
+    if live:
+        fmEndProgress()
+    result.seconds = epochTime() - t0
+    result.tokens = gen.len
+    result.text = decodeHf(tok, gen)
+    if result.text.len > printed.len and result.text.startsWith(printed):
+        fmOut().write(result.text[printed.len .. ^1])
+    fmOut().flushFile()
+
+function fmMambaStats(label: string, nTok: int, seconds: float)
+    if nTok > 0:
+        fmSay("[formers.n] " & label & ": " & $nTok & " tok / " & formatFloat(seconds, ffDecimal, 3) & " s = " & formatFloat(nTok.float / max(seconds, 1e-9), ffDecimal, 2) & " tok/s")
+
+function fmMambaGenerate(mm: var FmMambaModel, tok: hf_tokenizer.HfTokenizer, ctx: Backend, opts: FmOptions): string
+    ## One prompt, one completion (prompt echoed like llama-cli).
+    fmMambaSetNorm(mm)
+    fmMambaWarmup(mm, tok, ctx, opts)
+    var chat = fmMambaNewChat(mm, tok, opts)
+    let ids = encodeHf(tok, fmMambaTurnText(opts, opts.prompt, true))
+    if ids.len == 0:
+        raise newException(ValueError, "[formers.n] the prompt encodes to 0 tokens")
+    fmOut().write(decodeHf(tok, ids))
+    fmOut().flushFile()
+    let t0 = epochTime()
+    let logits = fmMambaFeed(mm, ctx, chat, ids)
+    let prefillTime = epochTime() - t0
+    let reply = fmMambaReplyTo(mm, tok, ctx, chat, logits, opts.nPredict, opts)
+    fmOut().write("\n")
+    fmOut().flushFile()
+    if fmStopRequested():
+        fmSay("[formers.n] stopped by Ctrl+C")
+    fmMambaStats("prompt eval", ids.len, prefillTime)
+    fmMambaStats("eval       ", reply.tokens, reply.seconds)
+    result = reply.text
+
+function fmMambaChatLoop(mm: var FmMambaModel, tok: hf_tokenizer.HfTokenizer, ctx: Backend, opts: FmOptions)
+    ## llama-cli conversation mode: the model stays loaded and the recurrent
+    ## state keeps every earlier turn; each turn feeds only "</s>" (when the
+    ## reply was cut short) + "[INST] user[/INST]".
+    fmMambaSetNorm(mm)
+    fmMambaWarmup(mm, tok, ctx, opts)
+    var chat = fmMambaNewChat(mm, tok, opts)
+    fmSay("[formers.n] chat: at most " & $opts.nPredict & " tok per reply; /exit quits, Ctrl+C stops a reply")
+    while true:
+        fmClearStop()
+        let turn = fmReadTurn()
+        if not turn.ok:
+            break
+        if turn.text.len == 0:
+            continue
+        let first = chat.ids.len == 0
+        var newIds: seq[int]
+        if first:
+            newIds = encodeHf(tok, fmMambaTurnText(opts, turn.text, true))
+        else:
+            if chat.pending.len > 0 and not isStopIdHf(tok, chat.pending[^1]):
+                newIds.add(tok.eosId)
+            newIds.add(encodeHf(tok, fmMambaTurnText(opts, turn.text, false), false, false))
+        let t0 = epochTime()
+        let logits = fmMambaFeed(mm, ctx, chat, newIds)
+        let feedTime = epochTime() - t0
+        let reply = fmMambaReplyTo(mm, tok, ctx, chat, logits, opts.nPredict, opts)
+        fmOut().write("\n")
+        fmOut().flushFile()
+        fmMambaStats("prompt eval", newIds.len, feedTime)
+        fmMambaStats("eval       ", reply.tokens, reply.seconds)
+
+function fmRunMamba2(det: FmDetection, opts: FmOptions): bool
+    # Kernel-selection defaults of the Mamba-2 GPU blocks; explicit env wins.
+    if opts.noMergeLora:
+        putEnv("BYBY_MERGE_LORA", "0")
+    configureInferenceDefaults()
+    setInferenceThreadPriority()
+    stderr.writeLine("[formers.n] tokenizer " & det.files.tokenizerDir)
+    let tok = hf_tokenizer.newHfTokenizer(det.files.tokenizerDir)
+    if vocabSizeHf(tok) != det.mamba.vocabSize:
+        fmSay("[formers.n] error: tokenizer vocab " & $vocabSizeHf(tok) & " differs from vocab_size " & $det.mamba.vocabSize)
+        return false
+    let ctx = newBackend(opts.backend)
+    var mm: FmMambaModel
+    if det.route == frMamba2Lora:
+        mm = fmMambaLoadLora(det.mamba, det.lora, det.files.nimqPath)
+    else:
+        mm = fmMambaLoadBase(det.mamba, det.files.nimqPath)
+    fmMambaPrepareGpu(mm, ctx)
+    if opts.conversation:
+        fmMambaChatLoop(mm, tok, ctx, opts)
+    else:
+        discard fmMambaGenerate(mm, tok, ctx, opts)
+    result = true

@@ -1,24 +1,24 @@
 ## lora.nim
-## LoRA (low-rank adapter) cho NimformerModelJamba, + hàm "cấy ghép"
-## (graft) thêm block LinearPlusAttention MỚI vào 1 checkpoint hiện tại chỉ
-## toàn Mamba2SSD (pattern kiểu "MMMMMM...").
+## LoRA (low-rank adapter) for NimformerModelJamba, + a function that "grafts"
+## NEW LinearPlusAttention blocks into an existing checkpoint that is
+## only Mamba2SSD (a pattern like "MMMMMM...").
 ##
-## Ý tưởng LoRA giống hệt script Python bạn gửi (LoRALinear: base đóng băng,
-## chỉ học A,B hạng thấp): thay vì viết riêng 1 "LoRALinear" tách biệt khỏi
-## Mamba2SSD/LinearPlusAttention (phải sửa lại toàn bộ forwardMamba2/
-## forwardLinearPlus để nhận Linear thay thế được - động vào quá nhiều),
-## ta dùng đúng 1 mẹo toán học:
+## The LoRA idea is the same as the Python script provided (LoRALinear: frozen base,
+## only the low-rank A,B are learned): instead of writing a separate "LoRALinear" detached from
+## Mamba2SSD/LinearPlusAttention (which would require reworking forwardMamba2/
+## forwardLinearPlus to accept a replaceable Linear - too invasive),
+## we use one mathematical trick:
 ##   W_eff = W_base + (alpha/r) * B @ A       (B:[outF,r], A:[r,inF])
-## rồi GHI ĐÈ TẠM w_base.data = W_eff, chạy y nguyên forwardBlock/
-## backwardBlock/computeLossAndGrads đã có (không sửa 1 dòng nào ở
-## jamba_hybrid.nim), backward trả ra dW_eff cho tên tham số đó - dùng
-## chain rule suy ngược ra dA, dB (base KHÔNG có gradient, không update),
-## rồi PHỤC HỒI w_base.data về nguyên bản trước khi sang bước sau.
+## then TEMPORARILY OVERWRITE w_base.data = W_eff, run the existing forwardBlock/
+## backwardBlock/computeLossAndGrads unchanged (not a single line changed in
+## jamba_hybrid.nim), the backward returns dW_eff for that parameter name - the
+## chain rule then gives dA, dB (the base has NO gradient and is not updated),
+## and w_base.data is RESTORED to the original before the next step.
 
 import std/[math, random, strformat, tables, strutils, times, os, monotimes]
 
 proc monoSecs*(): float =
-  ## Dong ho don dieu, KHONG chay khi may ngu (epochTime thi co).
+  ## Monotonic clock, does NOT advance while the machine sleeps (epochTime does).
   getMonoTime().ticks.float / 1e9
 
 import nimformer
@@ -35,9 +35,9 @@ import customfloat     # buildDecodeLUT, decodeArrayLUT
 import session_vm      # bytecode emit / .bvm / sessionVmFor*
 import jit_vm          # HotSpot-style: interpret -> profile -> Metal JIT cache
 when not defined(noOneDispatch):
-  import onedispatch   # mac dinh BAT (tat luc build: -d:noOneDispatch) : 1 compute dispatch / token cho ca stack R (xem ONE_DISPATCH_PLAN.md)
+  import onedispatch   # ON by default (disable at build: -d:noOneDispatch) : 1 compute dispatch / token for the whole R stack (see ONE_DISPATCH_PLAN.md)
 
-# Global JIT cache (infer + finetune cung dung)
+# Global JIT cache (shared by infer + finetune)
 var gJitCache* = initJitCache(defaultJitConfig())
 var gMicroVmBackend* = gbAuto
 
@@ -46,32 +46,32 @@ var gMicroVmBackend* = gbAuto
 # end of generation. Zero overhead when disabled (timers are skipped).
 var gProfBegin*, gProfEncode*, gProfEnd*, gProfRead*: float64
 var gProfTokens*: int
-var gProfFirst*: string   ## token dau tach rieng (thuong cham hon han: pipeline/driver lan dau)
+var gProfFirst*: string   ## the first token is reported separately (usually much slower: first pipeline/driver use)
 var gProfFirstMs*: float64
-# BYBY_DECODE_SPLIT=1 (chan doan, CHAM HON): sessionEnd+sessionBegin giua cac phan
-# cua 1 token (doan one-dispatch / block G / lm_head) de do thoi gian GPU tung phan.
+# BYBY_DECODE_SPLIT=1 (diagnostics, SLOWER): sessionEnd+sessionBegin between the parts
+# of 1 token (one-dispatch section / G blocks / lm_head) to time each part on the GPU.
 var gDecSplitOn = getEnv("BYBY_DECODE_SPLIT", "0") != "0"
 var gDecSplitActive = false
 var gDecSplitMs = initOrderedTable[string, float64]()
 var gDecSplitTokens = 0
 
 proc decSplitMark(be: GpuBackend; label: string; t0: var float64) =
-  ## Dong command buffer hien tai (cho GPU xong), cong thoi gian vao label, mo buffer moi.
+  ## Closes the current command buffer (waits for the GPU), adds the time to label, opens a new buffer.
   if not (gDecSplitOn and gDecSplitActive): return
   if not sessionEnd(be):
-    raise newException(CatchableError, "BYBY_DECODE_SPLIT: sessionEnd that bai sau " & label &
+    raise newException(CatchableError, "BYBY_DECODE_SPLIT: sessionEnd failed after " & label &
       ": " & sessionGetLastError(be))
   let t1 = monoSecs()
   gDecSplitMs.mgetOrPut(label, 0.0) += (t1 - t0) * 1000.0
   if not sessionBegin(be):
-    raise newException(CatchableError, "BYBY_DECODE_SPLIT: sessionBegin that bai sau " & label)
+    raise newException(CatchableError, "BYBY_DECODE_SPLIT: sessionBegin failed after " & label)
   t0 = monoSecs()
 
 proc decodeSplitSummary*(): string =
   if gDecSplitTokens == 0 or gDecSplitMs.len == 0: return ""
   var tot = 0.0
   for _, v in gDecSplitMs: tot += v
-  result = &"[infer] BYBY_DECODE_SPLIT over {gDecSplitTokens} tokens (bo token dau), ms/tok:"
+  result = &"[infer] BYBY_DECODE_SPLIT over {gDecSplitTokens} tokens (first token excluded), ms/tok:"
   for k, v in gDecSplitMs:
     let per = v / float64(gDecSplitTokens)
     result.add &"\n[infer]   {k:<14} {per:>8.1f}ms {100.0 * v / max(tot, 1e-9):>5.1f}%"
@@ -79,7 +79,7 @@ proc decodeSplitSummary*(): string =
 proc decodeProfileSummary*(): string =
   ## Human-readable per-token breakdown of the decode hot path. Empty string
   ## when no tokens were profiled. Called by infer_lora.nim after generation.
-  ## Trung binh KHONG tinh token dau (in rieng o dong thu 2).
+  ## The averages EXCLUDE the first token (printed separately on the 2nd line).
   if gProfTokens <= 1: return gProfFirst
   let n = float64(gProfTokens - 1)
   let perBegin = gProfBegin * 1000.0 / n
@@ -87,7 +87,7 @@ proc decodeProfileSummary*(): string =
   let perEnd = gProfEnd * 1000.0 / n
   let perRead = gProfRead * 1000.0 / n
   let total = perBegin + perEncode + perEnd + perRead
-  result = &"[infer] decode profile over {gProfTokens - 1} tokens (bo token dau): " &
+  result = &"[infer] decode profile over {gProfTokens - 1} tokens (first token excluded): " &
     &"sessionBegin={perBegin:.1f}ms encodeOneToken={perEncode:.1f}ms " &
     &"sessionEnd={perEnd:.1f}ms sessionRead={perRead:.1f}ms TOTAL={total:.1f}ms/tok\n" & gProfFirst
 
@@ -100,7 +100,7 @@ proc initMicroVmJit*(tag = "default"; selectedBackend = gbAuto) =
     cfg.enableMetalJit = false
   else:
     if not ensureJitDeviceReady():
-      raise newException(CatchableError, "initMicroVmJit: khoi tao GPU that bai")
+      raise newException(CatchableError, "initMicroVmJit: GPU initialisation failed")
   gJitCache = initJitCache(cfg)
 
 proc warmupMicroVmJit*(rounds = 12) =
@@ -123,12 +123,12 @@ type
     adamA*, adamB*: Table[string, ApfAdamState]
 
   JambaLora* = object
-    adapters*: Table[string, LoraAdapter]   ## key = tên tham số trong paramList (vd "block2.mamba.inProj.weight")
-    backup*: Table[string, seq[float32]]    ## giá trị base gốc (frozen) - phục hồi sau mỗi bước
-    quantBase*: Table[string, QuantTensor]  ## MOI: chi co entry cho tham so "quant-resident" (khong
-                                             ## giu ban fp32 thuong truc trong RAM - dequant qua LUT
-                                             ## MOI LAN mergeIn, xoa ngay sau restoreBase). Rong = mode
-                                             ## cu, hanh vi KHONG doi (backward-compatible 100%).
+    adapters*: Table[string, LoraAdapter]   ## key = parameter name in paramList (e.g. "block2.mamba.inProj.weight")
+    backup*: Table[string, seq[float32]]    ## original (frozen) base values - restored after each step
+    quantBase*: Table[string, QuantTensor]  ## NEW: only has entries for "quant-resident" parameters (no
+                                             ## resident fp32 copy kept in RAM - dequantized through the LUT
+                                             ## ON EVERY mergeIn, freed right after restoreBase). Empty = old
+                                             ## mode, behaviour UNCHANGED (100% backward-compatible).
 
 template aValues*(ad: LoraAdapter): untyped = weightValues(ad.A.data, ad.mappedA)
 template bValues*(ad: LoraAdapter): untyped = weightValues(ad.B.data, ad.mappedB)
@@ -140,65 +140,65 @@ proc attachAdapter(lin: var Linear; ad: LoraAdapter) =
   lin.mappedLoraB = ad.mappedB
 
 proc newLoraAdapter*(inF, outF, r: int, alpha: float32 = -1'f32): LoraAdapter =
-  ## alpha mặc định = 2*r (giống rule-of-thumb phổ biến, cũng là alpha=8,r=4
-  ## trong script Python bạn gửi -> alpha=2r).
+  ## alpha defaults to 2*r (the common rule of thumb, also alpha=8,r=4
+  ## in the Python script provided -> alpha=2r).
   ##
-  ## CANH BAO FP16: base weight cua Mamba-Chat-2.8B duoc luu/train goc o
-  ## fp16 (xem pytorch_bin_loader.nim). Du sau khi doc vao Nim moi thu deu
-  ## la fp32 (Tensor cua framework nay LUON fp32, xem nimformer.nim), gia
-  ## tri BEN TRONG van mang "dau vet" cua fp16 - nhieu weight rat gan 0
-  ## (duoi ~6e-5, gioi han min-normal cua fp16) hoac bi round ve dung 1
-  ## trong ~2048 muc gia tri co the co trong khoang do lon cua no. He qua
-  ## thuc te cho LoRA:
-  ##   - KHONG duoc requantize A/B qua CustomFloat/APF thap-bit (da ep
-  ##     requantizeEvery=int.high trong trainStepLora/trainStepGraft o duoi
-  ##     - GIU NGUYEN, dung tat no neu ban sua code roi lam gradient LoRA
-  ##     bien mat vi bi lam tron ve 0).
-  ##   - Init A nho (sqrt(1/inF), nhu duoi) la AN TOAN vi B=0 nen delta ban
-  ##     dau = 0 du A co nho, khong cong don voi phan "gan 0" cua base.
-  ##   - learning rate LoRA nen o muc 1e-4 hoac thap hon (CFG_LORA_LR trong
-  ##     finetune_lora.nim) - lr cao hon de gradient tu base-gan-0 lam A/B
-  ##     nhay qua nhanh, mat on dinh (mat tuong tu "loss spike" hay gap khi
-  ##     fine-tune model fp16 bang optimizer fp32 ma khong ha lr).
+  ## FP16 WARNING: the base weights of Mamba-Chat-2.8B were originally stored/trained in
+  ## fp16 (see pytorch_bin_loader.nim). Even though everything is fp32 once read into Nim
+  ## (this framework's Tensor is ALWAYS fp32, see nimformer.nim), the values
+  ## INSIDE still carry fp16 "traces" - many weights are very close to 0
+  ## (below ~6e-5, the fp16 min-normal) or rounded to exactly 1
+  ## of the ~2048 possible values in their magnitude range. Practical
+  ## consequences for LoRA:
+  ##   - A/B must NOT be requantized through low-bit CustomFloat/APF (requantizeEvery
+  ##     is forced to int.high in trainStepLora/trainStepGraft below
+  ##     - KEEP IT, do not disable it, or LoRA gradients
+  ##     vanish by being rounded to 0).
+  ##   - A small A init (sqrt(1/inF), as below) is SAFE since B=0 so the initial delta
+  ##     is 0 even with a small A, not accumulating with the "near 0" part of the base.
+  ##   - the LoRA learning rate should be 1e-4 or lower (CFG_LORA_LR in
+  ##     finetune_lora.nim) - a higher lr lets gradients from near-0 base weights make A/B
+  ##     jump too fast and destabilise (similar to the "loss spike" often seen when
+  ##     fine-tuning an fp16 model with an fp32 optimizer without lowering lr).
   result.r = r
   result.inF = inF
   result.outF = outF
   result.alpha = if alpha < 0'f32: float32(2 * r) else: alpha
   result.scale = result.alpha / float32(r)
-  # A: init nhỏ ngẫu nhiên (kaiming-ish); B: init 0 -> delta ban đầu = 0,
-  # model LoRA lúc mới gắn vào giống hệt model gốc (đúng chuẩn LoRA paper).
+  # A: small random init (kaiming-ish); B: init 0 -> the initial delta = 0,
+  # the model right after attaching LoRA is identical to the original (standard per the LoRA paper).
   result.A = randnTensor(@[r, inF], sqrt(1'f32 / float32(inF)))
   result.B = newTensor(@[outF, r], 0'f32)
 
 proc matmul2D(ctx: Backend, a: Tensor, b: Tensor): Tensor =
-  ## a:[M,K] @ b:[K,N] -> [M,N], dùng beMatmul đã có trong backend.nim.
+  ## a:[M,K] @ b:[K,N] -> [M,N], using the existing beMatmul in backend.nim.
   let M = a.shape[0]; let K = a.shape[1]; let K2 = b.shape[0]; let N = b.shape[1]
   assert K == K2
   result = newTensor(@[M, N])
   result.data = beMatmul(ctx, a.data, M, K, b.data, K2, N)
 
 proc constArr(scale: float32, n: int): seq[float32] =
-  ## Mảng hằng số để broadcast 1 scalar vào beMul/beAdd (backend.nim không có
-  ## kernel "nhân vô hướng" riêng, chỉ có elementwise 2 mảng cùng cỡ - đây là
-  ## cách dùng lại đúng API GPU sẵn có thay vì tự viết vòng for nhân tay).
-  ## Việc fill mảng này là O(n) CPU nhưng chỉ là memset, KHÔNG phải phép toán
-  ## (không nhân/cộng gì) - phần tính toán thật (nhân, cộng) nằm hết trong
-  ## beMul/beAdd bên dưới, chạy trên ctx (GPU).
+  ## A constant array to broadcast 1 scalar into beMul/beAdd (backend.nim has no
+  ## separate "scalar multiply" kernel, only elementwise ops on 2 same-sized arrays - this
+  ## reuses the existing GPU API instead of a hand-written multiply loop).
+  ## Filling this array is O(n) CPU but it is just a memset, NOT arithmetic
+  ## (no multiply/add) - the real computation (multiply, add) is all in
+  ## beMul/beAdd below, running on ctx (GPU).
   result = newSeq[float32](n)
   for i in 0 ..< n: result[i] = scale
 
 proc mergedWeight*(base: Tensor, ad: LoraAdapter, ctx: Backend): Tensor =
-  ## W_eff = W_base + scale * B @ A, shape giữ nguyên [outF, inF].
-  ## Toàn bộ nhân/cộng ở đây đi qua beMul/beAdd (GPU), KHÔNG còn vòng for
-  ## CPU tự cộng dồn từng phần tử như trước.
+  ## W_eff = W_base + scale * B @ A, shape unchanged [outF, inF].
+  ## All multiplies/adds here go through beMul/beAdd (GPU), NO more CPU
+  ## for loop accumulating element by element as before.
   let delta = matmul2D(ctx, Tensor(shape: ad.B.shape, data: @(ad.bValues)),
-    Tensor(shape: ad.A.shape, data: @(ad.aValues)))   # [outF,r]@[r,inF] -> [outF,inF], da GPU (beMatmul)
+    Tensor(shape: ad.A.shape, data: @(ad.aValues)))   # [outF,r]@[r,inF] -> [outF,inF], on the GPU (beMatmul)
   let scaled = beMul(ctx, delta.data, constArr(ad.scale, delta.data.len))
   result = newTensor(base.shape)
   result.data = beAdd(ctx, base.data, scaled)
 
 proc zeroAdapterOutRows*(ad: var LoraAdapter; row0, row1: int) =
-  ## Dat 0 cac hang B[row0 ..< row1] (delta LoRA = 0 tren hang out do).
+  ## Zeroes rows B[row0 ..< row1] (LoRA delta = 0 on those output rows).
   if ad.r <= 0 or ad.B.data.len != ad.outF * ad.r: return
   let a = max(0, row0)
   let b = min(ad.outF, row1)
@@ -242,8 +242,8 @@ proc adapterOutRowsAbsMax*(ad: LoraAdapter; row0, row1: int): float32 =
 
 proc freezeInProjSsmLora*(m: NimformerModelJamba; lo: var JambaLora;
                           loState: var LoraTrainState) =
-  ## G/R: LoRA inProj khong duoc viet B, C, dt. Checkpoint resume cu co the
-  ## da lech cac hang nay — zero lai B va Adam m/v tuong ung.
+  ## G/R: LoRA inProj must not write B, C, dt. Old resume checkpoints may have
+  ## drifted on these rows — zero B and the matching Adam m/v again.
   for i, blk in m.blocks:
     if blk.kind notin {bkMambaReal, bkMambaRealGated, bkMambaRealPlusAttn}:
       continue
@@ -259,11 +259,11 @@ proc freezeInProjSsmLora*(m: NimformerModelJamba; lo: var JambaLora;
       loState.adamB[name] = stB
 
 proc gradToAB*(dWeff: Tensor, ad: LoraAdapter, ctx: Backend): tuple[dA, dB: Tensor] =
-  ## dWeff: [outF,inF] (gradient theo W_eff, backward tính ra như bình
-  ## thường qua Linear.backward). Chain rule:
+  ## dWeff: [outF,inF] (gradient w.r.t. W_eff, computed by the backward as
+  ## usual through Linear.backward). Chain rule:
   ##   dB = scale * dWeff @ A^T     : [outF,inF]@[inF,r] -> [outF,r]
   ##   dA = scale * B^T @ dWeff     : [r,outF]@[outF,inF] -> [r,inF]
-  ## Phép nhân với `scale` dùng beMul (GPU) thay vì vòng for CPU.
+  ## The multiplication by `scale` uses beMul (GPU) instead of a CPU for loop.
   let At = transpose(ad.A)   # [inF, r]
   let Bt = transpose(ad.B)   # [r, outF]
   var dB = matmul2D(ctx, dWeff, At)
@@ -273,10 +273,10 @@ proc gradToAB*(dWeff: Tensor, ad: LoraAdapter, ctx: Backend): tuple[dA, dB: Tens
   result = (dA, dB)
 
 # ═══════════════════════════════════════════════════════════════
-# Gắn LoRA vào các tensor weight chỉ định (theo đúng tên trong paramList
-# của jamba_hybrid, vd "block0.mamba.inProj.weight",
-# "block3.attn.qkvProj.weight" ...). Chỉ gắn được lên tensor 2D (Linear
-# weight [outF,inF]) - KHÔNG gắn lên bias/LayerNorm/embedding.
+# Attach LoRA to the given weight tensors (by name in jamba_hybrid's paramList,
+# e.g. "block0.mamba.inProj.weight",
+# "block3.attn.qkvProj.weight" ...). Only 2D tensors (Linear
+# weights [outF,inF]) can take it - NOT biases/LayerNorm/embeddings.
 # ═══════════════════════════════════════════════════════════════
 proc attachLora*(m: var NimformerModelJamba, targetNames: seq[string],
                   r: int = 4, alpha: float32 = -1'f32): JambaLora =
@@ -286,32 +286,32 @@ proc attachLora*(m: var NimformerModelJamba, targetNames: seq[string],
   for (name, t) in paramList(m): byName[name] = t
   for name in targetNames:
     if name notin byName:
-      stderr.writeLine("[lora] CANH BAO: khong thay tham so '" & name & "', bo qua")
+      stderr.writeLine("[lora] WARNING: parameter '" & name & "' not found, skipped")
       continue
     let t = byName[name]
     if t[].shape.len != 2:
-      stderr.writeLine("[lora] CANH BAO: '" & name & "' khong phai ma tran 2D, bo qua")
+      stderr.writeLine("[lora] WARNING: '" & name & "' is not a 2D matrix, skipped")
       continue
     let outF = t[].shape[0]; let inF = t[].shape[1]
     result.adapters[name] = newLoraAdapter(inF, outF, r, alpha)
-  echo &"[lora] Da gan LoRA (r={r}) vao {result.adapters.len}/{targetNames.len} tham so"
+  echo &"[lora] Attached LoRA (r={r}) to {result.adapters.len}/{targetNames.len} parameters"
 
 proc attachLoraQuantResident*(m: var NimformerModelJamba, quantWeights: Table[string, QuantTensor],
                                targetNames: seq[string], r: int = 4,
                                alpha: float32 = -1'f32): JambaLora =
-  ## Giong attachLora, nhung cho cac tham so KHONG con dang fp32 thuong truc
-  ## trong t[].data (vi qua nang RAM voi model 7B - xem giai thich streaming
-  ## trong finetune_lora.nim) ma dang nam trong `quantWeights` (tu
-  ## load_codestral_into_jamba.loadCodestralQuantResident). Lay shape TU
-  ## QuantTensor.shape (khong doc t[].data, vi luc nay t[].data con la rac/
-  ## random-init tu newMamba2Real, CHUA duoc dien - se duoc dien MOI LAN
-  ## mergeIn qua dequant LUT, khong phai luc attach nay).
+  ## Like attachLora, but for parameters that are NO longer resident fp32
+  ## in t[].data (too heavy on RAM for a 7B model - see the streaming explanation
+  ## in finetune_lora.nim) but live in `quantWeights` (from
+  ## load_codestral_into_jamba.loadCodestralQuantResident). The shape comes FROM
+  ## QuantTensor.shape (t[].data is not read, since at this point t[].data is still garbage/
+  ## random init from newMamba2Real, NOT yet filled - it is filled ON EVERY
+  ## mergeIn through the LUT dequant, not at attach time).
   result.adapters = initTable[string, LoraAdapter]()
   result.backup = initTable[string, seq[float32]]()
   result.quantBase = quantWeights
   if targetNames.len == 0:
     raise newException(ValueError,
-      "attachLoraQuantResident: targetNames bat buoc; khong tu dong LoRA-hoa moi quant weight")
+      "attachLoraQuantResident: targetNames is required; quant weights are not LoRA-ified automatically")
   var seen = initTable[string, bool]()
   for name in targetNames:
     if name in seen:
@@ -319,29 +319,29 @@ proc attachLoraQuantResident*(m: var NimformerModelJamba, quantWeights: Table[st
     seen[name] = true
     if name notin quantWeights:
       raise newException(ValueError,
-        "attachLoraQuantResident: LoRA target khong co trong quant weights: " & name)
+        "attachLoraQuantResident: LoRA target not found in the quant weights: " & name)
     let qt = quantWeights[name]
     if qt.shape.len != 2:
       raise newException(ValueError,
-        "attachLoraQuantResident: LoRA target quant-resident khong phai ma tran 2D: " & name)
+        "attachLoraQuantResident: quant-resident LoRA target is not a 2D matrix: " & name)
     let outF = qt.shape[0]; let inF = qt.shape[1]
     result.adapters[name] = newLoraAdapter(inF, outF, r, alpha)
-  echo &"[lora] Da gan LoRA quant-resident (r={r}) vao {result.adapters.len} target"
+  echo &"[lora] Attached quant-resident LoRA (r={r}) to {result.adapters.len} targets"
 
 proc mergeQuantAdapters*(other: JambaLora, into: var JambaLora) =
-  ## Gop them adapter tu attachLora thuong (vd cho block 'A' moi cay) vao
-  ## CUNG 1 JambaLora da co adapter quant-resident - de dung 1 vong train
-  ## duy nhat cho ca 2 loai. KHONG dung 2 lan attachLora ROI GHI DE ket qua
-  ## (se mat quantBase cua lan truoc) - dung ham nay de GOP.
+  ## Merges adapters from a regular attachLora (e.g. for newly grafted 'A' blocks) into
+  ## the SAME JambaLora that already has quant-resident adapters - so 1 training loop
+  ## covers both kinds. Do NOT call attachLora twice and OVERWRITE the result
+  ## (that loses the previous quantBase) - use this function to MERGE.
   for name, ad in other.adapters:
     into.adapters[name] = ad
   for name, b in other.backup:
     into.backup[name] = b
 
 proc allProjectionWeightNames*(m: var NimformerModelJamba): seq[string] =
-  ## Tiện ích: liệt kê hết các tên weight 2D "gắn LoRA được" (qkvProj/
-  ## outProj của attn, inProj/outProj của mamba, fuseGate) - dùng khi muốn
-  ## LoRA-hoá TOÀN BỘ model thay vì chọn tay từng block.
+  ## Helper: lists every 2D weight name "LoRA-able" (qkvProj/
+  ## outProj of attn, inProj/outProj of mamba, fuseGate) - used to
+  ## LoRA-ify the WHOLE model instead of picking blocks by hand.
   result = @[]
   for (name, t) in paramList(m):
     if t[].shape.len == 2 and (".weight" in name) and
@@ -357,13 +357,13 @@ proc newLoraTrainState*(lora: JambaLora, lr: float32 = 1e-4'f32, wd: float32 = 0
     result.adamA[name] = newApfAdamState(ad.A.data.len)
     result.adamB[name] = newApfAdamState(ad.B.data.len)
 
-var gLutNameCache = initTable[string, array[256, float32]]()  # cache LUT theo ten CustomFloat - build 1 lan/spec (fp4 e2m1 dung chung cho ca 385 tensor, khong build lai moi lan)
+var gLutNameCache = initTable[string, array[256, float32]]()  # LUT cache by CustomFloat name - built once per spec (fp4 e2m1 shared by all 385 tensors, not rebuilt each time)
 
 proc dequantViaLUT(qt: QuantTensor): seq[float32] =
-  ## Nhu quant.dequantizeTensor nhung dung LUT (nhanh hon, xem customfloat.
-  ## buildDecodeLUT) khi qt.cf.itemSize==1 (fp4/fp8) - fallback ve
-  ## dequantizeTensor thuong (int8/int4/fp32raw hoac itemSize!=1) neu khong
-  ## ap dung duoc. KET QUA GIONG HET dequantizeTensor (da verify o test_lut.nim).
+  ## Like quant.dequantizeTensor but uses a LUT (faster, see customfloat.
+  ## buildDecodeLUT) when qt.cf.itemSize==1 (fp4/fp8) - falls back to the
+  ## regular dequantizeTensor (int8/int4/fp32raw or itemSize!=1) when it
+  ## does not apply. The RESULT IS IDENTICAL to dequantizeTensor (verified in test_lut.nim).
   case qt.kind
   of qkFp8E4M3, qkFp8E5M2, qkCustom, qkAuto:
     if qt.cf.itemSize == 1:
@@ -380,16 +380,16 @@ proc dequantViaLUT(qt: QuantTensor): seq[float32] =
       for i in 0 ..< raw.len: result[i] = raw[i] * s
       return result
   else: discard
-  result = dequantizeTensor(qt)   # fallback dung cho moi truong hop con lai
+  result = dequantizeTensor(qt)   # fallback for every other case
 
 proc mergeInOnePlain*(m: var NimformerModelJamba, lora: JambaLora, name: string) =
-  ## Ban KHONG-CAN-ADAPTER cua mergeInOne - dung cho tham so quant-resident
-  ## nhung KHONG duoc LoRA-hoa (vd lm_head/outProj.weight: dong bang hoan
-  ## toan, khong train, chi can dequant TAM THOI luc dung roi xoa - GIONG
-  ## HET tinh than mergeInOne cho block 'R', nhung mergeInOne ban goc doc
-  ## `lora.adapters[name]` VO DIEU KIEN (se KeyError neu tham so nay khong
-  ## co adapter, dung nhu truong hop lm_head). Ham nay CHI dequant qua LUT,
-  ## KHONG cong them delta LoRA nao (vi lam gi co adapter ma cong).
+  ## The ADAPTER-FREE version of mergeInOne - for quant-resident parameters
+  ## that are NOT LoRA-ified (e.g. lm_head/outProj.weight: fully frozen,
+  ## not trained, only dequantized TEMPORARILY while used and then freed - EXACTLY
+  ## the spirit of mergeInOne for 'R' blocks, but the original mergeInOne reads
+  ## `lora.adapters[name]` UNCONDITIONALLY (a KeyError if this parameter has no
+  ## adapter, as with lm_head). This function ONLY dequantizes through the LUT,
+  ## it adds NO LoRA delta (there is no adapter to add).
   var byName = initTable[string, ptr Tensor]()
   for (nm, t) in paramList(m):
     if nm == name: byName[nm] = t
@@ -398,9 +398,9 @@ proc mergeInOnePlain*(m: var NimformerModelJamba, lora: JambaLora, name: string)
   byName[name][].data = dequantViaLUT(lora.quantBase[name])
 
 proc restoreBaseOnePlain*(m: var NimformerModelJamba, lora: JambaLora, name: string) =
-  ## Doi xung voi mergeInOnePlain - xoa NGAY sau khi dung xong (giong
-  ## restoreBaseOne, nhung khong dong den lora.backup vi khong co gi de
-  ## backup - tham so nay chua bao gio bi "merge LoRA" thuc su).
+  ## Mirror of mergeInOnePlain - frees right after use (like
+  ## restoreBaseOne, but does not touch lora.backup since there is nothing to
+  ## back up - this parameter was never really "LoRA-merged").
   var byName = initTable[string, ptr Tensor]()
   for (nm, t) in paramList(m):
     if nm == name: byName[nm] = t
@@ -409,10 +409,10 @@ proc restoreBaseOnePlain*(m: var NimformerModelJamba, lora: JambaLora, name: str
   byName[name][].data = @[]
 
 proc dropZeroLoraAdapters*(lo: var JambaLora): seq[string] =
-  ## Bo adapter co A hoac B TOAN 0: delta = scale * B@A = 0 CHINH XAC, nen bo di khong doi
-  ## ket qua mot bit nao, chi bot viec (prefill: 2 GEMM LoRA/Linear; decode one-dispatch:
-  ## kernel bo qua stage LoRA cua layer do theo co trong bang meta). Tra ve ten da bo.
-  ## (Adapter khoi tao B=0 va khong nhan gradient luc train se roi vao truong hop nay.)
+  ## Drops adapters whose A or B is ALL ZERO: delta = scale * B@A = 0 EXACTLY, so dropping them changes
+  ## the result by not a single bit, it only saves work (prefill: 2 LoRA GEMMs/Linear; one-dispatch decode:
+  ## the kernel skips that layer's LoRA stage via a flag in the meta table). Returns the dropped names.
+  ## (Adapters initialised with B=0 that get no gradient during training end up here.)
   for name, ad in lo.adapters:
     var zeroA = true
     for v in ad.aValues:
@@ -428,20 +428,20 @@ proc dropZeroLoraAdapters*(lo: var JambaLora): seq[string] =
   for name in result: lo.adapters.del(name)
 
 proc mergeLoraIntoQuantBase*(lo: var JambaLora, verbose = true): int =
-  ## MERGE AN TOAN: khong bao gio xoa adapter truoc khi xac minh tensor da merge.
+  ## SAFE MERGE: never drops an adapter before the merged tensor is verified.
   ## W_ref = dequant(base) + scale*B@A, W_test = dequant(requant(W_ref)).
-  ## Kiem tra error tuong doi voi CHINH delta LoRA (khong so voi |W_base|:
-  ## LoRA nho ~0.1% |W|, so voi |W| se che giau mat het delta).
+  ## The relative error is checked against the LoRA delta ITSELF (not against |W_base|:
+  ## LoRA is ~0.1% of |W|, comparing to |W| would hide losing the whole delta).
   ##
-  ## Mac dinh KHONG thu requant FP4 / INT4 (khoang luong tu lon hon LoRA,
-  ## ton nhieu phut+RAM de thu). Set BYBY_MERGE_LORA_TRY_FP4=1 neu muon
-  ## KIEM THU CO GUARD. Neu khong qua thi GIU base + adapter nguyen ven,
-  ## forward van fuse LoRA trong one-dispatch; khong lam hu checkpoint .bin.
+  ## By default FP4 / INT4 requant is NOT attempted (the quantization step is larger than LoRA,
+  ## and trying costs minutes + RAM). Set BYBY_MERGE_LORA_TRY_FP4=1 to
+  ## TEST IT WITH THE GUARD. If it fails, base + adapter are KEPT intact,
+  ## the forward still fuses LoRA in one-dispatch; the .bin checkpoint is not damaged.
   ##
-  ## NOTE: Khong co cach "merge lossless vao 4-bit" noi chung voi LoRA
-  ## fp32 bat ky. Dense fp16/fp32 can backend khac va RAM cao hon.
-  const maxRelativeDeltaError = 0.001'f64  # 0.1% RMS error cua delta
-  const maxRelativePeakError = 0.01'f64    # 1% cua peak delta
+  ## NOTE: there is no general "lossless merge into 4-bit" for an arbitrary
+  ## fp32 LoRA. Dense fp16/fp32 needs another backend and more RAM.
+  const maxRelativeDeltaError = 0.001'f64  # 0.1% RMS error of the delta
+  const maxRelativePeakError = 0.01'f64    # 1% of the peak delta
   let tryLowBit = getEnv("BYBY_MERGE_LORA_TRY_FP4", "0") == "1"
   var names: seq[string] = @[]
   for name in lo.adapters.keys: names.add(name)
@@ -460,9 +460,9 @@ proc mergeLoraIntoQuantBase*(lo: var JambaLora, verbose = true): int =
     let inF = base.shape[1]
     if ad.inF != inF or ad.outF != outF or ad.r <= 0 or
        ad.aValues.len != ad.r * inF or ad.bValues.len != outF * ad.r:
-      raise newException(ValueError, "mergeLoraIntoQuantBase: shape adapter khong khop base: " & name)
-    # Chi preflight tren tensor co precision thap, KHONG cap phat dequant
-    # full-size ~128MB va khong requant hang tram trieu phan tu vo ich.
+      raise newException(ValueError, "mergeLoraIntoQuantBase: adapter shape does not match the base: " & name)
+    # Preflight only on low-precision tensors, do NOT allocate a full-size
+    # ~128MB dequant or requantize hundreds of millions of elements for nothing.
     if base.kind in {qkFp4KM, qkInt4, qkInt4Asymmetric, qkCustom} and not tryLowBit:
       inc skippedLowBit
       continue
@@ -474,10 +474,10 @@ proc mergeLoraIntoQuantBase*(lo: var JambaLora, verbose = true): int =
       inc rejected
       if verbose: echo "[lora-merge] scratch budget exceeded; keep fused adapter: " & name
       continue
-    # INT8/FP8 cung co the lam mat delta; bat buoc qua guard nhu FP4.
+    # INT8/FP8 can also lose the delta; they must pass the guard like FP4.
     var w = dequantViaLUT(base)
     if w.len != outF * inF:
-      raise newException(ValueError, "mergeLoraIntoQuantBase: dequant sai kich thuoc: " & name)
+      raise newException(ValueError, "mergeLoraIntoQuantBase: dequant has the wrong size: " & name)
     var deltaRow = newSeq[float32](inF)
     var deltaNormSq = 0.0
     var maxDelta = 0.0
@@ -504,23 +504,23 @@ proc mergeLoraIntoQuantBase*(lo: var JambaLora, verbose = true): int =
         addRoundSq += addErr * addErr
         if addErr > maxAddRound: maxAddRound = addErr
         w[row + i] = afterAdd
-    # Neu delta tong hop = 0, GIU adapter: B@A co the cancellation,
-    # chi drop-zero A/B duoc chung minh an toan o proc rieng.
+    # If the total delta = 0, KEEP the adapter: B@A may cancel out,
+    # only provably safe zero A/B are dropped, in a separate proc.
     if deltaNormSq == 0.0:
       inc rejected
       continue
-    # Bao toan groupSize; quantizeTensor() voi qkFp4KM mac dinh 32,
-    # khong duoc am tham doi layout neu base co groupSize khac.
+    # Preserve groupSize; quantizeTensor() with qkFp4KM defaults to 32,
+    # and must not silently change the layout when the base has another groupSize.
     let candidate =
       if base.kind == qkFp4KM:
         quantizeFp4KM(w, base.shape, groupSize =
           (if base.groupSize > 0: base.groupSize else: 32))
       else:
         quantizeTensor(w, base.shape, base.kind, customCf = base.cf)
-    # Kiem tra ket qua THUC sau luong tu, khong check truoc requant.
+    # Check the REAL result after quantization, not before the requant.
     let roundtrip = dequantViaLUT(candidate)
     if roundtrip.len != w.len:
-      raise newException(ValueError, "mergeLoraIntoQuantBase: roundtrip shape khong khop: " & name)
+      raise newException(ValueError, "mergeLoraIntoQuantBase: roundtrip shape mismatch: " & name)
     var errSq = 0.0
     var maxErr = 0.0
     var valid = true
@@ -535,7 +535,7 @@ proc mergeLoraIntoQuantBase*(lo: var JambaLora, verbose = true): int =
       errSq += e * e
       if e > maxErr: maxErr = e
     # Triangle-inequality upper bound vs EXACT real-valued W_base + delta.
-    # Khong duoc chi so voi float32 w: d nho co the bi mat vi FP32 add.
+    # Must not compare only against float32 w: a small d can be lost in the FP32 add.
     let rel = if valid: (sqrt(errSq) + sqrt(addRoundSq)) / sqrt(deltaNormSq) else: Inf
     if valid and rel <= maxRelativeDeltaError and
        maxErr + maxAddRound <= maxRelativePeakError * maxDelta:
@@ -548,23 +548,23 @@ proc mergeLoraIntoQuantBase*(lo: var JambaLora, verbose = true): int =
     else:
       inc rejected
       if verbose: echo &"[lora-merge] REJECT {name}: relErr/delta={rel:.6f} " &
-        "(base + LoRA GIU NGUYEN; khong xoa adapter)"
+        "(base + LoRA KEPT; adapter not dropped)"
   if verbose:
     echo &"[lora-merge] SAFE: {merged} adapter merged, {skippedLowBit} low-bit skip, " &
-      &"{rejected} rejected, {withoutBase} without base; {lo.adapters.len} adapter con lai."
+      &"{rejected} rejected, {withoutBase} without base; {lo.adapters.len} adapters left."
     if skippedLowBit + rejected > 0:
-      echo "[lora-merge] FP4-km khong the merge LoRA fp32 chinh xac o 4-bit: " &
-           "giu base packed + LoRA fused trong GPU de tranh token sai."
+      echo "[lora-merge] FP4-km cannot merge an fp32 LoRA exactly at 4-bit: " &
+           "keeping the packed base + LoRA fused on the GPU to avoid wrong tokens."
   result = merged
 
 proc mergeInOne*(m: var NimformerModelJamba, lora: var JambaLora, ctx: Backend, name: string) =
-  ## Ban SCOPED cua mergeIn - chi xu ly 1 THAM SO duy nhat (name). Dung cho
-  ## streaming train (xem trainStepGraftStreaming trong finetune_lora.nim):
-  ## goi mergeInOne ngay TRUOC KHI can weight do (dung cho block hien tai),
-  ## restoreBaseOne NGAY SAU KHI dung xong - khong bao gio co qua 1-2 block
-  ## quant-resident fp32 cung luc trong RAM (khac mergeIn/restoreBase goc,
-  ## xu ly CA LOAT adapters - se dequant ca 52 block cung luc, mat het y
-  ## nghia streaming neu dung nham ham do o day).
+  ## SCOPED version of mergeIn - handles a SINGLE parameter (name). Used for
+  ## streaming training (see trainStepGraftStreaming in finetune_lora.nim):
+  ## call mergeInOne right BEFORE the weight is needed (for the current block),
+  ## restoreBaseOne RIGHT AFTER it is used - never more than 1-2 quant-resident
+  ## blocks in fp32 in RAM at once (unlike the original mergeIn/restoreBase,
+  ## which handle ALL adapters at once - dequantizing all 52 blocks together, defeating
+  ## streaming if used here by mistake).
   var byName = initTable[string, ptr Tensor]()
   for (nm, t) in paramList(m):
     if nm == name: byName[nm] = t
@@ -578,10 +578,10 @@ proc mergeInOne*(m: var NimformerModelJamba, lora: var JambaLora, ctx: Backend, 
   let merged = mergedWeight(t[], ad, ctx)
   t[].data = merged.data
   if name in lora.quantBase:
-    # BUG FIX (xem paramQuantFlags trong jamba_hybrid.nim): t[].data gio la
-    # fp32 THAT (base+LoRA), khong phai hang nen nua - tat useQuant de
-    # Linear.forward()/uploadResident() dung THANG t[].data, khong dequant
-    # nham tu weightQ goc (se lam mat LoRA delta trong im lang).
+    # BUG FIX (see paramQuantFlags in jamba_hybrid.nim): t[].data is now
+    # REAL fp32 (base+LoRA), no longer compressed - useQuant is turned off so
+    # Linear.forward()/uploadResident() use t[].data DIRECTLY instead of wrongly
+    # dequantizing from the original weightQ (which would silently lose the LoRA delta).
     let qFlags = paramQuantFlags(m)
     if name in qFlags: qFlags[name][] = false
 
@@ -592,33 +592,33 @@ proc restoreBaseOne*(m: var NimformerModelJamba, lora: JambaLora, name: string) 
   if name notin byName: return
   if name in lora.quantBase:
     byName[name][].data = @[]   # giai phong ngay
-    # BUG FIX: khoi phuc useQuant=true - lan mergeInOne/uploadResident ke
-    # tiep se dequant DUNG tro lai tu weightQ (t[].data dang rong).
+    # BUG FIX: restore useQuant=true - the next mergeInOne/uploadResident
+    # dequantizes CORRECTLY from weightQ again (t[].data is empty).
     let qFlags = paramQuantFlags(m)
     if name in qFlags: qFlags[name][] = true
   else:
     byName[name][].data = lora.backup[name]
 
 proc bindQuantBaseToLinears*(m: var NimformerModelJamba, lora: var JambaLora) =
-  ## FIX IndexDefect "container is empty" trên đường quantResident + NIMBIN4:
+  ## Fix for the IndexDefect "container is empty" on the quantResident + NIMBIN4 path:
   ##
-  ## newJambaBlock(quantResident=true) cố ý xóa weight.data = @[] cho
-  ## inProj/outProj (tránh allocate ~29GB fp32). QuantTensor thật nằm trong
-  ## lora.quantBase (từ loadCodestralQuantResidentFromNimq + newBlock Q4).
-  ## Nhưng KHÔNG ai gọi setQuantWeight → Linear.useQuant vẫn false,
-  ## weightQ rỗng → uploadResident không upload được gì → forward() rơi
-  ## xuống transpose(l.weight) với data rỗng → crash.
+  ## newJambaBlock(quantResident=true) deliberately clears weight.data = @[] for
+  ## inProj/outProj (avoiding a ~29GB fp32 allocation). The real QuantTensors live in
+  ## lora.quantBase (from loadCodestralQuantResidentFromNimq + the Q4 newBlock).
+  ## But NOBODY called setQuantWeight → Linear.useQuant stayed false,
+  ## weightQ empty → uploadResident uploaded nothing → forward() fell
+  ## through to transpose(l.weight) with empty data → crash.
   ##
-  ## Gọi proc này NGAY SAU khi gán lo.quantBase, TRƯỚC mergeInUploadStreamingJamba
-  ## / generate. Bind mọi entry quantBase vào Linear tương ứng (R/A/M/S + outProj).
-  ## useQuant=true, weightQ giữ nén; LoRA A/B gắn riêng sau đó trong
-  ## mergeInUploadStreamingJamba như thiết kế QLoRA (không merge vật lý).
+  ## Call this proc RIGHT AFTER assigning lo.quantBase, BEFORE mergeInUploadStreamingJamba
+  ## / generate. Binds every quantBase entry to the matching Linear (R/A/M/S + outProj).
+  ## useQuant=true, weightQ stays compressed; LoRA A/B are attached separately afterwards in
+  ## mergeInUploadStreamingJamba as in the QLoRA design (no physical merge).
   let linears = paramLinears(m)
-  # SUA (BUG THAT): quantize_lora_bin_4bit.convert() nen MOI tensor "newBlock::*"
-  # ke ca tensor 1-D nho (LN gamma/beta, bias cua khoi A). Truoc day 96 tensor
-  # nay (12 khoi A x 8) bi BO QUA o day ("96 ten khong map Linear") => khoi A
-  # chay voi LN gamma=1/beta=0/bias=0 thay vi gia tri DA TRAIN. Giai nen lai
-  # vao dung Tensor cua model.
+  # (REAL BUG): quantize_lora_bin_4bit.convert() compresses EVERY "newBlock::*" tensor,
+  # including small 1-D ones (LN gamma/beta, A block biases). These 96 tensors
+  # (12 A blocks x 8) used to be SKIPPED here ("96 names not mapped to a Linear") => A blocks
+  # ran with LN gamma=1/beta=0/bias=0 instead of the TRAINED values. They are now decompressed
+  # into the model's own Tensors.
   var byName = initTable[string, ptr Tensor]()
   for (pname, pt) in paramList(m): byName[pname] = pt
   var bound = 0
@@ -626,10 +626,10 @@ proc bindQuantBaseToLinears*(m: var NimformerModelJamba, lora: var JambaLora) =
   var missing = 0
   var missingNames: seq[string] = @[]
   for name, qt in lora.quantBase.pairs:
-    # Guard: bỏ qua QuantTensor rỗng (shape.len == 0) - có thể do checkpoint
-    # chưa ghi đầy đủ (vd fuseGate/attn của block G mới init, chưa train).
+    # Guard: skip empty QuantTensors (shape.len == 0) - possibly a checkpoint
+    # that is not fully written (e.g. fuseGate/attn of a freshly initialised, untrained G block).
     if qt.shape.len == 0:
-      stderr.writeLine "[lora] bindQuantBaseToLinears: BỎ QUA '" & name & "' (QuantTensor rỗng, shape.len=0)"
+      stderr.writeLine "[lora] bindQuantBaseToLinears: SKIPPING '" & name & "' (empty QuantTensor, shape.len=0)"
       continue
     if name in linears:
       setQuantWeight(linears[name][], qt)
@@ -646,71 +646,71 @@ proc bindQuantBaseToLinears*(m: var NimformerModelJamba, lora: var JambaLora) =
         inc missing
         missingNames.add(name & " (dequant=" & $dq.len & " != model=" & $want & ")")
     else:
-      # Tên không map được tham số nào của model — bỏ qua, không crash.
+      # The name maps to no model parameter — skipped, no crash.
       inc missing
       missingNames.add(name)
-  echo &"[lora] bindQuantBaseToLinears: {bound} Linear useQuant=true (weightQ từ quantBase), " &
-       &"{restoredSmall} tham số nhỏ (LN gamma/beta, bias) giải nén lại vào model, " &
-       &"{missing} tên không map được (bỏ qua)."
+  echo &"[lora] bindQuantBaseToLinears: {bound} Linears useQuant=true (weightQ from quantBase), " &
+       &"{restoredSmall} small parameters (LN gamma/beta, bias) decompressed back into the model, " &
+       &"{missing} names not mapped (skipped)."
   for nm in missingNames:
-    stderr.writeLine "[lora]   KHONG khoi phuc duoc: " & nm
+    stderr.writeLine "[lora]   Could NOT restore: " & nm
 
 proc mergeInUploadStreamingJamba*(m: var NimformerModelJamba, lora: var JambaLora, ctx: Backend) =
-  ## GAN LoRA RIENG (KHONG merge vat ly) + upload GPU cho toan bo 105 tham
-  ## so quant-resident cua model, dung cho duong inference (generate()) khi
-  ## pattern co block khac 'R'.
+  ## Attaches LoRA SEPARATELY (NO physical merge) + uploads to the GPU for all 105
+  ## quant-resident parameters of the model, used by the inference path (generate()) when
+  ## the pattern has non-'R' blocks.
   ##
-  ## LICH SU (vi sao KHONG con goi mergeIn()/mergeInOne() o day nua): ban
-  ## truoc cua ham nay goi mergeInOne (dequant weightQ qua LUT + mergedWeight
-  ## = W_base + scale*B@A ra 1 ma tran fp32 DAY DU) roi upload+free tung
-  ## tham so mot. Da giam duoc dinh RAM cua RIENG buoc merge (tu O(105) tham
-  ## so cung luc xuong O(1)), nhung VAN bi Killed - vi ban than viec merge
-  ## vat ly BUOC weight phai roi khoi dang nen Q4 (~0.5 byte/phan tu) sang
-  ## fp32 (~4 byte/phan tu) DE UPLOAD - voi 105 tham so lon cua model 7B,
-  ## do la ~3.5GB (nen) -> ~28GB (fp32), BAT KE co free ngay sau do hay
-  ## khong, vi luc GPI/Metal can cap phat buffer resident fp32 kich thuoc do
-  ## la luc RAM da vuot han. Chinh comment goc o dinh nghia field `weightQ`
-  ## trong Linear (nimformer.nim) da canh bao dung diem nay tu truoc: "KHÔNG
-  ## bao giờ expand hết ra fp32 một lần rồi giữ mãi (đó là nguyên nhân OOM
-  ## trước đó: 6.7B tham số x 4 byte fp32 = ~27GB RAM)" - merge vat ly di
-  ## nguoc dung thiet ke goc cua chinh type nay.
+  ## HISTORY (why mergeIn()/mergeInOne() are no longer called here): the
+  ## previous version called mergeInOne (dequant weightQ through the LUT + mergedWeight
+  ## = W_base + scale*B@A into a FULL fp32 matrix) then uploaded+freed each
+  ## parameter in turn. That reduced the peak RAM of the merge step ALONE (from O(105) parameters
+  ## at once down to O(1)), but it was STILL Killed - because the physical merge itself
+  ## FORCES the weight out of the compressed Q4 form (~0.5 byte/element) into
+  ## fp32 (~4 bytes/element) FOR UPLOAD - for the 105 large parameters of the 7B model
+  ## that is ~3.5GB (compressed) -> ~28GB (fp32), REGARDLESS of freeing right after,
+  ## because when the GPU/Metal allocates a resident fp32 buffer of that size
+  ## RAM is already over the limit. The original comment on the `weightQ` field
+  ## of Linear (nimformer.nim) already warned about exactly this: "NEVER
+  ## expanded to fp32 all at once and kept (that was the earlier
+  ## OOM: 6.7B params x 4 bytes fp32 = ~27GB RAM)" - a physical merge goes
+  ## against the original design of this very type.
   ##
-  ## CACH MOI (dung tinh than QLoRA luc suy luan chuan, KHONG merge): base
-  ## weight (`weightQ`/`useQuant`) giu NGUYEN VEN dang nen suot doi - KHONG
-  ## dequant, KHONG merge, KHONG doi useQuant. Chi gan `loraA`/`loraB`/
-  ## `loraR`/`loraScale` (rat nho: [r,inF]+[outF,r] voi r~4-64, thay vi
-  ## [outF,inF] day du) truc tiep len Linear. Duong suy luan GPU phai goi
-  ## prepareGpuLinForLinear(): base FP4-KM duoc upload packed mot lan vao
-  ## Shared GPU cache, con A/B fp32 nho duoc upload private mot lan va fuse
-  ## ngay trong cung session. Khong duoc de Linear.forward() tu dong roi vao
-  ## dequant CPU cho FP4-KM.
-  # THEM (yeu cau debug: in ro block nao duoc gan LoRA - 'r' hay 'a'):
+  ## NEW APPROACH (standard QLoRA inference, NO merge): the base
+  ## weight (`weightQ`/`useQuant`) stays INTACT and compressed forever - NO
+  ## dequant, NO merge, NO useQuant change. Only `loraA`/`loraB`/
+  ## `loraR`/`loraScale` (very small: [r,inF]+[outF,r] with r~4-64, instead of
+  ## the full [outF,inF]) are attached directly to the Linear. The GPU inference path must call
+  ## prepareGpuLinForLinear(): the FP4-KM base is uploaded packed once into the
+  ## Shared GPU cache, and the small fp32 A/B are uploaded privately once and fused
+  ## in the same session. Linear.forward() must never fall back automatically to
+  ## a CPU dequant for FP4-KM.
+  # (debugging aid: print which blocks get LoRA - 'r' or 'a'):
   var attachedCount = 0
-  var fullQuantCount = 0   # weight full quant (useQuant) - KHONG phai LoRA
+  var fullQuantCount = 0   # full quant weights (useQuant) - NOT LoRA
   var fullFp32Count = 0
   var missingCount = 0
-  # Khong nested-proc bat `lora` (ARC: cannot capture JambaLora). Chi doc Linear.
+  # No nested proc capturing `lora` (ARC: cannot capture JambaLora). Only reads the Linear.
   template logWeightSource(name: string, lin: Linear) =
     if lin.useQuant:
       inc fullQuantCount
-      echo "[lora]     " & name & ": KHONG co LoRA adapter — FULL weight quant (newBlock/base), useQuant=true"
+      echo "[lora]     " & name & ": NO LoRA adapter — FULL quant weight (newBlock/base), useQuant=true"
     elif lin.weight.data.len > 0:
       inc fullFp32Count
-      echo "[lora]     " & name & ": KHONG co LoRA adapter — FULL weight fp32 tren Linear"
+      echo "[lora]     " & name & ": NO LoRA adapter — FULL fp32 weight on the Linear"
     else:
       inc missingCount
-      echo "[lora]     " & name & ": THIEU weight (khong LoRA, khong useQuant, khong fp32)"
+      echo "[lora]     " & name & ": MISSING weight (no LoRA, no useQuant, no fp32)"
 
-  # FIX Killed:9 / OOM tren GPU tich hop (Iris unified memory):
-  # uploadResident Q4 cho ~100+ Linear LON = giu dong thoi ban CPU weightQ +
-  # buffer resident GPU (cung an RAM he thong) -> peak vuot han, kernel kill.
-  # Khong upload resident nua: resident path tao ban fp32/Q4 rieng cho tung
-  # Linear va khong phai la kernel FP4-KM fused. Packed weight chi duoc cache
-  # tren GPU tai prepareGpuLinForLinear(), sau do encodeLinByName() su dung
-  # truc tiep trong session inference.
+  # Fix for Killed:9 / OOM on integrated GPUs (Iris unified memory):
+  # a Q4 uploadResident for ~100+ LARGE Linears = holding the CPU weightQ copy +
+  # the GPU resident buffer at the same time (both in system RAM) -> the peak exceeds the limit, the kernel kills it.
+  # No more resident upload: the resident path creates a separate fp32/Q4 copy per
+  # Linear and is not the fused FP4-KM kernel. Packed weights are only cached
+  # on the GPU in prepareGpuLinForLinear(), then encodeLinByName() uses them
+  # directly in the inference session.
   let doUploadResident = false
-  echo &"[lora] Bat dau gan LoRA, khong resident upload; GPU packed cache cho {m.blocks.len} block:"
-  echo "[lora]   (Ghi chu: block A train FULL — weight nam newBlock::* trong jamba_lora.bin, khong nam adapters.)"
+  echo &"[lora] Starting LoRA attach, no resident upload; GPU packed cache for {m.blocks.len} blocks:"
+  echo "[lora]   (Note: A blocks are trained in FULL — their weights are in newBlock::* in jamba_lora.bin, not in adapters.)"
   for i in 0 ..< m.blocks.len:
     let p = &"block{i}"
     let kindLetter = case m.blocks[i].kind
@@ -727,10 +727,10 @@ proc mergeInUploadStreamingJamba*(m: var NimformerModelJamba, lora: var JambaLor
       block:
         let name = p & ".mambaReal.inProj.weight"
         if name in lora.adapters:
-          # KHONG merge vat ly (mergeInOne) nua - xem Linear.loraA/loraB va
-          # forward() trong nimformer.nim: gan adapter RIENG, base (weightQ/
-          # useQuant) giu NGUYEN VEN dang nen, khong bao gio bi dequant/merge
-          # ra fp32 - tranh dung bloat ~27GB tung gay OOM.
+          # NO physical merge (mergeInOne) any more - see Linear.loraA/loraB and
+          # forward() in nimformer.nim: the adapter is attached SEPARATELY, the base (weightQ/
+          # useQuant) stays INTACT and compressed, never dequantized/merged
+          # to fp32 - avoiding the ~27GB bloat that caused OOM.
           let ad = lora.adapters[name]
           attachAdapter(m.blocks[i].mambaReal.inProj, ad)
           m.blocks[i].mambaReal.inProj.loraR = ad.r
@@ -745,10 +745,10 @@ proc mergeInUploadStreamingJamba*(m: var NimformerModelJamba, lora: var JambaLor
       block:
         let name = p & ".mambaReal.outProj.weight"
         if name in lora.adapters:
-          # KHONG merge vat ly (mergeInOne) nua - xem Linear.loraA/loraB va
-          # forward() trong nimformer.nim: gan adapter RIENG, base (weightQ/
-          # useQuant) giu NGUYEN VEN dang nen, khong bao gio bi dequant/merge
-          # ra fp32 - tranh dung bloat ~27GB tung gay OOM.
+          # NO physical merge (mergeInOne) any more - see Linear.loraA/loraB and
+          # forward() in nimformer.nim: the adapter is attached SEPARATELY, the base (weightQ/
+          # useQuant) stays INTACT and compressed, never dequantized/merged
+          # to fp32 - avoiding the ~27GB bloat that caused OOM.
           let ad = lora.adapters[name]
           attachAdapter(m.blocks[i].mambaReal.outProj, ad)
           m.blocks[i].mambaReal.outProj.loraR = ad.r
@@ -790,10 +790,10 @@ proc mergeInUploadStreamingJamba*(m: var NimformerModelJamba, lora: var JambaLor
       block:
         let name = p & ".mamba.inProj.weight"
         if name in lora.adapters:
-          # KHONG merge vat ly (mergeInOne) nua - xem Linear.loraA/loraB va
-          # forward() trong nimformer.nim: gan adapter RIENG, base (weightQ/
-          # useQuant) giu NGUYEN VEN dang nen, khong bao gio bi dequant/merge
-          # ra fp32 - tranh dung bloat ~27GB tung gay OOM.
+          # NO physical merge (mergeInOne) any more - see Linear.loraA/loraB and
+          # forward() in nimformer.nim: the adapter is attached SEPARATELY, the base (weightQ/
+          # useQuant) stays INTACT and compressed, never dequantized/merged
+          # to fp32 - avoiding the ~27GB bloat that caused OOM.
           let ad = lora.adapters[name]
           attachAdapter(m.blocks[i].mamba.inProj, ad)
           m.blocks[i].mamba.inProj.loraR = ad.r
@@ -808,10 +808,10 @@ proc mergeInUploadStreamingJamba*(m: var NimformerModelJamba, lora: var JambaLor
       block:
         let name = p & ".mamba.outProj.weight"
         if name in lora.adapters:
-          # KHONG merge vat ly (mergeInOne) nua - xem Linear.loraA/loraB va
-          # forward() trong nimformer.nim: gan adapter RIENG, base (weightQ/
-          # useQuant) giu NGUYEN VEN dang nen, khong bao gio bi dequant/merge
-          # ra fp32 - tranh dung bloat ~27GB tung gay OOM.
+          # NO physical merge (mergeInOne) any more - see Linear.loraA/loraB and
+          # forward() in nimformer.nim: the adapter is attached SEPARATELY, the base (weightQ/
+          # useQuant) stays INTACT and compressed, never dequantized/merged
+          # to fp32 - avoiding the ~27GB bloat that caused OOM.
           let ad = lora.adapters[name]
           attachAdapter(m.blocks[i].mamba.outProj, ad)
           m.blocks[i].mamba.outProj.loraR = ad.r
@@ -827,10 +827,10 @@ proc mergeInUploadStreamingJamba*(m: var NimformerModelJamba, lora: var JambaLor
       block:
         let name = p & ".attn.qkvProj.weight"
         if name in lora.adapters:
-          # KHONG merge vat ly (mergeInOne) nua - xem Linear.loraA/loraB va
-          # forward() trong nimformer.nim: gan adapter RIENG, base (weightQ/
-          # useQuant) giu NGUYEN VEN dang nen, khong bao gio bi dequant/merge
-          # ra fp32 - tranh dung bloat ~27GB tung gay OOM.
+          # NO physical merge (mergeInOne) any more - see Linear.loraA/loraB and
+          # forward() in nimformer.nim: the adapter is attached SEPARATELY, the base (weightQ/
+          # useQuant) stays INTACT and compressed, never dequantized/merged
+          # to fp32 - avoiding the ~27GB bloat that caused OOM.
           let ad = lora.adapters[name]
           attachAdapter(m.blocks[i].attn.qkvProj, ad)
           m.blocks[i].attn.qkvProj.loraR = ad.r
@@ -845,10 +845,10 @@ proc mergeInUploadStreamingJamba*(m: var NimformerModelJamba, lora: var JambaLor
       block:
         let name = p & ".attn.outProj.weight"
         if name in lora.adapters:
-          # KHONG merge vat ly (mergeInOne) nua - xem Linear.loraA/loraB va
-          # forward() trong nimformer.nim: gan adapter RIENG, base (weightQ/
-          # useQuant) giu NGUYEN VEN dang nen, khong bao gio bi dequant/merge
-          # ra fp32 - tranh dung bloat ~27GB tung gay OOM.
+          # NO physical merge (mergeInOne) any more - see Linear.loraA/loraB and
+          # forward() in nimformer.nim: the adapter is attached SEPARATELY, the base (weightQ/
+          # useQuant) stays INTACT and compressed, never dequantized/merged
+          # to fp32 - avoiding the ~27GB bloat that caused OOM.
           let ad = lora.adapters[name]
           attachAdapter(m.blocks[i].attn.outProj, ad)
           m.blocks[i].attn.outProj.loraR = ad.r
@@ -864,10 +864,10 @@ proc mergeInUploadStreamingJamba*(m: var NimformerModelJamba, lora: var JambaLor
       block:
         let name = p & ".mamba.inProj.weight"
         if name in lora.adapters:
-          # KHONG merge vat ly (mergeInOne) nua - xem Linear.loraA/loraB va
-          # forward() trong nimformer.nim: gan adapter RIENG, base (weightQ/
-          # useQuant) giu NGUYEN VEN dang nen, khong bao gio bi dequant/merge
-          # ra fp32 - tranh dung bloat ~27GB tung gay OOM.
+          # NO physical merge (mergeInOne) any more - see Linear.loraA/loraB and
+          # forward() in nimformer.nim: the adapter is attached SEPARATELY, the base (weightQ/
+          # useQuant) stays INTACT and compressed, never dequantized/merged
+          # to fp32 - avoiding the ~27GB bloat that caused OOM.
           let ad = lora.adapters[name]
           attachAdapter(m.blocks[i].mamba.inProj, ad)
           m.blocks[i].mamba.inProj.loraR = ad.r
@@ -882,10 +882,10 @@ proc mergeInUploadStreamingJamba*(m: var NimformerModelJamba, lora: var JambaLor
       block:
         let name = p & ".mamba.outProj.weight"
         if name in lora.adapters:
-          # KHONG merge vat ly (mergeInOne) nua - xem Linear.loraA/loraB va
-          # forward() trong nimformer.nim: gan adapter RIENG, base (weightQ/
-          # useQuant) giu NGUYEN VEN dang nen, khong bao gio bi dequant/merge
-          # ra fp32 - tranh dung bloat ~27GB tung gay OOM.
+          # NO physical merge (mergeInOne) any more - see Linear.loraA/loraB and
+          # forward() in nimformer.nim: the adapter is attached SEPARATELY, the base (weightQ/
+          # useQuant) stays INTACT and compressed, never dequantized/merged
+          # to fp32 - avoiding the ~27GB bloat that caused OOM.
           let ad = lora.adapters[name]
           attachAdapter(m.blocks[i].mamba.outProj, ad)
           m.blocks[i].mamba.outProj.loraR = ad.r
@@ -900,10 +900,10 @@ proc mergeInUploadStreamingJamba*(m: var NimformerModelJamba, lora: var JambaLor
       block:
         let name = p & ".attn.qkvProj.weight"
         if name in lora.adapters:
-          # KHONG merge vat ly (mergeInOne) nua - xem Linear.loraA/loraB va
-          # forward() trong nimformer.nim: gan adapter RIENG, base (weightQ/
-          # useQuant) giu NGUYEN VEN dang nen, khong bao gio bi dequant/merge
-          # ra fp32 - tranh dung bloat ~27GB tung gay OOM.
+          # NO physical merge (mergeInOne) any more - see Linear.loraA/loraB and
+          # forward() in nimformer.nim: the adapter is attached SEPARATELY, the base (weightQ/
+          # useQuant) stays INTACT and compressed, never dequantized/merged
+          # to fp32 - avoiding the ~27GB bloat that caused OOM.
           let ad = lora.adapters[name]
           attachAdapter(m.blocks[i].attn.qkvProj, ad)
           m.blocks[i].attn.qkvProj.loraR = ad.r
@@ -918,10 +918,10 @@ proc mergeInUploadStreamingJamba*(m: var NimformerModelJamba, lora: var JambaLor
       block:
         let name = p & ".attn.outProj.weight"
         if name in lora.adapters:
-          # KHONG merge vat ly (mergeInOne) nua - xem Linear.loraA/loraB va
-          # forward() trong nimformer.nim: gan adapter RIENG, base (weightQ/
-          # useQuant) giu NGUYEN VEN dang nen, khong bao gio bi dequant/merge
-          # ra fp32 - tranh dung bloat ~27GB tung gay OOM.
+          # NO physical merge (mergeInOne) any more - see Linear.loraA/loraB and
+          # forward() in nimformer.nim: the adapter is attached SEPARATELY, the base (weightQ/
+          # useQuant) stays INTACT and compressed, never dequantized/merged
+          # to fp32 - avoiding the ~27GB bloat that caused OOM.
           let ad = lora.adapters[name]
           attachAdapter(m.blocks[i].attn.outProj, ad)
           m.blocks[i].attn.outProj.loraR = ad.r
@@ -936,10 +936,10 @@ proc mergeInUploadStreamingJamba*(m: var NimformerModelJamba, lora: var JambaLor
       block:
         let name = p & ".fuseGate.weight"
         if name in lora.adapters:
-          # KHONG merge vat ly (mergeInOne) nua - xem Linear.loraA/loraB va
-          # forward() trong nimformer.nim: gan adapter RIENG, base (weightQ/
-          # useQuant) giu NGUYEN VEN dang nen, khong bao gio bi dequant/merge
-          # ra fp32 - tranh dung bloat ~27GB tung gay OOM.
+          # NO physical merge (mergeInOne) any more - see Linear.loraA/loraB and
+          # forward() in nimformer.nim: the adapter is attached SEPARATELY, the base (weightQ/
+          # useQuant) stays INTACT and compressed, never dequantized/merged
+          # to fp32 - avoiding the ~27GB bloat that caused OOM.
           let ad = lora.adapters[name]
           attachAdapter(m.blocks[i].fuseGate, ad)
           m.blocks[i].fuseGate.loraR = ad.r
@@ -954,8 +954,8 @@ proc mergeInUploadStreamingJamba*(m: var NimformerModelJamba, lora: var JambaLor
   block:
     let name = "outProj.weight"
     if name in lora.adapters:
-      # Mac dinh KHONG gan LoRA lm_head: checkpoint 105 adapter (outProj.weight)
-      # lech trainer hien tai (loraTargets chi R). Bat: BYBY_APPLY_LMHEAD_LORA=1.
+      # By default NO LoRA on lm_head: checkpoints with 105 adapters (outProj.weight)
+      # do not match the current trainer (loraTargets is R only). Enable: BYBY_APPLY_LMHEAD_LORA=1.
       if getEnv("BYBY_APPLY_LMHEAD_LORA") == "1":
         let ad = lora.adapters[name]
         attachAdapter(m.outProj, ad)
@@ -964,7 +964,7 @@ proc mergeInUploadStreamingJamba*(m: var NimformerModelJamba, lora: var JambaLor
         echo "[lora]     " & name & ": GAN adapter r=" & $ad.r & " scale=" & $ad.scale & " (BYBY_APPLY_LMHEAD_LORA=1)"
         inc attachedCount
       else:
-        echo "[lora]     " & name & ": BO QUA LoRA lm_head (mac dinh). Bat: BYBY_APPLY_LMHEAD_LORA=1"
+        echo "[lora]     " & name & ": SKIPPING lm_head LoRA (default). Enable: BYBY_APPLY_LMHEAD_LORA=1"
         inc missingCount
     else:
       logWeightSource(name, m.outProj)
@@ -972,44 +972,44 @@ proc mergeInUploadStreamingJamba*(m: var NimformerModelJamba, lora: var JambaLor
 
       uploadResident(m.outProj, ctx)
   echo &"[lora] Tong ket: {attachedCount} LoRA adapter | {fullQuantCount} FULL quant (newBlock/base, vd Attention) | {fullFp32Count} FULL fp32 | {missingCount} THIEU weight."
-  echo "[lora]   → Attention (block A) nam o cot FULL quant/fp32, KHONG phai 'bo sot adapter'."
-  echo "[lora]   → Da BO QUA uploadResident. FP4-KM base + LoRA duoc encode tren GPU trong session."
+  echo "[lora]   → Attention (A blocks) is in the FULL quant/fp32 column, NOT 'missing adapters'."
+  echo "[lora]   → uploadResident SKIPPED. The FP4-KM base + LoRA are encoded on the GPU in the session."
 
 proc mergeIn*(m: var NimformerModelJamba, lora: var JambaLora, ctx: Backend) =
-  ## Trước forward: ghi đè weight base bằng W_eff = base + LoRA delta.
-  ## SUA: neu tham so nam trong lora.quantBase (quant-resident, khong giu
-  ## fp32 thuong truc) -> DEQUANT MOI QUA LUT ngay tai day (thay vi backup
-  ## t[].data cu, vi t[].data dang la rac/khong dung duoc) roi cong LoRA
-  ## delta - KHONG luu backup (restoreBase se XOA thay vi phuc hoi, xem duoi).
+  ## Before forward: overwrites the base weight with W_eff = base + LoRA delta.
+  ## If the parameter is in lora.quantBase (quant-resident, no resident
+  ## fp32 copy) -> dequantize FRESH through the LUT right here (instead of backing up
+  ## the old t[].data, which is garbage/unusable) then add the LoRA
+  ## delta - NO backup is kept (restoreBase FREES instead of restoring, see below).
   var byName = initTable[string, ptr Tensor]()
   for (name, t) in paramList(m): byName[name] = t
   let qFlags = paramQuantFlags(m)
   for name, ad in lora.adapters:
     let t = byName[name]
     if name in lora.quantBase:
-      t[].data = dequantViaLUT(lora.quantBase[name])   # base "tuoi" moi lan, khong backup
+      t[].data = dequantViaLUT(lora.quantBase[name])   # a "fresh" base every time, no backup
     else:
       lora.backup[name] = t[].data
     let merged = mergedWeight(t[], ad, ctx)
     t[].data = merged.data
     if name in lora.quantBase and name in qFlags:
-      # BUG FIX: xem giai thich day du trong mergeInOne/paramQuantFlags o
-      # tren - khong tat cai nay thi uploadResidentJamba() goi ngay sau
-      # mergeIn() se dequant lai tu weightQ GOC, xoa sach LoRA vua merge.
+      # BUG FIX: see the full explanation in mergeInOne/paramQuantFlags
+      # above - without turning this off, uploadResidentJamba() called right after
+      # mergeIn() would dequantize again from the ORIGINAL weightQ, wiping the LoRA just merged.
       qFlags[name][] = false
 
 proc restoreBase*(m: var NimformerModelJamba, lora: JambaLora) =
-  ## Sau backward: trả base về nguyên bản.
-  ## SUA: voi tham so quant-resident, KHONG phuc hoi tu backup (khong co) -
-  ## XOA thang t[].data (giai phong RAM ngay - day la diem MAU CHOT giai
-  ## quyet RAM: khong bao gio co qua 1-2 block fp32 resident cung luc).
+  ## After backward: restores the base to the original.
+  ## For quant-resident parameters there is NO backup to restore from -
+  ## t[].data is FREED directly (releasing RAM right away - this is the KEY point of
+  ## the RAM fix: never more than 1-2 fp32 blocks resident at once).
   var byName = initTable[string, ptr Tensor]()
   for (name, t) in paramList(m): byName[name] = t
   let qFlags = paramQuantFlags(m)
   for name in lora.adapters.keys:
     if name in lora.quantBase:
-      byName[name][].data = @[]   # giai phong - lan mergeIn sau se dequant lai tu dau
-      if name in qFlags: qFlags[name][] = true   # BUG FIX: xem mergeIn o tren
+      byName[name][].data = @[]   # freed - the next mergeIn dequantizes again from scratch
+      if name in qFlags: qFlags[name][] = true   # BUG FIX: see mergeIn above
     else:
       byName[name][].data = lora.backup[name]
 
@@ -1017,24 +1017,24 @@ proc trainStepLora*(m: var NimformerModelJamba, lora: var JambaLora,
                      state: var LoraTrainState,
                      idsBatch, targetsBatch: seq[seq[int]], ctx: Backend,
                      requantizeEvery: int = 0): float32 =
-  ## 1 bước train CHỈ update A,B của LoRA - mọi tham số khác (base Mamba đã
-  ## fine-tune trước đó, embed, outProj, LayerNorm...) giữ NGUYÊN. Đây là
-  ## điểm khiến máy yếu vẫn chạy được: số tham số thật sự cập nhật = vài
-  ## chục nghìn (r * (inF+outF) mỗi adapter) thay vì toàn bộ model.
+  ## 1 training step that ONLY updates the LoRA A,B - every other parameter (the previously
+  ## fine-tuned Mamba base, embed, outProj, LayerNorm...) stays UNCHANGED. This is
+  ## what lets weak machines run it: the number of parameters actually updated = a few
+  ## tens of thousands (r * (inF+outF) per adapter) instead of the whole model.
   mergeIn(m, lora, ctx)
   let (loss, grads) = computeLossAndGrads(m, idsBatch, targetsBatch, ctx,
                                            trainLmHead = false, trainEmbed = false)
   for name, ad in lora.adapters.mpairs:
     if name notin grads:
-      stderr.writeLine("[lora] CANH BAO: thieu grad cho " & name)
+      stderr.writeLine("[lora] WARNING: missing grad for " & name)
       continue
     let (dA, dB) = gradToAB(grads[name], ad, ctx)
     var stA = state.adamA[name]
     var stB = state.adamB[name]
-    # requantizeEvery=0 nghia la KHONG ep APF/CustomFloat cho A/B (LoRA rank
-    # thap, gia tri nho, ep APF som se giet gradient giong y het canh bao da
-    # ghi trong trainStep goc cua test_nimformer.nim) - apfAdamStep coi
-    # requantizeEvery<=0 la "khong bao gio requantize", chi Adam thuan fp32.
+    # requantizeEvery=0 means NO APF/CustomFloat snapping for A/B (low-rank LoRA,
+    # small values, snapping to APF early kills the gradient, exactly as warned
+    # in the original trainStep of test_nimformer.nim) - apfAdamStep treats
+    # requantizeEvery<=0 as "never requantize", plain fp32 Adam only.
     discard apfAdamStepFused(ctx, ad.A, dA, stA, state.lr,
                             requantizeEvery = (if requantizeEvery <= 0: int.high else: requantizeEvery))
     discard apfAdamStepFused(ctx, ad.B, dB, stB, state.lr,
@@ -1044,28 +1044,28 @@ proc trainStepLora*(m: var NimformerModelJamba, lora: var JambaLora,
   restoreBase(m, lora)
   result = loss
 
-# MMMM...") -> model mới có thêm block
-# LinearPlusAttention/Spectron xen vào, giữ nguyên trọng số Mamba đã train.
+# MMMM...") -> a new model with LinearPlusAttention/Spectron blocks
+# inserted, keeping the trained Mamba weights.
 # ═══════════════════════════════════════════════════════════════
 proc graftBlocks*(old: var NimformerModelJamba, newPattern: string, ctx: Backend): NimformerModelJamba =
-  ## `newPattern` phải chứa đúng các ký tự 'M' ở đúng SỐ LƯỢNG và THỨ TỰ
-  ## tương đối như `old.pattern` (các 'M' được match tuần tự để copy trọng
-  ## số), cộng thêm ký tự 'A'/'S' mới xen vào bất kỳ vị trí nào. Ví dụ:
+  ## `newPattern` must contain the 'M' characters in the same COUNT and
+  ## relative ORDER as `old.pattern` (the 'M's are matched in sequence to copy
+  ## weights), plus new 'A'/'S' characters inserted anywhere. Example:
   ##   old.pattern  = "MMMM"
-  ##   newPattern   = "MMAMMSM"   # 4 chu 'M' theo dung thu tu, them 1 'A' + 1 'S'
-  ## Các block 'M' trong newPattern được copy y nguyên trọng số (ln1, ln2,
-  ## ff, mamba.*) từ old theo đúng thứ tự. Các block 'A'/'S' mới hoàn toàn
-  ## random-init - PHẢI train (không LoRA, vì chưa có gì để "thấp hạng
-  ## hoá" - train full những block này, ĐỒNG THỜI có thể gắn LoRA lên các
-  ## block 'M' đã copy để fine-tune nhẹ phần Mamba cho khớp với Attention
-  ## mới, xem attachLora ở trên).
+  ##   newPattern   = "MMAMMSM"   # 4 'M's in the same order, plus 1 'A' + 1 'S'
+  ## The 'M' blocks in newPattern get their weights copied as is (ln1, ln2,
+  ## ff, mamba.*) from old in order. The new 'A'/'S' blocks are fully
+  ## random-init - they MUST be trained (no LoRA, since there is nothing to "low-rank
+  ## approximate" - these blocks are trained in full, AND LoRA can be attached to the
+  ## copied 'M' blocks to lightly fine-tune the Mamba part to fit the new
+  ## Attention, see attachLora above).
   var oldMIdx = 0
   var mPositionsInNew: seq[int] = @[]
   for i, c in newPattern:
     if c in {'M', 'm'}: mPositionsInNew.add(i)
   let oldMCount = old.pattern.count('M') + old.pattern.count('m')
   assert mPositionsInNew.len == oldMCount,
-    &"So block 'M' trong newPattern ({mPositionsInNew.len}) phai khop voi old.pattern ({oldMCount})"
+    &"The number of 'M' blocks in newPattern ({mPositionsInNew.len}) must match old.pattern ({oldMCount})"
 
   result = newNimformerModelJamba(old.vocab, old.embedDim, old.nHeads, old.ffMult,
                                    newPattern, useSession = true)
@@ -1080,30 +1080,30 @@ proc graftBlocks*(old: var NimformerModelJamba, newPattern: string, ctx: Backend
     result.blocks[newIdx].ln2 = old.blocks[oi].ln2
     result.blocks[newIdx].ff = old.blocks[oi].ff
     result.blocks[newIdx].mamba = old.blocks[oi].mamba
-  echo &"[graft] Da copy {oldMIdx} block Mamba tu model cu -> model moi pattern '{newPattern}' " &
-       &"({newPattern.len - oldMIdx} block moi (A/S) random-init, can train)"
+  echo &"[graft] Copied {oldMIdx} Mamba blocks from the old model -> new model with pattern '{newPattern}' " &
+       &"({newPattern.len - oldMIdx} new (A/S) blocks random-init, need training)"
 # ═══════════════════════════════════════════════════════════════
-# INFER — 100% GPU, 1 command buffer / token, KHÔNG MSL nhúng trong Nim.
+# INFER — 100% GPU, 1 command buffer / token, NO MSL embedded in Nim.
 #
-# Toàn bộ kernel (gemv fp4-KM / int4-asymmetric / fp32, LoRA, bias+APFLU,
-# Linear++ step, split/conv/softplus, SSM step, RMSNorm theo nhóm) là
-# BYTECODE micro-VM (session_vm.nim + fp4_gemv_vm.nim), lower + JIT-compile
-# qua jit_vm.nim (đúng tinh thần HotSpot/tinygrad MetalCompiler đã ghi ở đầu
-# jit_vm.nim: bytecode -> Metal source SINH RA lúc runtime -> newLibraryWithSource
-# -> pipeline cache). KHÔNG có kernel .metal nào được viết tay trong Nim.
+# Every kernel (fp4-KM / int4-asymmetric / fp32 gemv, LoRA, bias+APFLU,
+# Linear++ step, split/conv/softplus, SSM step, grouped RMSNorm) is
+# micro-VM BYTECODE (session_vm.nim + fp4_gemv_vm.nim), lowered + JIT-compiled
+# by jit_vm.nim (in the HotSpot/tinygrad MetalCompiler spirit noted at the top of
+# jit_vm.nim: bytecode -> Metal source GENERATED at runtime -> newLibraryWithSource
+# -> pipeline cache). NO .metal kernel is hand-written in Nim.
 #
-# R (Mamba2Real): mamba2_fused_step.nim (encodeLayerV2, 7 lệnh/layer — giữ
-#   nguyên từ bản trước, đã đo ~30 tok/s trước khi bị chậm bởi
-#   commitContinue/yield; nay fp4GemvAt tổng quát cho cả int4-asymmetric).
-# A (LinearPlusAttention + FFN): gpu_layers.nim (encodeAttnLayer) — MỚI,
-#   thay hẳn nhánh forwardLinearPlusInferStep cũ (gọi sai chữ ký hàm — xem
-#   lỗi nim check trước khi sửa: nHeads truyền nhầm vào chỗ qkvName) bằng
-#   đường GPU thuần, cùng 1 session với R.
+# R (Mamba2Real): mamba2_fused_step.nim (encodeLayerV2, 7 commands/layer — kept
+#   from the previous version, measured ~30 tok/s before being slowed down by
+#   commitContinue/yield; fp4GemvAt now also covers int4-asymmetric).
+# A (LinearPlusAttention + FFN): gpu_layers.nim (encodeAttnLayer) — NEW,
+#   fully replaces the old forwardLinearPlusInferStep branch (which called a function with the wrong signature — see
+#   the nim check error before the fix: nHeads passed in qkvName's place) with
+#   a pure GPU path, in the same session as R.
 #
-# Mọi Linear (R in/out_proj, A qkv/out/fc1/fc2, lm_head) đi qua ĐÚNG 1 hàm
-# chuẩn bị: gpu_layers.prepareGpuLinForLinear — tự chọn kernel theo
-# lin.weightQ.kind (fp4-KM hay int4-asymmetric) hoặc fp32 fallback, và giải
-# phóng bản host trùng (Shared/Private GPU đã giữ 1 bản) sau khi upload.
+# Every Linear (R in/out_proj, A qkv/out/fc1/fc2, lm_head) goes through EXACTLY 1
+# preparation function: gpu_layers.prepareGpuLinForLinear — it picks the kernel from
+# lin.weightQ.kind (fp4-KM or int4-asymmetric) or an fp32 fallback, and frees
+# the duplicate host copy (the Shared/Private GPU buffer holds 1 copy) after upload.
 # ═══════════════════════════════════════════════════════════════
 
 import session_vm_dispatch
@@ -1120,8 +1120,8 @@ proc ilog(msg: string) =
   stderr.flushFile()
 
 proc gNormGroups*(nGroups: int): int =
-  ## So nhom cho gated RMSNorm trong mixer R (BAO_CAO.md muc 3.2):
-  ##   mac dinh = n_groups cua model  -> dung mamba_ssm / vLLM
+  ## Group count for the gated RMSNorm in the R mixer (BAO_CAO.md section 3.2):
+  ##   default = the model's n_groups  -> uses mamba_ssm / vLLM
   ##   BYBY_MAMBA_NORM_GROUPS=1       -> diagnostic legacy/full-width variant
   let raw = getEnv("BYBY_MAMBA_NORM_GROUPS", "")
   if raw.len > 0:
@@ -1130,38 +1130,38 @@ proc gNormGroups*(nGroups: int): int =
   nGroups
 
 var gHXPersist, gHNormPersist, gHFinalPersist, gHLogitsPersist: SessionHandle
-var gNormFGamma: SessionHandle      ## gamma cua normF (== backbone.norm_f cua HF, RMSNorm, KHONG co beta)
-var gNormFOnes: SessionHandle       ## gamma=1 (chi dung khi preset "-unit": xem setGpuNormPreset)
+var gNormFGamma: SessionHandle      ## normF gamma (== HF backbone.norm_f, RMSNorm, NO beta)
+var gNormFOnes: SessionHandle       ## gamma=1 (only used with the "-unit" preset: see setGpuNormPreset)
 var gLmHead: GpuLin
 var gGpuModelReady = false
 var gGpuWarmedUp = false
 
-# ── Cau hinh norm cua duong GPU infer ─────────────────────────────────
-# LECH THAT giua train va infer (doc code):
-#   TRAIN (jamba_hybrid.forwardBlock/forwardBatch + finetune_lora): ln1 cua khoi R
-#          = LayerNorm (tru mean + beta), KHONG co normF truoc lm_head.
-#   HF Mamba2 goc: RMSNorm cho ln1 va normF = RMSNorm(norm_f) truoc lm_head.
-# Checkpoint LoRA + khoi A chi khop voi cau hinh luc train => preset "train".
+# ── Norm configuration of the GPU infer path ─────────────────────────────────
+# A REAL mismatch between train and infer (from reading the code):
+#   TRAIN (jamba_hybrid.forwardBlock/forwardBatch + finetune_lora): the R block's ln1
+#          = LayerNorm (mean subtraction + beta), NO normF before lm_head.
+#   Original HF Mamba2: RMSNorm for ln1 and normF = RMSNorm(norm_f) before lm_head.
+# LoRA checkpoints + A blocks only match the training configuration => preset "train".
 var gUseNormF* = true
 proc setGpuDisableLora*(v: bool) = gDisableLora = v
 var gSkipAttn* = false
-  ## chan doan (bisect): true = bo qua MOI khoi A (residual di thang) -> chi con Mamba R.
+  ## diagnostics (bisect): true = skip EVERY A block (the residual passes straight through) -> only Mamba R remains.
 var gNormPresetName* = "hf"
 
 proc setGpuNormPreset*(name: string): bool =
-  ## Preset = "<norm>-<final>-<groups>" (khong phan biet hoa/thuong):
-  ##   norm   : ln  = LayerNorm (tru mean + beta)   | rms = RMSNorm
-  ##   final  : nof = KHONG normF truoc lm_head     | fin = co normF (RMSNorm)
+  ## Preset = "<norm>-<final>-<groups>" (case-insensitive):
+  ##   norm   : ln  = LayerNorm (mean subtraction + beta)   | rms = RMSNorm
+  ##   final  : nof = NO normF before lm_head     | fin = with normF (RMSNorm)
   ##   groups : g1  = full-width gated-RMSNorm | gn = prepared model groups
-  ## Bi danh:
-  ##   "train" = rms-fin-gn  (trainer hien tai: Mamba-SSM gated-RMSNorm groups)
-  ##   "train-legacy" = ln-nof-g1 (trainer cu thoi ky LayerNorm ln1, khong normF)
+  ## Aliases:
+  ##   "train" = rms-fin-gn  (current trainer: Mamba-SSM gated-RMSNorm groups)
+  ##   "train-legacy" = ln-nof-g1 (the old LayerNorm-ln1 era trainer, no normF)
   ##   "hf"    = rms-fin-g1   (legacy Transformers implementation: full-width reduction)
   ##   "mamba-ssm" = rms-fin-gn (grouped RMSNorm used by mamba_ssm implementations)
-  ## Hau to tuy chon "-unit" (vd "rms-fin-g1-unit", "hf-unit"): gamma cua RMSNorm
-  ## tien-block (R + sidecar P) va normF = 1. CHI de doc checkpoint train bang trainer
-  ## CU - trainer do khong bao gio nap gamma pretrain vao rms1/rmsF (xem
-  ## jamba_hybrid.syncRmsFromBaseNorms), nen LoRA + sidecar hoc tren dau vao gamma=1.
+  ## Optional "-unit" suffix (e.g. "rms-fin-g1-unit", "hf-unit"): gamma of the pre-block
+  ## RMSNorm (R + P sidecar) and normF = 1. ONLY for reading checkpoints trained with the OLD
+  ## trainer - that trainer never loaded the pretrain gamma into rms1/rmsF (see
+  ## jamba_hybrid.syncRmsFromBaseNorms), so LoRA + sidecar learned on gamma=1 inputs.
   var spec = name.strip().toLowerAscii()
   var unit = false
   if spec.endsWith("-unit"):
@@ -1176,7 +1176,7 @@ proc setGpuNormPreset*(name: string): bool =
   if parts[0] notin ["ln", "rms"]: return false
   if parts[1] notin ["nof", "fin"]: return false
   if parts[2] notin ["g1", "gn"]: return false
-  if unit and parts[0] != "rms": return false   # "-unit" chi co nghia voi RMSNorm
+  if unit and parts[0] != "rms": return false   # "-unit" only makes sense for RMSNorm
   gRNormOverride = (if parts[0] == "ln": 1 else: 0)
   gUseNormF = (parts[1] == "fin")
   gRNormGroupsOverride = (if parts[2] == "g1": 1 else: -1)
@@ -1195,7 +1195,7 @@ proc normPresetDescription*(m: NimformerModelJamba): string =
         if n notin groups: groups.add(n)
   result = "R+P-sidecar ln1=" & (if gRNormOverride == 1: "LayerNorm" else: "RMSNorm") &
     (if gRmsUnitGamma: " gamma=1(unit)" else: "") &
-    ", normF=" & (if gUseNormF: "bat" else: "tat") &
+    ", normF=" & (if gUseNormF: "on" else: "off") &
     ", gated-norm-groups=" & (if groups.len == 0: "n/a" else: $groups)
 
 when not defined(noOneDispatch):
@@ -1205,20 +1205,20 @@ when not defined(noOneDispatch):
     lin.loraR > 0 and lin.loraAValues.len == lin.loraR * K and lin.loraBValues.len == N * lin.loraR
 
   proc odLinOk(l: Linear): string =
-    if not (l.useQuant and l.weightQ.kind == qkFp4KM): return "khong phai fp4-KM"
+    if not (l.useQuant and l.weightQ.kind == qkFp4KM): return "not fp4-KM"
     if l.weightQ.groupSize != 0 and l.weightQ.groupSize != 32: return "groupSize != 32"
     ""
 
   proc odTryPrepare(m: var NimformerModelJamba; ctx: Backend): string =
-    ## Tra "" neu da pack xong + cai dat (gOdState san sang); khac rong = ly do KHONG eligible.
-    ## Moi kiem tra eligibility nam TRUOC khi dung vao weight -> path cu van chay duoc.
-    ## Dung con tro (addr) de KHONG deep-copy Linear/Mamba2Real (chua weight hang chuc MB).
+    ## Returns "" when packed + installed (gOdState ready); non-empty = the reason it is NOT eligible.
+    ## Every eligibility check happens BEFORE touching the weights -> the old path still works.
+    ## Uses pointers (addr) to NOT deep-copy Linear/Mamba2Real (holding tens of MB of weights).
     if not isGpuCtx(ctx): return "can GPU Metal"
     if gRNormOverride != -1 or gRNormGroupsOverride != -1 or gRmsUnitGamma:
-      return "preset norm override dang bat (LayerNorm / 1 nhom / unit gamma)"
-    if m.blocks.len == 0: return "model khong co block"
-    # HYBRID: block R (bkMambaReal) -> OD, theo tung DOAN lien tiep (1 dispatch/doan).
-    # Block G (bkMambaRealGated) chay path cu xen giua cac doan. Loai khac chua ho tro.
+      return "norm preset override is on (LayerNorm / 1 group / unit gamma)"
+    if m.blocks.len == 0: return "model has no blocks"
+    # HYBRID: R blocks (bkMambaReal) -> OD, per run of consecutive blocks (1 dispatch/run).
+    # G blocks (bkMambaRealGated) run the old path between runs. Other kinds are not supported yet.
     var odBlocks: seq[int]
     for i in 0 ..< m.blocks.len:
       case m.blocks[i].kind
@@ -1230,16 +1230,16 @@ when not defined(noOneDispatch):
         odBlocks.add i
       of bkMambaRealGated: discard
       else:
-        return "block " & $i & " kieu " & $m.blocks[i].kind & " chua ho tro (chi R + G)"
-    if odBlocks.len == 0: return "khong co block R nao"
+        return "block " & $i & " of kind " & $m.blocks[i].kind & " is not supported (only R + G)"
+    if odBlocks.len == 0: return "no R blocks"
     let b0 = odBlocks[0]
     let hidden = m.embedDim
     let C = m.blocks[b0].mambaReal.intermediateSize
     let cDim = m.blocks[b0].mambaReal.convDim
     let H = m.blocks[b0].mambaReal.numHeads
     let P = C + cDim + H
-    # Layer co the KHONG co adapter (vd adapter B=0 da bo luc nap): kernel bo qua stage LoRA
-    # cua layer do (co theo layer). Rank/scale phai dong nhat giua cac layer CO adapter.
+    # A layer may have NO adapter (e.g. a B=0 adapter dropped at load): the kernel skips that layer's
+    # LoRA stage (per-layer flag). Rank/scale must be uniform across the layers WITH adapters.
     var rIn, rOut = 0
     var sIn, sOut = 1'f32
     for i in odBlocks:
@@ -1252,7 +1252,7 @@ when not defined(noOneDispatch):
       let ho = odLinHasLora(m.blocks[i].mambaReal.outProj, C, hidden)
       if (hi and (m.blocks[i].mambaReal.inProj.loraR != rIn or m.blocks[i].mambaReal.inProj.loraScale != sIn)) or
          (ho and (m.blocks[i].mambaReal.outProj.loraR != rOut or m.blocks[i].mambaReal.outProj.loraScale != sOut)):
-        return "LoRA rank/scale khong dong nhat tren cac layer (block " & $i & ")"
+        return "LoRA rank/scale is not uniform across layers (block " & $i & ")"
     try:
       var st = odBegin(ctx, hidden, C, cDim, H, m.blocks[b0].mambaReal.headDim,
         m.blocks[b0].mambaReal.dState, m.blocks[b0].mambaReal.nGroups,
@@ -1264,8 +1264,8 @@ when not defined(noOneDispatch):
       for i in odBlocks:
         st.slotOfBlock[i] = slot
         inc slot
-      # DOAN R lien tiep (cat boi block G), moi doan = 1 dispatch + 1 buffer trong so rieng.
-      # Moi buffer Metal toi da ~2GB -> cat them doan neu qua ~1.5GB.
+      # Runs of consecutive R blocks (split by G blocks), each run = 1 dispatch + 1 separate weight buffer.
+      # Each Metal buffer is at most ~2GB -> split further past ~1.5GB.
       let perLayerBytes = odFp4Bytes(hidden, P) + odFp4Bytes(C, hidden) + 512
       let maxLayersPerSeg = max(1, 1_500_000_000 div perLayerBytes)
       var bi = 0
@@ -1293,8 +1293,8 @@ when not defined(noOneDispatch):
           (if odLinHasLora(mr[].outProj, C, hidden): @(mr[].outProj.loraBValues) else: @[]))
       odFinish(ctx, st)
       odInstall(st)
-      # KHONG giai phong weight host o day: vong prepareGpuModel ben duoi van nap cache fp4 rieng
-      # cho block R (de PREFILL SONG SONG chay GEMM M-block) roi tu bo ban host sau khi upload.
+      # Host weights are NOT freed here: the prepareGpuModel loop below still loads a separate fp4 cache
+      # for R blocks (so the PARALLEL PREFILL can run the M-block GEMM), then drops the host copy after upload.
       return ""
     except CatchableError as e:
       return e.msg
@@ -1309,14 +1309,14 @@ proc prepareGpuModel*(m: var NimformerModelJamba, lora: var JambaLora, ctx: Back
       let odWhy = odTryPrepare(m, ctx)
       if odWhy.len == 0:
         gOdActive = true
-        stderr.writeLine "[one-dispatch] BAT: " & $gOdState.sh.nLayers & " layer R trong " & $gOdState.segs.len &
-          " dispatch/token (block G chay path cu xen giua, ntg=" & $gOdState.ntg & ")"
+        stderr.writeLine "[one-dispatch] ON: " & $gOdState.sh.nLayers & " R layers in " & $gOdState.segs.len &
+          " dispatches/token (G blocks run the old path in between, ntg=" & $gOdState.ntg & ")"
       else:
-        stderr.writeLine "[one-dispatch] TAT -> dung path cu: " & odWhy
+        stderr.writeLine "[one-dispatch] OFF -> using the old path: " & odWhy
   for i in 0 ..< m.blocks.len:
     when not defined(noOneDispatch):
       if gOdActive and i < gOdState.slotOfBlock.len and gOdState.slotOfBlock[i] >= 0:
-        # Block R do OD so huu state + decode. Van nap cache fp4 rieng cho prefill song song.
+        # R blocks are owned by OD (state + decode). A separate fp4 cache is still loaded for the parallel prefill.
         discard prepareGpuLinForLinear(ctx, "block" & $i & ".mambaReal.inProj.weight", m.blocks[i].mambaReal.inProj)
         discard prepareGpuLinForLinear(ctx, "block" & $i & ".mambaReal.outProj.weight", m.blocks[i].mambaReal.outProj)
         continue
@@ -1341,7 +1341,7 @@ proc prepareGpuModel*(m: var NimformerModelJamba, lora: var JambaLora, ctx: Back
         let qkv = prepareGpuLinForLinear(ctx, pq, m.blocks[i].attn.qkvProj)
         let outp = prepareGpuLinForLinear(ctx, po, m.blocks[i].attn.outProj)
         var fc1, fc2: GpuLin
-        # FIX: DÙNG CHUNG ln1 (giống Mamba) cho Attention sidecar - không dùng attnLn1 riêng
+        # Fix: the Attention sidecar SHARES ln1 (like Mamba) - no separate attnLn1
         gAttnLayers[i] = initAttnLayer(ctx, hidden, m.blocks[i].attn.nHeads, 0,
           qkv, outp, fc1, fc2,
           m.blocks[i].ln1.gamma.data, m.blocks[i].ln1.beta.data,
@@ -1374,36 +1374,36 @@ proc prepareGpuModel*(m: var NimformerModelJamba, lora: var JambaLora, ctx: Back
           m.blocks[i].ln2.gamma.data, m.blocks[i].ln2.beta.data, 1e-5'f32)
     of bkMamba, bkSpectron:
       raise newException(ValueError,
-        "prepareGpuModel: block M/S chua co duong 100% GPU")
+        "prepareGpuModel: M/S blocks have no 100% GPU path yet")
 
-  # ── Buffer persist + normF + lm_head ─────────────────────────────────
-  # TRUOC DAY khong ai khoi tao: gHXPersist/gHNormPersist/gHFinalPersist/
-  # gHLogitsPersist la handle NIL, gLmHead la GpuLin rong (knF32 = "") ->
-  #   - sessionCopyInto(hEmb -> gHXPersist) bao "dst offset vuot qua kich thuoc"
-  #   - encodeLin(gLmHead) -> "encodeVmKernel: khong bind duoc pipeline ''"
-  # Scratch = Shared, song suot process (giong ban infer cu da chay dung).
+  # ── Persistent buffers + normF + lm_head ─────────────────────────────────
+  # Nobody used to initialise these: gHXPersist/gHNormPersist/gHFinalPersist/
+  # gHLogitsPersist were NIL handles, gLmHead was an empty GpuLin (knF32 = "") ->
+  #   - sessionCopyInto(hEmb -> gHXPersist) reported "dst offset exceeds the size"
+  #   - encodeLin(gLmHead) -> "encodeVmKernel: could not bind pipeline ''"
+  # Scratch = Shared, lives for the whole process (like the old infer version that worked).
   if not gGpuModelReady:
-    gHXPersist      = sessionAllocScratch(be, hidden)          # residual, ghi de tai cho qua moi layer
-    gHNormPersist   = sessionAllocScratch(be, hidden)          # scratch pre-norm dung chung
+    gHXPersist      = sessionAllocScratch(be, hidden)          # residual, overwritten in place by every layer
+    gHNormPersist   = sessionAllocScratch(be, hidden)          # shared pre-norm scratch
     gHFinalPersist  = sessionAllocScratch(be, hidden)          # output normF
     gHLogitsPersist = sessionAllocScratch(be, m.outProj.outF)  # logits [vocab]
     if m.normF.gamma.data.len != hidden:
       raise newException(ValueError,
         "prepareGpuModel: normF.gamma co " & $m.normF.gamma.data.len &
-        " phan tu, can " & $hidden)
+        " elements, need " & $hidden)
     gNormFGamma = sessionUploadPrivate(be, m.normF.gamma.data)
     block:
       var ones = newSeq[float32](hidden)
       for i in 0 ..< ones.len: ones[i] = 1'f32
       gNormFOnes = sessionUploadPrivate(be, ones)
-    # lm_head di qua CUNG 1 duong chuan bi voi moi Linear khac (fp4-KM / int4-asym,
-    # khong fallback fp32). Ten "outProj.weight" khop bindQuantBaseToLinears.
+    # lm_head goes through the SAME preparation path as every other Linear (fp4-KM / int4-asym,
+    # no fp32 fallback). The name "outProj.weight" matches bindQuantBaseToLinears.
     gLmHead = prepareGpuLinForLinear(ctx, "outProj.weight", m.outProj)
-    # Kiem tra handle theo backend that (Vulkan -> vulkanHandle, Metal -> metalHandle).
-    # Truoc day chi check metalHandle tren macosx -> backend=vulkan luon fail
-    # (metalHandle nil) du buffer Vulkan da cap phat thanh cong.
+    # Checks the handle for the real backend (Vulkan -> vulkanHandle, Metal -> metalHandle).
+    # This used to check only metalHandle on macosx -> backend=vulkan always failed
+    # (metalHandle nil) even when the Vulkan buffer was allocated successfully.
     proc persistNil(h: SessionHandle): bool =
-      # VulkanBufferHandle la object {buf, mem, sizeBytes} - check .buf
+      # VulkanBufferHandle is an object {buf, mem, sizeBytes} - check .buf
       if be == gbVulkan: return h.vulkanHandle.buf == nil
       if be == gbMetal: return h.metalHandle == nil
       false
@@ -1415,34 +1415,34 @@ proc prepareGpuModel*(m: var NimformerModelJamba, lora: var JambaLora, ctx: Back
         elif be == gbMetal: "metalHandle nil"
         else: "handle nil"
       raise newException(CatchableError,
-        "prepareGpuModel: cap phat buffer persist that bai (" & which &
-        ", backend=" & $be & ") - het bo nho GPU/unified?")
+        "prepareGpuModel: allocating persistent buffers failed (" & which &
+        ", backend=" & $be & ") - out of GPU/unified memory?")
     gGpuModelReady = true
 
 proc encodeHeadGpu(m: var NimformerModelJamba, ctx: Backend) =
-  ## normF (tuy preset) + lm_head. Dung chung cho encodeOneToken va ban trace.
+  ## normF (depending on the preset) + lm_head. Shared by encodeOneToken and the trace version.
   let be = ctx.kind.toByby()
   let hidden = m.embedDim
   if gUseNormF:
     let gamF = if gRmsUnitGamma: gNormFOnes else: gNormFGamma
     if not sessionRmsnormEnc(be, gHXPersist, gamF, gHFinalPersist, 1, hidden, 1e-5'f32):
-      raise newException(CatchableError, "encodeHeadGpu: rmsnorm normF that bai")
+      raise newException(CatchableError, "encodeHeadGpu: normF rmsnorm failed")
     encodeLin(gLmHead, gHFinalPersist, 0, gHLogitsPersist, 0, bias = false)
   else:
-    # Khop luc train: lm_head doc THANG residual, khong qua normF.
+    # Matches training: lm_head reads the residual DIRECTLY, without normF.
     encodeLin(gLmHead, gHXPersist, 0, gHLogitsPersist, 0, bias = false)
 
 proc encodeSidecarGpu(ctx: Backend, blockIdx: int) =
-  ## Nhanh Linear++ cua khoi P (R + sidecar song song). Norm dau vao GIONG HET nhanh R
-  ## cung khoi: luc train ca 2 nhanh doc chung x1 = rms1(x) (jamba_hybrid.forwardBlock),
-  ## nen o day cung dung 1 quyet dinh LN/RMS (layerUsesLayerNorm) + 1 co gamma.
-  ## Phai goi TRUOC encodeLayerV2 cua khoi do (encodeLayerV2 ghi de residual tai cho).
+  ## The Linear++ branch of P blocks (R + a parallel sidecar). Its input norm is IDENTICAL to the R branch
+  ## of the same block: in training both branches read the shared x1 = rms1(x) (jamba_hybrid.forwardBlock),
+  ## so here too 1 LN/RMS decision (layerUsesLayerNorm) + 1 gamma flag are used.
+  ## Must be called BEFORE that block's encodeLayerV2 (encodeLayerV2 overwrites the residual in place).
   encodeLinearPlusBranch(ctx, blockIdx, gHXPersist, gHNormPersist, gAttnScratch.hAttn,
                          useRms = not layerUsesLayerNorm(blockIdx),
                          unitGamma = gRmsUnitGamma)
 
 proc encodeBlockOld(m: var NimformerModelJamba, ctx: Backend, i: int) =
-  ## Encode 1 block theo path cu (dung cho moi block khi OD tat, va cho block G khi OD bat).
+  ## Encodes 1 block through the old path (used for every block when OD is off, and for G blocks when OD is on).
   case m.blocks[i].kind
   of bkMambaReal:
     encodeLayerV2(ctx, i, gHXPersist, gHNormPersist,
@@ -1456,17 +1456,17 @@ proc encodeBlockOld(m: var NimformerModelJamba, ctx: Backend, i: int) =
     if not gSkipAttn:
       encodeAttnLayer(ctx, i, gHXPersist, gHNormPersist)
   of bkMamba, bkSpectron:
-    raise newException(ValueError, "encodeOneToken: block M/S chua ho tro")
+    raise newException(ValueError, "encodeOneToken: M/S blocks are not supported yet")
 
 proc encodeOneToken(m: var NimformerModelJamba, ctx: Backend;
                     produceLogits: bool = true) =
-  ## Encode toan bo 1 buoc forward (R+A theo dung pattern -> normF -> lm_head)
-  ## vao session dang mo. Khong sessionRead giua chung.
+  ## Encodes a whole forward step (R+A following the pattern -> normF -> lm_head)
+  ## into the open session. No sessionRead in between.
   let be = ctx.kind.toByby()
   let hidden = m.embedDim
   when not defined(noOneDispatch):
     if gOdActive:
-      # Moi DOAN R lien tiep = 1 compute dispatch; block G chay path cu xen giua.
+      # Each run of consecutive R blocks = 1 compute dispatch; G blocks run the old path in between.
       var i = 0
       var segK = 0
       var tSplit = monoSecs()
@@ -1483,7 +1483,7 @@ proc encodeOneToken(m: var NimformerModelJamba, ctx: Backend;
       if produceLogits:
         encodeHeadGpu(m, ctx)
       if produceLogits and gDecSplitOn and gDecSplitActive:
-        # lm_head: ket thuc o sessionEnd cua caller; do bang buffer rieng cho dong nhat.
+        # lm_head: ends at the caller's sessionEnd; measured with a separate buffer for consistency.
         decSplitMark(be, "normF+lm_head", tSplit)
         inc gDecSplitTokens
       return
@@ -1492,9 +1492,9 @@ proc encodeOneToken(m: var NimformerModelJamba, ctx: Backend;
     encodeBlockOld(m, ctx, i)
     if produceLogits and gDecSplitOn and gDecSplitActive:
       decSplitMark(be, "block" & $i & "(" & $m.blocks[i].kind & ")", tSplit)
-  # normF == backbone.norm_f cua HF Mamba2 = RMSNorm chi co gamma (khop ban infer
-  # cu da chay dung, PATCH_MARKER_V4). KHONG con "copy thang neu norm loi": bo qua
-  # normF im lang se ra logit sai ma khong ai biet.
+  # normF == HF Mamba2 backbone.norm_f = a gamma-only RMSNorm (matches the old infer version
+  # that worked, PATCH_MARKER_V4). NO more "copy straight through if the norm fails": silently skipping
+  # normF would give wrong logits without anyone noticing.
   if produceLogits:
     encodeHeadGpu(m, ctx)
     if gDecSplitOn and gDecSplitActive:
@@ -1502,12 +1502,12 @@ proc encodeOneToken(m: var NimformerModelJamba, ctx: Backend;
       inc gDecSplitTokens
 
 proc warmupGpuKernelsOnce(m: var NimformerModelJamba, ctx: Backend) =
-  ## Ep JIT-compile + bind PSO lan dau cho MOI loai kernel, trong 1 session
-  ## CO LAP (input = embedding cua token 0, x = 0 do gHXPersist chua duoc
-  ## copy embedding that vao) roi RESET sach state R/A truoc khi prefill that
-  ## bat dau (tranh warmup ban vao trang thai truoc prefill - dung tinh than
-  ## ban truoc: "warmup nay ep MOI loai kernel duoc JIT-compile VA dispatch/
-  ## bind PSO lan dau O DAY, an toan tuyet doi voi watchdog").
+  ## Forces the JIT-compile + first PSO bind for EVERY kernel kind, in 1 ISOLATED
+  ## session (input = the embedding of token 0, x = 0 since gHXPersist has not received
+  ## the real embedding yet) then cleanly RESETS the R/A state before the real prefill
+  ## starts (so the warmup does not leak into the pre-prefill state - in the spirit of
+  ## the previous version: "this warmup forces EVERY kernel kind to be JIT-compiled AND dispatched/
+  ## PSO-bound for the first time HERE, completely safe from the watchdog").
   let be = ctx.kind.toByby()
   let svSkip = gSkipAttn
   let svLora = gDisableLora
@@ -1523,45 +1523,45 @@ proc warmupGpuKernelsOnce(m: var NimformerModelJamba, ctx: Backend) =
     except CatchableError as e:
       warmErr = e.msg
     if not sessionEnd(be):
-      stderr.writeLine "[warmup] session flush loi: " & sessionGetLastError(be) &
-        " -> sessionRecoverQueue() truoc buoc tiep theo"
+      stderr.writeLine "[warmup] session flush error: " & sessionGetLastError(be) &
+        " -> sessionRecoverQueue() before the next step"
       if not sessionRecoverQueue(be):
-        stderr.writeLine "[warmup] sessionRecoverQueue that bai"
+        stderr.writeLine "[warmup] sessionRecoverQueue failed"
     if warmErr.len > 0:
-      # KHONG nuot loi: encoder da hong thi cac session reset phia sau cung hong
-      # (sinh loi day chuyen "copy_into dst offset"), va forward that se lap lai loi.
-      raise newException(CatchableError, "warmup encode loi: " & warmErr)
+      # Do NOT swallow the error: if the encoder is broken the later reset sessions break too
+      # (a cascade of "copy_into dst offset" errors), and the real forward would repeat the error.
+      raise newException(CatchableError, "warmup encode error: " & warmErr)
 
   if sessionBegin(be):
     for i in 0 ..< m.blocks.len:
       case m.blocks[i].kind
       of bkMambaReal, bkMambaRealPlusAttn, bkMambaRealGated:
         if not resetLayerStateV2(ctx, i):
-          stderr.writeLine "[warmup] CANH BAO: khong reset duoc state R block " & $i
+          stderr.writeLine "[warmup] WARNING: could not reset the state of R block " & $i
         if m.blocks[i].kind in {bkMambaRealPlusAttn, bkMambaRealGated} and
            not resetAttnLayerState(ctx, i):
-          stderr.writeLine "[warmup] CANH BAO: khong reset duoc state sidecar A block " & $i
+          stderr.writeLine "[warmup] WARNING: could not reset the sidecar A state of block " & $i
       of bkAttn:
         if not resetAttnLayerState(ctx, i):
-          stderr.writeLine "[warmup] CANH BAO: khong reset duoc state A block " & $i
+          stderr.writeLine "[warmup] WARNING: could not reset the state of A block " & $i
       else: discard
     if not sessionEnd(be):
-      stderr.writeLine "[warmup] session reset state loi: " & sessionGetLastError(be)
+      stderr.writeLine "[warmup] session state reset error: " & sessionGetLastError(be)
       if not sessionRecoverQueue(be): discard
 
 proc forwardStepJambaGpu*(m: var NimformerModelJamba, tokenId: int, ctx: Backend;
                           produceLogits: bool = true): Tensor =
-  ## MOT session / token cho TOAN BO model (R + A xen ke theo dung pattern),
-  ## dung 1 command buffer duy nhat - dung yeu cau "gop thanh 1 kernel tuc 1
-  ## session moi token". Khong sessionRead giua layer; chi doc logits 1 lan.
+  ## ONE session / token for the WHOLE model (R + A interleaved following the pattern),
+  ## using a single command buffer - as required: "fuse into 1 kernel, i.e. 1
+  ## session per token". No sessionRead between layers; logits are read only once.
   inc gInferStepCount
   let be = ctx.kind.toByby()
   let hidden = m.embedDim
 
   if gGpuGenStatePoisoned:
     raise newException(CatchableError,
-      "forwardStepJambaGpu: recurrent GPU state khong con dang tin (buoc truoc gap loi/timeout). " &
-      "Goi resetGpuGenState() thanh cong truoc khi tiep tuc; khong duoc replay token tren state co the da cap nhat mot phan.")
+      "forwardStepJambaGpu: the recurrent GPU state is no longer trustworthy (the previous step hit an error/timeout). " &
+      "Call resetGpuGenState() successfully before continuing; do not replay a token on a state that may be partially updated.")
 
   let profDecode = produceLogits and getEnv("BYBY_DECODE_PROFILE", "0") != "0"
   let tProfEntry = (if profDecode: monoSecs() else: 0.0)
@@ -1580,11 +1580,11 @@ proc forwardStepJambaGpu*(m: var NimformerModelJamba, tokenId: int, ctx: Backend
       gGpuGenStatePoisoned = true
       discard sessionRecoverQueue(be)
       raise newException(CatchableError,
-        "forwardStepJambaGpu: sessionBegin that bai; khong co logits, can reset recurrent state truoc khi thu lai.")
+        "forwardStepJambaGpu: sessionBegin failed; no logits, reset the recurrent state before retrying.")
     if profDecode: tProf1 = monoSecs()
 
     if not sessionCopyInto(be, hEmb, gHXPersist, 0, 0, hidden):
-      let copyErr = "copy embedding -> gHXPersist that bai (prepareGpuModel da chay chua?)"
+      let copyErr = "copy embedding -> gHXPersist failed (has prepareGpuModel run?)"
       discard sessionEnd(be)
       discard sessionRecoverQueue(be)
       gGpuGenStatePoisoned = true
@@ -1592,7 +1592,7 @@ proc forwardStepJambaGpu*(m: var NimformerModelJamba, tokenId: int, ctx: Backend
 
     try:
       statefulDispatchStarted = true
-      gDecSplitActive = gInferStepCount > 0   # bo token dau + warmup
+      gDecSplitActive = gInferStepCount > 0   # excludes the first token + warmup
       try:
         encodeOneToken(m, ctx, produceLogits = produceLogits)
       finally:
@@ -1624,9 +1624,9 @@ proc forwardStepJambaGpu*(m: var NimformerModelJamba, tokenId: int, ctx: Backend
           gGpuGenStatePoisoned = true
           raise newException(CatchableError,
             "one-dispatch: grid barrier het gioi han spin (lastErr=" & $odErr &
-            ") - cac threadgroup khong dong thoi resident. Giam BYBY_OD_TG va chay t_grid_barrier.nim.")
+            ") - the threadgroups are not co-resident. Lower BYBY_OD_TG and run t_grid_barrier.nim.")
 
-    # BYBY_G_DIAGNOSTICS: doc so lieu SAU sessionEnd (doc giua session = rac)
+    # BYBY_G_DIAGNOSTICS: read the numbers AFTER sessionEnd (reading mid-session = garbage)
     if getEnv("BYBY_G_DIAGNOSTICS", "0") != "0":
       proc vecStats(name: string; bi: int; v: seq[float32]) =
         if v.len == 0:
@@ -1680,14 +1680,14 @@ proc forwardStepJambaGpu*(m: var NimformerModelJamba, tokenId: int, ctx: Backend
         if bi in gLayersV2:
           vecStats("mix(after)", bi, sessionRead(be, gLayersV2[bi].hMix, n))
         vecStats("residual x", bi, sessionRead(be, gHXPersist, n))
-    # Prefill token truoc token cuoi prompt: chi can update recurrent state.
-    # Khong chay normF/lm_head va khong read logits (head khong co dependency
-    # nao voi state, nen ket qua sau khi prefill hoan toan giong path cu).
+    # Prefill tokens before the last prompt token only need to update the recurrent state.
+    # normF/lm_head are not run and logits are not read (the head has no dependency
+    # on the state, so the result after prefill is exactly the same as the old path).
     let logits: seq[float32] =
       if produceLogits: sessionRead(be, gHLogitsPersist, m.outProj.outF)
       else: @[]
     block:
-      let dumpPath = if produceLogits: getEnv("BYBY_DUMP_LOGITS") else: ""   # so sanh path cu vs 1-dispatch: od_compare_logits.py
+      let dumpPath = if produceLogits: getEnv("BYBY_DUMP_LOGITS") else: ""   # compare the old path vs 1-dispatch: od_compare_logits.py
       if dumpPath.len > 0:
         var df: File
         if open(df, dumpPath, fmAppend):
@@ -1731,8 +1731,8 @@ type
     kind*: char          ## 'R' / 'A' / 'P'
     rms*, maxAbs*, mean*: float32
     nonFinite*: int
-    inRms*: float32      ## rms residual TRUOC khoi (de so voi dong gop cua sidecar)
-    sideRms*, sideMax*: float32   ## dau ra nhanh Linear++ cua khoi P (truoc khi cong vao residual); -1 = khong co
+    inRms*: float32      ## residual rms BEFORE the block (to compare with the sidecar contribution)
+    sideRms*, sideMax*: float32   ## output of the P block's Linear++ branch (before being added to the residual); -1 = none
 
 proc vecStats(v: seq[float32]): tuple[rms, maxAbs, mean: float32, bad: int] =
   var ss = 0.0
@@ -1752,15 +1752,15 @@ proc vecStats(v: seq[float32]): tuple[rms, maxAbs, mean: float32, bad: int] =
 
 proc forwardStepJambaGpuTrace*(m: var NimformerModelJamba, tokenId: int, ctx: Backend,
                                stats: var seq[BlockStat]): Tensor =
-  ## Giong forwardStepJambaGpu (CUNG toan hoc, CUNG state) nhung tach thanh
-  ## 1 session / khoi va doc residual sau moi khoi -> do rms/max/mean/NaN.
-  ## CHAM hon mot chut (64 lan commit) - CHI dung de chan doan (BYBY_TRACE_BLOCKS=1
-  ## hoac trong BYBY_NORM_SWEEP). Cho biet khoi nao lam residual no/NaN.
+  ## Like forwardStepJambaGpu (SAME math, SAME state) but split into
+  ## 1 session / block, reading the residual after each block -> measures rms/max/mean/NaN.
+  ## Somewhat SLOWER (64 commits) - ONLY for diagnostics (BYBY_TRACE_BLOCKS=1
+  ## or in BYBY_NORM_SWEEP). Shows which block makes the residual blow up/NaN.
   let be = ctx.kind.toByby()
   let hidden = m.embedDim
   if gGpuGenStatePoisoned:
     raise newException(CatchableError,
-      "forwardStepJambaGpuTrace: recurrent GPU state khong con dang tin; goi resetGpuGenState() truoc.")
+      "forwardStepJambaGpuTrace: the recurrent GPU state is no longer trustworthy; call resetGpuGenState() first.")
   if not gGpuWarmedUp:
     warmupGpuKernelsOnce(m, ctx)
     gGpuWarmedUp = true
@@ -1769,17 +1769,17 @@ proc forwardStepJambaGpuTrace*(m: var NimformerModelJamba, tokenId: int, ctx: Ba
   var hEmb = sessionUpload(be, xTensor.data)
   try:
     if not sessionBegin(be):
-      raise newException(CatchableError, "trace: sessionBegin (embedding) that bai")
+      raise newException(CatchableError, "trace: sessionBegin (embedding) failed")
     if not sessionCopyInto(be, hEmb, gHXPersist, 0, 0, hidden):
       discard sessionEnd(be)
-      raise newException(CatchableError, "trace: copy embedding that bai")
+      raise newException(CatchableError, "trace: copy embedding failed")
     if not sessionEnd(be):
-      raise newException(CatchableError, "trace: sessionEnd (embedding) that bai")
+      raise newException(CatchableError, "trace: sessionEnd (embedding) failed")
     var prevRms = vecStats(sessionRead(be, gHXPersist, hidden)).rms
     for i in 0 ..< m.blocks.len:
       if gSkipAttn and m.blocks[i].kind == bkAttn: continue
       if not sessionBegin(be):
-        raise newException(CatchableError, "trace: sessionBegin that bai o block " & $i)
+        raise newException(CatchableError, "trace: sessionBegin failed at block " & $i)
       var kindCh = '?'
       var sideRms = -1'f32
       var sideMax = -1'f32
@@ -1794,15 +1794,15 @@ proc forwardStepJambaGpuTrace*(m: var NimformerModelJamba, tokenId: int, ctx: Ba
           kindCh = 'P'
           if not gSkipAttn:
             encodeSidecarGpu(ctx, i)
-            # Tach session de DOC dau ra sidecar (rms/max) truoc khi no duoc cong vao residual:
-            # sidecar >> residual la dau hieu norm/trong so cua nhanh nay lech luc train.
+            # Split the session to READ the sidecar output (rms/max) before it is added to the residual:
+            # sidecar >> residual is a sign that this branch's norm/weights drifted during training.
             if not sessionEnd(be):
-              raise newException(CatchableError, "trace: sessionEnd (sidecar) that bai")
+              raise newException(CatchableError, "trace: sessionEnd (sidecar) failed")
             let sst = vecStats(sessionRead(be, gAttnScratch.hAttn, hidden))
             sideRms = sst.rms
             sideMax = sst.maxAbs
             if not sessionBegin(be):
-              raise newException(CatchableError, "trace: sessionBegin (sau sidecar) that bai o block " & $i)
+              raise newException(CatchableError, "trace: sessionBegin (after sidecar) failed at block " & $i)
           encodeLayerV2(ctx, i, gHXPersist, gHNormPersist,
                         "block" & $i & ".mambaReal.inProj.weight",
                         "block" & $i & ".mambaReal.outProj.weight",
@@ -1819,13 +1819,13 @@ proc forwardStepJambaGpuTrace*(m: var NimformerModelJamba, tokenId: int, ctx: Ba
           kindCh = 'A'
           encodeAttnLayer(ctx, i, gHXPersist, gHNormPersist)
         of bkMamba, bkSpectron:
-          raise newException(ValueError, "trace: block M/S chua ho tro")
+          raise newException(ValueError, "trace: M/S blocks are not supported yet")
       except CatchableError as e:
         discard sessionEnd(be)
-        raise newException(CatchableError, "trace: encode loi o block " & $i & ": " & e.msg)
+        raise newException(CatchableError, "trace: encode error at block " & $i & ": " & e.msg)
       if not sessionEnd(be):
         raise newException(CatchableError,
-          "trace: sessionEnd that bai o block " & $i & ": " & sessionGetLastError(be))
+          "trace: sessionEnd failed at block " & $i & ": " & sessionGetLastError(be))
       let xv = sessionRead(be, gHXPersist, hidden)
       let st = vecStats(xv)
       stats.add BlockStat(idx: i, kind: kindCh, rms: st.rms, maxAbs: st.maxAbs,
@@ -1834,15 +1834,15 @@ proc forwardStepJambaGpuTrace*(m: var NimformerModelJamba, tokenId: int, ctx: Ba
       prevRms = st.rms
     # head: normF (tuy preset) + lm_head
     if not sessionBegin(be):
-      raise newException(CatchableError, "trace: sessionBegin (head) that bai")
+      raise newException(CatchableError, "trace: sessionBegin (head) failed")
     try:
       encodeHeadGpu(m, ctx)
     except CatchableError as e:
       discard sessionEnd(be)
-      raise newException(CatchableError, "trace: encode head loi: " & e.msg)
+      raise newException(CatchableError, "trace: head encode error: " & e.msg)
     if not sessionEnd(be):
       raise newException(CatchableError,
-        "trace: sessionEnd (head) that bai: " & sessionGetLastError(be))
+        "trace: sessionEnd (head) failed: " & sessionGetLastError(be))
   except CatchableError:
     gGpuGenStatePoisoned = true
     raise
@@ -1853,9 +1853,9 @@ proc forwardStepJambaGpuTrace*(m: var NimformerModelJamba, tokenId: int, ctx: Ba
   result.data = logits
 
 proc resetGpuGenState*(m: var NimformerModelJamba, ctx: Backend) =
-  ## Xoa state R (conv/ssm) + A (z/S) - goi 1 lan truoc khi bat dau 1 chuoi
-  ## MOI (khac voi warmup: ham nay danh cho luc generate() thuc su bat dau,
-  ## sau khi warmup da chay it nhat 1 lan).
+  ## Clears the R (conv/ssm) + A (z/S) state - called once before starting a
+  ## NEW sequence (unlike the warmup: this is for when generate() really starts,
+  ## after the warmup has run at least once).
   let be = ctx.kind.toByby()
   # Reset is idempotent (writes zeros), so retrying the entire reset after a
   # failed command buffer cannot double-advance recurrent state.
@@ -1955,5 +1955,5 @@ proc forwardStepJambaGpuTraceRetry*(m: var NimformerModelJamba; tokenId: int;
         firstErr.msg & "; recovery=" & retryErr.msg)
 
 proc lpSelfCheck*(ctx: Backend, blockIdx: int): string =
-  ## Kiem tra kernel Linear++ step chay 100% tren GPU (xem gpu_layers.lpStepSelfCheck).
+  ## Checks that the Linear++ step kernel runs 100% on the GPU (see gpu_layers.lpStepSelfCheck).
   lpStepSelfCheck(ctx, blockIdx)

@@ -1,35 +1,35 @@
 ## jamba_hybrid.nim
-## Kiến trúc hybrid: mỗi vị trí chọn theo `pattern: string`:
-##   'M' = Mamba2SSD thuần (SSM, O(T) theo chiều dài chuỗi)
-##   'A' = LinearPlusAttention thuần ("Linear++" đã có trong test_nimformer)
-##   'S' = TransformerBlockSpectron (gated fusion 2 nhánh, xem test_nimformer)
-##   'R' = Mamba2Real; 'P' = Mamba2Real + Linear++ sidecar song song.
+## Hybrid architecture: each position is chosen by `pattern: string`:
+##   'M' = plain Mamba2SSD (SSM, O(T) in sequence length)
+##   'A' = plain LinearPlusAttention (the "Linear++" in test_nimformer)
+##   'S' = TransformerBlockSpectron (2-branch gated fusion, see test_nimformer)
+##   'R' = Mamba2Real; 'P' = Mamba2Real + a parallel Linear++ sidecar.
 ##
-## Ví dụ pattern "MMAMMAMS" = 8 layer: đa số Mamba, xen 1 layer Attention
-## mỗi 3 layer, layer cuối dùng gated fusion - đúng kiểu Jamba gốc (attention
-## thưa giữa 1 rừng Mamba) nhưng bạn được tự do chọn tỉ lệ, khác với Jamba
-## cố định 1:7. Không viết lại toán Mamba2SSD/LinearPlusAttention - IMPORT
-## thẳng từ test_nimformer.nim (module, không chạy main vì có isMainModule).
+## E.g. pattern "MMAMMAMS" = 8 layers: mostly Mamba, one Attention layer
+## every 3 layers, the last layer uses gated fusion - the original Jamba style (sparse
+## attention among many Mamba layers) but with a free ratio, unlike Jamba's
+## fixed 1:7. The Mamba2SSD/LinearPlusAttention math is not rewritten - it is IMPORTED
+## from test_nimformer.nim (as a module; its main does not run thanks to isMainModule).
 ##
-## Toàn bộ tham số train được (weight) quản lý qua 1 REGISTRY chung:
-## seq[(name: string, ptrTensor: ptr Tensor)] dựng 1 lần lúc tạo model, để
-## trainStep/Adam/checkpoint không phải viết tay từng field theo từng loại
-## block như ModelAdamState/trainStep gốc (dài dòng, phải sửa 3 chỗ mỗi khi
-## thêm loại block mới). Đổi lại: backward mỗi block phải trả về
-## Table[string, Tensor] (grad theo đúng tên tham số) thay vì tuple cứng.
+## All trainable parameters (weights) are managed through 1 shared REGISTRY:
+## seq[(name: string, ptrTensor: ptr Tensor)] built once at model creation, so
+## trainStep/Adam/checkpoint do not have to hand-write each field per block
+## kind like the original ModelAdamState/trainStep (verbose, 3 places to edit for each
+## new block kind). In exchange, each block's backward must return a
+## Table[string, Tensor] (grads keyed by parameter name) instead of a fixed tuple.
 
 import std/[math, random, strformat, tables, json, os, strutils, sets]
 import customfloat
 import backend
-import rawbin            # checkpoint .bin thô - dung RIENG cho pipeline fine-tune,
-                          # KHONG dung .nimq (quant.saveQuantStateDict/loadQuantStateDict)
-                          # o day - .nimq chi danh cho nim_inference.nim/test_nimformer.nim
+import rawbin            # raw .bin checkpoints - used ONLY by the fine-tune pipeline,
+                          # .nimq (quant.saveQuantStateDict/loadQuantStateDict) is NOT used
+                          # here - .nimq is only for nim_inference.nim/test_nimformer.nim
 when not defined(codestralInference):
   import pytorch_bin_loader  # HF file loading is training-only; inference has no Python bridge.
-                            # KHONG ghi ra file trung gian nao tren dia
+                            # NO intermediate file is written to disk
 import nimformer
-import mamba2_ssm_gpu       # RMSNorm fwd/bwd bang micro-kernel GPU
-import mamba2_real         # Mamba2Real THẬT (khác Mamba2SSD) - conv1d/A_log/dt/D/RMSNormGated
+import mamba2_ssm_gpu       # RMSNorm fwd/bwd with GPU micro-kernels
+import mamba2_real         # the REAL Mamba2Real (unlike Mamba2SSD) - conv1d/A_log/dt/D/RMSNormGated
 import test_nimformer   # Mamba2SSD, LinearPlusAttention, TransformerBlockSpectron,
                          # Model/training dependency only; hybrid inference uses the separate module below.
 import hybrid_block_kernel # end-to-end logical GPU kernel entrypoints for R/P blocks
@@ -44,36 +44,36 @@ type
     bkMamba = "M"
     bkAttn = "A"
     bkSpectron = "S"
-    bkMambaReal = "R"    # Mamba2 THẬT (mamba2_real.nim) - dùng khi load pretrain Codestral-7B
-    bkMambaRealPlusAttn = "P" # Mamba2Real + Linear++ sidecar chạy song song
+    bkMambaReal = "R"    # REAL Mamba2 (mamba2_real.nim) - used when loading the Codestral-7B pretrain
+    bkMambaRealPlusAttn = "P" # Mamba2Real + a Linear++ sidecar running in parallel
     bkMambaRealGated = "G" # Mamba2Real + Linear++ sidecar, g=gate Mamba
 
   RmsNorm* = object
-    ## RMSNorm ĐÚNG chuẩn pretrain Mamba2/Codestral (Mamba2RMSNorm của HF):
-    ##     y = x / sqrt(mean(x^2) + eps) * gamma     (KHÔNG trừ mean, KHÔNG có beta)
-    ## Đây là norm của base: backbone.layers[i].norm VÀ backbone.norm_f trong
-    ## HF Mamba2Model đều là RMSNorm. Đường train cũ dùng LayerNorm (có trừ
-    ## mean + beta) cho block 'R'/'P' và KHÔNG áp norm_f trước lm_head
-    ## (preset "ln-nof-g1") - lệch hẳn phân phối pretrain, LoRA r=4 phải gánh
-    ## toàn bộ shift đó. Preset mới ("rms-fin"): norm giống HỆT base, thứ duy
-    ## nhất khác base là sidecar attention ở block 'P'.
-    gamma*: Tensor      # [dim], khởi tạo = 1 (identity), nạp weight pretrain sau
+    ## RMSNorm exactly as in the Mamba2/Codestral pretrain (HF Mamba2RMSNorm):
+    ##     y = x / sqrt(mean(x^2) + eps) * gamma     (NO mean subtraction, NO beta)
+    ## This is the base norm: backbone.layers[i].norm AND backbone.norm_f in
+    ## HF Mamba2Model are both RMSNorm. The old training path used LayerNorm (with mean
+    ## subtraction + beta) for 'R'/'P' blocks and did NOT apply norm_f before lm_head
+    ## (preset "ln-nof-g1") - far off the pretrain distribution, LoRA r=4 had to absorb
+    ## that whole shift. New preset ("rms-fin"): norms IDENTICAL to the base, the only
+    ## difference from the base is the attention sidecar in 'P' blocks.
+    gamma*: Tensor      # [dim], initialised = 1 (identity), pretrain weights loaded later
     eps*: float32
 
   JambaBlock* = object
     kind*: BlockKind
     ln1*, ln2*: LayerNorm
-    rms1*: RmsNorm     # MOI (preset rms-fin): norm đầu block cho 'R'/'P', THAY
-                       # ln1 trên đường forward/backward của 2 loại block pretrain.
-                       # ln1 vẫn tồn tại cho block legacy 'M'/'A'/'S' (không
-                       # pretrain, tự train từ đầu nên LayerNorm không sao).
+    rms1*: RmsNorm     # NEW (preset rms-fin): block input norm for 'R'/'P', REPLACES
+                       # ln1 on the forward/backward path of the 2 pretrain block kinds.
+                       # ln1 still exists for the legacy 'M'/'A'/'S' blocks (not
+                       # pretrained, trained from scratch, so LayerNorm is fine).
     ff*: FeedForward
-    # chỉ field ứng với kind mới thực sự dùng, field khác giữ nguyên default
+    # only the fields for the kind are actually used, the others keep their defaults
     mamba*: Mamba2SSD
     mambaReal*: Mamba2Real
     attn*: LinearPlusAttention
-    # attnLn1 ĐÃ BỎ - block P dùng chung ln1 với Mamba (giống Jamba gốc)
-    fuseGate*: Linear        # chỉ dùng khi kind == bkSpectron
+    # attnLn1 REMOVED - block P shares ln1 with Mamba (like the original Jamba)
+    fuseGate*: Linear        # only used when kind == bkSpectron
 
   NimformerModelJamba* = object
     vocab*, embedDim*, nHeads*, ffMult*: int
@@ -81,41 +81,41 @@ type
     embed*: Embedding
     blocks*: seq[JambaBlock]
     outProj*: Linear
-    normF*: LayerNorm    # LEGACY - KHÔNG CÒN DÙNG trên đường forward/backward.
-                         # Giữ field để không vỡ các module ngoài có thể tham
-                         # chiếu (loader cũ). Norm cuối thật sự là rmsF dưới đây.
-    rmsF*: RmsNorm       # MOI (preset rms-fin): tương đương backbone.norm_f trong
-                         # HF Mamba2Model - RMSNorm áp 1 LẦN sau khi qua hết các
-                         # block, TRƯỚC lm_head. Trước đây normF tồn tại nhưng
-                         # KHÔNG forward nào gọi -> hidden vào lm_head sai scale.
+    normF*: LayerNorm    # LEGACY - NO LONGER USED on the forward/backward path.
+                         # Field kept so external modules that may reference it
+                         # (old loaders) do not break. The real final norm is rmsF below.
+    rmsF*: RmsNorm       # NEW (preset rms-fin): equivalent to backbone.norm_f in
+                         # HF Mamba2Model - RMSNorm applied ONCE after all
+                         # blocks, BEFORE lm_head. normF used to exist but
+                         # NO forward called it -> the hidden state entered lm_head at the wrong scale.
 
 const
   G_MAX_SIDE_RMS_RATIO* = 0.5'f32
   G_MAX_OUTPUT_RMS_RATIO* = 8'f32
   G_MAX_MAMBA_RMS_RATIO* = 1.5'f32
-    ## rms(mambaY)/rms(x) — nhánh Mamba TRƯỚC gate/residual. Linear++ đã bị
-    ## siết ≤0.5×; cùng thang mixer R 1.5×; 2.0 quá rộng.
+    ## rms(mambaY)/rms(x) — the Mamba branch BEFORE gate/residual. Linear++ is already
+    ## capped at ≤0.5×; same scale as the R mixer 1.5×; 2.0 is too wide.
   G_MIN_GATE_MEAN* = 0.75'f32
-    ## Trung binh gate (sigmoid) tren toan bo phan tu cua 1 G block phai
-    ## >= nguong nay. Gate khoi tao ~0.982 (bias=4); neu trung binh tut
-    ## xuong duoi 0.75 nghia la nhanh Linear++ dang chiem uu the tren
-    ## residual - guard se raise truoc khi checkpoint.
+    ## The mean gate (sigmoid) over all elements of a G block must be
+    ## >= this threshold. The gate starts at ~0.982 (bias=4); if the mean drops
+    ## below 0.75 the Linear++ branch is dominating the
+    ## residual - the guard raises before checkpointing.
 
 proc newRmsNorm*(dim: int, eps: float32 = 1e-5'f32): RmsNorm =
 
-  ## eps = 1e-5: đúng mặc định layer_norm_eps của HF Mamba2Config (Codestral).
+  ## eps = 1e-5: the HF Mamba2Config layer_norm_eps default (Codestral).
   result.gamma = newTensor(@[dim])
-  for i in 0 ..< dim: result.gamma.data[i] = 1'f32   # identity khi chưa nạp weight
+  for i in 0 ..< dim: result.gamma.data[i] = 1'f32   # identity until weights are loaded
   result.eps = eps
 
 proc forward*(n: RmsNorm, x: Tensor, ctx: Backend): Tensor =
-  ## Norm trên chiều cuối. GPU (micro-kernel) khi backend là Metal/CUDA/Vulkan;
-  ## vòng lặp fp32 CPU chỉ còn là fallback cho backend cpu.
+  ## Norm over the last dim. GPU (micro-kernel) when the backend is Metal/CUDA/Vulkan;
+  ## the fp32 CPU loop is only the fallback for the cpu backend.
   let C = x.shape[^1]
   let rows = x.data.len div C
   result = newTensor(x.shape)
   if isGpuCtx(ctx):
-    # GPU micro-kernel (train_gpu_vm.buildRmsFwdProgram), CPU chi la fallback backend cpu.
+    # GPU micro-kernel (train_gpu_vm.buildRmsFwdProgram), CPU is only the cpu-backend fallback.
     result.data = rmsNormForwardGpu(ctx, x.data, n.gamma.data, rows, C, n.eps)
     return
   for r in 0 ..< rows:
@@ -130,15 +130,15 @@ proc forward*(n: RmsNorm, x: Tensor, ctx: Backend): Tensor =
       result.data[base + c] = x.data[base + c] * invRms * n.gamma.data[c]
 
 proc backward*(n: RmsNorm, x, dOut: Tensor, ctx: Backend): tuple[dX, dGamma: Tensor] =
-  ## Backward đúng của RMSNorm (tuyến tính theo dOut - quan trọng cho block 'P'
-  ## có 2 nhánh song song chia chung 1 norm, xem backwardBlock):
+  ## Correct RMSNorm backward (linear in dOut - important for 'P' blocks
+  ## whose 2 parallel branches share 1 norm, see backwardBlock):
   ##   y = x * r * g,  r = (mean(x^2)+eps)^(-1/2)
   ##   dX_j      = r*g_j*dy_j - (r^3/C) * x_j * sum_c(dy_c*g_c*x_c)
   ##   dGamma_c += sum_rows dy_c * x_c * r
   let C = x.shape[^1]
   let rows = x.data.len div C
   result.dX = newTensor(x.shape)
-  result.dGamma = newTensor(n.gamma.shape)   # newTensor zero-init sẵn
+  result.dGamma = newTensor(n.gamma.shape)   # newTensor is zero-initialised
   if isGpuCtx(ctx):
     let g = rmsNormBackwardGpu(ctx, x.data, n.gamma.data, dOut.data, rows, C, n.eps)
     result.dX.data = g.dX
@@ -164,8 +164,8 @@ proc backward*(n: RmsNorm, x, dOut: Tensor, ctx: Backend): tuple[dX, dGamma: Ten
         invRms * n.gamma.data[c] * dOut.data[base + c] - x.data[base + c] * coeff
 
 proc concatLastDim(a, b: Tensor): Tensor =
-  ## Bản local (test_nimformer.nim không export concatLastDim/splitLastDim
-  ## gốc - copy y hệt logic để khỏi phải sửa file gốc của bạn).
+  ## Local version (test_nimformer.nim does not export the original concatLastDim/splitLastDim
+  ## - the logic is copied exactly to avoid editing the original file).
   let B = a.shape[0]; let T = a.shape[1]; let C = a.shape[2]
   result = newTensor(@[B, T, 2 * C])
   for i in 0 ..< B * T:
@@ -190,7 +190,7 @@ proc charToKind(c: char): BlockKind =
   of 'R', 'r': bkMambaReal
   of 'P', 'p': bkMambaRealPlusAttn
   of 'G', 'g': bkMambaRealGated
-  else: raise newException(ValueError, &"Ky tu pattern khong hop le: '{c}' (chi nhan M/A/S/R/P/G)")
+  else: raise newException(ValueError, &"Invalid pattern character: '{c}' (only M/A/S/R/P/G accepted)")
 
 proc newJambaBlock(kind: BlockKind, embedDim, nHeads, ffMult: int, useSession: bool,
                     mambaRealDState: int = 64, mambaRealNGroups: int = 1,
@@ -199,7 +199,7 @@ proc newJambaBlock(kind: BlockKind, embedDim, nHeads, ffMult: int, useSession: b
   result.kind = kind
   result.ln1 = newLayerNorm(embedDim)
   result.ln2 = newLayerNorm(embedDim)
-  result.rms1 = newRmsNorm(embedDim)   # dùng cho 'R'/'P' (xem forwardBlock)
+  result.rms1 = newRmsNorm(embedDim)   # used for 'R'/'P' (see forwardBlock)
   case kind
   of bkMamba:
     result.ff = newFeedForward(embedDim, ffMult)
@@ -213,35 +213,35 @@ proc newJambaBlock(kind: BlockKind, embedDim, nHeads, ffMult: int, useSession: b
     result.mamba = newMamba2SSD(embedDim, nHeads, useSession)
     result.fuseGate = newLinear(embedDim * 2, embedDim)
   of bkMambaReal:
-    # SUA: intermediateSize = embedDim * mambaRealExpand (Codestral-7B that
-    # dung expand=2 -> intermediateSize=8192 khi hiddenSize=4096, xac nhan
-    # tu shape THAT: mixer.norm.weight=[8192], mixer.out_proj.weight=[4096,8192]
-    # - truoc day hard-code expand=1 la SAI, se lam shape lech het khi nap
-    # weight that (load_codestral_into_jamba se bao 'SHAPE LECH' tren moi
-    # tensor cua mixer). result.ff/ln2 VAN duoc tao o tren (khong xoa field,
-    # tranh vo cac cho khac dang gia dinh field luon ton tai) nhung KHONG
-    # duoc DUNG trong forward/backward cua bkMambaReal (xem forwardBlock/
-    # backwardBlock ben duoi) - vi Mamba2 that cua HF KHONG co FFN xen giua
-    # moi layer (chi norm->mixer->residual), khac Transformer block thuong.
+    # intermediateSize = embedDim * mambaRealExpand (the real Codestral-7B
+    # uses expand=2 -> intermediateSize=8192 when hiddenSize=4096, confirmed
+    # from the REAL shapes: mixer.norm.weight=[8192], mixer.out_proj.weight=[4096,8192]
+    # - the old hard-coded expand=1 was WRONG and would mismatch every shape when loading
+    # real weights (load_codestral_into_jamba would report a shape mismatch on every
+    # mixer tensor). result.ff/ln2 are STILL created above (fields not removed,
+    # so other code assuming the fields always exist does not break) but are NOT
+    # USED in the bkMambaReal forward/backward (see forwardBlock/
+    # backwardBlock below) - the real HF Mamba2 has NO FFN between
+    # layers (only norm->mixer->residual), unlike a regular Transformer block.
     result.mambaReal = newMamba2Real(embedDim, embedDim * mambaRealExpand, nHeads,
                                       mambaRealDState, mambaRealNGroups, mambaRealConvKernel,
                                       initializeWeights = initializeWeights)
     if quantResident:
-      # SUA (fix OOM ~29GB luc DUNG MODEL, truoc ca khi load .nimq): inProj/
-      # outProj la 2 ma tran to nhat moi block (~90% tong tham so 1 block
-      # Mamba2Real). Che do quant-resident (xem load_codestral_into_jamba.nim
-      # + lora.nim mergeInOne/restoreBaseOne) da thiet ke san de 2 tensor nay
-      # o trang thai RONG (.data = @[]) luc nghi, CHI dequant tam thoi qua
-      # LUT dung 1 block ngay truoc forward/backward roi xoa ngay sau (xem
-      # trainStepGraftStreaming) - nhung newMamba2Real() VAN cap phat fp32
-      # DAY DU cho ca 2 tensor nay luc tao block (randnTensor/newTensor),
-      # roi bi bo phi ngay lap tuc (quant-resident khong bao gio doc gia tri
-      # nay). Voi 52 block 'R' (embedDim=4096, intermediateSize=8192) ->
-      # ~29GB cap phat VO ICH, du chi ton tai thoang qua - da du OOM-kill
-      # tren may RAM han che (vd may dung GPU tich hop, RAM se cung he
-      # thong). XOA NGAY o day, TRONG VONG LAP (khong doi newNimformerModelJamba
-      # tra ve xong moi xoa) - GC thu hoi tung block 1, dinh (peak) RAM
-      # trong luc dung model CHI con ~1 block, khong con 52 block cung luc.
+      # Fix for the ~29GB OOM while BUILDING THE MODEL, before the .nimq is even loaded: inProj/
+      # outProj are the 2 largest matrices of each block (~90% of a Mamba2Real
+      # block's parameters). Quant-resident mode (see load_codestral_into_jamba.nim
+      # + lora.nim mergeInOne/restoreBaseOne) is designed for these 2 tensors to be
+      # EMPTY (.data = @[]) at rest, dequantized only temporarily through the
+      # LUT for 1 block right before forward/backward and freed right after (see
+      # trainStepGraftStreaming) - but newMamba2Real() STILL allocated FULL fp32
+      # for both tensors at block creation (randnTensor/newTensor),
+      # wasted immediately (quant-resident never reads these values).
+      # With 52 'R' blocks (embedDim=4096, intermediateSize=8192) ->
+      # ~29GB of USELESS allocation, even if only transient - enough for an OOM kill
+      # on RAM-limited machines (e.g. integrated GPUs sharing system
+      # RAM). Freed RIGHT HERE, IN THE LOOP (not after newNimformerModelJamba
+      # returns) - the GC reclaims each block, so peak RAM
+      # while building the model is ~1 block, not 52 blocks at once.
       result.mambaReal.inProj.weight.data = @[]
       result.mambaReal.outProj.weight.data = @[]
   of bkMambaRealPlusAttn, bkMambaRealGated:
@@ -249,8 +249,8 @@ proc newJambaBlock(kind: BlockKind, embedDim, nHeads, ffMult: int, useSession: b
                                       mambaRealDState, mambaRealNGroups, mambaRealConvKernel,
                                       initializeWeights = initializeWeights)
     result.attn = newLinearPlusAttention(embedDim, nHeads, useSession, initializeWeights)
-    # FIX: DÙNG CHUNG ln1 CHO CẢ MAMBA VÀ ATTENTION (giống Jamba gốc).
-    # attnLn1 ĐÃ BỎ - 2 nhánh cùng thấy input đã chuẩn hóa y hệt → tránh lệch scale khi cộng residual.
+    # Fix: ln1 is SHARED BY MAMBA AND ATTENTION (like the original Jamba).
+    # attnLn1 REMOVED - both branches see the same normalised input → no scale mismatch when adding the residual.
     # P remains exact Mamba identity at initialization. G adds a near-identity
     # Mamba-first gate below, and must keep the sidecar output projection at zero.
     for i in 0 ..< result.attn.outProj.weight.data.len: result.attn.outProj.weight.data[i] = 0'f32
@@ -268,7 +268,7 @@ proc newNimformerModelJamba*(vocab, embedDim, nHeads, ffMult: int, pattern: stri
                               mambaRealNGroups: int = 1, mambaRealConvKernel: int = 4,
                               mambaRealExpand: int = 2, quantResident: bool = false;
                               initializeWeights = true): NimformerModelJamba =
-  assert pattern.len > 0, "pattern rong - can it nhat 1 layer"
+  assert pattern.len > 0, "empty pattern - need at least 1 layer"
   result.vocab = vocab
   result.embedDim = embedDim
   result.nHeads = nHeads
@@ -276,8 +276,8 @@ proc newNimformerModelJamba*(vocab, embedDim, nHeads, ffMult: int, pattern: stri
   result.pattern = pattern
   result.embed = newEmbedding(vocab, embedDim, initializeWeights)
   result.outProj = newLinear(embedDim, vocab, initializeWeights)
-  result.normF = newLayerNorm(embedDim)   # LEGACY - không còn dùng (xem struct)
-  result.rmsF = newRmsNorm(embedDim)      # MOI (rms-fin): norm_f THẬT trước lm_head
+  result.normF = newLayerNorm(embedDim)   # LEGACY - no longer used (see struct)
+  result.rmsF = newRmsNorm(embedDim)      # NEW (rms-fin): the REAL norm_f before lm_head
   result.blocks = newSeq[JambaBlock](pattern.len)
   for i, c in pattern:
     result.blocks[i] = newJambaBlock(charToKind(c), embedDim, nHeads, ffMult, useSession,
@@ -285,15 +285,15 @@ proc newNimformerModelJamba*(vocab, embedDim, nHeads, ffMult: int, pattern: stri
                                       mambaRealExpand, quantResident, initializeWeights)
 
 # ═══════════════════════════════════════════════════════════════
-# FORWARD / BACKWARD theo block. R/P được xử lý bởi block-kernel entrypoints
-# trong hybrid_block_kernel.nim; legacy M/A/S giữ đường hiện có bên dưới.
+# Per-block FORWARD / BACKWARD. R/P are handled by the block-kernel entrypoints
+# in hybrid_block_kernel.nim; legacy M/A/S keep the existing path below.
 # ═══════════════════════════════════════════════════════════════
 
 proc checkGBlockScale*(blockIndex: int; x, output: Tensor;
                        cache: HybridBlockKernelCache) =
-  ## Guard G: Linear++ weighted ≤0.5×, gate mean ≥0.75, VÀ nhánh Mamba
-  ## rms(mambaY)/rms(x) ≤ G_MAX_MAMBA_RMS_RATIO. cache.mambaY phải được
-  ## forwardPBlockKernel điền (trước residual).
+  ## Guard G: Linear++ weighted ≤0.5×, gate mean ≥0.75, AND the Mamba branch
+  ## rms(mambaY)/rms(x) ≤ G_MAX_MAMBA_RMS_RATIO. cache.mambaY must be
+  ## filled by forwardPBlockKernel (before the residual).
   doAssert x.shape == output.shape and x.data.len == cache.gate.len
   doAssert cache.mambaY.data.len == x.data.len,
     "checkGBlockScale: cache.mambaY missing/wrong size (block kernel must expose mambaY)"
@@ -364,7 +364,7 @@ proc checkGBlockScale*(blockIndex: int; x, output: Tensor;
 proc forwardBlockEx*(blk: JambaBlock, x: Tensor, ctx: Backend;
                      blockIndex = -1):
     tuple[y: Tensor, cache: HybridBlockKernelCache] =
-  ## Như forwardBlock nhưng trả cache (có mambaY trước residual cho R/P/G).
+  ## Like forwardBlock but returns the cache (with mambaY before the residual for R/P/G).
   if blk.kind == bkMambaReal:
     return forwardRBlockKernel(blk.mambaReal, x, blk.rms1.gamma, blk.rms1.eps, ctx)
   if blk.kind == bkMambaRealPlusAttn:
@@ -376,7 +376,7 @@ proc forwardBlockEx*(blk: JambaBlock, x: Tensor, ctx: Backend;
     checkGBlockScale(blockIndex, x, fw.y, fw.cache)
     return fw
   raise newException(CatchableError,
-    "forwardBlockEx: chỉ hỗ trợ R/P/G (cần HybridBlockKernelCache.mambaY)")
+    "forwardBlockEx: only R/P/G are supported (needs HybridBlockKernelCache.mambaY)")
 
 proc forwardBlock*(blk: JambaBlock, x: Tensor, ctx: Backend;
                    blockIndex = -1): Tensor =
@@ -403,7 +403,7 @@ proc forwardBlock*(blk: JambaBlock, x: Tensor, ctx: Backend;
   of bkSpectron:
     let attnOut = forwardLinearPlus(blk.attn, x1, ctx)
     let mambaOut = forwardMamba2(blk.mamba, x1, ctx)
-    let fuseIn = concatLastDim(attnOut, mambaOut)   # exported (*) từ test_nimformer
+    let fuseIn = concatLastDim(attnOut, mambaOut)   # exported (*) from test_nimformer
     let gateLogit = blk.fuseGate.forward(fuseIn, ctx)
     let gate = beSigmoid(ctx, gateLogit.data)
     combined = newTensor(attnOut.shape)
@@ -433,8 +433,8 @@ proc backwardBlock*(blk: JambaBlock, x: Tensor, dOut: Tensor, ctx: Backend,
                                  blk.rms1.eps, ctx)
     return backwardPBlockKernel(blk.mambaReal, blk.attn, x, blk.rms1.gamma,
                                 dOut, fw.cache, blk.rms1.eps, ctx, prefix, grads)
-  ## Trả về dX (để lan truyền tiếp lên block trước), đồng thời GHI gradient
-  ## của mọi tham số của block này vào `grads` với key = prefix & ".<ten>".
+  ## Returns dX (to propagate to the previous block) and WRITES the gradients
+  ## of every parameter of this block into `grads` with key = prefix & ".<name>".
   let x1 = blk.ln1.forward(x, ctx)
   var combined: Tensor
   var attnOut, mambaOut, fuseIn, gateLogit: Tensor
@@ -531,26 +531,26 @@ proc forwardBatch*(m: NimformerModelJamba, idsBatch: seq[seq[int]], ctx: Backend
   var x = m.embed.lookupBatch(idsBatch, ctx)
   for i, blk in m.blocks:
     x = forwardBlock(blk, x, ctx, blockIndex = i)
-  # SUA (rms-fin): norm_f (RMSNorm) TRƯỚC lm_head, đúng base HF. Trước đây
-  # gọi thẳng outProj lên hidden chưa norm -> sai scale tích lũy 64 block.
+  # (rms-fin): norm_f (RMSNorm) BEFORE lm_head, as in the HF base. This used to
+  # call outProj on the un-normalised hidden -> wrong scale accumulated over 64 blocks.
   let xNorm = m.rmsF.forward(x, ctx)
   result = m.outProj.forward(xNorm, ctx)
 
 # ═══════════════════════════════════════════════════════════════
-# forwardBatchSession: BẢN INFERENCE-ONLY, dùng Session API TOÀN BỘ khi
-# backend hỗ trợ (Metal/CUDA/OpenCL), không có backward (infer_lora.nim
-# không cần train qua đường này). KHÔNG dùng cho fine-tune (finetune_lora.nim
-# vẫn dùng forwardBlock/forwardBatch + backwardBlock ở trên, không đổi).
-#   - Block 'M' (Mamba2SSD): forwardMamba2 (test_nimformer.nim) ĐÃ TỰ dùng
-#     Session API sẵn khi model.useSession=true - không cần viết lại gì,
-#     gọi y hệt forwardBlock ở trên.
-#   - Block 'A'/'S' (LinearPlusAttention): forwardLinearPlus gốc KHÔNG dùng
-#     session (chỉ có 2 phép Linear qua ctx, còn phần attention cốt lõi
-#     luôn chạy CPU - xem comment "đường GPU-session có thể thêm sau theo
-#     đúng khuôn Mamba2SSD" ngay tại chỗ khai báo LinearPlusAttention trong
-#     test_nimformer.nim). forwardBatchSession dùng forwardLinearPlusSession
-#     (MỚI, cũng trong test_nimformer.nim) thay vào - cùng công thức toán,
-#     có CPU fallback y hệt nếu session lỗi, chỉ khác tốc độ.
+# forwardBatchSession: INFERENCE-ONLY version, using the Session API THROUGHOUT when
+# the backend supports it (Metal/CUDA/OpenCL), no backward (infer_lora.nim
+# does not train through this path). NOT used for fine-tuning (finetune_lora.nim
+# still uses forwardBlock/forwardBatch + backwardBlock above, unchanged).
+#   - Block 'M' (Mamba2SSD): forwardMamba2 (test_nimformer.nim) ALREADY uses
+#     the Session API itself when model.useSession=true - nothing to rewrite,
+#     called exactly like forwardBlock above.
+#   - Block 'A'/'S' (LinearPlusAttention): the original forwardLinearPlus does NOT use
+#     a session (only its 2 Linears go through ctx, the core attention
+#     always ran on the CPU - see the comment "a GPU-session path can be added later following
+#     the Mamba2SSD template" where LinearPlusAttention is declared in
+#     test_nimformer.nim). forwardBatchSession uses forwardLinearPlusSession
+#     (NEW, also in test_nimformer.nim) instead - same math,
+#     the same CPU fallback if the session fails, only the speed differs.
 # ═══════════════════════════════════════════════════════════════
 proc forwardBlockSession(blk: JambaBlock, x: Tensor, ctx: Backend;
                          blockIndex = -1): Tensor =
@@ -565,16 +565,16 @@ proc forwardBlockSession(blk: JambaBlock, x: Tensor, ctx: Backend;
   var combined: Tensor
   case blk.kind
   of bkMamba:
-    combined = forwardMamba2(blk.mamba, x1, ctx)                 # da session-capable san
+    combined = forwardMamba2(blk.mamba, x1, ctx)                 # already session-capable
   of bkMambaReal:
     raise newException(CatchableError, "R block missed the inference block-kernel entrypoint")
   of bkMambaRealPlusAttn, bkMambaRealGated:
     raise newException(CatchableError, "P block missed the inference block-kernel entrypoint")
   of bkAttn:
-    combined = forwardLinearPlusSession(blk.attn, x1, ctx)        # MOI - session-based
+    combined = forwardLinearPlusSession(blk.attn, x1, ctx)        # NEW - session-based
   of bkSpectron:
-    let attnOut = forwardLinearPlusSession(blk.attn, x1, ctx)     # MOI - session-based
-    let mambaOut = forwardMamba2(blk.mamba, x1, ctx)              # da session-capable san
+    let attnOut = forwardLinearPlusSession(blk.attn, x1, ctx)     # NEW - session-based
+    let mambaOut = forwardMamba2(blk.mamba, x1, ctx)              # already session-capable
     let fuseIn = concatLastDim(attnOut, mambaOut)
     let gateLogit = blk.fuseGate.forward(fuseIn, ctx)
     let gate = beSigmoid(ctx, gateLogit.data)
@@ -587,54 +587,54 @@ proc forwardBlockSession(blk: JambaBlock, x: Tensor, ctx: Backend;
   result = addT(ctx, x2, ffOut)
 
 proc forwardBatchSession*(m: NimformerModelJamba, idsBatch: seq[seq[int]], ctx: Backend): Tensor =
-  ## Dùng cho infer_lora.nim (generation loop) thay vì forwardBatch - CÙNG
-  ## công thức toán/kết quả, khác cách thực thi (Session API resident GPU
-  ## thay vì mỗi op tự upload/tải xuống riêng lẻ) khi backend hỗ trợ. Nếu
-  ## backend không hỗ trợ session hoặc session fail giữa chừng, tự rơi về
-  ## CPU đúng như cũ (xem forwardMamba2/forwardLinearPlusSession) - KHÔNG
-  ## BAO GIỜ sinh token khác với forwardBatch chỉ vì lỗi session.
+  ## Used by infer_lora.nim (generation loop) instead of forwardBatch - SAME
+  ## math/result, different execution (GPU-resident Session API
+  ## instead of each op uploading/downloading on its own) when the backend supports it. If
+  ## the backend has no session support or the session fails midway, it falls back to
+  ## the CPU as before (see forwardMamba2/forwardLinearPlusSession) - it NEVER
+  ## produces tokens different from forwardBatch just because of a session error.
   var x = m.embed.lookupBatch(idsBatch, ctx)
   for i, blk in m.blocks:
     x = forwardBlockSession(blk, x, ctx, blockIndex = i)
-  # SUA (rms-fin): norm_f trước lm_head cho khớp base + đường train.
+  # (rms-fin): norm_f before lm_head to match the base + the training path.
   let xNorm = m.rmsF.forward(x, ctx)
   result = m.outProj.forward(xNorm, ctx)
 
 # ═══════════════════════════════════════════════════════════════
-# STATE INCREMENTAL (MOI) cho CA MODEL - O(1)/token thay vi forwardBatchSession
-# o tren chay lai TOAN BO chuoi tu dau moi token (O(T), cang sinh dai cang
-# cham - da xac nhan qua log thuc te ~136s/token). Dung state incremental
-# tung block Mamba2Real (xem Mamba2RealState/forwardStepMamba2Real trong
-# mamba2_real.nim, doi chieu DUNG cong thuc HF that
+# INCREMENTAL STATE (NEW) for the WHOLE MODEL - O(1)/token instead of forwardBatchSession
+# above re-running the WHOLE sequence from the start each token (O(T), slower the longer it
+# generates - confirmed by a real log at ~136s/token). Uses the incremental state
+# of each Mamba2Real block (see Mamba2RealState/forwardStepMamba2Real in
+# mamba2_real.nim, checked against the REAL HF formula
 # transformers/models/mamba2/modeling_mamba2.py).
 #
-# GIOI HAN RO RANG (KHONG lam ngo): CHI dung duoc khi pattern model TOAN BO
-# la 'R' (Mamba2Real) - khong co block 'A'/'M'/'S' nao ca. Ly do: block
-# Attention ('A') can KV-cache rieng (giu K/V cua tung token cu) de attend
-# dung qua khu - neu chi forward 1 token don le KHONG co lich su, ket qua
-# SAI (khong phai chi cham), khac han Mamba2Real (state that su du de tai
-# tao dung ket qua). Chua viet KV-cache cho block 'A' o day - neu pattern
-# co block khac 'R', raise loi RO RANG thay vi am tham chay sai.
+# EXPLICIT LIMITATION (not ignored): ONLY usable when the model pattern is ENTIRELY
+# 'R' (Mamba2Real) - no 'A'/'M'/'S' blocks at all. Reason: an
+# Attention block ('A') needs its own KV cache (keeping K/V of every past token) to attend
+# to the past correctly - forwarding a single token WITHOUT history gives a WRONG
+# result (not just slow), unlike Mamba2Real (whose state is enough to reproduce
+# the right result). No KV cache is written for 'A' blocks here - if the pattern
+# has non-'R' blocks, an EXPLICIT error is raised instead of silently running wrong.
 # ═══════════════════════════════════════════════════════════════
 
 type
   JambaGenState* = object
-    ## 1 phan tu/block - CHI co gia tri that (Mamba2RealState) cho block
-    ## 'R', block khac (neu co) khong duoc dung qua duong nay (xem raise o
+    ## 1 element/block - only holds a real value (Mamba2RealState) for 'R'
+    ## blocks; other blocks (if any) are not used through this path (see the raise in
     ## forwardStepJamba).
     mambaStates*: seq[Mamba2RealState]
 
 proc isPureMambaRealPattern*(m: NimformerModelJamba): bool =
-  ## Kiem tra TRUOC (khong dung GPU) xem model co THUAN 'R' hay khong -
-  ## dieu kien BAT BUOC de dung forwardStepJamba an toan. Goi truoc luc
-  ## quyet dinh dung duong incremental hay duong forwardBatchSession cu.
+  ## Checks UP FRONT (no GPU) whether the model is PURE 'R' -
+  ## a REQUIRED condition for using forwardStepJamba safely. Call it before
+  ## choosing between the incremental path and the old forwardBatchSession path.
   for blk in m.blocks:
     if blk.kind != bkMambaReal: return false
   return true
 
 type
   HybridGenState* = object
-    ## Incremental hybrid: R dung Mamba2RealState; A dung Linear++ state rieng.
+    ## Incremental hybrid: R uses Mamba2RealState; A uses its own Linear++ state.
     mambaStates*: seq[Mamba2RealState]
     attnStates*: seq[LinearPlusInferState]
     hidden*: int
@@ -650,68 +650,68 @@ proc newHybridGenState*(m: NimformerModelJamba): HybridGenState =
       result.attnStates[i] = newLinearPlusInferState(m.embedDim, blk.attn.nHeads)
 
 proc newJambaGenState*(m: NimformerModelJamba): JambaGenState =
-  ## RAISE ro rang neu pattern KHONG thuan 'R' - khong am tham tao state
-  ## roi de forwardStepJamba tu phat hien sau (fail som, thong bao ro).
+  ## RAISES explicitly if the pattern is NOT pure 'R' - no silently creating a state
+  ## and letting forwardStepJamba detect it later (fail early, clear message).
   if not isPureMambaRealPattern(m):
     raise newException(ValueError,
       "[JambaGenState] Model co block KHAC 'R' (Attention/Mamba2SSD/Spectron) - " &
-      "state incremental CHUA ho tro cho cac block do (can KV-cache rieng, " &
-      "chua viet). Dung forwardBatchSession (cham hon nhung DUNG) cho pattern nay.")
+      "incremental state is NOT supported for those blocks yet (needs a separate KV cache, " &
+      "not written). Use forwardBatchSession (slower but CORRECT) for this pattern.")
   result.mambaStates = newSeq[Mamba2RealState](m.blocks.len)
   for i, blk in m.blocks:
     result.mambaStates[i] = newMamba2RealState(blk.mambaReal)
 
 proc forwardStepJamba*(m: NimformerModelJamba, tokenId: int, state: var JambaGenState,
                         ctx: Backend): Tensor =
-  ## DUNG 1 token moi, O(1) (khong phu thuoc do dai chuoi da sinh) - THAY
-  ## THE forwardBatchSession(m, @[ids], ctx) trong vong lap generate() khi
-  ## pattern thuan 'R' (xem isPureMambaRealPattern). Tra ve logits [1,1,vocab].
+  ## EXACTLY 1 new token, O(1) (independent of the generated length) - REPLACES
+  ## forwardBatchSession(m, @[ids], ctx) in the generate() loop when the
+  ## pattern is pure 'R' (see isPureMambaRealPattern). Returns logits [1,1,vocab].
   assert m.blocks.len == state.mambaStates.len,
-    "[forwardStepJamba] state khong khop so block model (JambaGenState cu?)"
+    "[forwardStepJamba] state does not match the model's block count (old JambaGenState?)"
   var x = m.embed.lookupBatch(@[@[tokenId]], ctx)   # [1,1,hiddenSize]
   for i, blk in m.blocks:
     doAssert blk.kind == bkMambaReal,
-      "[forwardStepJamba] gap block khong phai 'R' o vi tri " & $i &
-      " - khong duoc goi ham nay cho pattern nay (xem isPureMambaRealPattern)."
-    let x1 = blk.rms1.forward(x, ctx)   # SUA (rms-fin): RMSNorm thay ln1
+      "[forwardStepJamba] found a non-'R' block at position " & $i &
+      " - this function must not be called for this pattern (see isPureMambaRealPattern)."
+    let x1 = blk.rms1.forward(x, ctx)   # (rms-fin): RMSNorm instead of ln1
     let combined = forwardStepMamba2Real(blk.mambaReal, x1, state.mambaStates[i], ctx)
-    x = addT(ctx, x, combined)   # bkMambaReal: KHONG qua ln2/ff, giong het forwardBlock
-  # SUA (rms-fin): norm_f trước lm_head.
+    x = addT(ctx, x, combined)   # bkMambaReal: NO ln2/ff, exactly like forwardBlock
+  # (rms-fin): norm_f before lm_head.
   let xNorm = m.rmsF.forward(x, ctx)
   result = m.outProj.forward(xNorm, ctx)
 
 proc uploadResidentJamba*(m: var NimformerModelJamba, ctx: Backend,
                            mergedQuantNames: HashSet[string] = initHashSet[string]()) =
-  ## THÊM (theo mo hinh uploadAllResidentWeights trong generate.nim/
-  ## nim_inference): upload TOAN BO weight len GPU MOT LAN DUY NHAT truoc
-  ## khi vao vong lap generate. mamba2_real.nim (inProj/outProj) va
-  ## test_nimformer.nim (qkvProj/outProj cua LinearPlusAttention) DA GOI
-  ## `.forward()` cua chinh Linear type dung chung voi generate.nim (xem
-  ## nimformer.nim) - Linear.forward() DA TU KIEM TRA residentReady/
-  ## residentFp32Ready va di duong nhanh (chi upload activation nho moi
-  ## buoc, khong dequant/transpose lai weight) - nen KHONG can sua gi trong
-  ## mamba2_real.nim/test_nimformer.nim ca, chi can goi uploadResident() 1
-  ## lan o day cho tung Linear la moi forward() sau do TU DONG nhanh hon.
+  ## (following uploadAllResidentWeights in generate.nim/
+  ## nim_inference): uploads ALL weights to the GPU ONCE before
+  ## entering the generate loop. mamba2_real.nim (inProj/outProj) and
+  ## test_nimformer.nim (LinearPlusAttention qkvProj/outProj) ALREADY CALL
+  ## `.forward()` of the same Linear type used by generate.nim (see
+  ## nimformer.nim) - Linear.forward() ALREADY CHECKS residentReady/
+  ## residentFp32Ready and takes the fast path (uploads only the small activation each
+  ## step, no re-dequant/transpose of the weight) - so NOTHING needs changing in
+  ## mamba2_real.nim/test_nimformer.nim, just calling uploadResident() once
+  ## here for each Linear makes every later forward() faster AUTOMATICALLY.
   ##
-  ## BAT BUOC goi ham nay SAU KHI weight da o dang fp32 DAY DU trong
-  ## `.weight.data` (vd sau mergeIn() trong infer_lora.nim - luc dequant-
-  ## resident cua inProj/outProj tu .nimq da duoc dien vao t[].data va LoRA
-  ## da duoc cong vao permanent cho ca phien generate) - goi som hon (luc
-  ## `.weight.data` con rong do quant-resident) se KHONG co gi de upload
-  ## (uploadResident tu bo qua neu `l.weight.data.len == 0`, xem nimformer.nim).
+  ## This MUST be called AFTER the weights are in FULL fp32 form in
+  ## `.weight.data` (e.g. after mergeIn() in infer_lora.nim - once the dequant-
+  ## resident inProj/outProj from the .nimq are filled into t[].data and LoRA
+  ## is permanently added for the whole generate session) - calling it earlier (while
+  ## `.weight.data` is still empty due to quant-resident) gives NOTHING to upload
+  ## (uploadResident skips when `l.weight.data.len == 0`, see nimformer.nim).
   ##
-  ## THEM (tiet kiem RAM, sua tiep theo sau bug useQuant o lora.nim):
-  ## mergedQuantNames = tap ten tham so ma CALLER (infer_lora.generate) biet
-  ## chac la vua duoc mergeIn() TU dequant+cong LoRA rieng cho phien nay
-  ## (thuc te la lora.quantBase.keys) - danh dau "ban fp32 nay la CUA
-  ## RIENG minh, khong alias/chia se voi bat ky Tensor nao khac". Voi DUNG
-  ## nhung ten do, giai phong `.weight.data` NGAY sau khi uploadResident()
-  ## xong - neu khong, tham so vua merge se ton tai 2 ban fp32 CUNG LUC (CPU
-  ## + GPU-resident); tren GPU tich hop/unified memory (Intel Iris) ca 2 ban
-  ## DEU an chung RAM he thong = gap doi RAM that su can, day la nguyen nhan
-  ## bi kill (OOM) ngay sau dong log "matmul_q4 dang active". KHONG dung mac
-  ## dinh rong (tap rong = khong free gi ca, y het hanh vi CU) de moi caller
-  ## khac (neu co, vd test) khong bi anh huong neu khong chu dong truyen vao.
+  ## RAM saving (follow-up to the useQuant bug in lora.nim):
+  ## mergedQuantNames = the set of parameter names the CALLER (infer_lora.generate) knows
+  ## for sure were just dequantized + LoRA-added by mergeIn() for this session only
+  ## (in practice lora.quantBase.keys) - marking "this fp32 copy is OUR
+  ## OWN, not aliased/shared with any other Tensor". For EXACTLY
+  ## those names, `.weight.data` is freed RIGHT after uploadResident()
+  ## - otherwise the merged parameter would exist as 2 fp32 copies AT ONCE (CPU
+  ## + GPU-resident); on integrated GPUs/unified memory (Intel Iris) both copies
+  ## share system RAM = twice the RAM really needed, which caused the
+  ## OOM kill right after the "matmul_q4 active" log line. The default is
+  ## empty (empty set = free nothing, exactly the OLD behaviour) so other
+  ## callers (if any, e.g. tests) are unaffected unless they pass it explicitly.
   for i in 0 ..< m.blocks.len:
     let p = &"block{i}"
     case m.blocks[i].kind
@@ -770,13 +770,13 @@ proc uploadResidentJamba*(m: var NimformerModelJamba, ctx: Backend,
     m.outProj.weight.data = @[]
 
 # ═══════════════════════════════════════════════════════════════
-# PARAM REGISTRY - generic, không cần sửa tay mỗi khi thêm loại block.
+# PARAM REGISTRY - generic, no hand edits needed when a block kind is added.
 # ═══════════════════════════════════════════════════════════════
 
 proc paramList*(m: var NimformerModelJamba): seq[(string, ptr Tensor)] =
   result = @[("embed.weight", addr m.embed.weight), ("outProj.weight", addr m.outProj.weight),
              ("outProj.bias", addr m.outProj.bias),
-             ("rmsF.gamma", addr m.rmsF.gamma)]   # norm_f - checkpoint .bin luu/nap duoc
+             ("rmsF.gamma", addr m.rmsF.gamma)]   # norm_f - saved/loaded by the .bin checkpoint
   for i in 0 ..< m.blocks.len:
     let p = &"block{i}"
     result.add((p & ".ln1.gamma", addr m.blocks[i].ln1.gamma))
@@ -784,7 +784,7 @@ proc paramList*(m: var NimformerModelJamba): seq[(string, ptr Tensor)] =
     result.add((p & ".ln2.gamma", addr m.blocks[i].ln2.gamma))
     result.add((p & ".ln2.beta", addr m.blocks[i].ln2.beta))
     if m.blocks[i].kind in {bkMambaReal, bkMambaRealPlusAttn, bkMambaRealGated}:
-      # norm THẬT dùng trên đường forward/backward của 'R'/'P' (rms-fin)
+      # the REAL norm used on the 'R'/'P' forward/backward path (rms-fin)
       result.add((p & ".rms1.gamma", addr m.blocks[i].rms1.gamma))
     result.add((p & ".ff.fc1.weight", addr m.blocks[i].ff.fc1.weight))
     result.add((p & ".ff.fc1.bias", addr m.blocks[i].ff.fc1.bias))
@@ -802,7 +802,7 @@ proc paramList*(m: var NimformerModelJamba): seq[(string, ptr Tensor)] =
     of bkMambaRealPlusAttn, bkMambaRealGated:
       for (nm, pt) in paramListMamba2Real(m.blocks[i].mambaReal, p & ".mambaReal"):
         result.add((nm, pt))
-      # FIX: attnLn1 ĐÃ BỎ - dùng chung ln1 với Mamba
+      # Fix: attnLn1 REMOVED - shares ln1 with Mamba
       result.add((p & ".attn.qkvProj.weight", addr m.blocks[i].attn.qkvProj.weight))
       result.add((p & ".attn.qkvProj.bias", addr m.blocks[i].attn.qkvProj.bias))
       result.add((p & ".attn.outProj.weight", addr m.blocks[i].attn.outProj.weight))
@@ -832,28 +832,28 @@ type
     states*: Table[string, ApfAdamState]
 
 proc paramQuantFlags*(m: var NimformerModelJamba): Table[string, ptr bool] =
-  ## BUG FIX: dong bo voi paramList o tren, nhung tra ve con tro TOI THANG
-  ## truong `useQuant` cua tung Linear (chi cho ten ".weight" nao thuc su
-  ## backed boi 1 Linear - bo qua embed.weight vi Embedding khong co
-  ## useQuant, bo qua .bias vi LoRA khong ap dung len bias).
+  ## BUG FIX: in sync with paramList above, but returns pointers STRAIGHT to
+  ## each Linear's `useQuant` field (only for ".weight" names actually
+  ## backed by a Linear - embed.weight is skipped since Embedding has no
+  ## useQuant, .bias is skipped since LoRA does not apply to biases).
   ##
-  ## LY DO CAN: mergeIn/mergeInOne (lora.nim) chi cam duoc `ptr Tensor` (tro
-  ## thang vao truong `.weight` NAM BEN TRONG Linear) tu paramList, KHONG
-  ## cam duoc ca object Linear chua no - nen truoc ban vá nay, sau khi
-  ## mergeIn ghi `t[].data = merged.data` (base + delta LoRA, fp32 THAT),
-  ## Linear.useQuant VAN con true. Ke tiep, uploadResident()/Linear.forward()
-  ## (nimformer.nim) kiem tra `l.useQuant` TRUOC, thay true nen DEQUANT LAI
-  ## tu `l.weightQ` (ban nen GOC, CHUA co LoRA) - bo qua hoan toan t[].data
-  ## vua merge. Khong crash, khong warning, chi la LoRA bi "ngam" mat tren
-  ## moi tham so quant-resident (dung loai checkpoint dang gap: block khac
-  ## 'R', log in "mergeIn + uploadResident + forwardBatchSession").
+  ## WHY: mergeIn/mergeInOne (lora.nim) only hold a `ptr Tensor` (pointing
+  ## straight at the `.weight` field INSIDE the Linear) from paramList, NOT
+  ## the Linear object containing it - so before this patch, after
+  ## mergeIn wrote `t[].data = merged.data` (base + LoRA delta, REAL fp32),
+  ## Linear.useQuant was STILL true. Then uploadResident()/Linear.forward()
+  ## (nimformer.nim) checks `l.useQuant` FIRST, sees true and DEQUANTIZES AGAIN
+  ## from `l.weightQ` (the ORIGINAL compressed copy, WITHOUT LoRA) - ignoring the freshly merged
+  ## t[].data entirely. No crash, no warning, LoRA just silently "vanished" on
+  ## every quant-resident parameter (exactly the checkpoint kind being hit: non-'R'
+  ## blocks, log showing "mergeIn + uploadResident + forwardBatchSession").
   ##
-  ## mergeIn/mergeInOne dung bang nay de dat useQuant=false NGAY khi ghi
-  ## merged.data (bao Linear.forward()/uploadResident() "day la weight fp32
-  ## THAT, dung thang, dung dequant lai"); restoreBase/restoreBaseOne dat
-  ## lai true khi xoa t[].data ve rong (de lan mergeIn ke tiep - hoac bat ky
-  ## uploadResident nao khac chay giua chung - dequant dung tro lai tu
-  ## weightQ nhu thiet ke ban dau).
+  ## mergeIn/mergeInOne use this table to set useQuant=false RIGHT when writing
+  ## merged.data (telling Linear.forward()/uploadResident() "this is the REAL fp32
+  ## weight, use it directly, do not dequantize again"); restoreBase/restoreBaseOne set
+  ## it back to true when clearing t[].data (so the next mergeIn - or any
+  ## other uploadResident running in between - dequantizes correctly again from
+  ## weightQ as originally designed).
   result = initTable[string, ptr bool]()
   result["outProj.weight"] = addr m.outProj.useQuant
   for i in 0 ..< m.blocks.len:
@@ -885,12 +885,12 @@ proc paramQuantFlags*(m: var NimformerModelJamba): Table[string, ptr bool] =
       result[p & ".fuseGate.weight"] = addr m.blocks[i].fuseGate.useQuant
 
 proc paramLinears*(m: var NimformerModelJamba): Table[string, ptr Linear] =
-  ## Trả về bảng name → ptr Linear (chỉ các Linear có .weight, đồng bộ
-  ## paramQuantFlags / paramList). Dùng để bind quantBase → weightQ/useQuant
-  ## (setQuantWeight) trước uploadResident / mergeInUploadStreamingJamba.
-  ## Thiếu bước này là nguyên nhân IndexDefect "container is empty" trên
-  ## đường quantResident + NIMBIN4 (weight.data bị @[] lúc newJambaBlock,
-  ## nhưng weightQ/useQuant chưa được nối từ lora.quantBase).
+  ## Returns a name → ptr Linear table (only Linears with a .weight, in sync with
+  ## paramQuantFlags / paramList). Used to bind quantBase → weightQ/useQuant
+  ## (setQuantWeight) before uploadResident / mergeInUploadStreamingJamba.
+  ## Missing this step caused the IndexDefect "container is empty" on the
+  ## quantResident + NIMBIN4 path (weight.data was @[] at newJambaBlock,
+  ## but weightQ/useQuant had not been wired from lora.quantBase).
   result = initTable[string, ptr Linear]()
   result["outProj.weight"] = addr m.outProj
   for i in 0 ..< m.blocks.len:
@@ -930,15 +930,15 @@ proc computeLossAndGrads*(m: var NimformerModelJamba, idsBatch: seq[seq[int]],
                            targetsBatch: seq[seq[int]], ctx: Backend,
                            trainLmHead: bool = true, trainEmbed: bool = true):
                           tuple[loss: float32, grads: Table[string, Tensor]] =
-  ## Tách riêng forward+backward (KHÔNG tự update Adam) để lora.nim có thể
-  ## tự quyết update tham số nào (LoRA A/B) thay vì update thẳng base weight
-  ## như trainStep dưới đây làm cho toàn model.
+  ## Forward+backward only (does NOT update Adam itself) so lora.nim can
+  ## decide which parameters to update (LoRA A/B) instead of updating the base weights
+  ## directly like trainStep below does for the whole model.
   var x = m.embed.lookupBatch(idsBatch, ctx)
   var xs: seq[Tensor] = @[x]
   for i, blk in m.blocks:
     x = forwardBlock(blk, x, ctx, blockIndex = i)
     xs.add(x)
-  # SUA (rms-fin): norm_f TRƯỚC lm_head ở cả forward lẫn backward.
+  # (rms-fin): norm_f BEFORE lm_head in both forward and backward.
   let xNorm = m.rmsF.forward(x, ctx)
   let logits = m.outProj.forward(xNorm, ctx)
   let (loss, dLogits) = softmaxCrossEntropy(logits, targetsBatch, ctx)
@@ -972,15 +972,15 @@ proc trainStep*(m: var NimformerModelJamba, adam: var JambaAdamState,
       discard apfAdamStepFused(ctx, t[], grads[name], st, lr, requantizeEvery = requantizeEvery)
       adam.states[name] = st
     else:
-      stderr.writeLine("[CANH BAO] Thieu gradient cho tham so: " & name)
+      stderr.writeLine("[WARNING] Missing gradient for parameter: " & name)
   result = loss
 
 # ═══════════════════════════════════════════════════════════════
-# CHECKPOINT: dùng thẳng .bin thô (rawbin.nim), KHÔNG dùng .nimq ở đây.
-# .nimq (quant.nim) chỉ dành riêng cho nim_inference.nim/test_nimformer.nim -
-# toàn bộ pipeline fine-tune (graft_attention/finetune_lora/infer_lora) đọc
-# ghi checkpoint trực tiếp bằng .bin. arch + pattern + step được nhét gọn
-# trong phần "meta" của file .bin, không cần sidecar .pattern.json nữa.
+# CHECKPOINT: uses raw .bin directly (rawbin.nim), NOT .nimq here.
+# .nimq (quant.nim) is reserved for nim_inference.nim/test_nimformer.nim -
+# the whole fine-tune pipeline (graft_attention/finetune_lora/infer_lora) reads
+# and writes checkpoints directly as .bin. arch + pattern + step are packed
+# into the "meta" section of the .bin, no .pattern.json sidecar needed any more.
 # ═══════════════════════════════════════════════════════════════
 
 proc saveCheckpoint*(m: var NimformerModelJamba, path: string, step: int = 0) =
@@ -995,13 +995,13 @@ proc saveCheckpoint*(m: var NimformerModelJamba, path: string, step: int = 0) =
   meta["pattern"] = m.pattern
   meta["step"] = $step
   saveRawBin(path, meta, tensors)
-  echo &"[jamba] Da luu checkpoint .bin -> {path} ({tensors.len} tensor, step={step})"
+  echo &"[jamba] Saved .bin checkpoint -> {path} ({tensors.len} tensors, step={step})"
 
 proc loadCheckpoint*(path: string, useSession: bool = true): tuple[model: NimformerModelJamba, step: int] =
   let (meta, tensors) = loadRawBin(path)
   template reqMeta(key: string): string =
     if key notin meta:
-      raise newException(IOError, "Checkpoint .bin thieu meta bat buoc '" & key & "': " & path)
+      raise newException(IOError, ".bin checkpoint is missing required meta '" & key & "': " & path)
     meta[key]
   let vocab = parseInt(reqMeta("vocab"))
   let embedDim = parseInt(reqMeta("embedDim"))
@@ -1018,47 +1018,47 @@ proc loadCheckpoint*(path: string, useSession: bool = true): tuple[model: Nimfor
     if name in lookup:
       t[].data = lookup[name].data
     else:
-      stderr.writeLine("[CANH BAO] Checkpoint .bin thieu tham so '" & name & "' - giu khoi tao random")
+      stderr.writeLine("[WARNING] .bin checkpoint is missing parameter '" & name & "' - keeping its random init")
   result = (m, step)
 
 when not defined(codestralInference):
   # ═══════════════════════════════════════════════════════════════
-  # NẠP TRỌNG SỐ TỪ MODEL HF (đã export bằng pytorch_bin_loader.nim) VÀO
-  # JAMBA. QUAN TRỌNG: Mamba-1B (HF, kiến trúc mamba_ssm gốc: A_log, D, x_proj,
-  # dt_proj, conv1d, in_proj, out_proj...) KHÔNG cùng schema với Mamba2SSD ở
-  # đây (SSD/quadratic-form tự viết, tham số hoá khác hẳn). KHÔNG có phép map
-  # 1-1 tự động đúng nghĩa toán học giữa 2 kiến trúc này - copy thẳng theo tên
-  # gần giống nhau (vd "embeddings.weight" -> "embed.weight") CHỈ hợp lý cho
-  # embedding/lm_head (nếu cùng dim), còn phần thân SSD phải huấn luyện lại
-  # từ đầu (init random, dùng embedding của HF làm điểm khởi đầu tốt hơn thôi).
-  # Hàm dưới đây làm đúng phần "hợp lý tự động" đó, phần còn lại bạn tự thêm
-  # theo manifest in ra từ pytorch_bin_loader.
+  # LOADING WEIGHTS FROM AN HF MODEL (exported with pytorch_bin_loader.nim) INTO
+  # JAMBA. IMPORTANT: Mamba-1B (HF, the original mamba_ssm architecture: A_log, D, x_proj,
+  # dt_proj, conv1d, in_proj, out_proj...) does NOT share a schema with the Mamba2SSD
+  # here (a hand-written SSD/quadratic form, parameterised entirely differently). There is NO
+  # mathematically correct automatic 1-1 mapping between these 2 architectures - copying by
+  # similar names (e.g. "embeddings.weight" -> "embed.weight") ONLY makes sense for
+  # embedding/lm_head (if the dims match); the SSD body has to be retrained
+  # from scratch (random init, the HF embedding just gives a better starting point).
+  # The function below does exactly that "automatic, sensible" part; add the rest yourself
+  # from the manifest printed by pytorch_bin_loader.
   proc loadEmbeddingFromHF*(m: var NimformerModelJamba, hfBinPath: string,
                              hfEmbedKey: string = "backbone.embedding.weight") =
-    ## Doc TRUC TIEP tu file .bin GOC cua HF (pytorch_model.bin/.safetensors,
-    ## qua pytorch_bin_loader.loadAllHFTensors) - KHONG can xuat ra file trung
-    ## gian nao truoc (khong .nimq, khong ban sao .bin nao khac).
-    ## Luu y: "backbone.embedding.weight" (SO IT, khong phai "embeddings") la
-    ## key that su cua mamba_ssm/MambaLMHeadModel (Mamba-Chat-2.8B dung kien
-    ## truc nay) - kiem tra lai bang manifest neu ban doi model khac.
+    ## Reads DIRECTLY from the ORIGINAL HF .bin (pytorch_model.bin/.safetensors,
+    ## via pytorch_bin_loader.loadAllHFTensors) - NO intermediate file
+    ## needs exporting first (no .nimq, no other .bin copy).
+    ## Note: "backbone.embedding.weight" (SINGULAR, not "embeddings") is
+    ## the actual key of mamba_ssm/MambaLMHeadModel (Mamba-Chat-2.8B uses this
+    ## architecture) - check the manifest again if you switch models.
     let tensors = loadAllHFTensors(hfBinPath)
     for t in tensors:
       if t.name == hfEmbedKey:
         if t.data.len == m.embed.weight.data.len:
           m.embed.weight.data = t.data
-          echo &"[jamba] Da nap embedding tu HF ({hfEmbedKey}), {t.data.len} gia tri"
+          echo &"[jamba] Loaded the embedding from HF ({hfEmbedKey}), {t.data.len} values"
         else:
-          stderr.writeLine(&"[CANH BAO] Shape embedding HF ({t.data.len}) khong khop model Jamba ({m.embed.weight.data.len}) - bo qua")
+          stderr.writeLine(&"[WARNING] HF embedding shape ({t.data.len}) does not match the Jamba model ({m.embed.weight.data.len}) - skipped")
         return
-    stderr.writeLine(&"[CANH BAO] Khong thay key '{hfEmbedKey}' trong {hfBinPath}")
+    stderr.writeLine(&"[WARNING] Key '{hfEmbedKey}' not found in {hfBinPath}")
 
   # ═══════════════════════════════════════════════════════════════
-  # NẠP TOÀN BỘ khối 'M' (Mamba-only) TRỰC TIẾP TỪ pytorch_model.bin GỐC, không
-  # ghi ra bất kỳ file .bin/.nimq trung gian nào - tránh nhân đôi dung lượng
-  # đĩa khi checkpoint HF gốc đã nặng vài GB (yêu cầu bắt buộc của project).
-  # Chỉ map được các tên tự trùng/khai báo qua `nameMap`; tên nào không khớp
-  # giữ nguyên random-init (in cảnh báo tổng hợp, không log từng cái để đỡ rối
-  # - xem thêm cảnh báo "KHÔNG map 1-1 tự động" phía trên).
+  # LOADS ALL 'M' (Mamba-only) blocks DIRECTLY FROM THE ORIGINAL pytorch_model.bin, without
+  # writing any intermediate .bin/.nimq file - avoids doubling disk usage
+  # when the original HF checkpoint is already several GB (a hard project requirement).
+  # Only names that match exactly or are declared in `nameMap` are mapped; unmatched names
+  # keep their random init (one summary warning, not one log per name to avoid clutter
+  # - see also the "NO automatic 1-1 mapping" warning above).
   # ═══════════════════════════════════════════════════════════════
   proc loadMambaOnlyFromHFBin*(hfBinPath: string, vocab, embedDim, nHeads, ffMult, nLayers: int,
                                 nameMap: Table[string, string] = initTable[string, string](),
@@ -1068,7 +1068,7 @@ when not defined(codestralInference):
     for _ in 0 ..< nLayers: pattern.add('M')
     var m = newNimformerModelJamba(vocab, embedDim, nHeads, ffMult, pattern, useSession)
 
-    let tensors = loadAllHFTensors(hfBinPath)   # CHI o RAM - khong ghi file nao ra dia
+    let tensors = loadAllHFTensors(hfBinPath)   # in RAM ONLY - nothing written to disk
     var lookup = initTable[string, RawBinTensor]()
     for t in tensors:
       lookup[t.name] = t
@@ -1080,24 +1080,24 @@ when not defined(codestralInference):
       if hfName in lookup and lookup[hfName].data.len == t[].data.len:
         t[].data = lookup[hfName].data
         inc matched
-    echo &"[jamba] Da nap truc tiep tu {hfBinPath}: {matched}/{plist.len} tham so khop ten " &
-         "(phan con lai la Mamba2SSD tu viet, KHONG map 1-1 tu dong duoc voi mamba_ssm goc " &
-         "- can nameMap hoac train lai tu dau, xem ghi chu dau file)"
+    echo &"[jamba] Loaded directly from {hfBinPath}: {matched}/{plist.len} parameters matched by name " &
+         "(the rest is the hand-written Mamba2SSD, which CANNOT be mapped 1-1 automatically to the original mamba_ssm " &
+         "- needs a nameMap or retraining from scratch, see the notes at the top of the file)"
     result = (m, matched, plist.len)
 
 # ═══════════════════════════════════════════════════════════════
-# NẠP WEIGHT NORM PRETRAIN (preset rms-fin). BẮT BUỘC phải gọi sau khi nạp
-# weight mixer - nếu không, rms1/rmsF giữ nguyên gamma=1 (identity), trong
-# khi norm weight THẬT của Codestral KHÔNG phải toàn 1.0 -> lại lệch base.
+# LOADING PRETRAIN NORM WEIGHTS (preset rms-fin). MUST be called after loading the
+# mixer weights - otherwise rms1/rmsF keep gamma=1 (identity), while
+# Codestral's REAL norm weights are NOT all 1.0 -> off the base again.
 # Map:
 #   backbone.layers.{i}.norm.weight  ->  block{i}.rms1.gamma   (block 'R'/'P')
 #   backbone.norm_f.weight           ->  rmsF.gamma
 # ═══════════════════════════════════════════════════════════════
 proc loadNormsFromHfTensors*(m: var NimformerModelJamba, tensors: seq[RawBinTensor]): int =
-  ## `tensors` là danh sách tensor HF đã đọc (loadAllHFTensors từ safetensors,
-  ## hoặc danh sách dequant từ .nimq - miễn cùng schema tên HF). Trả về số
-  ## norm đã nạp. Kỳ vọng = số block 'R'/'P' + 1 (norm_f). In cảnh báo nếu
-  ## thiếu - KHÔNG raise (để caller tự quyết), nhưng thiếu norm_f là lỗi nặng.
+  ## `tensors` is the list of HF tensors already read (loadAllHFTensors from safetensors,
+  ## or the dequantized list from a .nimq - any list with the HF name schema). Returns the number
+  ## of norms loaded. Expected = number of 'R'/'P' blocks + 1 (norm_f). Warns when
+  ## some are missing - does NOT raise (the caller decides), but a missing norm_f is a serious error.
   var lookup = initTable[string, RawBinTensor]()
   for t in tensors: lookup[t.name] = t
   result = 0
@@ -1109,10 +1109,10 @@ proc loadNormsFromHfTensors*(m: var NimformerModelJamba, tensors: seq[RawBinTens
         m.blocks[i].rms1.gamma.data = lookup[key].data
         inc result
       else:
-        stderr.writeLine(&"[CANH BAO] {key}: shape lech ({lookup[key].data.len} != " &
-                         $m.blocks[i].rms1.gamma.data.len & ") - giu gamma=1")
+        stderr.writeLine(&"[WARNING] {key}: shape mismatch ({lookup[key].data.len} != " &
+                         $m.blocks[i].rms1.gamma.data.len & ") - keeping gamma=1")
     else:
-      stderr.writeLine("[CANH BAO] Thieu " & key & " trong nguon weight - giu gamma=1")
+      stderr.writeLine("[WARNING] Missing " & key & " in the weight source - keeping gamma=1")
   var foundF = false
   for key in ["backbone.norm_f.weight", "norm_f.weight"]:
     if key in lookup and lookup[key].data.len == m.rmsF.gamma.data.len:
@@ -1121,25 +1121,25 @@ proc loadNormsFromHfTensors*(m: var NimformerModelJamba, tensors: seq[RawBinTens
       foundF = true
       break
   if not foundF:
-    stderr.writeLine("[CANH BAO] KHONG thay backbone.norm_f.weight - rmsF giu gamma=1, " &
-                     "hidden vao lm_head van se lech base. Kiem tra lai nguon weight.")
-  echo &"[jamba] rms-fin: da nap {result} norm weight pretrain (rms1 + norm_f)"
+    stderr.writeLine("[WARNING] backbone.norm_f.weight NOT found - rmsF keeps gamma=1, " &
+                     "the hidden state entering lm_head will be off the base. Check the weight source.")
+  echo &"[jamba] rms-fin: loaded {result} pretrain norm weights (rms1 + norm_f)"
 
 const TRAIN_NORM_PRESET* = "rms-fin-gn"
 const TRAIN_MAMBA_NORM_IMPL* = "mamba-ssm-postgate-grouped-v1"
-  ## Ten preset infer (lora.setGpuNormPreset) tuong ung DUNG voi forward cua trainer nay:
-  ## RMSNorm gamma base (syncRmsFromBaseNorms) cho CA nhanh R lan sidecar P cua moi khoi
-  ## (forwardBlock: x1 = rms1(x) dung chung), norm_f (rmsF) truoc lm_head, gated-RMSNorm
-  ## theo 8 group (Mamba-SSM reference, group_size=8192/8). finetune_lora ghi no vao meta["normPreset"] cua checkpoint,
-  ## infer_lora doc lai de dung CHINH preset do - hai ben khong the lech nhau.
-  ## DOI cach forward chuan hoa => doi hang so nay (va setGpuNormPreset ben lora.nim).
+  ## The infer preset name (lora.setGpuNormPreset) matching EXACTLY this trainer's forward:
+  ## base RMSNorm gamma (syncRmsFromBaseNorms) for BOTH the R branch and the P sidecar of each block
+  ## (forwardBlock: x1 = rms1(x) shared), norm_f (rmsF) before lm_head, gated RMSNorm
+  ## over 8 groups (Mamba-SSM reference, group_size=8192/8). finetune_lora writes it into the checkpoint's meta["normPreset"],
+  ## infer_lora reads it back to use EXACTLY that preset - the two sides cannot diverge.
+  ## CHANGING the forward normalisation => change this constant (and setGpuNormPreset in lora.nim).
 
 proc syncRmsFromBaseNorms*(m: var NimformerModelJamba) =
-  ## SUA (train/infer preset khop): loadNormsFromHfTensors khong bao gio duoc goi,
-  ## nen rms1/rmsF luc train giu gamma=1 trong khi infer (lora.nim) dung
-  ## ln1.gamma / normF.gamma = weight pretrain THAT (nap boi load_codestral_*).
-  ## Goi ham nay SAU moi lan nap base: chep ln1.gamma -> rms1.gamma (R/P) va
-  ## normF.gamma -> rmsF.gamma de train va infer dung CUNG gamma.
+  ## (train/infer preset match): loadNormsFromHfTensors was never called,
+  ## so rms1/rmsF kept gamma=1 during training while infer (lora.nim) used
+  ## ln1.gamma / normF.gamma = the REAL pretrain weights (loaded by load_codestral_*).
+  ## Call this AFTER every base load: copies ln1.gamma -> rms1.gamma (R/P) and
+  ## normF.gamma -> rmsF.gamma so training and inference use the SAME gamma.
   var n = 0
   for i in 0 ..< m.blocks.len:
     if m.blocks[i].kind notin {bkMambaReal, bkMambaRealPlusAttn, bkMambaRealGated}: continue
@@ -1149,4 +1149,4 @@ proc syncRmsFromBaseNorms*(m: var NimformerModelJamba) =
   if m.normF.gamma.data.len == m.rmsF.gamma.data.len:
     m.rmsF.gamma.data = m.normF.gamma.data
     inc n
-  echo "[jamba] syncRmsFromBaseNorms: dong bo " & $n & " gamma (rms1 + rmsF) tu base"
+  echo "[jamba] syncRmsFromBaseNorms: synced " & $n & " gammas (rms1 + rmsF) from the base"

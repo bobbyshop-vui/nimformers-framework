@@ -1,11 +1,11 @@
 """
 dump_reference_states.py
-Dùng để bisect: chạy đúng prompt qua model HF thật (AutoGPTQ CPU), lấy hidden
-state ở từng điểm mốc (sau embedding, sau layer 0, sau layer cuối, logits token
-cuối) rồi in ra vài số đầu tiên (giống style verify_gptq_dequant.py cũ) để so
-tay với Nim.
+Used for bisecting: runs the exact prompt through the real HF model (AutoGPTQ CPU), takes the hidden
+state at each checkpoint (after the embedding, after layer 0, after the last layer, logits of the last
+token) and prints the first few values (same style as the old verify_gptq_dequant.py) to compare
+by hand with Nim.
 
-Chạy:
+Run:
   python3.10 dump_reference_states.py --model TheBloke/deepseek-coder-6.7B-instruct-GPTQ
 """
 import argparse
@@ -18,7 +18,7 @@ def main():
     ap.add_argument("--prompt", default='def fib(n):\n    """Return the n-th Fibonacci number."""\n    ')
     args = ap.parse_args()
 
-    print(f"Loading {args.model} (CPU, có thể mất vài phút)...")
+    print(f"Loading {args.model} (CPU, may take a few minutes)...")
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     from auto_gptq import AutoGPTQForCausalLM
     model = AutoGPTQForCausalLM.from_quantized(
@@ -39,13 +39,13 @@ def main():
         out = model(input_ids, output_hidden_states=True)
 
     hs = out.hidden_states
-    # hs[0] = sau embedding (truoc block 0)
-    # hs[1] = sau block 0
-    # hs[-1] = sau finalNorm (truoc lm_head) - CHU Y: HF thuong KHONG áp
-    #          finalNorm vao hidden_states[-1], no la truoc norm cuoi. Kiem
-    #          tra rieng model.model.norm neu can so khop tuyet doi.
+    # hs[0] = after the embedding (before block 0)
+    # hs[1] = after block 0
+    # hs[-1] = after finalNorm (before lm_head) - NOTE: HF usually does NOT apply
+    #          finalNorm to hidden_states[-1], it is before the last norm. Check
+    #          model.model.norm separately if an exact match is needed.
     def show(name, t):
-        flat = t[0, -1, :8].tolist()  # token cuoi cung, 8 phan tu dau
+        flat = t[0, -1, :8].tolist()  # last token, first 8 elements
         print(f"{name} last_token[:8] = {flat}")
 
     show("after_embedding (hidden_states[0])", hs[0])

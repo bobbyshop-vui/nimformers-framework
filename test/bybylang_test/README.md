@@ -8,6 +8,9 @@ These tests use the BybyLang DSL/compiler in
 For a line-by-line explanation of the DSL and C ABI calls, see the
 [BybyLang test API reference](../../docs/bybylang-tests.md).
 
+- `syntax_test.bybylang` — language features: functions with parameters and
+  return types, type/const sections, `case`/`try`, field/index/compound
+  assignments and blank lines inside blocks.
 - `capi_test.bybylang` — `import nim "../../lib_c_api"` and calls the C ABI
   from BybyLang: context/backend, elementwise add, matmul, softmax,
   layernorm, int8 quantization, micro-VM dispatch, and fused attention.

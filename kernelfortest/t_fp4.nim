@@ -1,4 +1,4 @@
-## Test: fp4_gemv_vm (mới, vòng chạy GPU) == bản gốc (unroll host), so BITWISE trên interpreter tham chiếu.
+## Test: fp4_gemv_vm (new, GPU loop) == the original (host unroll), compared BITWISE on the reference interpreter.
 import std/[math, strutils]
 import session_vm, vm_interp
 import fp4_gemv_vm as nw

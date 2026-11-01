@@ -219,6 +219,25 @@ nén mọi file `.bin`. Công cụ migrate chuyển checkpoint JSON cũ sang bin
 chọn output riêng như ví dụ để giữ bản gốc. Xem [định dạng checkpoint](checkpoint-formats.vi.md).
 
 
+## formers.n
+
+```sh
+make formers-cli
+make formers
+make formers FORMERS_MODELS=test/deepseek-inference/models
+make formers ARGS='--models test/codestral/models -p "Write quicksort in Python." -n 200'
+make formers-test
+make formers-smoke
+```
+
+`formers-cli` (alias `build-formers`) biên dịch `other/formers.n/` bằng BybyLang thành
+`other/formers.n/formers-cli`, không chạy model. `formers` build rồi mở chat với
+`--models $(FORMERS_MODELS)` (mặc định `test/codestral/models`); `ARGS` khác rỗng thì
+thay toàn bộ đối số. `formers-test` kiểm tra nhận diện kiến trúc mà không nạp trọng số;
+`formers-smoke` chạy một Llama ngẫu nhiên tí hon trên GPU. `formers-clean` xoá build của
+formers.n. Cách dùng và flag: [mục formers.n trong readme](../readme.vi.md#chạy-deepseek-hoặc-codestral-bằng-formersn-formers-cli).
+
+
 ## Python, C và BybyLang
 
 ```sh
@@ -280,7 +299,7 @@ make clean
 ```
 
 Target xóa các binary được liệt kê trong `CLEAN_BINS`, shared library,
-`nimcache/`, và các file `model_*.nimq` ở thư mục gốc. Danh sách hiện không
+`nimcache/`, các file `model_*.nimq` ở thư mục gốc và build của formers.n. Danh sách hiện không
 bao gồm `test/spectron/test_nimformer` do binary trainer nằm trong thư mục
 source, và không reset `test/spectron/models/finetune.nimq` hay tokenizer.
 Muốn bắt đầu một lần train Spectron mới, xem mục checkpoint trong

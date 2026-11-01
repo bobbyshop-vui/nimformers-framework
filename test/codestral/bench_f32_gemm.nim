@@ -63,7 +63,7 @@ proc main() =
     worst = max(worst, abs(float(yB[i] - y1[n + i])))
     scale = max(scale, abs(float(yB[i])))
   echo &"row0 vs gemv: max abs err {worst:.6g} (scale {scale:.4g})"
-  doAssert worst < 1e-3 * max(scale, 1.0), "batched fp32 GEMM khong khop GEMV"
+  doAssert worst < 1e-3 * max(scale, 1.0), "batched fp32 GEMM does not match the GEMV"
   # 4 block G sidecars each own a fresh 192 MiB buffer that the pipeline reads
   # exactly once per prefill. Time the first dispatch on a brand-new shared
   # buffer to see whether that first touch (page-in / wiring) is the real cost.

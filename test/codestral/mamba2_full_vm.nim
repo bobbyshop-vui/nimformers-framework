@@ -1,13 +1,13 @@
-## mamba2_full_vm.nim — forward + backward của CẢ lớp Mamba2 (mọi token) bằng micro-kernel.
-## Thay cho các vòng for b/t/c/h/d/n trên CPU trong mamba2_real.nim.
+## mamba2_full_vm.nim — forward + backward of the WHOLE Mamba2 layer (every token) with micro-kernels.
+## Replaces the CPU for loops over b/t/c/h/d/n in mamba2_real.nim.
 ##
-## Quy ước: 1 buffer float32 duy nhất (layout M2Lay), mỗi stage là 1 kernel.
-## Kernel "mỗi token = 1 threadgroup" (TG = M2Tg lane, lane lặp qua kênh bằng vòng FOR
-## trên GPU) -> địa chỉ tính bằng U[] (uint32) nên không dính giới hạn 2^24 của float32.
-## Gradient cộng dồn dùng OP_U_ATOMIC_ADD (MSL 3.0+, chỉ qua đường JIT) -> caller phải
-## để các vùng d* ở trạng thái 0 trước khi chạy (newSeq đã zero-init).
+## Convention: one single float32 buffer (layout M2Lay), each stage is one kernel.
+## "One token = one threadgroup" kernels (TG = M2Tg lanes, the lanes loop over channels with a FOR
+## on the GPU) -> addresses are computed in U[] (uint32), so the 2^24 float32 limit does not apply.
+## Accumulated gradients use OP_U_ATOMIC_ADD (MSL 3.0+, JIT path only) -> the caller must
+## leave the d* regions at 0 before running (newSeq zero-initialises).
 ##
-## Thứ tự dispatch (cùng buffer, tuần tự trong 1 session):
+## Dispatch order (same buffer, sequential in one session):
 ##   forward : (convSilu + dtSoftplus fused) -> scan -> rmsFwd
 ##   backward: rmsBwd -> scanBwd -> dtBwd -> convBwd
 
@@ -15,7 +15,7 @@ import std/bitops
 import session_vm
 import mamba2_vm_kernels
 
-const M2Tg* = 256            ## lane / threadgroup cho kernel conv/dt (<= mọi GPU)
+const M2Tg* = 256            ## lanes / threadgroup for the conv/dt kernels (<= every GPU)
 
 type
   M2Lay* = object
@@ -32,12 +32,12 @@ type
 
 proc m2Layout*(B, T, H, D, N, G, K, C: int; eps: float32;
                normGroups = 0): M2Lay =
-  ## Mọi offset TUYỆT ĐỐI (float32). proj row = [z(C) | xBC(cDim) | dt(H)], P = C+cDim+H.
+  ## Every offset is ABSOLUTE (float32). proj row = [z(C) | xBC(cDim) | dt(H)], P = C+cDim+H.
   var L: M2Lay
   L.B = B; L.T = T; L.H = H; L.D = D; L.N = N; L.G = G; L.K = K; L.C = C; L.eps = eps
   L.normGroups = if normGroups <= 0: G else: normGroups
   doAssert L.normGroups > 0 and C mod L.normGroups == 0,
-    "m2Layout: intermediateSize phai chia het gated RMSNorm groups"
+    "m2Layout: intermediateSize must be divisible by the gated RMSNorm groups"
   L.HD = H * D; L.GN = G * N; L.BT = B * T
   L.cDim = C + 2 * L.GN; L.P = C + L.cDim + H
   var o = 0
@@ -56,17 +56,17 @@ proc m2Layout*(B, T, H, D, N, G, K, C: int; eps: float32;
   take(L.dALog, H); take(L.dDSkip, H)
   take(L.dConvW, L.cDim * K); take(L.dConvB, L.cDim); take(L.dNormW, C)
   L.total = o
-  doAssert L.total < (1 shl 31), "m2Layout: buffer qua lon cho dia chi uint32/offset"
-  doAssert H mod G == 0 and C == L.HD, "m2Layout: C phai = H*D, H chia het G"
+  doAssert L.total < (1 shl 31), "m2Layout: buffer too large for uint32 addresses/offsets"
+  doAssert H mod G == 0 and C == L.HD, "m2Layout: C must = H*D, H divisible by G"
   result = L
 
 var gTgCap* = 1024
-  ## Số lane/threadgroup tối đa của GPU (kernel reduction PHẢI dispatch đúng tgSize, không được hạ âm thầm).
-  ## Intel Iris Plus 640 chỉ cho 256. mamba2_ssm_gpu.ensureTgCap() đặt giá trị này từ
-  ## maxTotalThreadsPerThreadgroup thật (hoặc env BYBY_RMS_TG) TRƯỚC khi build program.
+  ## Maximum lanes/threadgroup of the GPU (reduction kernels MUST dispatch exactly tgSize, no silent lowering).
+  ## Intel Iris Plus 640 allows only 256. mamba2_ssm_gpu.ensureTgCap() sets this from the
+  ## real maxTotalThreadsPerThreadgroup (or env BYBY_RMS_TG) BEFORE the programs are built.
 
 proc m2Tag*(L: M2Lay): string =
-  ## Dinh danh layout: moi program m2_* chi phu thuoc cac so nay -> dung lam tag '@...' (hash 1 lan).
+  ## Layout identity: every m2_* program depends only on these numbers -> used as the '@...' tag (hashed once).
   $L.B & "_" & $L.T & "_" & $L.H & "_" & $L.D & "_" & $L.N & "_" & $L.G & "_" & $L.K & "_" &
     $L.C & "_ng" & $L.normGroups & "_" & $L.eps & "_" &
     $min((L.C div L.normGroups) and (-(L.C div L.normGroups)), gTgCap)
@@ -118,7 +118,7 @@ proc buildM2ConvSiluProgram*(L: M2Lay): VmProgram =
   p.emitToken(L.T)
   p.emitUMulK(3, 0, uint32(P))                    # U3 = token*P
   p.emitUMulK(4, 0, uint32(cDim))                 # U4 = token*cDim
-  p.emitLoadConstF32(4, float32((cDim + M2Tg - 1) div M2Tg))   # số vòng e (HẰNG)
+  p.emitLoadConstF32(4, float32((cDim + M2Tg - 1) div M2Tg))   # number of e iterations (CONSTANT)
   p.emitLoadConstF32(5, 0.0'f32)                  # e
   p.emitLoadConstF32(12, float32(K - 1))
   p.emitLoadConstF32(13, float32(K))
@@ -130,11 +130,11 @@ proc buildM2ConvSiluProgram*(L: M2Lay): VmProgram =
       p.emitRToU(5, 6)                            # U5 = c
       p.emitULoadF32(8, 5, uint32(L.convB))       # acc = bias[c]
       p.emitUAdd(6, 3, 5); p.emitUAddK(6, 6, uint32(L.C))
-      p.emitUAddK(6, 6, uint32(0xFFFFFFFF'u32 - uint32((K - 1) * P) + 1))   # x ptr tại k=0
+      p.emitUAddK(6, 6, uint32(0xFFFFFFFF'u32 - uint32((K - 1) * P) + 1))   # x ptr at k=0
       p.emitUMulK(7, 5, uint32(K))                # w ptr
       p.emitAddConst(11, 2, 0.0'f32)              # R11 = t + k
       sessionVmForGpu(p, 13):
-        p.emitCmpLt(14, 11, 12)                   # t+k < K-1 -> tap ngoài biên
+        p.emitCmpLt(14, 11, 12)                   # t+k < K-1 -> tap outside the edge
         p.emitLoadConstF32(15, 1.0'f32); p.emitSub(15, 15, 14)
         sessionVmIfGpu(p, 15):
           p.emitULoadF32(9, 6, uint32(L.proj))
@@ -184,9 +184,9 @@ proc buildM2ConvDtProgram*(L: M2Lay): VmProgram =
   let dt = buildM2DtProgram(L)
   result.words.add(dt.words)
 
-# ── F3: selective scan, mọi timestep, 1 thread / (b,h,d) ─────
+# ── F3: selective scan, every timestep, 1 thread / (b,h,d) ─────
 proc emitDecodeBHD(p: var VmProgram; L: M2Lay) =
-  ## R0 = tid. Kết quả: U0=b, U1=hd, U2=h, U3=g.
+  ## R0 = tid. Result: U0=b, U1=hd, U2=h, U3=g.
   let hpg = L.H div L.G
   p.emitAddConst(1, 0, 0.5'f32); p.emitLoadConstF32(2, float32(L.HD)); p.emitDiv(1, 1, 2)
   p.emitRToU(0, 1)                                 # U0 = b
@@ -367,12 +367,12 @@ proc buildM2RmsFwdProgram*(L: M2Lay): VmProgram =
   emitTokenNormGroup(p, groups)
   p.emitULid(1)
   p.emitUToR(14, 1)                                # R14 = lid (float)
-  p.emitUMulK(4, 2, uint32(L.P))                   # U4 = token*P   (z nằm đầu hàng proj)
+  p.emitUMulK(4, 2, uint32(L.P))                   # U4 = token*P   (z is at the start of the proj row)
   p.emitUMulK(5, 2, uint32(C))                     # U5 = token*C
   p.emitUMulK(6, 3, uint32(groupLen))
   p.emitUAdd(5, 5, 6)                              # U5 = token*C + groupBase
   p.emitLoadConstF32(1, 0.0'f32)                   # sum gated^2
-  p.emitLoadConstF32(3, float32(ept))              # số vòng (HẰNG)
+  p.emitLoadConstF32(3, float32(ept))              # number of iterations (CONSTANT)
   p.emitLoadConstF32(4, 0.0'f32)
   sessionVmForGpu(p, 3):
     p.emitMulConst(7, 4, float32(tg)); p.emitAdd(7, 7, 14); p.emitRToU(8, 7)
@@ -388,7 +388,7 @@ proc buildM2RmsFwdProgram*(L: M2Lay): VmProgram =
     p.emitAddConst(4, 4, 1.0'f32)
   p.emitTgStoreF32(1, 14, 0); p.emitBarrierTg()
   p.emitTgTreeReduce(14, tg, 6, 7, 8, 9, 10)
-  p.emitLoadConstF32(11, 0.0'f32); p.emitTgLoadF32(13, 11, 0)                  # tổng
+  p.emitLoadConstF32(11, 0.0'f32); p.emitTgLoadF32(13, 11, 0)                  # total
   p.emitMulConst(13, 13, 1.0'f32 / float32(groupLen)); p.emitAddConst(13, 13, L.eps)
   p.emitRsqrt(13, 13)                                                          # r
   p.emitUStoreF32(13, 0, uint32(L.rms))
@@ -405,7 +405,7 @@ proc buildM2RmsFwdProgram*(L: M2Lay): VmProgram =
   p.emitHalt()
   result = p
 
-# ── B1: RMSNorm-gate backward theo token (dZ ghi thẳng vào dProj) ─
+# ── B1: per-token RMSNorm-gate backward (dZ written straight into dProj) ─
 proc buildM2RmsBwdProgram*(L: M2Lay): VmProgram =
   let groups = L.normGroups
   let groupLen = L.C div groups
@@ -467,7 +467,7 @@ proc buildM2RmsBwdProgram*(L: M2Lay): VmProgram =
   p.emitHalt()
   result = p
 
-# ── B2: selective-scan backward đọc/ghi thẳng buffer conv/dXBC ─
+# ── B2: selective-scan backward reading/writing the conv/dXBC buffers directly ─
 proc buildM2ScanBwdProgram*(L: M2Lay; nBeg = 0; nCnt = -1): VmProgram =
   buildMamba2BackwardFullAt(L.B, L.T, L.H, L.D, L.N, L.G,
     L.conv, L.conv + L.C, L.conv + L.C + L.GN, L.dt, L.aLog, L.dSkip,
@@ -512,7 +512,7 @@ proc buildM2ConvBwdProgram*(L: M2Lay): VmProgram =
     p.emitLoadConstF32(7, float32(cDim)); p.emitCmpLt(7, 6, 7)
     sessionVmIfGpu(p, 7):
       p.emitRToU(5, 6)                                       # U5 = c
-      # ── phần A: grad trọng số từ dPre của CHÍNH (token,c) ──
+      # ── part A: weight grads from the dPre of THIS (token,c) ──
       p.emitUAdd(6, 4, 5)                                    # U6 = token*cDim + c
       p.emitDPre(L.pre, L.dXBC, 6, 8, 9, 10, 11)             # R8 = dPre
       p.emitUAtomicAdd(8, 5, uint32(L.dConvB))
@@ -529,7 +529,7 @@ proc buildM2ConvBwdProgram*(L: M2Lay): VmProgram =
           p.emitUAtomicAdd(9, 8, uint32(L.dConvW))
         p.emitUAddK(7, 7, uint32(P)); p.emitUAddK(8, 8, 1)
         p.emitAddConst(11, 11, 1.0'f32)
-      # ── phần B: dX[token,c] = sum_k dPre(token+K-1-k, c) * w[c,k] (gather, không atomic) ──
+      # ── part B: dX[token,c] = sum_k dPre(token+K-1-k, c) * w[c,k] (gather, no atomics) ──
       p.emitUAdd(6, 4, 5); p.emitUAddK(6, 6, uint32((K - 1) * cDim))
       p.emitUMulK(7, 5, uint32(K))
       p.emitAddConst(11, 2, float32(K - 1))                  # R11 = t + (K-1) - k
@@ -547,9 +547,9 @@ proc buildM2ConvBwdProgram*(L: M2Lay): VmProgram =
   p.emitHalt()
   result = p
 
-# ── tiện ích: dst[i] += scale * src[i]  (thay vòng `for i: x[i] += delta[i]*s` của LoRA) ──
+# ── utility: dst[i] += scale * src[i]  (replaces LoRA's `for i: x[i] += delta[i]*s` loop) ──
 proc buildAxpyProgram*(offDst, offSrc: int; scale: float32): VmProgram =
-  ## grid = n thread, R0 = i. mem: dst ở offDst, src ở offSrc.
+  ## grid = n threads, R0 = i. mem: dst at offDst, src at offSrc.
   var p: VmProgram
   p.emitAddConst(1, 0, float32(offDst)); p.emitLoadF32Idx(2, 1)
   p.emitAddConst(3, 0, float32(offSrc)); p.emitLoadF32Idx(4, 3)
@@ -561,10 +561,10 @@ proc buildAxpyProgram*(offDst, offSrc: int; scale: float32): VmProgram =
 proc m2FwdTgBytes*(L: M2Lay): int = rmsTg(L) * 4
 
 # ═════════════════════════════════════════════════════════════
-# KERNEL TRAIN: RMSNorm, Linear++ (scan tuyến tính), softmax-CE, Adam gộp
+# TRAINING KERNELS: RMSNorm, Linear++ (linear scan), softmax-CE, fused Adam
 # ═════════════════════════════════════════════════════════════
 const
-  LpEps* = 1e-6'f32       ## PHẢI khớp LP_EPS trong test_nimformer.nim
+  LpEps* = 1e-6'f32       ## MUST match LP_EPS in test_nimformer.nim
   LpPhiTgMax* = 256
 
 # ═════════════════════════════════════════════════════════════
@@ -588,10 +588,10 @@ proc rmsLayout*(rows, C: int; eps: float32): RmsLay =
   L.total = o
   result = L
 
-proc rmsRowTg*(C: int): int = min(C and (-C), gTgCap)   ## luỹ thừa 2 lớn nhất chia hết C, <= giới hạn GPU
+proc rmsRowTg*(C: int): int = min(C and (-C), gTgCap)   ## the largest power of 2 dividing C, <= the GPU limit
 
 proc buildRmsFwdProgram*(L: RmsLay): VmProgram =
-  ## grid = rows * tg, tgSize = tg. Thread lid xử lý các cột lid, lid+tg, ...
+  ## grid = rows * tg, tgSize = tg. Thread lid handles columns lid, lid+tg, ...
   let C = L.C; let tg = rmsRowTg(C); let ept = C div tg
   var p: VmProgram
   p.emitUTgid(0); p.emitULid(1)
@@ -623,7 +623,7 @@ proc buildRmsFwdProgram*(L: RmsLay): VmProgram =
 
 proc buildRmsBwdProgram*(L: RmsLay): VmProgram =
   ## dX_j = r*g_j*dy_j - (r³/C) * x_j * Σ_c(dy_c*g_c*x_c);  dGamma_c += dy_c*x_c*r
-  ## dGamma cộng dồn bằng atomic -> vùng dGamma phải = 0 trước khi chạy.
+  ## dGamma is accumulated atomically -> the dGamma region must be 0 before running.
   let C = L.C; let tg = rmsRowTg(C); let ept = C div tg
   var p: VmProgram
   p.emitUTgid(0); p.emitULid(1)
@@ -664,20 +664,20 @@ proc buildRmsBwdProgram*(L: RmsLay): VmProgram =
   result = p
 
 # ═════════════════════════════════════════════════════════════
-# (2) Linear++ attention TUYẾN TÍNH theo T (scan), O(T·D²) / head — KHÔNG có ma trận T×T.
+# (2) Linear++ attention LINEAR in T (scan), O(T·D²) / head — NO T×T matrix.
 #   phi = ELU+1;  S_t = Σ_{j≤t} phi(k_j) ⊗ v_j  (D×D);  z_t = Σ_{j≤t} phi(k_j)
 #   y_t = phi(q_t)·S_t / (phi(q_t)·z_t + eps)
 #   Backward (g_t = dY_t*invDen_t, dDen_t = -(dY_t·y_t)*invDen_t):
-#     dqf_t[d] = Σ_e g_t[e] S_t[d,e] + dDen_t z_t[d]                (scan xuôi)
-#     dS_t = Σ_{i≥t} qf_i ⊗ g_i ;  dz_t = Σ_{i≥t} dDen_i qf_i       (scan ngược)
+#     dqf_t[d] = Σ_e g_t[e] S_t[d,e] + dDen_t z_t[d]                (forward scan)
+#     dS_t = Σ_{i≥t} qf_i ⊗ g_i ;  dz_t = Σ_{i≥t} dDen_i qf_i       (backward scan)
 #     dkf_t[d] = Σ_e dS_t[d,e] v_t[e] + dz_t[d] ; dv_t[e] = Σ_d dS_t[d,e] kf_t[d]
-# Trạng thái scan nằm trong buffer (mỗi thread một vùng riêng) -> không giới hạn thanh ghi.
+# The scan state lives in the buffer (one region per thread) -> no register limit.
 # ═════════════════════════════════════════════════════════════
 type
   LpLay* = object
     B*, T*, H*, D*, C*, BT*: int
     qkv*, phi*, y*, invDen*, dY*, dDen*, dQKV*: int
-    zF*, cF*, rQ*, zQ*, rK*, zK*, cV*: int      ## vùng trạng thái scan (khởi tạo 0)
+    zF*, cF*, rQ*, zQ*, rK*, zK*, cV*: int      ## scan state regions (initialised to 0)
     total*: int
 
 proc lpLayout*(B, T, H, D: int): LpLay =
@@ -687,13 +687,13 @@ proc lpLayout*(B, T, H, D: int): LpLay =
   template take(f: untyped; n: int) =
     f = o; o += n
   let BC = B * L.C
-  take(L.qkv, L.BT * 3 * L.C)      # [BT, 3C] = q | k | v  (đầu ra qkvProj)
+  take(L.qkv, L.BT * 3 * L.C)      # [BT, 3C] = q | k | v  (qkvProj output)
   take(L.phi, L.BT * 2 * L.C)      # [BT, 2C] = phi(q) | phi(k)
   take(L.y, L.BT * L.C)            # [BT, C]
   take(L.invDen, L.BT * H)         # [BT, H]
   take(L.dY, L.BT * L.C)           # [BT, C]
   take(L.dDen, L.BT * H)           # [BT, H]
-  take(L.dQKV, L.BT * 3 * L.C)     # [BT, 3C] gradient ra (dq | dk | dv) — GHI ĐÈ, không cần 0
+  take(L.dQKV, L.BT * 3 * L.C)     # [BT, 3C] output gradient (dq | dk | dv) — OVERWRITTEN, no zeroing needed
   take(L.zF, BC); take(L.cF, BC * D)
   take(L.rQ, BC * D); take(L.zQ, BC)
   take(L.rK, BC * D); take(L.zK, BC)
@@ -721,7 +721,7 @@ proc lpScanStateChunkSize*(D: int): int =
   result = min(max(D, 1), LpScanStateChunkMax)
 
 proc emitElu1(p: var VmProgram; rd, rs, rz, rc: uint32) =
-  ## rd = elu(rs)+1 = rs>0 ? rs+1 : exp(rs).  rd,rs,rz,rc phải khác nhau.
+  ## rd = elu(rs)+1 = rs>0 ? rs+1 : exp(rs).  rd,rs,rz,rc must all differ.
   p.emitExp(rd, rs)
   p.emitLoadConstF32(rz, 0.0'f32)
   p.emitCmpLt(rc, rz, rs)
@@ -737,7 +737,7 @@ proc emitEluGrad(p: var VmProgram; rd, rs, rz, rc: uint32) =
     p.emitLoadConstF32(rd, 1.0'f32)
 
 proc buildLpPhiProgram*(L: LpLay): VmProgram =
-  ## grid = BT * 2C phần tử; tgSize = lpPhiTg. phi[bt*2C + c'] = elu1(qkv[bt*3C + c'])
+  ## grid = BT * 2C elements; tgSize = lpPhiTg. phi[bt*2C + c'] = elu1(qkv[bt*3C + c'])
   let tg = lpPhiTg(L); let c2 = 2 * L.C; let nChunks = c2 div tg
   var p: VmProgram
   p.emitUTgid(0); p.emitULid(1)
@@ -768,7 +768,7 @@ proc emitDecodeBHX(p: var VmProgram; L: LpLay) =
   let D = L.D
   p.emitAddConst(1, 0, 0.5'f32); p.emitLoadConstF32(2, float32(D)); p.emitDiv(1, 1, 2)
   p.emitRToU(4, 1)                                  # U4 = bh
-  p.emitUToR(5, 4)                                  # R5 = bh (float, nguyên)
+  p.emitUToR(5, 4)                                  # R5 = bh (float, integral)
   p.emitMulConst(3, 5, float32(D)); p.emitSub(3, 0, 3)
   p.emitRToU(1, 3)                                  # U1 = x
   p.emitAddConst(4, 5, 0.5'f32); p.emitLoadConstF32(2, float32(L.H)); p.emitDiv(4, 4, 2)
@@ -787,7 +787,7 @@ proc emitLpDecode(p: var VmProgram; L: LpLay) =
 proc negStride(s: int): uint32 = uint32(0) - uint32(s)
 
 proc buildLpDenProgram*(L: LpLay): VmProgram =
-  ## 1 thread / (b,h). z += phi(k_t); invDen_t = 1/(phi(q_t)·z + eps). Quét xuôi theo t.
+  ## 1 thread / (b,h). z += phi(k_t); invDen_t = 1/(phi(q_t)·z + eps). Forward scan over t.
   let C = L.C; let D = L.D
   var p: VmProgram
   p.emitDecodeBH(L)
@@ -815,7 +815,7 @@ proc buildLpDenProgram*(L: LpLay): VmProgram =
   result = p
 
 proc buildLpFwdProgram*(L: LpLay): VmProgram =
-  ## 1 thread / (b,h,e): giữ cột S[:,e] (D phần tử) trong buffer; y_t[e] = invDen_t * Σ_d qf_t[d] S_t[d,e].
+  ## 1 thread / (b,h,e): keeps column S[:,e] (D elements) in the buffer; y_t[e] = invDen_t * Σ_d qf_t[d] S_t[d,e].
   let C = L.C; let D = L.D
   var p: VmProgram
   p.emitDecodeBHX(L)
@@ -1051,7 +1051,7 @@ proc buildLpDDenProgram*(L: LpLay): VmProgram =
   result = p
 
 proc buildLpBwdQProgram*(L: LpLay): VmProgram =
-  ## 1 thread / (b,h,d), quét XUÔI: giữ hàng S[d,:] và z[d]; ghi dQ_t[d] (đã nhân elu').
+  ## 1 thread / (b,h,d), FORWARD scan: keeps row S[d,:] and z[d]; writes dQ_t[d] (already times elu').
   let C = L.C; let D = L.D
   var p: VmProgram
   p.emitDecodeBHX(L)
@@ -1087,7 +1087,7 @@ proc buildLpBwdQProgram*(L: LpLay): VmProgram =
   result = p
 
 proc buildLpBwdKProgram*(L: LpLay): VmProgram =
-  ## 1 thread / (b,h,d), quét NGƯỢC: giữ hàng dS[d,:] và dz[d]; ghi dK_t[d] (đã nhân elu').
+  ## 1 thread / (b,h,d), BACKWARD scan: keeps row dS[d,:] and dz[d]; writes dK_t[d] (already times elu').
   let C = L.C; let D = L.D
   var p: VmProgram
   p.emitDecodeBHX(L)
@@ -1126,7 +1126,7 @@ proc buildLpBwdKProgram*(L: LpLay): VmProgram =
   result = p
 
 proc buildLpBwdVProgram*(L: LpLay): VmProgram =
-  ## 1 thread / (b,h,e), quét NGƯỢC: giữ cột dS[:,e]; ghi dV_t[e].
+  ## 1 thread / (b,h,e), BACKWARD scan: keeps column dS[:,e]; writes dV_t[e].
   let C = L.C; let D = L.D
   var p: VmProgram
   p.emitDecodeBHX(L)
@@ -1156,10 +1156,10 @@ proc buildLpBwdVProgram*(L: LpLay): VmProgram =
   result = p
 
 # ═════════════════════════════════════════════════════════════
-# (3) Softmax cross-entropy có mask: loss + dLogits trong 1 kernel / hàng
-#   target < 0 => bỏ qua (dLogits hàng = 0, loss hàng = 0).
+# (3) Masked softmax cross-entropy: loss + dLogits in one kernel per row
+#   target < 0 => skipped (row dLogits = 0, row loss = 0).
 #   dLogits = (softmax - onehot) * invN ;  loss_row = m + ln(Σexp(x-m)) - x_tgt
-#   (ln bằng Halley trên GPU vì VM không có opcode LOG)
+#   (ln through Halley iterations on the GPU because the VM has no LOG opcode)
 # ═════════════════════════════════════════════════════════════
 type
   CeLay* = object
@@ -1242,7 +1242,7 @@ proc buildCeProgram*(L: CeLay): VmProgram =
     p.emitSub(8, 8, 1); p.emitMul(8, 8, 7); p.emitMul(8, 8, 9)
     p.emitUStoreF32(8, 6, uint32(L.dLogits))
     p.emitAddConst(4, 4, 1.0'f32)
-  # ── loss_row = m + ln S - x_tgt  (ln S: Halley, 24 vòng) ──
+  # ── loss_row = m + ln S - x_tgt  (ln S: Halley, 24 iterations) ──
   p.emitLoadConstF32(1, 0.0'f32); p.emitLoadConstF32(4, 24.0'f32)
   sessionVmForGpu(p, 4):
     p.emitExp(2, 1)                                            # e = exp(y)
@@ -1269,9 +1269,9 @@ proc buildCeSumProgram*(L: CeLay): VmProgram =
   result = p
 
 # ═════════════════════════════════════════════════════════════
-# (4) Adam gộp 1 kernel (thay chuỗi ~14 phép be* rời):
+# (4) Adam fused into one kernel (replacing a chain of ~14 separate be* ops):
 #   m = b1 m + (1-b1) g ; v = b2 v + (1-b2) g² ; p -= lr * (m/bc1) / (sqrt(v/bc2) + eps)
-#   scal = [lr, 1/bc1, 1/bc2] đọc từ buffer => bytecode KHÔNG đổi theo step (không JIT lại).
+#   scal = [lr, 1/bc1, 1/bc2] read from the buffer => the bytecode does NOT change per step (no re-JIT).
 # ═════════════════════════════════════════════════════════════
 const AdamTg* = 256
 type
@@ -1280,7 +1280,7 @@ type
     p*, g*, m*, v*, scal*, total*: int
 
 proc adamLayout*(n: int): AdamLay =
-  doAssert n mod AdamTg == 0, "adamLayout: n phai chia het " & $AdamTg & " (pad phia host)"
+  doAssert n mod AdamTg == 0, "adamLayout: n must be a multiple of " & $AdamTg & " (pad on the host)"
   var L: AdamLay
   L.n = n
   var o = 0

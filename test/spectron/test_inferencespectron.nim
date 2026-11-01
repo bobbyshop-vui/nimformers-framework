@@ -1,6 +1,6 @@
 import std/[math, random, strformat, os, strutils, terminal]
 import backend
-import test_nimformer  # Import toàn bộ module test_nimformer
+import test_nimformer  # Imports the whole test_nimformer module
 
 # =============================================================================
 # CẤU HÌNH
@@ -68,7 +68,7 @@ when isMainModule:
   randomize(SEED)
   let ctx = newBackend()
 
-  # Load tokenizer từ test_nimformer
+  # Load the tokenizer from test_nimformer
   if not fileExists(BPE_TOKENIZER_PATH):
     stderr.writeLine("ERROR: Tokenizer file not found: " & BPE_TOKENIZER_PATH)
     quit(1)

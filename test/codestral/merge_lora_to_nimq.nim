@@ -1,22 +1,22 @@
 ## merge_lora_to_nimq.nim
-## Gop adapter LoRA + Attention (da train, luu trong <ckpt>.lora.json) VINH
-## VIEN vao base, roi QUANTIZE ra .nimq (fp4) DUY NHAT.
+## Merges the trained LoRA adapters + Attention (stored in <ckpt>.lora.json)
+## PERMANENTLY into the base, then QUANTIZES a SINGLE .nimq (fp4).
 ##
-## CAM .bin: KHONG doc .bin o input, KHONG ghi .bin o output, o BAT KY buoc
-## nao. Base (phan Mamba) TAI TAO 100% trong RAM tu chinh .nimq goc + pattern
-## (dung y het co che dequant-on-the-fly cua finetune_lora.nim/infer_lora.nim),
-## Attention (block moi, train full) nap tu ".lora.json" (khong co trong
-## .nimq goc), roi merge adapter LoRA vinh vien, cuoi cung quantize CA
-## Attention lan Mamba thanh 1 file .nimq output MOI. Input DUY NHAT can co:
-##   - <ckpt>.lora.json   (adapter + Attention da train, sinh ra tu finetune_lora.nim)
-##   - .nimq goc ma <ckpt>.lora.json tro toi (field "nimqPath" trong chinh no)
+## NO .bin: does NOT read a .bin as input or write a .bin as output, at ANY
+## step. The base (Mamba part) is REBUILT 100% in RAM from the original .nimq + the pattern
+## (the same dequant-on-the-fly mechanism as finetune_lora.nim/infer_lora.nim),
+## the Attention (new blocks, fully trained) is loaded from ".lora.json" (not in the
+## original .nimq), then the LoRA adapters are merged permanently, and finally BOTH
+## Attention and Mamba are quantized into one NEW output .nimq. The ONLY inputs needed:
+##   - <ckpt>.lora.json   (adapters + trained Attention, produced by finetune_lora.nim)
+##   - the original .nimq that <ckpt>.lora.json points to (its "nimqPath" field)
 ##
-## CACH BUILD:
+## BUILD:
 ##   nim c -d:release --hints:off -o:merge_lora_to_nimq merge_lora_to_nimq.nim
-## CACH DUNG:
+## USAGE:
 ##   ./merge_lora_to_nimq jamba_lora.bin jamba_lora_merged.nimq [--graft-quant int8|int4|fp4|fp8]
-## (tham so dau la TIEN TO ten checkpoint - chi de tim ra "<tien_to>.lora.json",
-##  KHONG phai duong dan toi 1 file .bin thuc su - file .bin do KHONG TON TAI).
+## (the first argument is the checkpoint name PREFIX - only used to find "<prefix>.lora.json",
+##  NOT the path of a real .bin file - that .bin file does NOT EXIST).
 
 import std/[os, strutils, strformat, json, tables]
 import quant
@@ -30,7 +30,7 @@ import backend
 let FP4_E2M1 = newCustomFloat(2, 1, "fp4_e2m1")
 
 const
-  # Phai KHOP CHINH XAC voi hang so cung ten trong finetune_lora.nim/infer_lora.nim.
+  # Must match EXACTLY the constants of the same name in finetune_lora.nim/infer_lora.nim.
   CFG_CODESTRAL_VOCAB = 32768
   CFG_CODESTRAL_HIDDEN = 4096
   CFG_CODESTRAL_NHEADS = 128
@@ -45,7 +45,7 @@ proc parseGraftQuant(s: string): QuantKind =
   of "int4": qkInt4
   of "fp4":  qkCustom
   of "fp8":  qkFp8E4M3
-  else: raise newException(ValueError, &"--graft-quant khong hop le: {s}")
+  else: raise newException(ValueError, &"invalid --graft-quant: {s}")
 
 const PrecisionSensitiveHints = ["embed", "norm", "gamma", "beta", ".bias"]
 
@@ -58,29 +58,29 @@ proc isPrecisionSensitive(name: string): bool =
 when isMainModule:
   if paramCount() < 2:
     echo "usage (LEGACY/UNSAFE): merge_lora_to_nimq <tien_to_checkpoint (co <tien_to>.lora.json canh ben)> <out.nimq> [--graft-quant int8|int4|fp4|fp8] [--unsafe-legacy-requant]"
-    echo "       CAM .bin: tham so dau CHI dung de tim <tien_to>.lora.json, KHONG doc file .bin nao."
+    echo "       NO .bin: the first argument is ONLY used to find <prefix>.lora.json, NO .bin file is read."
     quit(1)
 
   let ckptPrefix = paramStr(1)
   let outPath = paramStr(2)
-  # Tool nay CHI doc JSON legacy; khong the merge checkpoint NIMBIN4
-  # cua `finetune_lora.nim` hien tai. Mac dinh fail-closed de tranh tao .nimq
-  # bi requant Mamba toan bo -> token sai va mat LoRA delta.
+  # This tool reads ONLY legacy JSON; it cannot merge the NIMBIN4 checkpoints
+  # of the current `finetune_lora.nim`. Fail-closed by default to avoid producing a .nimq
+  # with the whole Mamba requantized -> wrong tokens and a lost LoRA delta.
   var unsafeLegacy = false
   for k in 3 .. paramCount():
     if paramStr(k) == "--unsafe-legacy-requant": unsafeLegacy = true
   if not unsafeLegacy:
-    stderr.writeLine "[merge] SAFE STOP: tool nay chi ho tro .lora.json legacy, " &
-      "khong doc checkpoint NIMBIN4 .bin hien tai; no con requant Mamba ve FP4."
-    stderr.writeLine "[merge] KHONG tao merged .nimq vi co nguy co mat delta LoRA " &
-      "va lam model sinh token sai. BYBY_MERGE_LORA=1 trong infer_lora.nim " &
-      "co quality guard va fallback ve fused adapter."
-    stderr.writeLine "[merge] Neu buoc phai chay tool JSON cu, " &
-      "dung --unsafe-legacy-requant (KHONG dung voi .bin hien tai)."
+    stderr.writeLine "[merge] SAFE STOP: this tool only supports legacy .lora.json, " &
+      "it does not read current NIMBIN4 .bin checkpoints, and it would requantize Mamba to FP4."
+    stderr.writeLine "[merge] NOT creating a merged .nimq because the LoRA delta could be lost " &
+      "and the model would generate wrong tokens. BYBY_MERGE_LORA=1 in infer_lora.nim " &
+      "has a quality guard and falls back to the fused adapter."
+    stderr.writeLine "[merge] If you must run the old JSON tool, " &
+      "use --unsafe-legacy-requant (NOT with current .bin files)."
     quit(1)
   if ckptPrefix.toLowerAscii.endsWith(".bin") and fileExists(ckptPrefix):
-    stderr.writeLine "[merge] STOP: input la checkpoint .bin, " &
-      "nhung tool nay KHONG biet doc .bin. Khong duoc merge JSON thay the."
+    stderr.writeLine "[merge] STOP: the input is a .bin checkpoint, " &
+      "but this tool CANNOT read .bin. Merging the JSON instead is not allowed."
     quit(1)
   var graftQuantStr = "int8"
   var i = 3
@@ -94,13 +94,13 @@ when isMainModule:
 
   let loraJsonPath = ckptPrefix & ".lora.json"
   if not fileExists(loraJsonPath):
-    echo &"[merge] LOI: khong tim thay {loraJsonPath}"
+    echo &"[merge] ERROR: {loraJsonPath} not found"
     quit(1)
   let j = parseFile(loraJsonPath)
   let nimqPath = j["nimqPath"].getStr
   let pattern = j["pattern"].getStr
 
-  echo &"[merge] Tai tao base tu {nimqPath} (dequant on-the-fly qua LUT, pattern='{pattern}') - KHONG doc .bin nao ..."
+  echo &"[merge] Rebuilding the base from {nimqPath} (dequant on the fly through the LUT, pattern='{pattern}') - NO .bin is read ..."
   var m = newNimformerModelJamba(CFG_CODESTRAL_VOCAB, CFG_CODESTRAL_HIDDEN, CFG_CODESTRAL_NHEADS,
                                   ffMult = 4, pattern = pattern, useSession = true,
                                   mambaRealDState = CFG_CODESTRAL_DSTATE,
@@ -117,7 +117,7 @@ when isMainModule:
     var idx = 0
     for x in v.items: byName[name][].data[idx] = x.getFloat.float32; inc idx
     inc nAttnW
-  echo &"[merge] Da nap {nAttnW} tensor Linear++ Attention (block moi, train full) tu {loraJsonPath}"
+  echo &"[merge] Loaded {nAttnW} Linear++ Attention tensors (new blocks, fully trained) from {loraJsonPath}"
 
   var lo: JambaLora
   lo.adapters = initTable[string, LoraAdapter]()
@@ -136,27 +136,27 @@ when isMainModule:
     idx = 0
     for x in v["B"].items: ad.B.data[idx] = x.getFloat.float32; inc idx
     lo.adapters[name] = ad
-  lo.quantBase = quantResident   # inProj/outProj (quant-resident, ~29GB neu dequant het)
-                                  # - mergeIn se tu dequant qua LUT dung luc can, ghi thang
-                                  # vao t[].data (permanent, vi tool nay KHONG goi restoreBase).
+  lo.quantBase = quantResident   # inProj/outProj (quant-resident, ~29GB if fully dequantized)
+                                  # - mergeIn dequantizes through the LUT when needed and writes directly
+                                  # into t[].data (permanent, because this tool does NOT call restoreBase).
 
   let ctx = newBackend()
-  echo &"[merge] Gop vinh vien {lo.adapters.len} adapter LoRA vao base (W_eff = W_base + (alpha/r)*B@A) ..."
-  mergeIn(m, lo, ctx)   # KHONG goi restoreBase - giu merged permanent
+  echo &"[merge] Permanently merging {lo.adapters.len} LoRA adapters into the base (W_eff = W_base + (alpha/r)*B@A) ..."
+  mergeIn(m, lo, ctx)   # restoreBase is NOT called - keeps the merge permanent
 
-  # FIX: outProj.weight (lm_head) nam trong lo.quantBase nhung KHONG nam trong
-  # lo.adapters (khong LoRA-hoa) nen mergeIn() KHONG dequant no. Phai dequant
-  # tai day, neu khong thi m.outProj.weight.data van la @[] va quantize ra rong.
+  # FIX: outProj.weight (lm_head) is in lo.quantBase but NOT in
+  # lo.adapters (not LoRA-ised), so mergeIn() does NOT dequantize it. It must be dequantized
+  # here, otherwise m.outProj.weight.data stays @[] and quantizes to nothing.
   if m.outProj.weight.data.len == 0 and "outProj.weight" in lo.quantBase:
     echo "[merge] Dequantize lm_head (outProj.weight) tu quantBase ..."
     m.outProj.weight.data = quant.dequantizeTensor(lo.quantBase["outProj.weight"])
 
-  echo "[merge] Quantize toan bo model (Mamba + Attention, da merge LoRA) -> .nimq ..."
+  echo "[merge] Quantizing the whole model (Mamba + Attention, LoRA merged) -> .nimq ..."
   var sd: seq[(string, QuantTensor)] = @[]
   var nFp4, nFp32, nGraft = 0
   for (name, t) in paramList(m):
     var qt: QuantTensor
-    let isAttnNew = ".attn." in name   # tensor Linear++ Attention - KHONG co trong .nimq HF goc
+    let isAttnNew = ".attn." in name   # Linear++ Attention tensor - NOT in the original HF .nimq
     if isPrecisionSensitive(name):
       qt = quantizeTensor(t[].data, t[].shape, qkFp32Raw)
       inc nFp32
@@ -170,7 +170,7 @@ when isMainModule:
 
   let arch = [CFG_CODESTRAL_VOCAB, CFG_CODESTRAL_HIDDEN, m.blocks.len, CFG_CODESTRAL_NHEADS, CFG_CODESTRAL_EXPAND]
   saveQuantStateDict(outPath, arch, sd)
-  echo &"[merge] Da ghi {outPath} ({sd.len} tensor, fp4(Mamba)={nFp4} fp32={nFp32} " &
-       &"{graftQuantStr}(Attention-moi)={nGraft}). KHONG co file .bin nao duoc tao ra."
-  echo "[merge] File nay dung duoc thang cho nim_inference.nim, hoac lam CFG_NIMQ_PATH " &
-       "cho lan finetune_lora.nim tiep theo - da co san Linear++ Attention, da gop LoRA."
+  echo &"[merge] Wrote {outPath} ({sd.len} tensors, fp4(Mamba)={nFp4} fp32={nFp32} " &
+       &"{graftQuantStr}(new Attention)={nGraft}). NO .bin file was created."
+  echo "[merge] This file can be used directly by nim_inference.nim, or as CFG_NIMQ_PATH " &
+       "for the next finetune_lora.nim run - it already has the Linear++ Attention and the merged LoRA."

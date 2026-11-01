@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-verify_gptq_dequant.py - Kiểm chứng công thức dequantize_gptq_torch_mps
-bằng cách so sánh với auto_gptq THẬT (ground truth) trên 1 tensor nhỏ.
+verify_gptq_dequant.py - Checks the dequantize_gptq_torch_mps formula
+by comparing it with the REAL auto_gptq (ground truth) on one small tensor.
 
-Chạy: python3.10 verify_gptq_dequant.py --model TheBloke/deepseek-coder-6.7B-instruct-GPTQ
+Run: python3.10 verify_gptq_dequant.py --model TheBloke/deepseek-coder-6.7B-instruct-GPTQ
 
-In ra sai số max/mean giữa 2 cách tính. Nếu sai số ~0 (< 1e-3) -> công thức
-đúng, bug nằm ở chỗ khác (RoPE/attention/embedding/...). Nếu sai số lớn ->
-xác nhận đúng là công thức dequant sai, cần sửa tiếp ở đó.
+Prints the max/mean error between the two computations. If the error is ~0 (< 1e-3) the formula
+is right and the bug is elsewhere (RoPE/attention/embedding/...). If the error is large,
+the dequant formula is confirmed wrong and needs more work there.
 """
 import argparse
 import torch
@@ -45,18 +45,18 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--layer", default="model.layers.0.self_attn.q_proj",
-                     help="tên layer GPTQ để test (không có prefix model. lặp lại)")
+                     help="GPTQ layer name to test (without the repeated model. prefix)")
     args = ap.parse_args()
 
     from auto_gptq import AutoGPTQForCausalLM
-    print(f"Loading {args.model} (CPU, có thể mất vài phút)...")
+    print(f"Loading {args.model} (CPU, may take a few minutes)...")
     model = AutoGPTQForCausalLM.from_quantized(
         args.model, device="cpu", use_triton=False, use_safetensors=True,
         trust_remote_code=True, disable_exllama=True, use_exllama=False,
         use_exllamav2=False, use_qigen=False, torch_dtype=torch.float16,
     )
 
-    # Tìm đúng module GPTQ theo tên layer yêu cầu
+    # Find the GPTQ module for the requested layer name
     target = None
     target_name = None
     for name, module in model.named_modules():
@@ -65,7 +65,7 @@ def main():
             target_name = name
             break
     if target is None:
-        print(f"Không tìm thấy layer chứa '{args.layer}'. Các layer GPTQ có sẵn:")
+        print(f"No layer containing '{args.layer}'. Available GPTQ layers:")
         for name, module in model.named_modules():
             if hasattr(module, "qweight"):
                 print(" -", name)
@@ -89,7 +89,7 @@ def main():
         target.bias.data = saved_bias
     weight_true = out_true.t().contiguous().to(torch.float32)  # [out_features, in_features]
 
-    # ===== Công thức tự viết (torch, không numpy) =====
+    # ===== Hand-written formula (torch, no numpy) =====
     weight_mine = dequantize_gptq_torch_mps(
         target.qweight.detach(), target.qzeros.detach(),
         target.scales.detach(), target.g_idx.detach(), device="cpu",
@@ -103,9 +103,9 @@ def main():
     print(f"weight_mine sample [0,:8]: {weight_mine[0,:8].tolist()}")
 
     if diff.max().item() < 1e-2:
-        print("\n✅ KHỚP - công thức dequant ĐÚNG. Bug nằm ở chỗ khác (RoPE/attention/embedding/lm_head/...).")
+        print("\n✅ MATCH - the dequant formula is RIGHT. The bug is elsewhere (RoPE/attention/embedding/lm_head/...).")
     else:
-        print("\n❌ SAI - công thức dequant còn lỗi, cần sửa tiếp ở dequantize_gptq_torch_mps.")
+        print("\n❌ WRONG - the dequant formula is still broken, fix dequantize_gptq_torch_mps.")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,220 @@
+# formers.n — command-line options, llama.cpp style.
+#
+#   formers-cli --models <dir> -p "prompt" -n 128 --temp 0.7 --ngl 99
+#
+# Every flag also accepts the "--flag=value" form.
+
+import nim "std/[os, strutils]"
+
+type
+  FmOptions* = object
+    modelsDir*, modelFile*, loraFile*, configFile*, tokenizerDir*: string
+    noLora*, noMergeLora*: bool
+    prompt*, systemText*: string
+    rawPrompt*: bool
+    nPredict*: int
+    temperature*, topP*, minP*, repeatPenalty*: float32
+    repeatLastN*: int
+    seed*: int64
+    ngl*: int                     ## -1 = every layer on the GPU
+    backend*: string
+    showProgress*, detectOnly*, showHelp*: bool
+    conversation*: bool           ## chat: "> " turns, context kept between turns
+    ctxSize*: int                 ## KV capacity in tokens; 0 = automatic
+    promptSet*, nPredictSet*: bool
+    noWarmup*: bool               ## skip the startup warmup run
+    verbose*: bool                ## show the library logs (loader, JIT, kernels, profiles)
+    errors*: seq[string]
+
+const FmDefaultPrompt = "Write a Python function to return the n-th Fibonacci number."
+
+function fmDefaultOptions(): FmOptions
+    result.prompt = FmDefaultPrompt
+    result.nPredict = 128
+    result.temperature = 0.7'f32
+    result.topP = 0.9'f32
+    result.minP = 0.05'f32
+    result.repeatPenalty = 1.0'f32
+    result.repeatLastN = 64
+    result.seed = -1
+    result.ngl = -1
+    result.backend = "auto"
+    result.showProgress = true
+
+function fmUsage(): string
+    var lines: seq[string]
+    lines.add("formers-cli - DeepSeek/Llama and Codestral (Mamba-2) inference on nimformers + BybyLang")
+    lines.add("")
+    lines.add("Usage: formers-cli --models <dir> [options]")
+    lines.add("")
+    lines.add("Model:")
+    lines.add("  --models DIR           directory with the .nimq, config.json, tokenizer, LoRA .bin")
+    lines.add("  -m, --model FILE       .nimq file (default: found in --models)")
+    lines.add("  --lora FILE            LoRA adapter .bin (NIMBIN1/NIMBIN4) for Mamba-2")
+    lines.add("  --no-lora              ignore a LoRA found in --models")
+    lines.add("  --no-merge-lora        keep the LoRA adapters separate (default: merged into the weights)")
+    lines.add("  --config FILE          config.json (default: found automatically)")
+    lines.add("  --tokenizer DIR        tokenizer directory (default: found automatically)")
+    lines.add("")
+    lines.add("Generation:")
+    lines.add("  -p, --prompt TEXT      prompt")
+    lines.add("  -f, --file FILE        read the prompt from a file")
+    lines.add("  --system TEXT          system prompt (chat template)")
+    lines.add("  --raw-prompt           do not apply the chat template")
+    lines.add("  -n, --n-predict N      maximum tokens to generate (default 128)")
+    lines.add("  --temp T               temperature (default 0.7; 0 = greedy)")
+    lines.add("  --top-p P              nucleus sampling (default 0.9; 1 = off)")
+    lines.add("  --min-p P              min-p (default 0.05; 0 = off)")
+    lines.add("  --repeat-penalty R     repetition penalty (default 1.0 = off)")
+    lines.add("  --repeat-last-n N      repetition penalty window (default 64)")
+    lines.add("  -s, --seed N           sampling seed (default: random)")
+    lines.add("")
+    lines.add("Chat (like llama-cli):")
+    lines.add("  -cnv, --conversation   multi-turn chat, context (KV/state) kept between turns")
+    lines.add("  -i, --interactive      same as -cnv")
+    lines.add("                         in chat -p is the system prompt; -n limits each reply")
+    lines.add("  -c, --ctx-size N       context (KV) size in tokens (Llama chat default 1024)")
+    lines.add("                         type /exit to quit; Ctrl+C stops a reply, Ctrl+C at the prompt quits;")
+    lines.add("                         end a line with \\ to continue on the next line")
+    lines.add("")
+    lines.add("Device:")
+    lines.add("  --backend NAME         auto | metal | vulkan | cuda (= vulkan)")
+    lines.add("  -ngl, --ngl, --n-gpu-layers N")
+    lines.add("                         layers on the GPU (default: all)")
+    lines.add("")
+    lines.add("Other:")
+    lines.add("  --no-progress          no tok/s in the terminal window title")
+    lines.add("  --no-warmup            skip the startup warmup (GPU pipeline compile) before the first prompt")
+    lines.add("  -v, --verbose          show every log line (loader, JIT, kernel tuning, profiles); default: quiet")
+    lines.add("  --detect-only          detect the architecture and exit")
+    lines.add("  -h, --help             show this help")
+    result = lines.join("\n")
+
+function fmOptValue(args: seq[string], i: var int, flag: string, inlineVal: string, hasInline: bool, errors: var seq[string]): string
+    if hasInline:
+        return inlineVal
+    if i + 1 >= args.len:
+        errors.add("missing value for " & flag)
+        return ""
+    inc i
+    result = args[i]
+
+function fmToInt(s, flag: string, errors: var seq[string]): int
+    try:
+        result = parseInt(s.strip())
+    except ValueError:
+        errors.add(flag & ": '" & s & "' is not an integer")
+
+function fmToFloat(s, flag: string, errors: var seq[string]): float32
+    try:
+        result = parseFloat(s.strip()).float32
+    except ValueError:
+        errors.add(flag & ": '" & s & "' is not a number")
+
+function fmParseOptions(args: seq[string]): FmOptions
+    result = fmDefaultOptions()
+    var i = 0
+    while i < args.len:
+        var flag = args[i]
+        var inlineVal = ""
+        var hasInline = false
+        if flag.startsWith("--") and flag.contains('='):
+            inlineVal = flag[flag.find('=') + 1 .. ^1]
+            flag = flag[0 ..< flag.find('=')]
+            hasInline = true
+        case flag
+        of "--models", "--model-dir":
+            result.modelsDir = fmOptValue(args, i, flag, inlineVal, hasInline, result.errors)
+        of "-m", "--model":
+            result.modelFile = fmOptValue(args, i, flag, inlineVal, hasInline, result.errors)
+        of "--lora":
+            result.loraFile = fmOptValue(args, i, flag, inlineVal, hasInline, result.errors)
+        of "--no-lora":
+            result.noLora = true
+        of "--no-merge-lora":
+            result.noMergeLora = true
+        of "--config":
+            result.configFile = fmOptValue(args, i, flag, inlineVal, hasInline, result.errors)
+        of "--tokenizer":
+            result.tokenizerDir = fmOptValue(args, i, flag, inlineVal, hasInline, result.errors)
+        of "-p", "--prompt":
+            result.prompt = fmOptValue(args, i, flag, inlineVal, hasInline, result.errors)
+            result.promptSet = true
+        of "-f", "--file":
+            let path = fmOptValue(args, i, flag, inlineVal, hasInline, result.errors)
+            if fileExists(path):
+                result.prompt = readFile(path)
+                result.promptSet = true
+            else:
+                result.errors.add(flag & ": file not found: " & path)
+        of "--system", "-sys":
+            result.systemText = fmOptValue(args, i, flag, inlineVal, hasInline, result.errors)
+        of "--raw-prompt":
+            result.rawPrompt = true
+        of "-n", "--n-predict", "--predict":
+            result.nPredict = fmToInt(fmOptValue(args, i, flag, inlineVal, hasInline, result.errors), flag, result.errors)
+            result.nPredictSet = true
+        of "--temp", "--temperature":
+            result.temperature = fmToFloat(fmOptValue(args, i, flag, inlineVal, hasInline, result.errors), flag, result.errors)
+        of "--top-p":
+            result.topP = fmToFloat(fmOptValue(args, i, flag, inlineVal, hasInline, result.errors), flag, result.errors)
+        of "--min-p":
+            result.minP = fmToFloat(fmOptValue(args, i, flag, inlineVal, hasInline, result.errors), flag, result.errors)
+        of "--repeat-penalty":
+            result.repeatPenalty = fmToFloat(fmOptValue(args, i, flag, inlineVal, hasInline, result.errors), flag, result.errors)
+        of "--repeat-last-n":
+            result.repeatLastN = fmToInt(fmOptValue(args, i, flag, inlineVal, hasInline, result.errors), flag, result.errors)
+        of "-s", "--seed":
+            result.seed = fmToInt(fmOptValue(args, i, flag, inlineVal, hasInline, result.errors), flag, result.errors).int64
+        of "--backend":
+            result.backend = fmOptValue(args, i, flag, inlineVal, hasInline, result.errors).toLowerAscii()
+        of "-ngl", "--ngl", "--n-gpu-layers", "--gpu-layers":
+            result.ngl = fmToInt(fmOptValue(args, i, flag, inlineVal, hasInline, result.errors), flag, result.errors)
+        of "--no-progress":
+            result.showProgress = false
+        of "--no-warmup":
+            result.noWarmup = true
+        of "-v", "--verbose":
+            result.verbose = true
+        of "--progress":
+            result.showProgress = true
+        of "-cnv", "--conversation", "-i", "--interactive", "--chat":
+            result.conversation = true
+        of "-c", "--ctx-size":
+            result.ctxSize = fmToInt(fmOptValue(args, i, flag, inlineVal, hasInline, result.errors), flag, result.errors)
+        of "--detect-only", "--dry-run":
+            result.detectOnly = true
+        of "-h", "--help":
+            result.showHelp = true
+        else:
+            result.errors.add("unknown option: " & args[i])
+        inc i
+    # Validation
+    if result.modelsDir.len == 0 and result.modelFile.len > 0:
+        result.modelsDir = parentDir(result.modelFile)
+    if result.modelsDir.len == 0 and not result.showHelp:
+        result.errors.add("--models <dir> (or -m <file.nimq>) is required")
+    # llama.cpp conversation mode: -p is the system prompt, -n limits each reply.
+    if result.conversation:
+        if result.promptSet and result.systemText.len == 0:
+            result.systemText = result.prompt
+        if not result.nPredictSet:
+            result.nPredict = 512
+    if result.ctxSize < 0:
+        result.errors.add("--ctx-size must be >= 0")
+    if result.nPredict < 1:
+        result.errors.add("--n-predict must be >= 1")
+    if result.temperature < 0:
+        result.errors.add("--temp must be >= 0")
+    if result.topP <= 0 or result.topP > 1:
+        result.errors.add("--top-p must be in (0, 1]")
+    if result.minP < 0 or result.minP >= 1:
+        result.errors.add("--min-p must be in [0, 1)")
+    if result.repeatPenalty <= 0:
+        result.errors.add("--repeat-penalty must be > 0")
+    if result.repeatLastN < 0:
+        result.errors.add("--repeat-last-n must be >= 0")
+    if result.ngl < -1:
+        result.errors.add("--ngl must be >= 0 (or -1 = all)")
+    if result.backend notin ["auto", "metal", "vulkan", "cuda"]:
+        result.errors.add("invalid --backend: " & result.backend)

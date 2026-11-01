@@ -1,0 +1,142 @@
+# formers.n — header-only readers for .nimq weights and LoRA .bin adapters.
+#
+# Architecture detection needs only tensor names/shapes and adapter metadata,
+# so these readers seek past every payload: a 4-5 GB checkpoint is identified
+# after reading a few hundred KB.
+#
+# .nimq (quant.nim saveQuantStateDict):
+#   string magic ("NIMQ2" | "NIMQ3" + int32 align, padded to align)
+#   int32[5] arch, int32 n, then n x (string name, uint8 kind, int32 ndims,
+#   int32[ndims] shape, int32 nScales, f32[nScales] scale, f32[nScales] zero,
+#   int32 groupSize, int32 eb, int32 mb, int32 nBytes, [pad], bytes)
+# LoRA .bin (rawbin.nim / quantize_lora_bin_4bit.nim):
+#   8 byte magic "NIMBIN1\0" | "NIMBIN4\0", int32 nMeta, nMeta x (key, value)
+
+import nim "std/[os, tables, strutils]"
+
+type
+  FmTensorInfo* = object
+    name*: string
+    kind*: int                  ## quant.QuantKind ordinal
+    shape*: seq[int]
+    groupSize*: int
+  FmNimqHeader* = object
+    path*, magic*: string
+    payloadAlign*: int
+    arch*: array[5, int]
+    tensors*: seq[FmTensorInfo]
+  FmLoraHeader* = object
+    path*, magic*: string
+    meta*: Table[string, string]
+
+const FmLoraMagics = ["NIMBIN1\0", "NIMBIN4\0"]
+
+function fmReadI32(f: File, path: string): int
+    var v: int32
+    if f.readBuffer(addr v, 4) != 4:
+        raise newException(IOError, "truncated header: " & path)
+    result = int(v)
+
+function fmReadStr(f: File, path: string): string
+    let n = fmReadI32(f, path)
+    if n < 0 or n > (1 shl 24):
+        raise newException(IOError, "invalid string length in header: " & path)
+    result = newString(n)
+    if n > 0 and f.readBuffer(addr result[0], n) != n:
+        raise newException(IOError, "truncated header: " & path)
+
+function fmSkip(f: File, nBytes: int64)
+    f.setFilePos(f.getFilePos() + nBytes)
+
+function fmReadNimqHeader(path: string): FmNimqHeader
+    var f: File
+    if not open(f, path, fmRead):
+        raise newException(IOError, "cannot open " & path)
+    defer: close(f)
+    let fileSize = getFileSize(f)
+    result.path = path
+    result.magic = fmReadStr(f, path)
+    if result.magic == "NIMQ3":
+        result.payloadAlign = fmReadI32(f, path)
+        if result.payloadAlign <= 13 or result.payloadAlign > (1 shl 24):
+            raise newException(IOError, "invalid NIMQ3 payload alignment: " & path)
+        f.setFilePos(result.payloadAlign)
+    elif result.magic != "NIMQ2":
+        raise newException(IOError, "not a .nimq file (magic '" & result.magic & "'): " & path)
+    for i in 0 ..< 5:
+        result.arch[i] = fmReadI32(f, path)
+    let n = fmReadI32(f, path)
+    if n < 0 or n > 1_000_000:
+        raise newException(IOError, "invalid tensor count: " & path)
+    for i in 0 ..< n:
+        var t: FmTensorInfo
+        t.name = fmReadStr(f, path)
+        var kindByte: uint8
+        if f.readBuffer(addr kindByte, 1) != 1:
+            raise newException(IOError, "truncated header: " & path)
+        t.kind = int(kindByte)
+        let nd = fmReadI32(f, path)
+        if nd < 0 or nd > 8:
+            raise newException(IOError, "invalid tensor rank (" & t.name & "): " & path)
+        for d in 0 ..< nd:
+            t.shape.add(fmReadI32(f, path))
+        let nScales = fmReadI32(f, path)
+        fmSkip(f, int64(nScales) * 8)
+        t.groupSize = fmReadI32(f, path)
+        fmSkip(f, 8)
+        let nBytes = fmReadI32(f, path)
+        if result.payloadAlign > 1:
+            let pos = f.getFilePos()
+            let pad = (result.payloadAlign - int(pos mod result.payloadAlign)) mod result.payloadAlign
+            fmSkip(f, pad)
+        fmSkip(f, nBytes)
+        if f.getFilePos() > fileSize:
+            raise newException(IOError, "tensor " & t.name & " runs past the end of the file: " & path)
+        result.tensors.add(t)
+
+function fmIsLoraBin(path: string): bool
+    var f: File
+    if not open(f, path, fmRead):
+        return false
+    defer: close(f)
+    var magic = newString(8)
+    result = f.readBuffer(addr magic[0], 8) == 8 and magic in FmLoraMagics
+
+function fmReadLoraHeader(path: string): FmLoraHeader
+    var f: File
+    if not open(f, path, fmRead):
+        raise newException(IOError, "cannot open " & path)
+    defer: close(f)
+    result.path = path
+    result.magic = newString(8)
+    if f.readBuffer(addr result.magic[0], 8) != 8 or result.magic notin FmLoraMagics:
+        raise newException(IOError, "not a LoRA .bin (NIMBIN1/NIMBIN4): " & path)
+    result.meta = initTable[string, string]()
+    let nMeta = fmReadI32(f, path)
+    if nMeta < 0 or nMeta > 1_000_000:
+        raise newException(IOError, "invalid metadata count: " & path)
+    for i in 0 ..< nMeta:
+        let key = fmReadStr(f, path)
+        result.meta[key] = fmReadStr(f, path)
+
+function fmShapeIndex(h: FmNimqHeader): Table[string, seq[int]]
+    result = initTable[string, seq[int]]()
+    for t in h.tensors:
+        result[t.name] = t.shape
+
+function fmLayerCount(h: FmNimqHeader, prefix: string): int
+    ## Number of consecutive layers "prefix<N>." starting at 0.
+    var seen = initTable[int, bool]()
+    for t in h.tensors:
+        if t.name.startsWith(prefix):
+            let rest = t.name[prefix.len .. ^1]
+            let dot = rest.find('.')
+            if dot > 0:
+                try:
+                    seen[parseInt(rest[0 ..< dot])] = true
+                except ValueError:
+                    discard
+    while result in seen:
+        inc result
+    if seen.len != result:
+        result = -seen.len

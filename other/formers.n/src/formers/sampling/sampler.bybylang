@@ -1,0 +1,95 @@
+# formers.n — token sampler shared by every model.
+#
+# Order: banned ids -> repeat penalty over the last N ids -> temperature ->
+# min-p (relative to the best token) -> top-p -> draw. temperature 0 is
+# greedy. NaN/Inf logits are treated as -inf so one bad value cannot select
+# the last vocabulary id.
+
+import nim "std/[random, algorithm, math, sets]"
+import "../cli/options.bybylang"
+
+type
+  FmSampler* = object
+    temperature*, topP*, minP*, repeatPenalty*: float32
+    repeatLastN*: int
+    banned*, noPenalty*: seq[bool]
+    rng*: Rand
+
+const FmNegInf = -3.0e38'f32
+
+function fmNewSampler(opts: FmOptions, vocab: int): FmSampler
+    result.temperature = opts.temperature
+    result.topP = opts.topP
+    result.minP = opts.minP
+    result.repeatPenalty = opts.repeatPenalty
+    result.repeatLastN = opts.repeatLastN
+    result.banned = newSeq[bool](vocab)
+    result.noPenalty = newSeq[bool](vocab)
+    if opts.seed >= 0:
+        result.rng = initRand(opts.seed)
+    else:
+        result.rng = initRand()
+
+function fmSamplerSummary(s: FmSampler): string
+    var nBanned = 0
+    for b in s.banned:
+        if b:
+            inc nBanned
+    result = "temp=" & $s.temperature & " top_p=" & $s.topP & " min_p=" & $s.minP & " repeat_penalty=" & $s.repeatPenalty & "/" & $s.repeatLastN & " banned=" & $nBanned
+
+function fmSample(s: var FmSampler, logits: openArray[float32], history: openArray[int]): int
+    let vocab = min(logits.len, s.banned.len)
+    var adj = newSeq[float32](vocab)
+    for i in 0 ..< vocab:
+        let v = logits[i]
+        if s.banned[i] or v.isNaN or v.classify in {fcInf, fcNegInf}:
+            adj[i] = FmNegInf
+        else:
+            adj[i] = v
+    if s.repeatPenalty != 1.0'f32 and s.repeatLastN > 0:
+        var seen = initHashSet[int]()
+        for k in max(0, history.len - s.repeatLastN) ..< history.len:
+            let id = history[k]
+            if id >= 0 and id < vocab and not s.noPenalty[id] and id notin seen:
+                seen.incl(id)
+                if adj[id] > 0:
+                    adj[id] = adj[id] / s.repeatPenalty
+                else:
+                    adj[id] = adj[id] * s.repeatPenalty
+    var best = 0
+    for i in 1 ..< vocab:
+        if adj[i] > adj[best]:
+            best = i
+    if s.temperature <= 0 or adj[best] <= FmNegInf:
+        return best
+    # Softmax over the survivors, relative to the best logit.
+    var probs = newSeq[float32](vocab)
+    var idx: seq[int]
+    let top = adj[best]
+    for i in 0 ..< vocab:
+        if adj[i] > FmNegInf:
+            probs[i] = exp((adj[i] - top) / s.temperature)
+            if s.minP <= 0 or probs[i] >= s.minP:
+                idx.add(i)
+    idx.sort(proc (a, b: int): int = cmp(probs[b], probs[a]))
+    var total = 0'f32
+    for id in idx:
+        total += probs[id]
+    var cutoff = idx.len
+    if s.topP < 1:
+        var cum = 0'f32
+        for k, id in idx:
+            cum += probs[id]
+            if cum >= s.topP * total:
+                cutoff = k + 1
+                break
+    var mass = 0'f32
+    for k in 0 ..< cutoff:
+        mass += probs[idx[k]]
+    let r = s.rng.rand(1.0'f32) * mass
+    var acc = 0'f32
+    for k in 0 ..< cutoff:
+        acc += probs[idx[k]]
+        if acc >= r:
+            return idx[k]
+    result = idx[cutoff - 1]

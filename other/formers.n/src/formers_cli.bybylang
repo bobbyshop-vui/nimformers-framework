@@ -1,0 +1,49 @@
+# formers-cli — llama.cpp-style command line for formers.n.
+#
+#   formers-cli --models test/deepseek-inference/models -p "..." -n 128
+#   formers-cli --models test/codestral/models --temp 0.7 --ngl 99
+#   formers-cli --models <dir> --detect-only
+#
+# Exit codes: 0 ok, 1 runtime failure, 2 bad options, 3 unsupported model.
+
+import nim "std/os"
+import "formers/cli/options.bybylang"
+import "formers/arch/detect.bybylang"
+import "formers/runtime/signals.bybylang"
+import "formers/runtime/console.bybylang"
+import "formers/router.bybylang"
+
+opts = fmParseOptions(commandLineParams())
+if opts.showHelp:
+    print fmUsage()
+    quit(0)
+if opts.errors.len > 0:
+    for e in opts.errors:
+        stderr.writeLine("[formers.n] " & e)
+    stderr.writeLine("[formers.n] see: formers-cli --help")
+    quit(2)
+det = fmDetect(opts)
+if opts.verbose or opts.detectOnly:
+    stderr.writeLine(fmDescribe(det, opts))
+reason = ""
+if not fmCheckRun(det, opts, reason):
+    if not (opts.verbose or opts.detectOnly):
+        stderr.writeLine(fmDescribe(det, opts))
+    stderr.writeLine("[formers.n] not running: " & reason)
+    quit(3)
+if opts.detectOnly:
+    quit(0)
+if not opts.verbose:
+    stderr.writeLine("[formers.n] " & $det.arch & " " & det.files.nimqPath & (if det.files.loraPath.len > 0: " + " & extractFilename(det.files.loraPath) else: "") & " - loading (logs: --verbose)")
+# From here on the library logs go to /dev/null unless --verbose.
+fmConsoleInit(opts.verbose)
+setControlCHook(fmOnCtrlC)
+ok = false
+try:
+    ok = fmRun(det, opts)
+except Exception as e:
+    fmSay("[formers.n] error: " & e.msg & (if fmQuiet(): " (rerun with --verbose for the full log)" else: ""))
+    if not fmQuiet():
+        stderr.writeLine(e.getStackTrace())
+if not ok:
+    quit(1)

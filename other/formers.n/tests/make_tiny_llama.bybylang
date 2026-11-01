@@ -1,0 +1,97 @@
+# formers.n — write a tiny random Llama model for an end-to-end GPU smoke run.
+#
+#   make_tiny_llama <out-dir> [tokenizer-dir]
+#
+# 2 layers, hidden 128, 4 heads / 2 KV heads (GQA), FFN 256, random weights
+# quantized int4 per group of 64 exactly like export_to_nimq.py
+# (quantize_int4_asymmetric_per_group). The tokenizer files are copied from
+# tokenizer-dir (default test/deepseek-inference/models), so vocab_size is
+# the tokenizer's. The text it generates is noise; the run checks that
+# loading, GPU upload, prefill, decode and sampling work for a Llama of a
+# size other than DeepSeek 6.7B.
+
+import nim "std/[os, json, random, math]"
+import nim "quant"
+
+const TinyHidden = 128
+const TinyHeads = 4
+const TinyKVHeads = 2
+const TinyFfn = 256
+const TinyLayers = 2
+const TinyGroup = 64
+
+function tinyRandom(rng: var Rand, n: int, std: float32): seq[float32]
+    result = newSeq[float32](n)
+    for i in 0 ..< n:
+        result[i] = float32(rng.gauss(0.0, float(std)))
+
+function tinyQ4(w: seq[float32], rows, cols: int): QuantTensor
+    ## Asymmetric int4, one scale/zero point per group of TinyGroup columns.
+    let groups = (cols + TinyGroup - 1) div TinyGroup
+    result = QuantTensor(kind: qkInt4Asymmetric, shape: @[rows, cols], groupSize: TinyGroup)
+    result.scale = newSeq[float32](rows * groups)
+    result.zero_point = newSeq[float32](rows * groups)
+    let bytesPerRow = (cols + 1) div 2
+    result.data = newSeq[uint8](rows * bytesPerRow)
+    for r in 0 ..< rows:
+        for g in 0 ..< groups:
+            let c0 = g * TinyGroup
+            let c1 = min(c0 + TinyGroup, cols)
+            var lo = w[r * cols + c0]
+            var hi = lo
+            for c in c0 ..< c1:
+                lo = min(lo, w[r * cols + c])
+                hi = max(hi, w[r * cols + c])
+            let span = hi - lo
+            let scale = if span > 1e-12: span / 15'f32 else: 1'f32
+            let zp = if span > 1e-12: -lo / scale else: 0'f32
+            result.scale[r * groups + g] = scale
+            result.zero_point[r * groups + g] = zp
+            for c in c0 ..< c1:
+                let q = uint8(clamp(round(w[r * cols + c] / scale + zp), 0'f32, 15'f32))
+                if c mod 2 == 0:
+                    result.data[r * bytesPerRow + c div 2] = result.data[r * bytesPerRow + c div 2] or q
+                else:
+                    result.data[r * bytesPerRow + c div 2] = result.data[r * bytesPerRow + c div 2] or (q shl 4)
+
+function tinyOnes(n: int): QuantTensor
+    result = quantizeRaw(newSeqWith(n, 1'f32), @[n])
+
+args = commandLineParams()
+if args.len < 1:
+    print "usage: make_tiny_llama <out-dir> [tokenizer-dir]"
+    quit(2)
+outDir = args[0]
+tokDir = if args.len > 1: args[1] else: "test/deepseek-inference/models"
+tokCfg = parseFile(tokDir / "tokenizer.json")
+vocab = 0
+for _, id in tokCfg["model"]["vocab"].pairs:
+    vocab = max(vocab, id.getInt() + 1)
+if tokCfg.hasKey("added_tokens"):
+    for t in tokCfg["added_tokens"]:
+        vocab = max(vocab, t["id"].getInt() + 1)
+createDir(outDir)
+copyFile(tokDir / "tokenizer.json", outDir / "tokenizer.json")
+copyFile(tokDir / "tokenizer_config.json", outDir / "tokenizer_config.json")
+cfg = %*{"model_type": "llama", "architectures": ["LlamaForCausalLM"], "vocab_size": vocab, "hidden_size": TinyHidden, "intermediate_size": TinyFfn, "num_hidden_layers": TinyLayers, "num_attention_heads": TinyHeads, "num_key_value_heads": TinyKVHeads, "max_position_embeddings": 512, "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "hidden_act": "silu", "tie_word_embeddings": false}
+writeFile(outDir / "config.json", cfg.pretty)
+rng = initRand(7)
+headDim = TinyHidden div TinyHeads
+sd = newSeq[(string, QuantTensor)]()
+sd.add(("model.embed_tokens.weight", quantizeRaw(tinyRandom(rng, vocab * TinyHidden, 0.5), @[vocab, TinyHidden])))
+sd.add(("model.norm.weight", tinyOnes(TinyHidden)))
+sd.add(("lm_head.weight", quantizeRaw(tinyRandom(rng, vocab * TinyHidden, 0.05), @[vocab, TinyHidden])))
+for l in 0 ..< TinyLayers:
+    p = "model.layers." & $l & "."
+    sd.add((p & "input_layernorm.weight", tinyOnes(TinyHidden)))
+    sd.add((p & "post_attention_layernorm.weight", tinyOnes(TinyHidden)))
+    sd.add((p & "self_attn.q_proj.weight", tinyQ4(tinyRandom(rng, TinyHeads * headDim * TinyHidden, 0.05), TinyHeads * headDim, TinyHidden)))
+    sd.add((p & "self_attn.k_proj.weight", tinyQ4(tinyRandom(rng, TinyKVHeads * headDim * TinyHidden, 0.05), TinyKVHeads * headDim, TinyHidden)))
+    sd.add((p & "self_attn.v_proj.weight", tinyQ4(tinyRandom(rng, TinyKVHeads * headDim * TinyHidden, 0.05), TinyKVHeads * headDim, TinyHidden)))
+    sd.add((p & "self_attn.o_proj.weight", tinyQ4(tinyRandom(rng, TinyHidden * TinyHeads * headDim, 0.05), TinyHidden, TinyHeads * headDim)))
+    sd.add((p & "mlp.gate_proj.weight", tinyQ4(tinyRandom(rng, TinyFfn * TinyHidden, 0.05), TinyFfn, TinyHidden)))
+    sd.add((p & "mlp.up_proj.weight", tinyQ4(tinyRandom(rng, TinyFfn * TinyHidden, 0.05), TinyFfn, TinyHidden)))
+    sd.add((p & "mlp.down_proj.weight", tinyQ4(tinyRandom(rng, TinyHidden * TinyFfn, 0.05), TinyHidden, TinyFfn)))
+var arch: array[5, int]
+saveQuantStateDict(outDir / "model.nimq", arch, sd)
+print "tiny llama: " & outDir & " vocab=" & $vocab & " hidden=" & $TinyHidden & " layers=" & $TinyLayers & " heads=" & $TinyHeads & "/" & $TinyKVHeads

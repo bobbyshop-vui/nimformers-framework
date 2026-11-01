@@ -1,26 +1,26 @@
 ## load_codestral_into_jamba.nim
-## Nap TRUC TIEP weight pretrain that cua Mamba-Codestral-7B-v0.1 vao model
-## Jamba-hybrid (jamba_hybrid.nim) da co block 'R' (Mamba2Real - khop dung
-## cong thuc). Cac block 'A' (LinearPlusAttention) van GIU NGUYEN random-init
-## - day la phan "cay them" (graft) MOI, khong nam trong checkpoint HF goc,
-## se duoc train (thang hoac qua LoRA - dung lora.nim, khong doi gi ca vi
-## lora.nim generic theo ten tham so).
+## Loads the REAL pretrained weights of Mamba-Codestral-7B-v0.1 DIRECTLY into the
+## Jamba-hybrid model (jamba_hybrid.nim) with 'R' blocks (Mamba2Real - matching the
+## formula exactly). The 'A' blocks (LinearPlusAttention) KEEP their random init
+## - they are the NEW grafted part, not in the original HF checkpoint,
+## to be trained (directly or through LoRA - with lora.nim, unchanged because
+## lora.nim is generic over parameter names).
 ##
-## QUY UOC MAP LAYER: cac block 'R' trong pattern cua ban duoc gan weight
-## HF theo THU TU XUAT HIEN (block 'R' dau tien -> HF layer 0, block 'R' thu
-## 2 -> HF layer 1, v.v...) - BO QUA cac layer HF tuong ung voi vi tri dat
-## block 'A' (vi 'A' la layer MOI thay cho 1 layer Mamba nao do bi "cay de").
-## Vi du pattern "RRRARRRA" (8 block, 6 'R' + 2 'A') se dung HF layer 0..5
-## cho 6 block 'R', bo qua HF layer 6,7 (hoac bat ky layer HF nao) - KHONG co
-## quan he 1-1 giua vi tri block va vi tri layer HF, chi giu THU TU.
+## LAYER MAPPING CONVENTION: the 'R' blocks of your pattern get HF weights
+## IN ORDER OF APPEARANCE (first 'R' block -> HF layer 0, second 'R'
+## block -> HF layer 1, etc.) - the HF layers matching the positions of
+## 'A' blocks are SKIPPED (an 'A' is a NEW layer replacing some Mamba layer that was "grafted over").
+## E.g. the pattern "RRRARRRA" (8 blocks, 6 'R' + 2 'A') uses HF layers 0..5
+## for the 6 'R' blocks and skips HF layers 6,7 (or whichever HF layers) - there is NO
+## 1-1 relation between block positions and HF layer positions, only the ORDER is kept.
 ##
-## CANH BAO: chua verify ten tensor "backbone.embeddings.weight"/"lm_head.weight"
-## voi manifest that cua Mamba-Codestral-7B-v0.1 (transformers co the doi ten
-## giua version) - IN ra danh sach ten tensor KHONG map duoc o cuoi, tu doi
-## lai hfNameMapMamba2/EMBED_NAME/LMHEAD_NAME trong file nay cho khop truoc
-## khi tin ket qua.
+## WARNING: the tensor names "backbone.embeddings.weight"/"lm_head.weight" are not verified
+## against the real manifest of Mamba-Codestral-7B-v0.1 (transformers may rename them
+## between versions) - the tensor names that could NOT be mapped are PRINTED at the end; adjust
+## hfNameMapMamba2/EMBED_NAME/LMHEAD_NAME in this file to match before
+## trusting the result.
 
-import std/[tables, strformat, strutils, os]   # os: getEnv cho BYBY_ALLOW_RANDOM_EMBED
+import std/[tables, strformat, strutils, os]   # os: getEnv for BYBY_ALLOW_RANDOM_EMBED
 import nimformer
 import jamba_hybrid
 import mamba2_real
@@ -28,12 +28,12 @@ when not defined(codestralInference):
   import sharded_hf_loader
 import rawbin   # RawBinTensor
 import std/os
-import quant    # loadQuantStateDict, dequantizeTensor - cho nguon .nimq (da quantize fp4)
+import quant    # loadQuantStateDict, dequantizeTensor - for the .nimq source (fp4 quantized)
 
 const
   EmbedName = "backbone.embeddings.weight"
   LmHeadName = "lm_head.weight"
-  NormFName = "backbone.norm_f.weight"   # MOI: xem bao cao debug - norm cuoi truoc lm_head
+  NormFName = "backbone.norm_f.weight"   # NEW: see the debug report - the final norm before lm_head
 
 proc findTensor(tensors: seq[RawBinTensor], name: string): int =
   for i, t in tensors:
@@ -41,12 +41,12 @@ proc findTensor(tensors: seq[RawBinTensor], name: string): int =
   return -1
 
 proc loadCodestralIntoJambaFromTensors*(m: var NimformerModelJamba, tensors: seq[RawBinTensor]) =
-  ## Ham LOI - nhan san 1 danh sach tensor da giai nen ve fp32 trong RAM,
-  ## KHONG QUAN TAM tensor do den tu dau (safetensors goc DOC THANG, hay
-  ## .nimq da quantize fp4 roi DEQUANTIZE lai) - 2 ham wrapper ben duoi
-  ## (loadCodestralIntoJamba/loadCodestralIntoJambaFromNimq) chi khac nhau
-  ## O BUOC LAY `tensors`, phan map ten/gan vao model GIONG HET nhau.
-  echo &"[load_codestral] {tensors.len} tensor. Bat dau map vao model ..."
+  ## CORE function - takes a list of tensors already decoded to fp32 in RAM,
+  ## WHATEVER their source (the original safetensors READ DIRECTLY, or
+  ## a quantized fp4 .nimq DEQUANTIZED back) - the 2 wrappers below
+  ## (loadCodestralIntoJamba/loadCodestralIntoJambaFromNimq) differ only
+  ## IN HOW `tensors` IS OBTAINED, the name mapping/assignment to the model is IDENTICAL.
+  echo &"[load_codestral] {tensors.len} tensors. Starting the mapping into the model ..."
 
   var usedNames = initTable[string, bool]()
 
@@ -59,13 +59,13 @@ proc loadCodestralIntoJambaFromTensors*(m: var NimformerModelJamba, tensors: seq
     usedNames[EmbedName] = true
     echo &"[load_codestral] OK embed <- {EmbedName}"
   else:
-    # SUA: truoc day chi `echo` roi chay tiep voi EMBEDDING NGAU NHIEN. Do la
-    # cach chac chan nhat de sinh token rac 100% ma log van trong nhu binh
-    # thuong va loss van "hoi tu" (ve mot model vo nghia). Dau file nay con
-    # ghi ro "chua verify ten tensor" -> kha nang lech ten la THAT.
+    # CHANGED: it used to just `echo` and continue with a RANDOM EMBEDDING. That is
+    # the surest way to generate 100% garbage tokens while the log looks normal
+    # and the loss still "converges" (to a meaningless model). The top of this file
+    # also says "tensor names not verified" -> a name mismatch is a REAL possibility.
     raise newException(ValueError,
-      &"[load_codestral] KHONG thay tensor '{EmbedName}' trong checkpoint HF. " &
-      "Embedding random-init se gay token rac; sua EmbedName theo manifest.")
+      &"[load_codestral] tensor '{EmbedName}' NOT found in the HF checkpoint. " &
+      "A random-init embedding would produce garbage tokens; fix EmbedName from the manifest.")
 
   let lmHeadIdx = findTensor(tensors, LmHeadName)
   if lmHeadIdx >= 0:
@@ -75,27 +75,27 @@ proc loadCodestralIntoJambaFromTensors*(m: var NimformerModelJamba, tensors: seq
     usedNames[LmHeadName] = true
     echo "[load_codestral] OK outProj <- lm_head.weight"
   else:
-    echo "[load_codestral] CANH BAO: khong thay 'lm_head.weight' - co the model dung " &
-         "tied-embedding (lm_head = embed.weight, khong co tensor rieng) - " &
-         "thu tam dung lai embed.weight cho outProj:"
+    echo "[load_codestral] WARNING: 'lm_head.weight' not found - the model may use " &
+         "tied embeddings (lm_head = embed.weight, no separate tensor) - " &
+         "trying to reuse embed.weight for outProj:"
     if embedIdx >= 0 and tensors[embedIdx].data.len == m.outProj.weight.data.len:
       m.outProj.weight.data = tensors[embedIdx].data
-      echo "[load_codestral]   -> ap dung tied-embedding OK (shape khop)."
+      echo "[load_codestral]   -> tied embedding applied OK (shapes match)."
     else:
-      # SUA: giong truong hop embed o tren - lm_head random-init nghia la
-      # logits HOAN TOAN ngau nhien tren 32768 token. Khong duoc am tham.
+      # CHANGED: like the embedding case above - a random-init lm_head means
+      # COMPLETELY random logits over 32768 tokens. It must not be silent.
       raise newException(ValueError,
-        "[load_codestral] KHONG thay 'lm_head.weight' va cung KHONG the dung " &
-        "tied-embedding (shape khong khop). Neu chay tiep thi lm_head la " &
-        "RANDOM-INIT -> logits ngau nhien tren toan bo vocab -> token rac 100%. " &
-        "Chay print_manifest.nim de doi chieu ten tensor that.")
+        "[load_codestral] 'lm_head.weight' NOT found and tied embeddings CANNOT " &
+        "be used either (shape mismatch). Continuing would leave lm_head " &
+        "RANDOM-INIT -> random logits over the whole vocab -> 100% garbage tokens. " &
+        "Run print_manifest.nim to compare with the real tensor names.")
 
-  # ── normF (== backbone.norm_f, ap dung 1 lan truoc lm_head) ────────────
-  # FIX token rac (bug #8): ham nay dung CHUNG cho ca loadCodestralIntoJamba
-  # (safetensors goc) LAN loadCodestralIntoJambaFromNimq (dequant tu .nimq,
-  # duong cua finetune_lora.nim). Fix normF truoc day (bug #4) CHI ap dung o
-  # loadCodestralQuantResidentFromNimq (nhanh infer_lora_bin) -> 2 duong nay
-  # van thieu normF, van chay gamma=1.
+  # ── normF (== backbone.norm_f, applied once before lm_head) ────────────
+  # FIX for garbage tokens (bug #8): this function is SHARED by loadCodestralIntoJamba
+  # (original safetensors) AND loadCodestralIntoJambaFromNimq (dequant from .nimq,
+  # the finetune_lora.nim path). The earlier normF fix (bug #4) applied ONLY to
+  # loadCodestralQuantResidentFromNimq (the infer_lora_bin branch) -> these 2 paths
+  # still lacked normF and still ran with gamma=1.
   let normFIdx = findTensor(tensors, NormFName)
   if normFIdx >= 0:
     doAssert tensors[normFIdx].data.len == m.normF.gamma.data.len,
@@ -105,9 +105,9 @@ proc loadCodestralIntoJambaFromTensors*(m: var NimformerModelJamba, tensors: seq
     echo &"[load_codestral] OK normF <- {NormFName}"
   else:
     raise newException(ValueError,
-      "[load_codestral] KHONG thay '" & NormFName & "' - normF random/identity se gay token rac.")
+      "[load_codestral] '" & NormFName & "' NOT found - a random/identity normF would produce garbage tokens.")
 
-  # ── tung block 'R' theo thu tu xuat hien -> HF layer 0,1,2,... ──
+  # ── each 'R' block in order of appearance -> HF layers 0,1,2,... ──
   var hfLayerCounter = 0
   var matchedLayers = 0
   var totalLayers = 0
@@ -126,8 +126,8 @@ proc loadCodestralIntoJambaFromTensors*(m: var NimformerModelJamba, tensors: seq
           usedNames[nameMap[hfKey]] = true
           return true
         else:
-          echo &"[load_codestral] layer {hfLayerCounter} '{hfKey}': SHAPE LECH " &
-               &"(HF={tensors[idx].data.len} model={fieldData.len}) - BO QUA, giu random-init"
+          echo &"[load_codestral] layer {hfLayerCounter} '{hfKey}': SHAPE MISMATCH " &
+               &"(HF={tensors[idx].data.len} model={fieldData.len}) - SKIPPED, keeping the random init"
           return false
       else:
         missing.add(nameMap[hfKey])
@@ -141,13 +141,13 @@ proc loadCodestralIntoJambaFromTensors*(m: var NimformerModelJamba, tensors: seq
     if not tryLoad(m.blocks[bi].mambaReal.dtBias.data, "dtBias"): allOk = false
     if not tryLoad(m.blocks[bi].mambaReal.normWeight.data, "normWeight"): allOk = false
     if not tryLoad(m.blocks[bi].mambaReal.outProj.weight.data, "outProj.weight"): allOk = false
-    # FIX token rac (bug #7): pre-norm CA BLOCK (ln1 == Mamba2Block.norm ben
-    # HF, NGOAI submodule mixer - KHAC voi 'normWeight' o tren la norm BEN
-    # TRONG mixer). Truoc day KHONG duoc nap o day -> ln1.gamma = 1.0 cho moi
-    # block. Xem hfNameMapMamba2.
+    # FIX for garbage tokens (bug #7): the pre-norm OF THE WHOLE BLOCK (ln1 == Mamba2Block.norm in
+    # HF, OUTSIDE the mixer submodule - DIFFERENT from 'normWeight' above, which is the norm
+    # INSIDE the mixer). It was NOT loaded here before -> ln1.gamma = 1.0 for every
+    # block. See hfNameMapMamba2.
     if not tryLoad(m.blocks[bi].ln1.gamma.data, "ln1Weight"): allOk = false
-    # inProj.bias / outProj.bias: Mamba2 HF THUONG khong co bias (bias=False)
-    # -> KHONG coi la loi neu thieu, chi log info, giu bias=0 mac dinh.
+    # inProj.bias / outProj.bias: HF Mamba2 USUALLY has no bias (bias=False)
+    # -> NOT an error when missing, only logged as info, the bias stays 0 by default.
     let inBiasIdx = findTensor(tensors, nameMap["inProj.bias"])
     if inBiasIdx >= 0 and tensors[inBiasIdx].data.len == m.blocks[bi].mambaReal.inProj.bias.data.len:
       m.blocks[bi].mambaReal.inProj.bias.data = tensors[inBiasIdx].data
@@ -155,51 +155,51 @@ proc loadCodestralIntoJambaFromTensors*(m: var NimformerModelJamba, tensors: seq
 
     if allOk:
       matchedLayers += 1
-      echo &"[load_codestral] block{bi} <- HF mixer layer {hfLayerCounter}: OK (9/9 tensor chinh khop)"
+      echo &"[load_codestral] block{bi} <- HF mixer layer {hfLayerCounter}: OK (9/9 main tensors match)"
     else:
       echo &"[load_codestral] block{bi} <- HF mixer layer {hfLayerCounter}: THIEU {missing}"
     hfLayerCounter += 1
 
-  echo &"\n[load_codestral] TOM TAT: {matchedLayers}/{totalLayers} block 'R' map DAY DU. " &
-       "Block nao khong 'OK' o tren se GIU random-init (train tu dau) - kiem tra lai " &
-       "hfNameMapMamba2 neu so nay thap hon ky vong."
+  echo &"\n[load_codestral] SUMMARY: {matchedLayers}/{totalLayers} 'R' blocks FULLY mapped. " &
+       "Blocks not marked 'OK' above KEEP the random init (trained from scratch) - check " &
+       "hfNameMapMamba2 if this number is lower than expected."
   if matchedLayers != totalLayers:
     raise newException(ValueError,
-      &"[load_codestral] DUNG: chi map du {matchedLayers}/{totalLayers} block R; " &
-       "khong cho phep train voi weight random-init de tranh token rac.")
+      &"[load_codestral] STOP: only {matchedLayers}/{totalLayers} R blocks fully mapped; " &
+       "training with random-init weights is not allowed, to avoid garbage tokens.")
 
-  # liet ke tensor HF KHONG dung den (co the la bias khong ton tai o model
-  # nay - binh thuong - hoac ten map SAI - can xem lai)
+  # list the HF tensors NOT used (maybe biases that do not exist in this
+  # model - normal - or WRONG name mappings - need checking)
   var unusedSample: seq[string] = @[]
   for t in tensors:
     if t.name notin usedNames:
       unusedSample.add(t.name)
       if unusedSample.len >= 15: break
   if unusedSample.len > 0:
-    echo &"[load_codestral] Vi du {unusedSample.len} tensor HF KHONG duoc dung: {unusedSample}"
+    echo &"[load_codestral] Sample of {unusedSample.len} HF tensors NOT used: {unusedSample}"
 
 proc loadCodestralQuantResidentFromNimq*(m: var NimformerModelJamba, nimqPath: string):
                                           Table[string, QuantTensor] =
-  ## Ban "quant-resident" - KHONG dequantize inProj.weight/outProj.weight
-  ## (2 ma tran lon nhat, ~29GB neu dequant het ca 52 block) - giu NGUYEN
-  ## DANG NEN (QuantTensor, ~1 byte/phan tu voi fp4), tra ve trong bang
-  ## ket qua de lora.nim (attachLoraQuantResident/mergeInOne) dequant TUC
-  ## THOI qua LUT MOI KHI can 1 block, xoa ngay sau dung (xem
-  ## trainStepGraftStreaming trong finetune_lora.nim).
-  ## Cac tham so KHAC (embed, lm_head, aLog/dSkip/dtBias/normWeight/
-  ## convWeight - deu nho, tong ~1.1GB) VAN dequantize BINH THUONG va gan
-  ## thang vao model nhu loadCodestralIntoJambaFromNimq (khong quant-resident
-  ## cho phan nay, khong can thiet).
+  ## "Quant-resident" variant - does NOT dequantize inProj.weight/outProj.weight
+  ## (the 2 largest matrices, ~29GB if all 52 blocks were dequantized) - keeps them
+  ## COMPRESSED (QuantTensor, ~1 byte/element with fp4), returned in the result
+  ## table so lora.nim (attachLoraQuantResident/mergeInOne) dequantizes them ON THE
+  ## FLY through the LUT WHENEVER a block is needed, and frees them right after (see
+  ## trainStepGraftStreaming in finetune_lora.nim).
+  ## The OTHER parameters (embed, lm_head, aLog/dSkip/dtBias/normWeight/
+  ## convWeight - all small, ~1.1GB in total) ARE dequantized NORMALLY and assigned
+  ## directly to the model like loadCodestralIntoJambaFromNimq (no quant-resident
+  ## for this part, not needed).
   echo &"[load_codestral] (quant-resident) Doc {nimqPath} ..."
   var sd = quant.loadQuantStateDict(nimqPath, mapped = getEnv("BYBY_MODEL_MMAP", "1") != "0").sd
   var byName = initTable[string, QuantTensor]()
   for (name, qt) in sd.mitems: byName[name] = move(qt)
-  # NGHI VAN #2 cho RSS-sau-load cao bat thuong (xem bao cao debug): truoc
-  # day 'sd' (seq goc tu loadQuantStateDict) van song tiep TOI KHI HAM NAY
-  # RETURN du da copy het sang byName roi - nghia la trong luc load co THE
-  # ton tai 2-3 ban sao cung luc cua ca 129 tensor LON (sd + byName +
-  # result, moi ban co the vai GB). Giai phong 'sd' NGAY sau khi da move
-  # het sang byName (move o tren + xoa o day = chac chan khong con giu du).
+  # SUSPECT #2 for the unusually high RSS after load (see the debug report): before,
+  # 'sd' (the original seq from loadQuantStateDict) stayed alive UNTIL THIS FUNCTION
+  # RETURNED although everything had been copied into byName - so during loading there
+  # COULD be 2-3 copies at once of all 129 LARGE tensors (sd + byName +
+  # result, each possibly several GB). 'sd' is released RIGHT after everything
+  # moved into byName (the move above + the delete here = surely nothing extra kept).
   sd = @[]
 
   result = initTable[string, QuantTensor]()
@@ -230,38 +230,38 @@ proc loadCodestralQuantResidentFromNimq*(m: var NimformerModelJamba, nimqPath: s
     let values = quant.dequantizeTensor(qt)
     if values.len != shapeNumel(qt.shape):
       raise newException(ValueError,
-        &"[load_codestral] .nimq '{name}' giai nen ra {values.len} phan tu, " &
-        &"nhung metadata shape {qt.shape} can {shapeNumel(qt.shape)}; file co the hong.")
+        &"[load_codestral] .nimq '{name}' decoded into {values.len} elements, " &
+        &"but the metadata shape {qt.shape} needs {shapeNumel(qt.shape)}; the file may be corrupt.")
     RawBinTensor(name: name, shape: qt.shape, data: values)
 
-  # embed - dequant binh thuong (can cho lookupBatch truy cap tung hang
-  # ngau nhien theo token id, khong phai 1 phep matmul don le nhu lm_head
-  # nen giu resident luon cho don gian, ~0.54GB).
+  # embed - normal dequant (needed so lookupBatch can access rows
+  # randomly by token id, not a single matmul like lm_head,
+  # so it stays resident for simplicity, ~0.54GB).
   var smallTensors: seq[RawBinTensor] = @[]
   var missingRequired: seq[string] = @[]
   requireTensor(EmbedName, m.embed.weight.shape, missingRequired)
   requireTensor(NormFName, m.normF.gamma.shape, missingRequired)
   if EmbedName in byName: smallTensors.add(dequantSmall(EmbedName))
-  if NormFName in byName: smallTensors.add(dequantSmall(NormFName))   # MOI
-  # lm_head - SUA: KHONG dequant eager nua (tiet kiem ~0.54GB thuong tru RAM
-  # suot ca qua trinh train) - dua vao `result` (bang quant-resident) DUNG
-  # TEN THAM SO THAT ("outProj.weight") giong het 52 block 'R'. lm_head chi
-  # dung DUNG 1 LAN/buoc train (cuoi forward tinh logits, dau backward tinh
-  # dX) - xem mergeInOnePlain/restoreBaseOnePlain trong lora.nim + cho goi
-  # trong trainStepGraftStreaming (finetune_lora.nim) bao quanh 2 lan dung
-  # do. KHONG dua vao smallTensors nua vi se bi dequant eager o duoi.
+  if NormFName in byName: smallTensors.add(dequantSmall(NormFName))   # NEW
+  # lm_head - CHANGED: NO eager dequant any more (saves ~0.54GB of resident RAM
+  # during the whole training) - put into `result` (the quant-resident table) under the
+  # REAL PARAMETER NAME ("outProj.weight") exactly like the 52 'R' blocks. lm_head is
+  # used EXACTLY ONCE per training step (at the end of the forward for the logits, at the start of the backward for
+  # dX) - see mergeInOnePlain/restoreBaseOnePlain in lora.nim + the call sites
+  # in trainStepGraftStreaming (finetune_lora.nim) around those 2 uses.
+  # NO longer put into smallTensors, because it would be eagerly dequantized below.
   if LmHeadName in byName:
     let qt = byName[LmHeadName]
     var expectedLen = 1
     for d in qt.shape: expectedLen *= d
     if qt.shape == m.outProj.weight.shape and qt.bytes.len > 0:
       result["outProj.weight"] = qt
-      byName.del(LmHeadName)   # giai phong ban trong byName, result da giu roi
+      byName.del(LmHeadName)   # releases the copy in byName, result already holds it
     else:
       missingRequired.add(LmHeadName & " (shape=" & $qt.shape & ")")
   else:
-    # Cho phép checkpoint tied-embedding hợp lệ: dùng đúng embed làm lm_head.
-    # Nếu shape không khớp thì giữ fail-fast, tuyệt đối không để random lm_head.
+    # Allows valid tied-embedding checkpoints: uses the embedding itself as lm_head.
+    # If the shapes do not match it still fails fast, never a random lm_head.
     if EmbedName in byName and byName[EmbedName].shape == m.outProj.weight.shape and
        byName[EmbedName].bytes.len > 0:
       discard
@@ -284,35 +284,35 @@ proc loadCodestralQuantResidentFromNimq*(m: var NimformerModelJamba, nimqPath: s
     requireTensor(nameMap["dtBias"], m.blocks[bi].mambaReal.dtBias.shape, missingRequired)
     requireTensor(nameMap["normWeight"], m.blocks[bi].mambaReal.normWeight.shape, missingRequired)
     requireTensor(nameMap["ln1Weight"], m.blocks[bi].ln1.gamma.shape, missingRequired)
-    # 2 ma tran LON - GIU NGUYEN NEN, dua vao result voi TEN THEO PARAMLIST
-    # (khop dung "block{bi}.mambaReal.inProj.weight" ma paramListMamba2Real
-    # dat, KHONG phai ten HF goc - de lora.nim tra cuu thang theo ten
-    # adapter khong can map lai).
+    # 2 LARGE matrices - KEPT COMPRESSED, put into result under PARAMLIST NAMES
+    # (exactly "block{bi}.mambaReal.inProj.weight" as paramListMamba2Real
+    # sets them, NOT the original HF names - so lora.nim looks them up directly by the
+    # adapter name with no remapping).
     if nameMap["inProj.weight"] in byName:
       result[&"block{bi}.mambaReal.inProj.weight"] = byName[nameMap["inProj.weight"]]
-      byName.del(nameMap["inProj.weight"])   # giai phong ban trong byName
+      byName.del(nameMap["inProj.weight"])   # releases the copy in byName
     else:
-      echo &"[load_codestral] CANH BAO: layer {hfLayerCounter} thieu in_proj.weight trong .nimq"
+      echo &"[load_codestral] WARNING: layer {hfLayerCounter} lacks in_proj.weight in the .nimq"
     if nameMap["outProj.weight"] in byName:
       result[&"block{bi}.mambaReal.outProj.weight"] = byName[nameMap["outProj.weight"]]
-      byName.del(nameMap["outProj.weight"])   # giai phong ban trong byName
+      byName.del(nameMap["outProj.weight"])   # releases the copy in byName
     else:
-      echo &"[load_codestral] CANH BAO: layer {hfLayerCounter} thieu out_proj.weight trong .nimq"
+      echo &"[load_codestral] WARNING: layer {hfLayerCounter} lacks out_proj.weight in the .nimq"
 
-    # tham so NHO - dequant binh thuong nhu cu (convWeight/convBias/aLog/
-    # dSkip/dtBias/normWeight - tong vai chuc KB/block, khong dang ke).
-    # ln1Weight MOI THEM - FIX token rac (bug #7): pre-norm ca block
-    # (backbone.layers.N.norm.weight, NGOAI mixer) truoc day KHONG nam trong
-    # danh sach nay -> ln1.gamma khong bao gio duoc nap that, giu gamma=1.
+    # SMALL parameters - normal dequant as before (convWeight/convBias/aLog/
+    # dSkip/dtBias/normWeight - a few tens of KB per block in total, negligible).
+    # ln1Weight NEWLY ADDED - FIX for garbage tokens (bug #7): the pre-norm of the whole block
+    # (backbone.layers.N.norm.weight, OUTSIDE the mixer) used NOT to be in
+    # this list -> ln1.gamma was never really loaded and stayed gamma=1.
     for key in ["convWeight", "convBias", "aLog", "dSkip", "dtBias", "normWeight", "ln1Weight"]:
       if nameMap[key] in byName:
         smallTensors.add(dequantSmall(nameMap[key]))
     hfLayerCounter += 1
 
-  # gan truc tiep cac tham so NHO vao model (KHONG goi loadCodestralIntoJambaFromTensors -
-  # ham do se bao "THIEU inProj.weight/outProj.weight" cho MOI block 'R' vi
-  # co tinh khong dua 2 tensor lon do vao smallTensors - gay hieu lam, tuy
-  # khong sai chuc nang).
+  # assigns the SMALL parameters directly to the model (does NOT call loadCodestralIntoJambaFromTensors -
+  # that function would report "MISSING inProj.weight/outProj.weight" for EVERY 'R' block because
+  # those 2 large tensors are deliberately not in smallTensors - misleading, although
+  # functionally harmless).
   proc findRaw(tensors: seq[RawBinTensor], name: string): int =
     for i, t in tensors:
       if t.name == name: return i
@@ -322,26 +322,26 @@ proc loadCodestralQuantResidentFromNimq*(m: var NimformerModelJamba, nimqPath: s
   if embedIdx >= 0 and smallTensors[embedIdx].data.len == shapeNumel(m.embed.weight.shape):
     m.embed.weight.data = smallTensors[embedIdx].data
     echo "[load_codestral] (quant-resident) OK embed"
-  let normFIdx = findRaw(smallTensors, NormFName)   # MOI: xem bao cao debug
+  let normFIdx = findRaw(smallTensors, NormFName)   # NEW: see the debug report
   if normFIdx >= 0 and smallTensors[normFIdx].data.len == shapeNumel(m.normF.gamma.shape):
     m.normF.gamma.data = smallTensors[normFIdx].data
-    echo "[load_codestral] (quant-resident) OK normF (norm cuoi truoc lm_head)"
+    echo "[load_codestral] (quant-resident) OK normF (final norm before lm_head)"
   else:
-    raise newException(ValueError, "[load_codestral] normF khong nap duoc - tu choi chay de tranh token rac")
+    raise newException(ValueError, "[load_codestral] normF could not be loaded - refusing to run to avoid garbage tokens")
   if "outProj.weight" in result:
-    echo "[load_codestral] (quant-resident) OK outProj (lm_head) - giu nen, dequant tam thoi luc dung"
+    echo "[load_codestral] (quant-resident) OK outProj (lm_head) - kept compressed, dequantized temporarily when used"
   elif embedIdx >= 0 and smallTensors[embedIdx].data.len == shapeNumel(m.outProj.weight.shape):
-    # tied-embedding that su (khong co lm_head.weight rieng trong file .nimq) -
-    # truong hop nay VAN dequant thang (khong quant-resident duoc vi dung
-    # chung storage voi embed, da dequant o tren roi).
+    # a real tied embedding (no separate lm_head.weight in the .nimq) -
+    # in this case it IS dequantized directly (cannot be quant-resident because it
+    # shares storage with embed, already dequantized above).
     m.outProj.weight.data = smallTensors[embedIdx].data
     echo "[load_codestral] (quant-resident) OK outProj (tied-embedding)"
 
   hfLayerCounter = 0
   var ln1MissingCount = 0
-  # Dem THUC TE so field gan duoc — truoc day log "N tham so nho da dequant+gan"
-  # chi dem smallTensors.len (so tensor trong file), KHONG dem so field model
-  # nhan gia tri. Shape lech / ten lech -> field giu random/init, token rac im lang.
+  # Counts the fields REALLY assigned — the log "N small parameters dequantized+assigned"
+  # used to count only smallTensors.len (the tensors in the file), NOT the model fields
+  # that got values. A shape/name mismatch -> the field keeps random/init, silent garbage tokens.
   var smallAssigned = 0
   var smallMissed = 0
   var smallMissNames: seq[string] = @[]
@@ -358,7 +358,7 @@ proc loadCodestralQuantResidentFromNimq*(m: var NimformerModelJamba, nimqPath: s
           let whyStr =
             if idx < 0: "missing"
             else: "shape " & $smallTensors[idx].data.len & " != model " & $field.len
-          # Tranh &"..." trong template (hygiene: key/why undeclared).
+          # Avoids &"..." inside the template (hygiene: key/why undeclared).
           smallMissNames.add("block" & $bi & "." & key & " (" & whyStr & ")")
     assignSmall(m.blocks[bi].mambaReal.convWeight.data, "convWeight")
     assignSmall(m.blocks[bi].mambaReal.convBias.data, "convBias")
@@ -366,11 +366,11 @@ proc loadCodestralQuantResidentFromNimq*(m: var NimformerModelJamba, nimqPath: s
     assignSmall(m.blocks[bi].mambaReal.dSkip.data, "dSkip")
     assignSmall(m.blocks[bi].mambaReal.dtBias.data, "dtBias")
     assignSmall(m.blocks[bi].mambaReal.normWeight.data, "normWeight")
-    # FIX token rac (bug #7): ln1.gamma = pre-norm CA BLOCK, ap dung TRUOC
-    # mixer - khac 'normWeight' o tren (norm BEN TRONG mixer). Truoc day
-    # khong nam trong assignSmall nao -> gamma=1 cho moi block. Dem rieng
-    # (khong dung assignSmall vi template do khong tra ve bool) de canh bao
-    # gop 1 dong thay vi spam 64 dong.
+    # FIX for garbage tokens (bug #7): ln1.gamma = the pre-norm OF THE WHOLE BLOCK, applied BEFORE
+    # the mixer - different from 'normWeight' above (the norm INSIDE the mixer). It used to be
+    # in no assignSmall at all -> gamma=1 for every block. Counted separately
+    # (not through assignSmall because that template does not return a bool) to warn
+    # in one line instead of spamming 64 lines.
     let ln1Idx = findRaw(smallTensors, nameMap["ln1Weight"])
     if ln1Idx >= 0 and smallTensors[ln1Idx].data.len == m.blocks[bi].ln1.gamma.data.len:
       m.blocks[bi].ln1.gamma.data = smallTensors[ln1Idx].data
@@ -381,53 +381,53 @@ proc loadCodestralQuantResidentFromNimq*(m: var NimformerModelJamba, nimqPath: s
     hfLayerCounter += 1
 
   if ln1MissingCount > 0:
-    echo &"[load_codestral] CANH BAO: {ln1MissingCount}/{rBlockIdx.len} block THIEU ln1.gamma " &
-         "(backbone.layers.N.norm.weight - pre-norm truoc mixer, KHONG phai " &
-         "mixer.norm.weight) trong .nimq - cac block nay dang chay ln1 voi " &
-         "gamma=1 (identity, SAI so voi checkpoint -> token rac)."
+    echo &"[load_codestral] WARNING: {ln1MissingCount}/{rBlockIdx.len} blocks LACK ln1.gamma " &
+         "(backbone.layers.N.norm.weight - the pre-norm before the mixer, NOT " &
+         "mixer.norm.weight) in the .nimq - these blocks run ln1 with " &
+         "gamma=1 (identity, WRONG compared to the checkpoint -> garbage tokens)."
   else:
-    echo &"[load_codestral] (quant-resident) OK ln1.gamma ca {rBlockIdx.len} block (pre-norm truoc mixer)"
+    echo &"[load_codestral] (quant-resident) OK ln1.gamma for all {rBlockIdx.len} blocks (pre-norm before the mixer)"
 
   if smallMissed > 0:
-    echo &"[load_codestral] CANH BAO: assignSmall that bai {smallMissed} field " &
-         &"(gan thanh cong {smallAssigned}). Field miss giu init/random -> token rac."
+    echo &"[load_codestral] WARNING: assignSmall failed for {smallMissed} fields " &
+         &"(assigned successfully: {smallAssigned}). Missed fields keep init/random -> garbage tokens."
     for nm in smallMissNames:
       stderr.writeLine "[load_codestral]   miss: " & nm
-    # SSM small weights (aLog/dtBias/normWeight/...) lech shape = logits lech nang.
-    # Fail-loud de khong train/infer voi backbone bi thieu tham so.
+    # SSM small weights (aLog/dtBias/normWeight/...) with a wrong shape = badly wrong logits.
+    # Fail loudly so training/inference never runs with a backbone missing parameters.
     raise newException(ValueError,
-      &"[load_codestral] {smallMissed} small-tensor field khong gan duoc " &
-      &"(vi du: {smallMissNames[0 ..< min(smallMissNames.len, 6)]}). " &
-      "Sua .nimq / shape map truoc khi train/infer.")
+      &"[load_codestral] {smallMissed} small-tensor fields could not be assigned " &
+      &"(e.g.: {smallMissNames[0 ..< min(smallMissNames.len, 6)]}). " &
+      "Fix the .nimq / shape map before training/inference.")
 
   if missingRequired.len > 0:
     raise newException(ValueError,
-      "[load_codestral] .nimq thieu/sai weight BAT BUOC - khong train/infer de tranh token rac: " &
+      "[load_codestral] .nimq lacks/has wrong REQUIRED weights - not training/inferring, to avoid garbage tokens: " &
       $missingRequired[0 ..< min(missingRequired.len, 12)])
 
-  echo &"[load_codestral] (quant-resident) {result.len} tham so LON giu dang nen " &
-       &"({rBlockIdx.len} block 'R'), {smallAssigned} field nho gan THANH CONG " &
-       &"(smallTensors trong file={smallTensors.len})."
+  echo &"[load_codestral] (quant-resident) {result.len} LARGE parameters kept compressed " &
+       &"({rBlockIdx.len} 'R' blocks), {smallAssigned} small fields assigned SUCCESSFULLY " &
+       &"(smallTensors in the file={smallTensors.len})."
 
 when not defined(codestralInference):
   proc loadCodestralIntoJamba*(m: var NimformerModelJamba, hfDir: string) =
-    ## Doc THANG tu safetensors goc (~14GB bf16 tren dia, ~28GB sau khi giai
-    ## nen fp32 trong RAM - xem canh bao RAM trong sharded_hf_loader.nim).
-    echo &"[load_codestral] Doc {hfDir} (chi RAM) ..."
+    ## Reads DIRECTLY from the original safetensors (~14GB bf16 on disk, ~28GB once
+    ## decoded to fp32 in RAM - see the RAM warning in sharded_hf_loader.nim).
+    echo &"[load_codestral] Reading {hfDir} (RAM only) ..."
     let tensors = loadAllHFTensorsSharded(hfDir)
     loadCodestralIntoJambaFromTensors(m, tensors)
 
 proc loadCodestralIntoJambaFromNimq*(m: var NimformerModelJamba, nimqPath: string) =
-  ## Doc tu FILE DA QUANTIZE fp4 (~3.5GB tren dia - xem quantize_codestral.nim
-  ## de tao file nay MOT LAN tu safetensors goc, sau do co the XOA safetensors
-  ## goc di, tiet kiem o) - DEQUANTIZE lai ve fp32 TRONG RAM luc load (train
-  ## van can fp32 vi Mamba2Real.nim chi co ham toan hoc tren float32 thuan,
-  ## KHONG co kernel train truc tiep tren du lieu da quantize - fp4 O DAY LA
-  ## DE TIET KIEM O DIA, KHONG PHAI tiet kiem RAM luc train).
-  echo &"[load_codestral] Doc {nimqPath} (.nimq, da quantize) roi dequantize ve fp32 ..."
+  ## Reads from a QUANTIZED fp4 FILE (~3.5GB on disk - see quantize_codestral.nim
+  ## to create it ONCE from the original safetensors, after which the original safetensors can be
+  ## DELETED to save disk) - DEQUANTIZED back to fp32 IN RAM at load (training
+  ## still needs fp32 because Mamba2Real.nim only has math on plain float32,
+  ## NO kernel training directly on quantized data - the fp4 HERE IS
+  ## TO SAVE DISK, NOT to save RAM during training).
+  echo &"[load_codestral] Reading {nimqPath} (.nimq, quantized), then dequantizing to fp32 ..."
   let sd = quant.loadQuantStateDict(nimqPath).sd
   var tensors: seq[RawBinTensor] = @[]
   for (name, qt) in sd:
     tensors.add(RawBinTensor(name: name, shape: qt.shape, data: quant.dequantizeTensor(qt)))
-  echo &"[load_codestral] Da dequantize {tensors.len} tensor tu .nimq"
+  echo &"[load_codestral] Dequantized {tensors.len} tensors from the .nimq"
   loadCodestralIntoJambaFromTensors(m, tensors)

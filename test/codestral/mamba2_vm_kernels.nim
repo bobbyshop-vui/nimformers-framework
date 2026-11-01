@@ -1,24 +1,24 @@
 ## mamba2_vm_kernels.nim
-## Build 2 VmProgram (session_vm.nim) chạy phần SSM recurrence + RMSNorm
-## gate của Mamba2 100% trên GPU. Dùng cùng opcode mới trong session_vm.nim
+## Builds 2 VmPrograms (session_vm.nim) that run the SSM recurrence + RMSNorm
+## gate of Mamba2 100% on the GPU. Uses the new opcodes in session_vm.nim
 ## (EXP, NEG, SIGMOID, RSQRT, LOAD/STORE_F32_IDX, IF_BEGIN/END, CMP_LT...).
-## Dispatch qua session_vm_dispatch.nim (metal_enc_* thật, không giả lập).
+## Dispatched through session_vm_dispatch.nim (real metal_enc_*, not emulated).
 
 import std/bitops
 import session_vm
 
 
-# ── Reduction cây trong threadgroup, chạy 100% trên GPU ──────
-## Trước đây: `while stride >= 1:` trên HOST, unroll log2(n) bước lúc build.
-## Giờ: 1 vòng FOR_BEGIN/END trên GPU; stride nằm trong thanh ghi, giảm đôi mỗi
-## vòng bằng MUL_CONST 0.5 (chính xác với luỹ thừa 2). Barrier nằm NGOÀI IF nên
-## mọi thread trong threadgroup cùng gặp nó (không deadlock).
-## Thanh ghi: rStride (đổi), rCnt (HẰNG trong vòng: Metal đọc lại mỗi vòng),
-## rTmp (cmp rồi addr), rA, rB. idxReg = chỉ số trong threadgroup.
+# ── Tree reduction in the threadgroup, 100% on the GPU ──────
+## Before: `while stride >= 1:` on the HOST, log2(n) steps unrolled at build time.
+## Now: 1 FOR_BEGIN/END loop on the GPU; the stride lives in a register and halves each
+## iteration via MUL_CONST 0.5 (exact for powers of 2). The barrier is OUTSIDE the IF so
+## every thread in the threadgroup reaches it (no deadlock).
+## Registers: rStride (changes), rCnt (CONSTANT in the loop: Metal rereads it each iteration),
+## rTmp (cmp then addr), rA, rB. idxReg = index within the threadgroup.
 proc emitTgTreeReduce*(p: var VmProgram; idxReg: uint32; n: int;
                       rStride, rCnt, rTmp, rA, rB: uint32) =
-  doAssert n >= 1 and (n and (n - 1)) == 0, "emitTgTreeReduce: n phai la luy thua 2"
-  p.emitLoadConstF32(rCnt, float32(countTrailingZeroBits(n)))   # log2(n) bước
+  doAssert n >= 1 and (n and (n - 1)) == 0, "emitTgTreeReduce: n must be a power of 2"
+  p.emitLoadConstF32(rCnt, float32(countTrailingZeroBits(n)))   # log2(n) steps
   p.emitLoadConstF32(rStride, float32(n div 2))
   sessionVmForGpu(p, rCnt):
     p.emitCmpLt(rTmp, idxReg, rStride)                # tid < stride
@@ -32,20 +32,20 @@ proc emitTgTreeReduce*(p: var VmProgram; idxReg: uint32; n: int;
     p.emitMulConst(rStride, rStride, 0.5'f32)         # stride /= 2
 
 # ════════════════════════════════════════════════════════════
-# 1) Mamba2 SSM step — grid = H*D thread, vòng n chạy GPU.
-# Dùng đúng 16 thanh ghi, không tràn, không spill.
-# Bảng idx h/d/g build 1 lần lúc load model (hằng số suốt đời model).
+# 1) Mamba2 SSM step — grid = H*D threads, the n loop runs on the GPU.
+# Uses exactly 16 registers, no overflow, no spill.
+# The h/d/g index tables are built once at model load (constant for the model's lifetime).
 #
 # memF32 layout:
 #   offX     : xPart[HD]
 #   offB     : bMat[G*N]
 #   offC     : cMat[G*N]
-#   offDt    : dt[H]        (đã softplus, tính bằng sessionActivation có sẵn)
+#   offDt    : dt[H]        (already softplus'd, computed with the existing sessionActivation)
 #   offALog  : aLog[H]
 #   offDSkip : dSkip[H]
-#   offState : ssmState[HD*N]   (đọc + ghi tại chỗ, persistent)
+#   offState : ssmState[HD*N]   (read + written in place, persistent)
 #   offY     : yPre[HD]         (output)
-#   offIdxH/D/G : bảng chỉ số const, build 1 lần
+#   offIdxH/D/G : const index tables, built once
 # ════════════════════════════════════════════════════════════
 proc buildMamba2StepProgram*(H, D, N, G: int): VmProgram =
   let HD = H * D
@@ -57,45 +57,45 @@ proc buildMamba2StepProgram*(H, D, N, G: int): VmProgram =
   let offDSkip  = offALog + H
   let offState  = offDSkip + H
   let offY      = offState + HD*N
-  # FIX token rac (bug #11): TRUOC DAY o day khai bao THEM mot bang
-  # `offIdxD` xen GIUA idxH va idxG:
+  # Garbage-token fix (bug #11): this used to declare an EXTRA table
+  # `offIdxD` BETWEEN idxH and idxG:
   #     let offIdxD = offIdxH + HD
   #     let offIdxG = offIdxD + HD
-  # Nhung buildShapeInfo() trong mamba2_ssm_gpu.nim CHI dung 2 bang
-  # (idxH, idxG) nam LIEN NHAU, va totalLen = offIdxG + HD. Ket qua:
-  # bytecode doc `g` o offset offY+3*HD, trong khi host ghi `g` o
-  # offY+2*HD - lech dung HD phan tu, va offY+3*HD CHINH BANG totalLen
-  # tuc la doc NGOAI vung du lieu host cap. Tren hot path hScratch la
-  # buffer lon dung chung nen khong crash: vung do chua ai ghi (0) ->
-  # g = 0 cho CA 8192 thread, MOI block, MOI token -> 128 head deu lay
-  # B va C cua group 0. Do o quy mo that (H=128 D=64 N=128 G=8):
-  # rel-L2 cua y = 0.62, cua ssmState (mang sang token sau) = 0.20,
-  # 7168/8192 thread sai group. Bang idxD KHONG duoc dung o bat ky
-  # dau trong chuong trinh nay (x lay o offX+tid, stateBase = tid*N)
-  # nen bo han, khong thay the.
+  # But buildShapeInfo() in mamba2_ssm_gpu.nim uses ONLY 2 tables
+  # (idxH, idxG) ADJACENT, and totalLen = offIdxG + HD. Result:
+  # the bytecode read `g` at offset offY+3*HD while the host wrote `g` at
+  # offY+2*HD - off by exactly HD elements, and offY+3*HD EQUALS totalLen,
+  # i.e. it read OUTSIDE the host-allocated data. On the hot path hScratch is
+  # a large shared buffer so it did not crash: nobody had written there (0) ->
+  # g = 0 for ALL 8192 threads, EVERY block, EVERY token -> all 128 heads took
+  # group 0's B and C. Measured at real scale (H=128 D=64 N=128 G=8):
+  # rel-L2 of y = 0.62, of ssmState (carried to the next token) = 0.20,
+  # 7168/8192 threads on the wrong group. The idxD table is NOT used anywhere
+  # in this program (x comes from offX+tid, stateBase = tid*N)
+  # so it is removed outright, not replaced.
   let offIdxH   = offY + HD
   let offIdxG   = offIdxH + HD
 
   var p: VmProgram
-  # reserved suốt hàm: R0=tid R1=h R3=g R4=yAcc R9=dA R10=xVal R11=dt
-  # scratch trong vòng n: R12,R13,R14,R15 (4 thanh ghi, đủ)
+  # reserved for the whole function: R0=tid R1=h R3=g R4=yAcc R9=dA R10=xVal R11=dt
+  # scratch in the n loop: R12,R13,R14,R15 (4 registers, enough)
   p.emitAddConst(12, 0, float32(offIdxH)); p.emitLoadF32Idx(1, 12)   # R1 = h
   p.emitAddConst(12, 0, float32(offIdxG)); p.emitLoadF32Idx(3, 12)   # R3 = g
 
   p.emitAddConst(12, 1, float32(offALog)); p.emitLoadF32Idx(12, 12)
-  p.emitExp(12, 12); p.emitNeg(12, 12)                                # R12 = A_h (tạm)
-  p.emitAddConst(11, 1, float32(offDt));   p.emitLoadF32Idx(11, 11)   # R11 = dt[h]  [dài hạn]
-  p.emitMul(9, 11, 12); p.emitExp(9, 9)                               # R9 = dA      [dài hạn]
+  p.emitExp(12, 12); p.emitNeg(12, 12)                                # R12 = A_h (temp)
+  p.emitAddConst(11, 1, float32(offDt));   p.emitLoadF32Idx(11, 11)   # R11 = dt[h]  [long-lived]
+  p.emitMul(9, 11, 12); p.emitExp(9, 9)                               # R9 = dA      [long-lived]
 
-  p.emitLoadF32Idx(10, 0)                                             # R10 = xVal   [dài hạn]  (offX=0)
+  p.emitLoadF32Idx(10, 0)                                             # R10 = xVal   [long-lived]  (offX=0)
 
   p.emitAddConst(12, 1, float32(offDSkip)); p.emitLoadF32Idx(12, 12)
-  p.emitMul(4, 12, 10)                                                # R4 = yAcc init [dài hạn]
+  p.emitMul(4, 12, 10)                                                # R4 = yAcc init [long-lived]
 
-  p.emitMulConst(2, 3, float32(N))          # R2 = gN         [dài hạn]
-  p.emitMulConst(6, 0, float32(N))          # R6 = stateBase  [dài hạn]
-  p.emitLoadConstF32(7, 0.0'f32)             # R7 = n          [dài hạn]
-  p.emitLoadConstF32(8, float32(N))          # R8 = count FOR  [dài hạn]
+  p.emitMulConst(2, 3, float32(N))          # R2 = gN         [long-lived]
+  p.emitMulConst(6, 0, float32(N))          # R6 = stateBase  [long-lived]
+  p.emitLoadConstF32(7, 0.0'f32)             # R7 = n          [long-lived]
+  p.emitLoadConstF32(8, float32(N))          # R8 = count FOR  [long-lived]
 
   sessionVmForGpu(p, 8):
     p.emitAddConst(13, 2, float32(offB)); p.emitAdd(13, 13, 7); p.emitLoadF32Idx(13, 13)  # R13 = bVal
@@ -103,7 +103,7 @@ proc buildMamba2StepProgram*(H, D, N, G: int): VmProgram =
     p.emitAddConst(15, 6, float32(offState)); p.emitAdd(15, 15, 7)                        # R15 = stateIdx
     p.emitLoadF32Idx(12, 15)              # R12 = sOld
     p.emitMul(12, 12, 9)                  # R12 = sOld*dA
-    p.emitMul(13, 13, 10)                 # R13 = bVal*xVal  (đè, bVal dùng xong)
+    p.emitMul(13, 13, 10)                 # R13 = bVal*xVal  (overwrites, bVal no longer needed)
     p.emitFma(12, 11, 13, 12)             # R12 = sNew = dt*bVal*xVal + sOld*dA
     p.emitStoreF32Idx(12, 15)             # ssmState[stateIdx] = sNew
     p.emitFma(4, 14, 12, 4)               # yAcc += cVal*sNew
@@ -115,22 +115,22 @@ proc buildMamba2StepProgram*(H, D, N, G: int): VmProgram =
   result = p
 
 # ════════════════════════════════════════════════════════════
-# 2) RMSNorm + gate cuối — 1 threadgroup / token, C thread.
+# 2) Final RMSNorm + gate — 1 threadgroup / token, C threads.
 # gated = yPre*silu(z) ; out = gated * rsqrt(mean(gated^2)+eps) * w
-# Reduction cây trong threadgroup dùng IF_BEGIN/END + CMP_LT.
-# Yêu cầu C là lũy thừa 2 và <= max threads/threadgroup của thiết bị
-# (thường 1024) — C lớn hơn cần chia nhiều threadgroup + cộng partial
-# sum bằng kernel phụ, CHƯA làm ở đây (nói rõ, không né).
+# Tree reduction in the threadgroup with IF_BEGIN/END + CMP_LT.
+# Requires C to be a power of 2 and <= the device's max threads/threadgroup
+# (usually 1024) — a larger C needs several threadgroups + summing partial
+# sums with a helper kernel, NOT done here (stated plainly).
 # memF32: [ yPre(0..<C) | z(C..<2C) | w(2C..<3C) | out(3C..<4C) ]
 # ════════════════════════════════════════════════════════════
 proc buildRmsGateProgram*(C: int; eps: float32): VmProgram =
-  doAssert (C and (C-1)) == 0, "buildRmsGateProgram: C phải là lũy thừa 2 (pad nếu cần)"
+  doAssert (C and (C-1)) == 0, "buildRmsGateProgram: C must be a power of 2 (pad if needed)"
   let offZ = C
   let offW = 2*C
   let offOut = 3*C
 
   var p: VmProgram
-  # R0=tid  R1=gated  [dài hạn]
+  # R0=tid  R1=gated  [long-lived]
   p.emitLoadF32Idx(1, 0)                              # R1 = yPre[tid]
   p.emitAddConst(2, 0, float32(offZ)); p.emitLoadF32Idx(2, 2)   # R2 = z[tid]
   p.emitNeg(3, 2)                                     # R3 = -z
@@ -138,16 +138,16 @@ proc buildRmsGateProgram*(C: int; eps: float32): VmProgram =
   p.emitLoadConstF32(5, 1.0'f32)
   p.emitDiv(3, 5, 3)                                   # R3 = sigmoid(z)
   p.emitMul(3, 2, 3)                                   # R3 = silu(z)
-  p.emitMul(1, 1, 3)                                   # R1 = gated  [dài hạn]
+  p.emitMul(1, 1, 3)                                   # R1 = gated  [long-lived]
 
   p.emitMul(4, 1, 1)                                   # R4 = gated^2
   p.emitTgStoreF32(4, 0, 0)
   p.emitBarrierTg()
 
-  p.emitTgTreeReduce(0, C, 6, 7, 8, 9, 10)   # GPU loop, không còn while host
+  p.emitTgTreeReduce(0, C, 6, 7, 8, 9, 10)   # GPU loop, no more host while
 
   p.emitLoadConstF32(12, 0.0'f32)
-  p.emitTgLoadF32(11, 12, 0)         # R11 = tg[0] = tổng gated^2
+  p.emitTgLoadF32(11, 12, 0)         # R11 = tg[0] = sum of gated^2
   p.emitMulConst(11, 11, 1.0'f32/float32(C))
   p.emitAddConst(11, 11, eps)
   p.emitRsqrt(11, 11)                # R11 = rsqrt(mean+eps)
@@ -162,13 +162,13 @@ proc buildRmsGateProgram*(C: int; eps: float32): VmProgram =
   result = p
 
 # ════════════════════════════════════════════════════════════
-# 3) Conv1d incremental (K=4 điển hình) — grid = cDim thread.
+# 3) Incremental conv1d (typically K=4) — grid = cDim threads.
 # memF32 layout:
-#   offXBC   : xBCPre[cDim]          (input mới)
-#   offState : convState[cDim*(K-1)] (đọc + ghi tại chỗ)
+#   offXBC   : xBCPre[cDim]          (new input)
+#   offState : convState[cDim*(K-1)] (read + written in place)
 #   offW     : convWeight[cDim*K]    (row-major c*K + k)
 #   offBias  : convBias[cDim]
-#   offOut   : xBCConv[cDim]         (output sau silu)
+#   offOut   : xBCConv[cDim]         (output after silu)
 # ════════════════════════════════════════════════════════════
 proc buildConv1dIncProgram*(cDim, K: int): VmProgram =
   ## Layout memF32:
@@ -189,8 +189,8 @@ proc buildConv1dIncProgram*(cDim, K: int): VmProgram =
   p.emitAddConst(1, 0, float32(offBias))
   p.emitLoadF32Idx(1, 1)
 
-  p.emitLoadConstF32(5, 0.0'f32)                 # k (đếm trên GPU)
-  p.emitLoadConstF32(6, float32(K-1))     # số vòng
+  p.emitLoadConstF32(5, 0.0'f32)                 # k (counted on the GPU)
+  p.emitLoadConstF32(6, float32(K-1))     # iteration count
   sessionVmForGpu(p, 6):
     # state addr = offState + tid*(K-1) + k
     p.emitMulConst(3, 0, float32(K-1))
@@ -222,8 +222,8 @@ proc buildConv1dIncProgram*(cDim, K: int): VmProgram =
   p.emitStoreF32Idx(1, 6)
 
   # slide state
-  p.emitLoadConstF32(5, 0.0'f32)                 # k (đếm trên GPU)
-  p.emitLoadConstF32(6, float32(K-2))     # số vòng
+  p.emitLoadConstF32(5, 0.0'f32)                 # k (counted on the GPU)
+  p.emitLoadConstF32(6, float32(K-2))     # iteration count
   sessionVmForGpu(p, 6):
     p.emitMulConst(3, 0, float32(K-1))
     p.emitAdd(3, 3, 5); p.emitAddConst(3, 3, float32(1 + offState))
@@ -242,7 +242,7 @@ proc buildConv1dIncProgram*(cDim, K: int): VmProgram =
   result = p
 
 # ════════════════════════════════════════════════════════════
-# 4) Softplus(dt) + split helper — grid = H thread (dt) hoặc full.
+# 4) Softplus(dt) + split helper — grid = H threads (dt) or full.
 # Simple: softplus on dtPre + dtBias → dt
 # mem: [dtPre(0..<H) | dtBias(H..<2H) | dtOut(2H..<3H)]
 # ════════════════════════════════════════════════════════════
@@ -257,11 +257,11 @@ proc buildSoftplusDtProgram*(H: int): VmProgram =
   result = p
 
 # ════════════════════════════════════════════════════════════
-# 5) RMS+gate cho C lớn (chunked): mỗi threadgroup xử lý 1 chunk
-# kích thước TG=1024 (power-of-2). Phase 1: partial sum per chunk
-# vào memF32[offPartial + chunkId]. Phase 2 (grid=1 TG): reduce
+# 5) RMS+gate for large C (chunked): each threadgroup handles 1 chunk
+# of size TG=1024 (power of 2). Phase 1: partial sum per chunk
+# into memF32[offPartial + chunkId]. Phase 2 (grid=1 TG): reduce
 # partials → rsqrt → broadcast scale. Phase 3: scale * gated * w.
-# Để đơn giản và đúng, dùng 2 program riêng + 1 dispatch nhỏ.
+# For simplicity and correctness, 2 separate programs + 1 small dispatch.
 # ════════════════════════════════════════════════════════════
 # ════════════════════════════════════════════════════════════
 # 6) Split proj [2C+2GN+H] → z[C] | xBC[cDim] | dt[H]
@@ -269,35 +269,35 @@ proc buildSoftplusDtProgram*(H: int): VmProgram =
 # mem: [ proj(0..<P) | z(P..<P+C) | xBC(P+C..<P+C+cDim) | dt(P+C+cDim..<...) ]
 # ════════════════════════════════════════════════════════════
 proc buildFusedSplitConvSoftplusProgram*(C, cDim, H, K: int): VmProgram =
-  ## MOI - GOP split(z,xBC,dt) + conv1d(xBC) + softplus(dt) THANH 1 KERNEL
-  ## DUY NHAT, dung CHINH bo opcode co san cua micro-VM (KHONG viet .metal
-  ## tay). Hoc theo fusedNormQKVRoPE/fusedResidualNormFFN cua nim_inference.nim
-  ## (model 6.7B THAT, khong lag tren cung phan cung) - nguyen tac chung:
-  ## giam so luong dispatch GPU + sessionCopyInto rieng le moi layer.
+  ## NEW - FUSES split(z,xBC,dt) + conv1d(xBC) + softplus(dt) INTO A SINGLE
+  ## KERNEL, using only the micro-VM's existing opcodes (NO hand-written .metal).
+  ## Modelled on fusedNormQKVRoPE/fusedResidualNormFFN in nim_inference.nim
+  ## (the REAL 6.7B model, no lag on the same hardware) - the common rule:
+  ## fewer GPU dispatches + separate sessionCopyInto calls per layer.
   ##
-  ## AN TOAN DE GOP (khong can threadgroup_barrier): conv1d o day la
-  ## DEPTHWISE THEO THOI GIAN - xem buildConv1dIncProgram goc, MOI truy cap
-  ## (state/weight/bias/input) deu qua CHINH SO tid=c cua thread do, khong
-  ## thread nao can du lieu cua thread khac. Vay 1 thread co the lam LIEN
-  ## TIEP: split gia tri xBC[tid] cua CHINH NO (giu trong register, KHONG
-  ## ghi RAM trung gian) roi dung NGAY cho conv1d; tuong tu voi dt+softplus.
+  ## SAFE TO FUSE (no threadgroup_barrier needed): the conv1d here is
+  ## DEPTHWISE OVER TIME - see the original buildConv1dIncProgram, EVERY access
+  ## (state/weight/bias/input) goes through the thread's OWN tid=c, no
+  ## thread needs another thread's data. So one thread can, in sequence,
+  ## split ITS OWN xBC[tid] value (kept in a register, NO intermediate
+  ## RAM write) and use it IMMEDIATELY for conv1d; same for dt+softplus.
   ##
-  ## Loi ich: 3 dispatch (split, conv, softplus) + 4 sessionCopyInto (chuyen
-  ## xBC/dt qua lai giua cac buffer scratch) -> CON 1 dispatch DUY NHAT,
-  ## khong copy trung gian nao. Dung toi da R0..R7 (VM chi co 16 register
-  ## - R0..R15, xem pack2() mask 0xF trong session_vm.nim va "float R[16]"
-  ## trong jit_vm.nim - vuot qua se TRAN THAM LANG, sai ket qua).
+  ## Benefit: 3 dispatches (split, conv, softplus) + 4 sessionCopyInto (moving
+  ## xBC/dt between scratch buffers) -> a SINGLE dispatch,
+  ## no intermediate copy. Uses at most R0..R7 (the VM has only 16 registers
+  ## - R0..R15, see the pack2() 0xF mask in session_vm.nim and "float R[16]"
+  ## in jit_vm.nim - going past that OVERFLOWS SILENTLY, giving wrong results).
   ##
-  ## Memory layout dau vao (khop voi cach encodeLayerStep se goi):
-  ##   [0, P)                    proj (P=C+cDim+H, dau ra fp4 gemv inProj)
-  ##   [P, P+C)                  outZ (copy thang, dung sau boi rmsnorm-gate)
-  ##   [P+C, P+C+cDim*(K-1))     convState (persistent, doc - CHUA cap nhat
-  ##                              o day, encodeLayerStep tu ghi lai sau)
-  ##   [.. + cDim*K)             convWeight (persistent, chi doc)
-  ##   [.. + cDim)               convBias (persistent, chi doc)
-  ##   [.. + cDim)               outXBC (= silu(conv(...)), dung boi ssm-step)
-  ##   [.. + H)                  dtBias (persistent, chi doc)
-  ##   [.. + H)                  outDt (= softplus(...), dung boi ssm-step)
+  ## Input memory layout (matches how encodeLayerStep calls it):
+  ##   [0, P)                    proj (P=C+cDim+H, output of the inProj fp4 gemv)
+  ##   [P, P+C)                  outZ (plain copy, used later by rmsnorm-gate)
+  ##   [P+C, P+C+cDim*(K-1))     convState (persistent, read - NOT updated
+  ##                              here, encodeLayerStep writes it back later)
+  ##   [.. + cDim*K)             convWeight (persistent, read only)
+  ##   [.. + cDim)               convBias (persistent, read only)
+  ##   [.. + cDim)               outXBC (= silu(conv(...)), used by ssm-step)
+  ##   [.. + H)                  dtBias (persistent, read only)
+  ##   [.. + H)                  outDt (= softplus(...), used by ssm-step)
   doAssert K >= 2 and K <= 8, "buildFusedSplitConvSoftplusProgram: K in [2,8]"
   let P = C + cDim + H
   let offOutZ   = P
@@ -308,17 +308,17 @@ proc buildFusedSplitConvSoftplusProgram*(C, cDim, H, K: int): VmProgram =
   let offDtBias = offOutXBC + cDim
   let offOutDt  = offDtBias + H
   let offOutConvSt = offOutDt + H
-  ## MOI (fix bug convState dong bang - xem bao cao debug): output THEM
-  ## [offOutConvSt, offOutConvSt + cDim*(K-1)) = convState DA TRUOT, y het
-  ## logic "slide state" cua buildConv1dIncProgram goc (da CO san, chi bi
-  ## bo sot luc gop kernel) - encodeLayerStep phai copy vung nay ve
-  ## o.offConvSt SAU khi dispatch, xem sua tuong ung o do.
+  ## NEW (fix for the frozen convState bug - see the debug report): an EXTRA output
+  ## [offOutConvSt, offOutConvSt + cDim*(K-1)) = the SHIFTED convState, exactly the
+  ## "slide state" logic of the original buildConv1dIncProgram (it WAS there, just
+  ## dropped when the kernel was fused) - encodeLayerStep must copy this area back to
+  ## o.offConvSt AFTER the dispatch, see the matching fix there.
 
   var p: VmProgram
-  # R0 = tid, dat 1 lan boi runtime VM, dung suot ca chuong trinh - KHONG
-  # bao gio bi cac phan duoi ghi de.
+  # R0 = tid, set once by the VM runtime, used for the whole program - NEVER
+  # overwritten by the parts below.
 
-  # ── Phan 1: split z (thuan copy, dung boi rmsnorm-gate ve sau) ──
+  # ── Part 1: split z (plain copy, used later by rmsnorm-gate) ──
   p.emitLoadConstF32(1, float32(C))
   p.emitCmpLt(2, 0, 1)
   sessionVmIfGpu(p, 2):
@@ -326,9 +326,9 @@ proc buildFusedSplitConvSoftplusProgram*(C, cDim, H, K: int): VmProgram =
     p.emitAddConst(4, 0, float32(offOutZ))
     p.emitStoreF32Idx(3, 4)
 
-  # ── Phan 2: split xBC (giu o R7, KHONG ghi RAM trung gian) + conv1d
-  # NGAY tai cho (y het buildConv1dIncProgram goc, chi doi input tu memory
-  # sang register R7) ──
+  # ── Part 2: split xBC (kept in R7, NO intermediate RAM write) + conv1d
+  # right in place (exactly the original buildConv1dIncProgram, only the input moves from memory
+  # to register R7) ──
   p.emitLoadConstF32(1, float32(cDim))
   p.emitCmpLt(2, 0, 1)
   sessionVmIfGpu(p, 2):
@@ -337,8 +337,8 @@ proc buildFusedSplitConvSoftplusProgram*(C, cDim, H, K: int): VmProgram =
 
     p.emitAddConst(1, 0, float32(offConvB))
     p.emitLoadF32Idx(1, 1)                      # R1 = acc = bias[c]
-    p.emitLoadConstF32(8, 0.0'f32)                 # k (đếm trên GPU)
-    p.emitLoadConstF32(9, float32(K-1))     # số vòng
+    p.emitLoadConstF32(8, 0.0'f32)                 # k (counted on the GPU)
+    p.emitLoadConstF32(9, float32(K-1))     # iteration count
     sessionVmForGpu(p, 9):
       p.emitMulConst(3, 0, float32(K-1))
       p.emitAdd(3, 3, 8); p.emitAddConst(3, 3, float32(offConvSt))
@@ -363,12 +363,12 @@ proc buildFusedSplitConvSoftplusProgram*(C, cDim, H, K: int): VmProgram =
     p.emitAddConst(6, 0, float32(offOutXBC))
     p.emitStoreF32Idx(1, 6)
 
-    # ── MOI: "truot" convState - y het buildConv1dIncProgram goc (bi bo
-    # sot luc gop kernel, xem ghi chu o offOutConvSt phia tren). R7 van con
-    # giu xBC[tid] hien tai tu luc load o dau block nay (khong bi FMA/silu
-    # o tren dung toi) - dung lai thang, khong can doc lai tu memory. ──
-    p.emitLoadConstF32(8, 0.0'f32)                 # k (đếm trên GPU)
-    p.emitLoadConstF32(9, float32(K-2))     # số vòng
+    # ── NEW: "slide" convState - exactly the original buildConv1dIncProgram (dropped
+    # when the kernel was fused, see the offOutConvSt note above). R7 still
+    # holds the current xBC[tid] loaded at the start of this block (not touched by the FMA/silu
+    # above) - reused directly, no need to reread memory. ──
+    p.emitLoadConstF32(8, 0.0'f32)                 # k (counted on the GPU)
+    p.emitLoadConstF32(9, float32(K-2))     # iteration count
     sessionVmForGpu(p, 9):
       p.emitMulConst(3, 0, float32(K-1))
       p.emitAdd(3, 3, 8); p.emitAddConst(3, 3, float32(1 + offConvSt))
@@ -381,7 +381,7 @@ proc buildFusedSplitConvSoftplusProgram*(C, cDim, H, K: int): VmProgram =
     p.emitAddConst(3, 3, float32((K-2) + offOutConvSt))
     p.emitStoreF32Idx(7, 3)
 
-  # ── Phan 3: split dt (R3) + softplus NGAY tai cho ──
+  # ── Part 3: split dt (R3) + softplus right in place ──
   p.emitLoadConstF32(1, float32(H))
   p.emitCmpLt(2, 0, 1)
   sessionVmIfGpu(p, 2):
@@ -441,10 +441,10 @@ proc buildSplitProjProgram*(C, cDim, H: int): VmProgram =
 
 # ════════════════════════════════════════════════════════════
 # 7) RMS+gate LARGE C (e.g. 8192) — 100% GPU, 1 threadgroup=1024
-# Mỗi thread xử lý elemsPerThread = C/1024 phần tử:
-#   gated, localSumSq, rồi TG tree reduce → rsqrt → scale ghi out.
+# Each thread handles elemsPerThread = C/1024 elements:
+#   gated, localSumSq, then TG tree reduce → rsqrt → scale written to out.
 # mem: [ yPre(0..<C) | z(C..<2C) | w(2C..<3C) | out(3C..<4C) ]
-# Yêu cầu C % 1024 == 0.
+# Requires C % 1024 == 0.
 # ════════════════════════════════════════════════════════════
 proc buildRmsGateLargeProgram*(C: int; eps: float32; tgSize: int = 1024): VmProgram =
   doAssert C mod tgSize == 0, "buildRmsGateLargeProgram: C must be multiple of tgSize"
@@ -491,7 +491,7 @@ proc buildRmsGateLargeProgram*(C: int; eps: float32; tgSize: int = 1024): VmProg
   p.emitTgStoreF32(1, 0, 0)
   p.emitBarrierTg()
 
-  p.emitTgTreeReduce(0, tgSize, 6, 7, 8, 9, 10)   # GPU loop, không còn while host
+  p.emitTgTreeReduce(0, tgSize, 6, 7, 8, 9, 10)   # GPU loop, no more host while
 
   # R11 = rsqrt(mean + eps)
   p.emitLoadConstF32(12, 0.0'f32)
@@ -520,41 +520,41 @@ proc buildRmsGateLargeProgram*(C: int; eps: float32; tgSize: int = 1024): VmProg
   result = p
 
 # ════════════════════════════════════════════════════════════
-# 9) BAN "TAI CHO" (moi) - split+conv1d+softplus, ssm-step, gated-rmsnorm
-# THEO NHOM, tat ca nhan OFFSET TUYET DOI va doc/ghi TRUC TIEP tren buffer
-# layer thuong tru (hWork) - khong con sessionCopyInto nao giua cac buoc
-# (xem giai thich day du trong BAO_CAO.md muc 2, va patch session_vm.nim/
-# jit_vm.nim/micro_vm.metal them OP_LOAD_LID/OP_LOAD_TGID can cho ham thu 3).
+# 9) "IN PLACE" VERSION (new) - split+conv1d+softplus, ssm-step, GROUPED
+# gated-rmsnorm, all taking ABSOLUTE OFFSETS and reading/writing DIRECTLY on the resident
+# layer buffer (hWork) - no more sessionCopyInto between steps
+# (see the full explanation in BAO_CAO.md section 2, and the session_vm.nim/
+# jit_vm.nim/micro_vm.metal patch adding OP_LOAD_LID/OP_LOAD_TGID needed by the 3rd function).
 #
-# gated RMSNorm o day chuan hoa THEO NHOM (group_size = C div nGroups),
-# dung cong thuc GOC cua mamba_ssm (RMSNormGated(..., group_size=d_inner//
-# ngroups)) va cua vLLM (Mixer2RMSNormGated(intermediate_size, n_groups,...)).
-# Ham buildRmsGateProgram/buildRmsGateLargeProgram o TREN (muc 2/7) chuan hoa
-# tren CA C - dung HANH VI CUA HF transformers modeling_mamba2.py, noi
-# n_groups bi BO SOT trong MambaRMSNormGated (xac nhan trong PR
-# huggingface/transformers#35943, da sua cho Zamba2; PR #40861 "Support
-# n_groups>1 for mamba2" con mo). Goi buildRmsGateGroupedAt voi nGroups=1
-# se tai tao CHINH XAC ham cu o tren, nen 2 duong co the doi chieu truc tiep
-# (xem test_layer0.nim / BYBY_MAMBA_NORM_GROUPS).
+# The gated RMSNorm here normalises PER GROUP (group_size = C div nGroups),
+# the ORIGINAL formula of mamba_ssm (RMSNormGated(..., group_size=d_inner//
+# ngroups)) and of vLLM (Mixer2RMSNormGated(intermediate_size, n_groups,...)).
+# buildRmsGateProgram/buildRmsGateLargeProgram ABOVE (sections 2/7) normalise
+# over ALL of C - the BEHAVIOUR of HF transformers modeling_mamba2.py, where
+# n_groups is MISSING in MambaRMSNormGated (confirmed in PR
+# huggingface/transformers#35943, fixed for Zamba2; PR #40861 "Support
+# n_groups>1 for mamba2" is still open). Calling buildRmsGateGroupedAt with nGroups=1
+# reproduces the old function above EXACTLY, so the 2 paths can be compared directly
+# (see test_layer0.nim / BYBY_MAMBA_NORM_GROUPS).
 # ════════════════════════════════════════════════════════════
 
 proc buildSplitConvSoftplusAt*(C, cDim, H, K: int;
                                offZ, offXBC, offDt,
                                offConvW, offConvB, offConvSt,
                                offDtBias: int): VmProgram =
-  ## hWork layout (offset TUYET DOI, do computeOffV2 sinh):
-  ##   [0, P)                proj = in_proj(x),  P = C + cDim + H  (chi doc)
-  ##   [offZ,  offZ+C)       z          (ghi)
-  ##   [offXBC, +cDim)       xBCConv sau SiLU  (ghi)
-  ##   [offDt,  +H)          dt sau softplus   (ghi)
-  ##   [offConvW, +cDim*K)   convWeight (chi doc, thuong tru)
-  ##   [offConvB, +cDim)     convBias   (chi doc, thuong tru)
-  ##   [offConvSt,+cDim*(K-1)) convState (DOC + GHI TAI CHO)
-  ##   [offDtBias,+H)        dtBias     (chi doc, thuong tru)
-  ## convState cap nhat tai cho AN TOAN vi thread c chi dung hang c: doc HET
-  ## K-1 gia tri vao thanh ghi TRUOC, tinh xong moi ghi lai (khong con can
-  ## buffer offOutConvSt rieng nhu buildFusedSplitConvSoftplusProgram cu).
-  doAssert K >= 2 and K <= 8, "buildSplitConvSoftplusAt: K trong [2,8]"
+  ## hWork layout (ABSOLUTE offsets, produced by computeOffV2):
+  ##   [0, P)                proj = in_proj(x),  P = C + cDim + H  (read only)
+  ##   [offZ,  offZ+C)       z          (written)
+  ##   [offXBC, +cDim)       xBCConv after SiLU  (written)
+  ##   [offDt,  +H)          dt after softplus   (written)
+  ##   [offConvW, +cDim*K)   convWeight (read only, resident)
+  ##   [offConvB, +cDim)     convBias   (read only, resident)
+  ##   [offConvSt,+cDim*(K-1)) convState (READ + WRITTEN IN PLACE)
+  ##   [offDtBias,+H)        dtBias     (read only, resident)
+  ## convState is updated in place SAFELY since thread c only uses row c: it reads ALL
+  ## K-1 values into registers FIRST and writes back only when done (no more need for
+  ## the separate offOutConvSt buffer of the old buildFusedSplitConvSoftplusProgram).
+  doAssert K >= 2 and K <= 8, "buildSplitConvSoftplusAt: K must be in [2,8]"
   var p: VmProgram
 
   # ── Phan 1: z = proj[0..C) ──
@@ -565,21 +565,21 @@ proc buildSplitConvSoftplusAt*(C, cDim, H, K: int;
     p.emitAddConst(4, 0, float32(offZ))
     p.emitStoreF32Idx(3, 4)
 
-  # ── Phan 2: xBC = proj[C..C+cDim) -> conv1d -> SiLU, roi truot convState ──
+  # ── Part 2: xBC = proj[C..C+cDim) -> conv1d -> SiLU, then slide convState ──
   p.emitLoadConstF32(1, float32(cDim))
   p.emitCmpLt(2, 0, 1)
   sessionVmIfGpu(p, 2):
     p.emitAddConst(3, 0, float32(C))
-    p.emitLoadF32Idx(7, 3)                       # R7 = xNew (giu suot block)
-    p.emitMulConst(6, 0, float32(K - 1))         # R6 = tid*(K-1) (giu suot block)
-    # acc = bias + sum_k w[c,k]*state[c,k] + w[c,K-1]*xNew   (vòng k chạy GPU)
-    # Không cần "stage" state vào R8..: ghi trượt TUẦN TỰ tại chỗ vẫn an toàn vì
-    # vòng acc xong hẳn trước, và vòng trượt đọc state[k+1] trước khi vòng k+1 ghi đè nó.
+    p.emitLoadF32Idx(7, 3)                       # R7 = xNew (kept for the whole block)
+    p.emitMulConst(6, 0, float32(K - 1))         # R6 = tid*(K-1) (kept for the whole block)
+    # acc = bias + sum_k w[c,k]*state[c,k] + w[c,K-1]*xNew   (k loop runs on the GPU)
+    # No need to "stage" the state into R8..: sliding SEQUENTIALLY in place is still safe because
+    # the acc loop finishes first, and the slide loop reads state[k+1] before iteration k+1 overwrites it.
     p.emitAddConst(1, 0, float32(offConvB))
     p.emitLoadF32Idx(1, 1)                       # R1 = acc = bias[c]
     p.emitMulConst(5, 0, float32(K))             # R5 = tid*K
     p.emitLoadConstF32(8, 0.0'f32)               # R8 = k
-    p.emitLoadConstF32(9, float32(K - 1))        # R9 = số vòng (hằng)
+    p.emitLoadConstF32(9, float32(K - 1))        # R9 = iteration count (constant)
     sessionVmForGpu(p, 9):
       p.emitAdd(3, 6, 8); p.emitAddConst(3, 3, float32(offConvSt))
       p.emitLoadF32Idx(2, 3)                     # R2 = state[c,k]
@@ -592,12 +592,12 @@ proc buildSplitConvSoftplusAt*(C, cDim, H, K: int;
     p.emitFma(1, 4, 7, 1)
     # SiLU(acc)
     p.emitNeg(3, 1); p.emitExp(3, 3); p.emitAddConst(3, 3, 1.0'f32)
-    p.emitLoadConstF32(5, 1.0'f32)               # R5 (tid*K) da dung xong
+    p.emitLoadConstF32(5, 1.0'f32)               # R5 (tid*K) is no longer needed
     p.emitDiv(3, 5, 3)
     p.emitMul(1, 1, 3)
     p.emitAddConst(4, 0, float32(offXBC))
     p.emitStoreF32Idx(1, 4)
-    # truot cua so: state[k] = state[k+1] (k=0..K-3), state[K-2] = xNew  (vòng GPU)
+    # slide the window: state[k] = state[k+1] (k=0..K-3), state[K-2] = xNew  (GPU loop)
     p.emitLoadConstF32(8, 0.0'f32)
     p.emitLoadConstF32(9, float32(K - 2))
     sessionVmForGpu(p, 9):
@@ -628,8 +628,8 @@ proc buildSplitConvSoftplusAt*(C, cDim, H, K: int;
 proc buildMamba2StepAt*(H, D, N, G: int;
                         offX, offB, offC, offDt, offALog, offDSkip,
                         offState, offY, offIdxH, offIdxG: int): VmProgram =
-  ## Y HET buildMamba2StepProgram o tren, chi khac o cho: MOI offset la
-  ## THAM SO thay vi tinh cung tu 0 - cho phep doc/ghi thang tren hWork.
+  ## EXACTLY buildMamba2StepProgram above, with one difference: EVERY offset is a
+  ## PARAMETER instead of being hard-coded from 0 - allows reading/writing directly on hWork.
   var p: VmProgram
   p.emitAddConst(12, 0, float32(offIdxH)); p.emitLoadF32Idx(1, 12)   # R1 = h
   p.emitAddConst(12, 0, float32(offIdxG)); p.emitLoadF32Idx(3, 12)   # R3 = g
@@ -668,20 +668,20 @@ proc buildMamba2StepAt*(H, D, N, G: int;
 
 proc buildRmsGateGroupedAt*(C, nGroups, tgSize: int; eps: float32;
                             offY, offZ, offW, offOut: int): VmProgram =
-  ## gated = y * SiLU(z); moi nhom g (do dai L = C/nGroups):
+  ## gated = y * SiLU(z); each group g (length L = C/nGroups):
   ##   r_g = rsqrt(mean_{i in g}(gated^2) + eps)
   ##   out[i] = gated[i] * r_{g(i)} * w[i]
-  ## Dispatch: nThreads = nGroups*tgSize, threadgroup = tgSize -> MOI
-  ## threadgroup lo DUNG 1 nhom. nGroups=1 tai tao CHINH XAC
-  ## buildRmsGateProgram/buildRmsGateLargeProgram o tren (chuan hoa tren ca C).
-  ## Dung OP_LOAD_LID/OP_LOAD_TGID (them moi trong session_vm.nim) vi VM cu
-  ## chi co thread_position_in_grid, khong tach duoc lid/groupId.
+  ## Dispatch: nThreads = nGroups*tgSize, threadgroup = tgSize -> EACH
+  ## threadgroup handles exactly 1 group. nGroups=1 reproduces EXACTLY
+  ## buildRmsGateProgram/buildRmsGateLargeProgram above (normalising over all of C).
+  ## Uses OP_LOAD_LID/OP_LOAD_TGID (newly added in session_vm.nim) because the old VM
+  ## only had thread_position_in_grid and could not split lid/groupId.
   doAssert nGroups >= 1 and C mod nGroups == 0,
-    "buildRmsGateGroupedAt: C phai chia het nGroups"
+    "buildRmsGateGroupedAt: C must be divisible by nGroups"
   let groupLen = C div nGroups
   doAssert tgSize >= 1 and groupLen mod tgSize == 0,
-    "buildRmsGateGroupedAt: groupLen (" & $groupLen & ") phai chia het tgSize (" & $tgSize & ")"
-  doAssert (tgSize and (tgSize - 1)) == 0, "buildRmsGateGroupedAt: tgSize phai la luy thua 2"
+    "buildRmsGateGroupedAt: groupLen (" & $groupLen & ") must be divisible by tgSize (" & $tgSize & ")"
+  doAssert (tgSize and (tgSize - 1)) == 0, "buildRmsGateGroupedAt: tgSize must be a power of 2"
   let ept = groupLen div tgSize
 
   var p: VmProgram
@@ -690,13 +690,13 @@ proc buildRmsGateGroupedAt*(C, nGroups, tgSize: int; eps: float32;
   p.emitMulConst(2, 2, float32(groupLen))            # R2 = groupBase
   p.emitLoadConstF32(3, 0.0'f32)                     # R3 = localSum
 
-  # ── pass 1: gated + localSum(gated^2), stash gated vao offOut ──
+  # ── pass 1: gated + localSum(gated^2), stash gated in offOut ──
   p.emitLoadConstF32(8, float32(ept))
   p.emitLoadConstF32(7, 0.0'f32)
   sessionVmForGpu(p, 8):
     p.emitMulConst(9, 7, float32(tgSize))
     p.emitAdd(9, 9, 1)
-    p.emitAdd(9, 9, 2)                               # R9 = i (chi so trong C)
+    p.emitAdd(9, 9, 2)                               # R9 = i (index within C)
     p.emitAddConst(10, 9, float32(offY));  p.emitLoadF32Idx(10, 10)
     p.emitAddConst(11, 9, float32(offZ));  p.emitLoadF32Idx(11, 11)
     p.emitNeg(12, 11); p.emitExp(12, 12); p.emitAddConst(12, 12, 1.0'f32)
@@ -707,16 +707,16 @@ proc buildRmsGateGroupedAt*(C, nGroups, tgSize: int; eps: float32;
     p.emitMul(14, 10, 10); p.emitAdd(3, 3, 14)
     p.emitAddConst(7, 7, 1.0'f32)
 
-  # ── reduce cay trong threadgroup (chi so = lid, KHONG phai tid toan cuc) ──
+  # ── tree reduce in the threadgroup (index = lid, NOT the global tid) ──
   p.emitTgStoreF32(3, 1, 0)
   p.emitBarrierTg()
-  p.emitTgTreeReduce(1, tgSize, 4, 5, 6, 10, 11)   # GPU loop, không còn while host
+  p.emitTgTreeReduce(1, tgSize, 4, 5, 6, 10, 11)   # GPU loop, no more host while
 
   p.emitLoadConstF32(4, 0.0'f32)
   p.emitTgLoadF32(15, 4, 0)
   p.emitMulConst(15, 15, 1.0'f32 / float32(groupLen))
   p.emitAddConst(15, 15, eps)
-  p.emitRsqrt(15, 15)                                # R15 = r_g (giu den het)
+  p.emitRsqrt(15, 15)                                # R15 = r_g (kept until the end)
 
   # ── pass 2: out = gated * r * w ──
   p.emitLoadConstF32(8, float32(ept))
@@ -736,61 +736,61 @@ proc buildRmsGateGroupedAt*(C, nGroups, tgSize: int; eps: float32;
   result = p
 
 # ═══════════════════════════════════════════════════════════════════════
-# BACKWARD SELECTIVE SCAN — 1 DISPATCH CHO TOÀN BỘ T BƯỚC, 100% GPU
+# SELECTIVE SCAN BACKWARD — 1 DISPATCH FOR ALL T STEPS, 100% GPU
 # ═══════════════════════════════════════════════════════════════════════
-## Bản cũ có 2 vấn đề: (1) buildMamba2StepBackwardAt cần VÒNG CPU qua t, lại ghi đè
-## thanh ghi lẫn nhau (R12/R13 dùng cho 3 thứ) và gọi emitAtomicAdd chưa từng tồn tại;
-## (2) buildMamba2BackwardFullAt chỉ là stub (`emitHalt` trong vòng) -> kernel không
-## làm gì, selectiveScanBackwardGpu trả về toàn số 0 IM LẶNG. Cả hai thay bằng kernel
-## dưới đây (đã đối chiếu với gradient sai phân số - xem t_mamba.nim).
+## The old version had 2 problems: (1) buildMamba2StepBackwardAt needed a CPU LOOP over t, and its
+## registers clobbered each other (R12/R13 used for 3 things) and it called an emitAtomicAdd that never existed;
+## (2) buildMamba2BackwardFullAt was only a stub (`emitHalt` in the loop) -> the kernel did
+## nothing and selectiveScanBackwardGpu SILENTLY returned all zeros. Both are replaced by the kernel
+## below (checked against finite-difference gradients - see t_mamba.nim).
 ##
-## Toán (mỗi thread = 1 (b,h,d); s_t = s_{t-1}*dA_t + dt_t*B_t*x_t ; y_t = D*x_t + sum_n C_t[n]*s_t[n]):
+## Math (each thread = 1 (b,h,d); s_t = s_{t-1}*dA_t + dt_t*B_t*x_t ; y_t = D*x_t + sum_n C_t[n]*s_t[n]):
 ##   dS_tn   = dS_{t+1,n}*dA_{t+1} + C_t[n]*dY_t
-##   dC[t,g,n] += dY_t * s_t[n]                         (atomic - chung cho mọi h,d trong nhóm g)
+##   dC[t,g,n] += dY_t * s_t[n]                         (atomic - shared by every h,d in group g)
 ##   dB[t,g,n] += dS_tn*dt_t*x_t                        (atomic)
-##   dX[t]     += dS_tn*dt_t*B_t[n]  (+ dY_t*D ở pass skip)
+##   dX[t]     += dS_tn*dt_t*B_t[n]  (+ dY_t*D in the skip pass)
 ##   dDt[t,h]  += dS_tn*s_{t-1}[n]*dA_t*A + dS_tn*B_t[n]*x_t   (atomic)
 ##   dALog[h]  += dS_tn*s_{t-1}[n]*dA_t*dt_t*A                 (atomic)
 ##   dDSkip[h] += dY_t*x_t                                      (atomic)
-## dS_n chỉ phụ thuộc cùng n nên đảo vòng: n NGOÀI, t TRONG (lùi) -> dS nằm gọn trong
-## 1 thanh ghi, không cần mảng per-thread. Địa chỉ đi qua U[] (uint32) vì
-## B*(T+1)*HD*N dễ vượt 2^24 là mức float32 còn chính xác.
+## dS_n depends only on the same n, so the loops are swapped: n OUTER, t INNER (backwards) -> dS fits in
+## 1 register, no per-thread array needed. Addresses go through U[] (uint32) since
+## B*(T+1)*HD*N easily exceeds 2^24, the limit where float32 is still exact.
 ##
-## Layout memF32 (offset tuyệt đối do caller đặt):
-##   đọc : X[B,T,HD] Bm[B,T,G,N] Cm[B,T,G,N] Dt[B,T,H] ALog[H] DSkip[H]
-##         State[B,T+1,HD,N] (State[:,0] = ban đầu, State[:,t+1] = sau bước t)  DY[B,T,HD]
-##   ghi : DX[B,T,HD] (kernel tự ghi đè, không cần zero)
-##   cộng dồn atomic -> caller PHẢI zero trước: DB DC DDt DALog DDSkip
-## Grid = B*HD thread. h, g suy ra ngay trong kernel (không còn bảng idxH/idxG
-## precompute trên CPU). Cần MSL 3.0+ (atomic_float) - chỉ chạy qua đường JIT.
+## memF32 layout (absolute offsets set by the caller):
+##   read : X[B,T,HD] Bm[B,T,G,N] Cm[B,T,G,N] Dt[B,T,H] ALog[H] DSkip[H]
+##         State[B,T+1,HD,N] (State[:,0] = initial, State[:,t+1] = after step t)  DY[B,T,HD]
+##   write: DX[B,T,HD] (the kernel overwrites it, no zeroing needed)
+##   atomic accumulation -> the caller MUST zero first: DB DC DDt DALog DDSkip
+## Grid = B*HD threads. h, g are derived inside the kernel (no more idxH/idxG tables
+## precomputed on the CPU). Needs MSL 3.0+ (atomic_float) - only runs through the JIT path.
 proc buildMamba2BackwardFullAt*(B, T, H, D, N, G: int;
                                 offX, offB, offC, offDt, offALog, offDSkip,
                                 offState, offDY,
                                 offDX, offDB, offDC, offDDt, offDALog, offDDSkip: int;
                                 xStr = -1, bcStr = -1;
                                 nBeg = 0, nCnt = -1): VmProgram =
-  ## nBeg/nCnt: chỉ xử lý n in [nBeg, nBeg+nCnt) (mặc định cả N). Pass skip (dX=dY*D, dDSkip)
-  ## chỉ chạy khi nBeg == 0. Chia nhỏ để mỗi command buffer < watchdog GPU (Intel ~vài giây);
-  ## các lần gọi cộng dồn atomic nên kết quả cộng lại đúng bằng gọi 1 lần.
-  ## xStr/bcStr: bước nhảy mỗi timestep của X/dX và B,C/dB,dC (mặc định HD và G*N =
-  ## layout liền khối). Đặt = cDim để đọc/ghi THẲNG trong buffer conv [BT,cDim]
-  ## (khi đó offB = offConv+C, offC = offConv+C+G*N, offDX/DB/DC trỏ vào dXBC cùng hàng).
-  doAssert B >= 1 and T >= 1 and H mod G == 0, "buildMamba2BackwardFullAt: tham so sai"
+  ## nBeg/nCnt: only handles n in [nBeg, nBeg+nCnt) (all of N by default). The skip pass (dX=dY*D, dDSkip)
+  ## only runs when nBeg == 0. Split up so each command buffer stays under the GPU watchdog (Intel ~a few seconds);
+  ## the calls accumulate atomically so the summed result equals a single call.
+  ## xStr/bcStr: per-timestep stride of X/dX and B,C/dB,dC (default HD and G*N =
+  ## contiguous layout). Set = cDim to read/write DIRECTLY in the conv buffer [BT,cDim]
+  ## (then offB = offConv+C, offC = offConv+C+G*N, offDX/DB/DC point into dXBC on the same row).
+  doAssert B >= 1 and T >= 1 and H mod G == 0, "buildMamba2BackwardFullAt: invalid parameters"
   let HD = H * D
   let xS = if xStr < 0: HD else: xStr
   let bcS = if bcStr < 0: G * N else: bcStr
   let hpg = H div G
   let nC = if nCnt < 0: N - nBeg else: nCnt
-  doAssert nBeg >= 0 and nC >= 1 and nBeg + nC <= N, "buildMamba2BackwardFullAt: khoang n sai"
+  doAssert nBeg >= 0 and nC >= 1 and nBeg + nC <= N, "buildMamba2BackwardFullAt: invalid n range"
   var p: VmProgram
 
-  # ── giải mã tid -> b, hd, h, g (trunc((x+0.5)/m) tránh sai số làm tròn float) ──
+  # ── decode tid -> b, hd, h, g (trunc((x+0.5)/m) avoids float rounding errors) ──
   p.emitAddConst(1, 0, 0.5'f32)
   p.emitMulConst(1, 1, 1.0'f32 / float32(HD))
   p.emitRToU(0, 1)                                   # U0 = b
   p.emitUToR(2, 0)
   p.emitMulConst(3, 2, float32(HD))
-  p.emitSub(4, 0, 3)                                 # R4 = hd (float, chính xác)
+  p.emitSub(4, 0, 3)                                 # R4 = hd (float, exact)
   p.emitRToU(3, 4)                                   # U3 = hd
   p.emitAddConst(5, 4, 0.5'f32)
   p.emitMulConst(5, 5, 1.0'f32 / float32(D))
@@ -804,14 +804,14 @@ proc buildMamba2BackwardFullAt*(B, T, H, D, N, G: int;
   p.emitULoadF32(8, 4, uint32(offALog)); p.emitExp(8, 8); p.emitNeg(8, 8)
   p.emitULoadF32(9, 4, uint32(offDSkip))
 
-  # ── con trỏ gốc (uint32) ──
+  # ── base pointers (uint32) ──
   p.emitUMulK(6, 0, uint32((T + 1) * HD * N)); p.emitUMulK(7, 3, uint32(N)); p.emitUAdd(6, 6, 7)   # U6 = stateBase
   p.emitUMulK(7, 0, uint32(T * xS)); p.emitUAdd(7, 7, 3)                                        # U7 = xBase
   p.emitUMulK(1, 0, uint32(T * HD)); p.emitUAdd(1, 1, 3)                                        # U1 = dYBase
   p.emitUMulK(8, 0, uint32(T * bcS)); p.emitUMulK(9, 5, uint32(N)); p.emitUAdd(8, 8, 9)         # U8 = bcBase
   p.emitUMulK(9, 0, uint32(T * H)); p.emitUAdd(9, 9, 4)                                         # U9 = dtBase
 
-  # ── pass 1 (skip): dX = dY*D ; dDSkip[h] += dY*x   — vòng t chạy GPU ──
+  # ── pass 1 (skip): dX = dY*D ; dDSkip[h] += dY*x   — the t loop runs on the GPU ──
   if nBeg == 0:
     p.emitUAddK(10, 7, 0)                              # U10 = x ptr
     p.emitUAddK(2, 1, 0)                               # U2 = dY ptr
@@ -824,8 +824,8 @@ proc buildMamba2BackwardFullAt*(B, T, H, D, N, G: int;
       p.emitUAddK(10, 10, uint32(xS)); p.emitUAddK(2, 2, uint32(HD))
 
   # ── pass 2: for n (GPU) { dS=0; for t=T-1..0 (GPU) {...} } ──
-  p.emitLoadConstF32(0, float32(nC))                 # R0 = số vòng n (HẰNG; tid không còn cần)
-  p.emitLoadConstF32(12, float32(T))                 # R12 = số vòng t (HẰNG)
+  p.emitLoadConstF32(0, float32(nC))                 # R0 = n iteration count (CONSTANT; tid no longer needed)
+  p.emitLoadConstF32(12, float32(T))                 # R12 = t iteration count (CONSTANT)
   p.emitUConst(10, uint32(nBeg))                     # U10 = n
   sessionVmForGpu(p, 0):
     p.emitLoadConstF32(15, 0.0'f32)                  # dS = 0
@@ -864,27 +864,27 @@ proc buildMamba2BackwardFullAt*(B, T, H, D, N, G: int;
   result = p
 
 # ═══════════════════════════════════════════════════════════════════════
-# RMSNorm-gate BACKWARD — 1 threadgroup, 2 reduction (sum gated², dot) trên GPU
+# RMSNorm-gate BACKWARD — 1 threadgroup, 2 reductions (sum gated², dot) on the GPU
 # ═══════════════════════════════════════════════════════════════════════
-## Thay cho backwardRmsGateGpu cũ (CPU: `for v in gated2: sum += v`, `for i in 0..<C:
-## dotSum += ...`, `newSeq(C).mapIt(...)` + ~20 dispatch beMul/beAdd rời).
-## Layout memF32 (offset do caller): [yPre | z | w | dN | dYpre | dZ | dNormW] mỗi vùng C float
-## Grid = tgSize thread, 1 threadgroup, tgSize = luỹ thừa 2 chia hết C (xem rmsBwdTgSize).
-## tgBytes caller cấp >= tgSize*4.
+## Replaces the old backwardRmsGateGpu (CPU: `for v in gated2: sum += v`, `for i in 0..<C:
+## dotSum += ...`, `newSeq(C).mapIt(...)` + ~20 separate beMul/beAdd dispatches).
+## memF32 layout (offsets from the caller): [yPre | z | w | dN | dYpre | dZ | dNormW], each area C floats
+## Grid = tgSize threads, 1 threadgroup, tgSize = a power of 2 dividing C (see rmsBwdTgSize).
+## The caller provides tgBytes >= tgSize*4.
 proc rmsBwdTgSize*(C: int; cap = 1024): int =
-  ## luỹ thừa 2 lớn nhất chia hết C, chặn trên bởi cap (bit trick, không vòng lặp)
+  ## largest power of 2 dividing C, capped by cap (bit trick, no loop)
   min(C and (-C), cap)
 
 proc buildRmsGateBackwardProgram*(C: int; eps: float32; tgSize: int): VmProgram =
   doAssert tgSize >= 1 and (tgSize and (tgSize - 1)) == 0 and C mod tgSize == 0,
-    "buildRmsGateBackwardProgram: tgSize phai la luy thua 2 va chia het C"
+    "buildRmsGateBackwardProgram: tgSize must be a power of 2 and divide C"
   let ept = C div tgSize
   let offY = 0; let offZ = C; let offW = 2*C; let offDN = 3*C
   let offDYp = 4*C; let offDZ = 5*C; let offDW = 6*C
   var p: VmProgram
   p.emitLoadConstF32(1, 0.0'f32)                 # sumG2
   p.emitLoadConstF32(2, 0.0'f32)                 # dotSum
-  p.emitLoadConstF32(3, float32(ept))            # số vòng (HẰNG)
+  p.emitLoadConstF32(3, float32(ept))            # iteration count (CONSTANT)
   p.emitLoadConstF32(4, 0.0'f32)                 # e
   sessionVmForGpu(p, 3):
     p.emitMulConst(5, 4, float32(tgSize)); p.emitAdd(5, 5, 0)       # R5 = idx = e*tg + lid
@@ -934,17 +934,17 @@ proc buildRmsGateBackwardProgram*(C: int; eps: float32; tgSize: int): VmProgram 
   p.emitHalt()
   result = p
 
-# ── Bảng chỉ số idxH/idxG sinh bằng GPU (thay cho vòng `for h/for d` trên CPU) ──
-## Layout: [idxH(HD) | idxG(HD)], grid = HD thread. h = floor(tid/D) = #{k in 1..H-1 : tid >= k*D},
-## g = floor(h/hpg) tương tự — chỉ dùng CMP_LT/SUB/ADD nên chạy được cả ở interpreter
-## lẫn JIT (không cần op U-*, không cần floor).
+# ── idxH/idxG index tables generated on the GPU (replaces the `for h/for d` loop on the CPU) ──
+## Layout: [idxH(HD) | idxG(HD)], grid = HD threads. h = floor(tid/D) = #{k in 1..H-1 : tid >= k*D},
+## g = floor(h/hpg) likewise — uses only CMP_LT/SUB/ADD so it runs both in the interpreter
+## and the JIT (no U-* ops, no floor needed).
 proc buildIdxTableProgram*(H, D, G: int): VmProgram =
   let HD = H * D
   let hpg = max(1, H div G)
   var p: VmProgram
   p.emitLoadConstF32(1, 0.0'f32)                     # h
   p.emitLoadConstF32(2, 1.0'f32)                     # k
-  p.emitLoadConstF32(3, float32(H - 1))              # số vòng (HẰNG)
+  p.emitLoadConstF32(3, float32(H - 1))              # iteration count (CONSTANT)
   sessionVmForGpu(p, 3):
     p.emitMulConst(4, 2, float32(D)); p.emitCmpLt(5, 0, 4)       # tid < k*D ?
     p.emitLoadConstF32(6, 1.0'f32); p.emitSub(6, 6, 5); p.emitAdd(1, 1, 6)

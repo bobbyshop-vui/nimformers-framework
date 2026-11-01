@@ -1,0 +1,105 @@
+# formers.n — locate the files of a model directory given by --models.
+#
+# A model directory holds one .nimq, a config.json, a tokenizer
+# (tokenizer.json + tokenizer_config.json, or tokenizer.model) and optionally
+# a LoRA .bin. config/tokenizer may sit in a subdirectory (Codestral keeps
+# them in hf/). Explicit -m/--lora/--config/--tokenizer override the search.
+
+import nim "std/[os, strutils, algorithm]"
+import "../cli/options.bybylang"
+import "headers.bybylang"
+
+type
+  FmModelFiles* = object
+    modelsDir*, nimqPath*, configPath*, tokenizerDir*, loraPath*: string
+    nimqCandidates*, loraCandidates*: seq[string]
+    notes*, errors*: seq[string]
+
+function fmSearchDirs(dir: string): seq[string]
+    ## dir itself first, then its direct subdirectories in name order.
+    result.add(dir)
+    var subs: seq[string]
+    for kind, p in walkDir(dir):
+        if kind == pcDir or kind == pcLinkToDir:
+            subs.add(p)
+    subs.sort()
+    result.add(subs)
+
+function fmHasTokenizer(dir: string): bool
+    result = fileExists(dir / "tokenizer.json") or fileExists(dir / "tokenizer.model")
+
+function fmFilesWithExt(dir, ext: string): seq[string]
+    for kind, p in walkDir(dir):
+        if (kind == pcFile or kind == pcLinkToFile) and p.toLowerAscii().endsWith(ext):
+            result.add(p)
+    result.sort()
+
+function fmPickNimq(candidates: seq[string], loraPath: string, notes, errors: var seq[string]): string
+    if candidates.len == 1:
+        return candidates[0]
+    if candidates.len == 0:
+        errors.add("no .nimq file found (use -m <file.nimq>)")
+        return ""
+    # Several weights: the base named by the adapter, else model.nimq.
+    if loraPath.len > 0:
+        let wanted = extractFilename(fmReadLoraHeader(loraPath).meta.getOrDefault("nimqPath"))
+        for c in candidates:
+            if extractFilename(c) == wanted:
+                notes.add("picked " & extractFilename(c) & " from the LoRA nimqPath metadata")
+                return c
+    for c in candidates:
+        if extractFilename(c) == "model.nimq":
+            return c
+    errors.add($candidates.len & " .nimq files, choose one with -m: " & candidates.join(", "))
+
+function fmFindModelFiles(opts: FmOptions): FmModelFiles
+    result.modelsDir = opts.modelsDir
+    if not dirExists(opts.modelsDir):
+        result.errors.add("--models directory not found: " & opts.modelsDir)
+        return
+    let dirs = fmSearchDirs(opts.modelsDir)
+    # LoRA adapter (.bin with a NIMBIN magic)
+    if opts.loraFile.len > 0:
+        if fmIsLoraBin(opts.loraFile):
+            result.loraPath = opts.loraFile
+        else:
+            result.errors.add("--lora is not a LoRA .bin (NIMBIN1/NIMBIN4): " & opts.loraFile)
+    elif not opts.noLora:
+        for p in fmFilesWithExt(opts.modelsDir, ".bin"):
+            if fmIsLoraBin(p):
+                result.loraCandidates.add(p)
+        if result.loraCandidates.len == 1:
+            result.loraPath = result.loraCandidates[0]
+        elif result.loraCandidates.len > 1:
+            result.errors.add($result.loraCandidates.len & " LoRA .bin files, choose with --lora or --no-lora: " & result.loraCandidates.join(", "))
+    # Weights
+    if opts.modelFile.len > 0:
+        if fileExists(opts.modelFile):
+            result.nimqPath = opts.modelFile
+        else:
+            result.errors.add("-m not found: " & opts.modelFile)
+    else:
+        result.nimqCandidates = fmFilesWithExt(opts.modelsDir, ".nimq")
+        result.nimqPath = fmPickNimq(result.nimqCandidates, result.loraPath, result.notes, result.errors)
+    # config.json
+    if opts.configFile.len > 0:
+        if fileExists(opts.configFile):
+            result.configPath = opts.configFile
+        else:
+            result.errors.add("--config not found: " & opts.configFile)
+    else:
+        for d in dirs:
+            if result.configPath.len == 0 and fileExists(d / "config.json"):
+                result.configPath = d / "config.json"
+    # Tokenizer: next to config.json when it is there, else the first directory with one.
+    if opts.tokenizerDir.len > 0:
+        if fmHasTokenizer(opts.tokenizerDir):
+            result.tokenizerDir = opts.tokenizerDir
+        else:
+            result.errors.add("--tokenizer has no tokenizer.json/tokenizer.model: " & opts.tokenizerDir)
+    elif result.configPath.len > 0 and fmHasTokenizer(parentDir(result.configPath)):
+        result.tokenizerDir = parentDir(result.configPath)
+    else:
+        for d in dirs:
+            if result.tokenizerDir.len == 0 and fmHasTokenizer(d):
+                result.tokenizerDir = d

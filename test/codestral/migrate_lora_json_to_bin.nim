@@ -104,8 +104,8 @@ type AdapterData = object
 
 proc migrate(source, target: string) =
   let jsonPath = if source.endsWith(".json"): source else: source & ".lora.json"
-  if not fileExists(jsonPath): raise newException(IOError, "Khong tim thay: " & jsonPath)
-  echo "[migrate] Streaming mot pass, khong load base model."
+  if not fileExists(jsonPath): raise newException(IOError, "Not found: " & jsonPath)
+  echo "[migrate] Streaming in one pass, the base model is not loaded."
   var p = openRoot(jsonPath)
   defer: p.close()
   var epoch = 0
@@ -172,7 +172,7 @@ proc migrate(source, target: string) =
         let name = nextKey(p)
         if name.len == 0: break
         let values = readArray(p)
-        # shape suy ra tu ten tensor (hidden=4096); fallback 1D neu khong khop
+        # shape inferred from the tensor name (hidden=4096); falls back to 1D if it does not match
         let nbShape: seq[int] =
           if name.endsWith(".attn.qkvProj.weight"): @[12288, 4096]
           elif name.endsWith(".attn.outProj.weight"): @[4096, 4096]
@@ -186,7 +186,7 @@ proc migrate(source, target: string) =
   writer.finishRawBin()
   if fileExists(source & ".hf_tokenizer_dir"): copyFile(source & ".hf_tokenizer_dir", target & ".hf_tokenizer_dir")
   elif fileExists(source & ".bpe.json"): copyFile(source & ".bpe.json", target & ".bpe.json")
-  echo &"[migrate] Hoan tat: {target}; base khong duoc ghi. JSON goc giu nguyen."
+  echo &"[migrate] Done: {target}; the base was not written. The original JSON is unchanged."
 
 when isMainModule:
   let source = if paramCount() >= 1: paramStr(1) else: "jamba_lora.bin"

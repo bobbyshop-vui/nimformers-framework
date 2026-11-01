@@ -16,6 +16,8 @@ Practical guides:
   NumPy, quantization, NIMQ, micro-VM, and troubleshooting.
 - [BybyLang walkthrough](docs/bybylang-guide.md): compiler, DSL/AOT, sessions,
   micro-kernels, and the C ABI.
+- [formers.n](#run-deepseek-or-codestral-with-formersn-formers-cli): one llama.cpp-style
+  `formers-cli` for DeepSeek/Llama and Codestral (Mamba-2, LoRA), single prompt or chat.
 
 Model-specific programs and data live under `test/spectron/`, `test/codestral/`, and `test/deepseek-inference/`. Model assets live in each project's `models/` folder. The FP4 GEMV micro-kernel modules live under `kernelfortest/`; shared runtime modules remain at the project root.
 
@@ -98,9 +100,21 @@ These repositories contain the model files used by the inference targets in this
 
 | Repository | Contents | Make target |
 | --- | --- | --- |
-| [DeepSeek Coder 6.7B NimQ](https://huggingface.co/bobbydeveloper2014/deepseek-coder-6.7b-nimq) | `model.nimq`, `config.json`, and tokenizer files for `test/deepseek-inference/nim_inference.nim` | `infer-deepseek` |
-| [Codestral v0.1 7B NimQ](https://huggingface.co/bobbydeveloper2014/codestral-v0.1-7b-nimq) | Codestral base weights, model config, and Tekken/HF tokenizer files | `infer-lora` base |
-| [Codestral v0.1 QLoRA LinearAttention](https://huggingface.co/bobbydeveloper2014/codestral-v0.1-nimq-qlora-linearattention) | `jamba_parallel_lora.bin` adapter checkpoint; it uses the Codestral NimQ base above | `infer-lora` adapter |
+| [DeepSeek Coder 6.7B NimQ](https://huggingface.co/bobbydeveloper2014/deepseek-coder-6.7b-nimq) | `model.nimq`, `config.json`, and tokenizer files for `test/deepseek-inference/nim_inference.nim` | `infer-deepseek`, `formers` |
+| [Codestral v0.1 7B NimQ](https://huggingface.co/bobbydeveloper2014/codestral-v0.1-7b-nimq) | Codestral base weights, model config, and Tekken/HF tokenizer files | `infer-lora` base, `formers` |
+| [Codestral v0.1 QLoRA LinearAttention](https://huggingface.co/bobbydeveloper2014/codestral-v0.1-nimq-qlora-linearattention) | `jamba_parallel_lora.bin` adapter checkpoint; it uses the Codestral NimQ base above | `infer-lora` adapter, `formers` |
+
+
+### Inference benchmarks
+
+Prefill and decode tok/s for each model on a Colab Tesla T4 (Vulkan) and a
+MacBook Pro with Intel Iris Plus 640 (Metal and Vulkan/MoltenVK), with the
+test machines and the commands used:
+
+| Model | Benchmark |
+| --- | --- |
+| DeepSeek Coder 6.7B (`nim_inference`) | [`test/deepseek-inference/benchmark.md`](test/deepseek-inference/benchmark.md) |
+| Codestral Mamba + QLoRA (`infer_lora`) | [`test/codestral/benchmark.md`](test/codestral/benchmark.md) |
 
 
 ### Download the models
@@ -142,6 +156,9 @@ It reads the local DeepSeek byte-level BPE vocabulary, merge rules, added tokens
 and chat template directly; Nimpy, Transformers and Python tokenizer packages are
 not required. Build it with `make build-nim-inference`.
 
+Pass `--no-progress` to hide the live tok/s line. Speeds:
+[`test/deepseek-inference/benchmark.md`](test/deepseek-inference/benchmark.md).
+
 
 ### Run Codestral with the QLoRA adapter
 
@@ -153,6 +170,140 @@ make infer-lora \
 ```
 
 `infer-lora` accepts `<checkpoint.bin> <prompt> <temperature> [hfDir] [nimqPath]`. The binary metadata selects the base `.nimq`; the sidecar points the tokenizer loader at the current base-model directory. The last two CLI arguments configure the base-Mamba fallback path. `infer-mamba` is an alias for `infer-lora`. `make infer-lora` defaults to `auto`, preserving automatic backend selection on macOS and other platforms. It checks the selected device type: dGPU weights go to device-local VRAM; iGPU weights use host-visible/shared memory. To override the backend explicitly, use `make infer-lora BYBY_INFER_BACKEND=metal` or `make infer-lora BYBY_INFER_BACKEND=vulkan`.
+
+Speeds: [`test/codestral/benchmark.md`](test/codestral/benchmark.md).
+
+
+### Run DeepSeek or Codestral with formers.n (`formers-cli`)
+
+formers.n (`other/formers.n/`) is a llama.cpp-style command-line runner written in
+BybyLang on top of the nimformers blocks. Point it at a model directory: it detects the
+architecture from `config.json` and the `.nimq` header, then runs the matching path with
+one binary and one set of flags:
+
+| Detected | Path | Example directory |
+| --- | --- | --- |
+| Llama family (`LlamaForCausalLM`, DeepSeek Coder) | `nim_inference` transformer blocks | `test/deepseek-inference/models` |
+| Mamba-2 (Codestral Mamba) | `infer_lora` base-Mamba path | a directory without a LoRA `.bin` |
+| Mamba-2 + LoRA / Linear++ | `infer_lora` checkpoint path | `test/codestral/models` |
+
+#### Build
+
+```sh
+make formers-cli
+```
+
+This builds the BybyLang compiler in `vendor/bybylang` when needed, compiles
+`other/formers.n/src/formers_cli.bybylang` ahead of time to Nim and writes
+`other/formers.n/formers-cli`. `make build-formers` is the same target. Only Nim and
+a C compiler are required; the GPU backends are the same Metal/Vulkan backends as the
+other inference targets.
+
+#### Quick start
+
+Download the models first (`make download-models`), then from the repository root:
+
+```sh
+# Codestral + QLoRA, multi-turn chat
+other/formers.n/formers-cli --models test/codestral/models -cnv -n 256
+
+# DeepSeek Coder, one prompt
+other/formers.n/formers-cli --models test/deepseek-inference/models \
+  -p "Write a Python function for Fibonacci." -n 128
+
+# Only print what was detected, without loading the weights
+other/formers.n/formers-cli --models test/codestral/models --detect-only
+```
+
+The same through make (`make formers` builds first):
+
+```sh
+make formers                                              # chat with test/codestral/models
+make formers FORMERS_MODELS=test/deepseek-inference/models
+make formers ARGS='--models test/codestral/models -p "Write quicksort in Python." -n 200'
+```
+
+#### What `--models` must contain
+
+| File | Found as | Override |
+| --- | --- | --- |
+| weights | the only `.nimq`; with several, the one named in the LoRA `nimqPath` metadata, else `model.nimq` | `-m FILE` |
+| config | `config.json` in the directory or a subdirectory (Codestral keeps it in `hf/`) | `--config FILE` |
+| tokenizer | a directory with `tokenizer.json` or `tokenizer.model` | `--tokenizer DIR` |
+| LoRA (Mamba-2) | the only `.bin` with a `NIMBIN1`/`NIMBIN4` header; several is an error | `--lora FILE`, `--no-lora` |
+
+`--detect-only` prints the files, the architecture, the route and the model sizes, and
+says why a model is not supported (for example Mamba-1 or an unknown `model_type`).
+
+#### Single prompt and chat
+
+- Without `-cnv`, `-p TEXT` (or `-f FILE`) is wrapped in the model's chat template and
+  generated once; `--system TEXT` sets the system prompt and `--raw-prompt` sends the text
+  as is.
+- `-cnv` (or `-i`) starts a chat: the context (KV cache for Llama, recurrent state for
+  Mamba-2) is kept between turns, `-n` limits each reply and `-p` becomes the system
+  prompt. Type `/exit` (or `/quit`, `/bye`) to leave, end a line with `\` to continue on
+  the next one, press Ctrl+C to stop a reply and Ctrl+C at the prompt to quit.
+- `-c N` sets the Llama chat context size (default 1024 tokens).
+- In chat each reply ends with its `prompt eval` and `eval` tok/s; a single Llama prompt
+  ends with the `Speed stats` block (prefill, decode, total).
+
+Before the first prompt a warmup compiles the GPU pipelines and prints
+`ready: warmup ...`; `--no-warmup` skips it, and the first reply then pays the compile
+time. For Mamba-2, prompts shorter than 129 tokens run through the decode kernels already
+compiled by the warmup; longer prompts send whole 128-token chunks
+(`BYBY_PREFILL_BATCH_SIZE`) through the parallel prefill.
+
+#### LoRA merge
+
+A Mamba-2 LoRA is merged into the resident FP4-KM weights on the GPU at startup
+(`infer_lora.mergeResidentLoraIfEnabled`, the same merge as `make infer-lora`). The decode
+kernels then skip the A/B adapter work, and the output matches a merged checkpoint. The
+merge adds a one-time pass to startup.
+
+- `--no-merge-lora` (or `BYBY_MERGE_LORA=0`) keeps the adapters separate and fused in the
+  kernels.
+- On by default, the merge steps aside by itself when `BYBY_ONE_DISPATCH=1`,
+  `BYBY_MODEL_MMAP=0` or the process has no memory headroom (`BYBY_MEMORY_LIMIT_MB`,
+  default 7000), and inference continues with the separate adapters. Set
+  `BYBY_MERGE_LORA=inplace` by hand to make those cases errors instead.
+
+#### Logs
+
+formers-cli is quiet by default. The loader, LoRA, JIT, Metal and kernel-tuning logs go to
+`/dev/null`; only the loading line, `ready`, the generated text, the statistics and errors
+are shown. `-v`/`--verbose` shows every log line. An error in quiet mode prints its message
+and suggests rerunning with `--verbose`.
+
+#### Main flags
+
+| Flag | Meaning | Default |
+| --- | --- | --- |
+| `-n, --n-predict N` | tokens to generate (per reply in chat) | 128 |
+| `--temp T` | temperature, `0` = greedy | 0.7 |
+| `--top-p P` | nucleus sampling, `1` = off | 0.9 |
+| `--min-p P` | min-p, `0` = off | 0.05 |
+| `--repeat-penalty R`, `--repeat-last-n N` | repetition penalty and its window | 1.0 (off), 64 |
+| `-s, --seed N` | sampling seed | random |
+| `--backend NAME` | `auto`, `metal`, `vulkan`, `cuda` (= `vulkan`) | `auto` |
+| `-ngl N` | layers on the GPU; all layers run on the GPU, a smaller value is rejected | all |
+| `--no-progress` | no tok/s in the terminal window title | |
+
+`formers-cli --help` lists every flag. Exit codes: 0 ok, 1 runtime error, 2 bad options,
+3 unsupported model.
+
+#### Make targets
+
+| Target | What it does |
+| --- | --- |
+| `make formers-cli` / `make build-formers` | build `other/formers.n/formers-cli` |
+| `make formers` | build, then chat with `FORMERS_MODELS` (default `test/codestral/models`); `ARGS='...'` replaces every argument |
+| `make formers-test` | architecture-detection test, no model load and no GPU |
+| `make formers-smoke` | builds a tiny random Llama and runs it end to end on the GPU |
+| `make formers-clean` | removes the formers.n build and binary (`make clean` does too) |
+
+More detail (source layout, the detection rules, what is not done yet):
+[`other/formers.n/README.md`](other/formers.n/README.md).
 
 
 ### Train Spectron with `test/spectron/test_nimformer.nim`
