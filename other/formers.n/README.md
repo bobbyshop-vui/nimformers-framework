@@ -123,6 +123,15 @@ later chat turn, runs on the decode kernels the warmup already compiled. Prompts
 than one chunk therefore compile nothing after `ready`; the first prompt with a full chunk
 compiles the chunk kernels once and later ones reuse them.
 
+On a Vulkan dGPU with tensor cores (`prefill=tensor-cores-only` in the device line;
+`infer_lora`'s cooperative routes then take every GEMM from 2 rows up), prefill beats
+decode even for a few tokens, so the remainder of a prompt also goes through 16-token
+chunks and later turns prefill as well, with `forwardPrefillBatch(continued = true)`
+carrying the chat state in. The warmup runs one 16-token prefill, so these kernels
+compile before `ready` too: only the 128- and 16-token lengths ever compile. With
+`BYBY_ONE_DISPATCH=1` the decode state lives apart from the prefill's, so later turns
+decode instead.
+
 ### Logs
 
 Quiet by default: the loader, LoRA, JIT, Metal and kernel-tuning logs of the libraries

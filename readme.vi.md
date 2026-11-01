@@ -239,7 +239,12 @@ model không được hỗ trợ (ví dụ Mamba-1 hoặc `model_type` lạ).
 Trước prompt đầu tiên, warmup biên dịch pipeline GPU và in `ready: warmup ...`;
 `--no-warmup` bỏ qua, khi đó câu trả lời đầu chịu thời gian biên dịch. Với Mamba-2,
 prompt ngắn hơn 129 token chạy bằng kernel decode đã warm; prompt dài hơn đưa các chunk
-đủ 128 token (`BYBY_PREFILL_BATCH_SIZE`) qua prefill song song.
+đủ 128 token (`BYBY_PREFILL_BATCH_SIZE`) qua prefill song song. Trên dGPU Vulkan có tensor
+core (dòng thiết bị trong `--verbose` có `prefill=tensor-cores-only`), phần còn lại của
+prompt cũng prefill theo chunk 16 token, các lượt chat sau cũng prefill (tiếp tục
+recurrent state), và warmup biên dịch sẵn kernel 16 token; mọi GEMM prefill khi đó chạy
+trên tensor core, không bao giờ trên kernel scalar. `BYBY_VULKAN_TENSOR_CORES=tune` cho
+kernel scalar cạnh tranh lại, `0` tắt tensor core.
 
 #### Merge LoRA
 

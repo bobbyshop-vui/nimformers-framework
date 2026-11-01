@@ -710,6 +710,9 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
   var f32Kns = initTable[string, string]()
   var expandKns=initTable[string,seq[tuple[kn,scatter: string,row,count,tg: int]]]()
   let useM8 = T >= 8 and getEnv("BYBY_PREFILL_FP4_KERNEL", "auto") != "m4"
+  # Vulkan dGPU with tensor cores: every GEMM from 2 rows up stays on them
+  # (the driver's cooperative routes take M >= 2 there, M >= 8 elsewhere).
+  let coopMinT = if byby.sessionTensorCoreRequired(be): 2 else: 8
   # Only the Linear++ sidecar linears pass bias=true; the Mamba in/out
   # projections never do, so their bias kernels are not worth compiling.
   var biasCols: seq[int]
@@ -995,7 +998,7 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
           inc f32Mps
         else:
           discard
-      elif T >= 8 and byby.sessionMatmulNTFp16Coop(be, input, lin.wF32,
+      elif T >= coopMinT and byby.sessionMatmulNTFp16Coop(be, input, lin.wF32,
           output, T, lin.K, lin.N):
         # Vulkan FP16 cooperative matrix first, with FP32 accumulation/output.
         # Unsupported hardware or shapes return false and keep the VM fallback.
@@ -1113,7 +1116,7 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
   # let the session GEMM entry points prefer them.
   # No cooperative route (MoltenVK, scalar GPUs): neither kernel can run, so
   # there is nothing to check.
-  if be == gbVulkan and T >= 8 and byby.sessionCooperativeGemmEnabled(be):
+  if be == gbVulkan and T >= coopMinT and byby.sessionCooperativeGemmEnabled(be):
     for fp4 in [true, false]:
       let kind = if fp4: "FP4" else: "FP32"
       if getEnv("BYBY_PREFILL_" & kind & "_TILED", "1") == "0": continue

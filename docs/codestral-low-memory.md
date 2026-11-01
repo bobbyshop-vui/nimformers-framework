@@ -103,6 +103,24 @@ and [KHR cooperative matrix specification](https://docs.vulkan.org/refpages/late
 Older NV-only drivers need a driver update for this KHR path. Unsupported devices
 and shader compiler failures retain ordinary Vulkan compute.
 
+On a dGPU with tensor cores the device log adds `prefill=tensor-cores-only`: every
+prefill GEMM from 2 rows up (Codestral FP4-KM and FP32 sidecar projections, DeepSeek
+asymmetric Q4 projections) runs on a cooperative-matrix kernel. The Q4 autotuner only
+times the tensor-core kernels against each other (`KHR-cooperative-matrix-tiled64`, the
+64x64-per-workgroup kernel, and `KHR-cooperative-matrix`); the scalar reference is
+kept as the parity baseline and is used only when no tensor-core kernel passes
+parity, which the log reports as a warning. Decode (one row) keeps its GEMV kernels,
+which are bound by memory bandwidth. In formers.n chat, a tensor-core GPU also
+prefills prompts in 16-token chunks and later turns continue the recurrent state
+through the prefill.
+
+| `BYBY_VULKAN_TENSOR_CORES` | Effect |
+| --- | --- |
+| `1` (default) | tensor cores on; prefill tensor-core-only on a dGPU |
+| `force` | prefill tensor-core-only on any device with them (also an iGPU) |
+| `tune` | tensor cores timed against the scalar kernels, the fastest wins |
+| `0` | tensor cores off |
+
 
 ## Verification
 

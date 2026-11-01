@@ -71,3 +71,5 @@ test/bybylang_test/nim.cfg
 # formers.n build outputs
 other/formers.n/build/
 other/formers.n/formers-cli
+test/deepseek-inference/models/tokenizer.json
+test/deepseek-inference/models/tokenizer_config.json

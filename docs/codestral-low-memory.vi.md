@@ -96,6 +96,23 @@ và [đặc tả KHR cooperative matrix](https://docs.vulkan.org/refpages/latest
 `matrix=scalar`. Driver cũ chỉ có NV cần cập nhật cho nhánh KHR. Thiết bị
 không hỗ trợ hoặc shader compile lỗi sẽ giữ Vulkan compute thông thường.
 
+Trên dGPU có tensor core, log thiết bị thêm `prefill=tensor-cores-only`: mọi
+GEMM prefill từ 2 hàng trở lên (projection FP4-KM và sidecar FP32 của Codestral,
+projection Q4 bất đối xứng của DeepSeek) chạy trên kernel cooperative-matrix.
+Autotune Q4 chỉ so các kernel tensor core với nhau (`KHR-cooperative-matrix-tiled64`,
+kernel 64x64 mỗi workgroup, và `KHR-cooperative-matrix`); kernel scalar tham chiếu
+chỉ dùng làm mốc parity và chỉ được chọn khi không kernel tensor core nào qua
+parity, khi đó log in cảnh báo. Decode (một hàng) giữ kernel GEMV vì bị giới hạn
+bởi băng thông bộ nhớ. Trong chat của formers.n, GPU có tensor core còn prefill
+prompt theo chunk 16 token, và các lượt sau tiếp tục recurrent state qua prefill.
+
+| `BYBY_VULKAN_TENSOR_CORES` | Tác dụng |
+| --- | --- |
+| `1` (mặc định) | bật tensor core; trên dGPU prefill chỉ dùng tensor core |
+| `force` | prefill chỉ dùng tensor core trên mọi thiết bị có nó (cả iGPU) |
+| `tune` | đo tensor core cùng kernel scalar, cái nhanh nhất thắng |
+| `0` | tắt tensor core |
+
 
 ## Kiểm tra
 

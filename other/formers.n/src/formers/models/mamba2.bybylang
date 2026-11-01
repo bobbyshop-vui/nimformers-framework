@@ -263,13 +263,38 @@ function fmMambaPrefillChunk(): int
         discard
     result = max(2, min(result, 128))
 
+const FmMambaTensorCoreChunk = 16
+    ## Short prefill chunk on tensor-core GPUs: one 16-row MMA tile.
+
+function fmMambaTensorCores(ctx: Backend): bool
+    ## Vulkan dGPU with KHR_cooperative_matrix: prefill GEMMs run on the tensor
+    ## cores, so even a short prompt prefills far faster than it decodes.
+    ## The one-dispatch decode keeps its state apart from the prefill's, so
+    ## later turns could not carry it into a prefill there.
+    result = sessionTensorCoreRequired(ctx.kind.toByby()) and getEnv("BYBY_ONE_DISPATCH", "0") == "0"
+
+function fmMambaPrefillPieces(n: int, tensorCores: bool): seq[int]
+    ## Splits n prefill tokens into whole chunks: BYBY_PREFILL_BATCH_SIZE ones,
+    ## then (tensor cores) 16-token ones. The scan kernels are JIT-compiled per
+    ## chunk length, so only these two lengths ever compile; the remainder
+    ## (under one chunk) goes through decode.
+    let chunk = fmMambaPrefillChunk()
+    var left = n
+    if left >= chunk:
+        result.add((left div chunk) * chunk)
+        left = left mod chunk
+    if tensorCores and chunk > FmMambaTensorCoreChunk:
+        for i in 0 ..< left div FmMambaTensorCoreChunk:
+            result.add(FmMambaTensorCoreChunk)
+
 function fmMambaFeed(mm: var FmMambaModel, ctx: Backend, chat: var FmMambaChat, newIds: seq[int]): seq[float32]
     ## Consumes pending + newIds; returns the logits after the last one.
     ## The first input starts the state. Only whole prefill chunks go through
-    ## the resident parallel prefill, so its kernels are compiled for one
-    ## chunk length, once; the rest (and every later turn) continues the state
-    ## token by token with the decode kernels the warmup already compiled
-    ## (state is O(1), there is no context limit).
+    ## the resident parallel prefill, so its kernels are compiled for a fixed
+    ## set of chunk lengths, once; the rest continues the state token by token
+    ## with the decode kernels the warmup already compiled (state is O(1),
+    ## there is no context limit). On tensor-core GPUs later turns also
+    ## prefill, carrying the chat state in.
     let input = chat.pending & newIds
     chat.pending.setLen(0)
     if input.len == 0:
@@ -277,17 +302,18 @@ function fmMambaFeed(mm: var FmMambaModel, ctx: Backend, chat: var FmMambaChat, 
     for id in input:
         if id < 0 or id >= mm.model.vocab:
             raise newException(ValueError, "[formers.n] token id " & $id & " outside vocab " & $mm.model.vocab)
-    var start = 0
-    if chat.ids.len == 0:
+    let tensorCores = fmMambaTensorCores(ctx)
+    let first = chat.ids.len == 0
+    if first:
         resetGpuGenState(mm.model, ctx)
-        let chunk = fmMambaPrefillChunk()
-        let nPrefill = ((input.len - 1) div chunk) * chunk
-        if nPrefill > 0:
-            forwardPrefillBatch(mm.model, mm.lora, input[0 ..< nPrefill], ctx)
-            chat.ids.add(input[0 ..< nPrefill])
-            if getEnv("BYBY_PREFILL_KEEP_SCRATCH", "0") != "1":
-                discard releaseResidentPrefill()
-        start = nPrefill
+    var start = 0
+    if first or tensorCores:
+        for piece in fmMambaPrefillPieces(input.len - 1, tensorCores):
+            forwardPrefillBatch(mm.model, mm.lora, input[start ..< start + piece], ctx, continued = not first or start > 0)
+            chat.ids.add(input[start ..< start + piece])
+            start += piece
+        if start > 0 and getEnv("BYBY_PREFILL_KEEP_SCRATCH", "0") != "1":
+            discard releaseResidentPrefill()
     for k in start ..< input.len:
         chat.ids.add(input[k])
         let last = k == input.len - 1
@@ -299,12 +325,20 @@ function fmMambaWarmup(mm: var FmMambaModel, tok: hf_tokenizer.HfTokenizer, ctx:
     ## Before the first prompt: decode steps until the step time settles
     ## (kernel JIT, autotuning, first-use buffers). Prompts shorter than a
     ## prefill chunk run on these same kernels, so nothing is compiled after
-    ## the "ready" line. The next real input starts from a reset state.
+    ## the "ready" line (on tensor-core GPUs a 16-token prefill compiles the
+    ## short-chunk kernels too). The next real input starts from a reset state.
     if opts.noWarmup:
         return
     var chat: FmMambaChat
-    let ids = encodeHf(tok, "[INST] hi[/INST]")
-    stderr.writeLine("[formers.n] warmup: decode until steady ...")
+    var ids = encodeHf(tok, "[INST] hi[/INST]")
+    if fmMambaTensorCores(ctx):
+        # Long enough for one 16-token prefill chunk, so its kernels compile here.
+        let unit = ids
+        while ids.len <= FmMambaTensorCoreChunk:
+            ids.add(unit)
+        stderr.writeLine("[formers.n] warmup: one 16-token tensor-core prefill, then decode until steady ...")
+    else:
+        stderr.writeLine("[formers.n] warmup: decode until steady ...")
     let t0 = epochTime()
     discard fmMambaFeed(mm, ctx, chat, ids)
     let firstTime = epochTime() - t0
