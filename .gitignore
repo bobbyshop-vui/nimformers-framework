@@ -73,3 +73,12 @@ other/formers.n/build/
 other/formers.n/formers-cli
 test/deepseek-inference/models/tokenizer.json
 test/deepseek-inference/models/tokenizer_config.json
+test/deepseek-inference/models/config.json
+models/tinyllama/config.json
+models/tinyllama/config.nim.json
+models/tinyllama/generation_config.json
+models/tinyllama/model.safetensors
+models/tinyllama/special_tokens_map.json
+models/tinyllama/tokenizer_config.json
+models/tinyllama/tokenizer.json
+models/tinyllama/tokenizer.model
