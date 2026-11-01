@@ -155,6 +155,31 @@ Flags: `--models`, `-m/--model`, `--lora`, `--no-lora`, `--no-merge-lora`, `--co
 `--no-progress`, `--no-warmup`, `-v/--verbose`, `--detect-only`, `-h`. Exit codes: 0 ok, 1 runtime error,
 2 bad options, 3 unsupported model.
 
+## Module API
+
+Every module is BybyLang (`src/formers/**.bybylang`); `formers_cli.bybylang` only parses the
+options and calls `fmRun`.
+
+| Module | Functions |
+| --- | --- |
+| `cli/options` | `fmDefaultOptions`, `fmParseOptions` (argv → options, exit code 2 on a bad flag), `fmUsage`, `fmOptValue`, `fmToInt`, `fmToFloat` |
+| `io/model_files` | `fmFindModelFiles` (weights, LoRA, config and tokenizer from `--models`), `fmSearchDirs`, `fmPickNimq`, `fmFilesWithExt`, `fmHasTokenizer` |
+| `io/headers` | `fmReadNimqHeader`, `fmReadLoraHeader`, `fmIsLoraBin`, `fmLayerCount`, `fmShapeIndex`, `fmReadI32`, `fmReadStr`, `fmSkip` (headers only, no tensor data) |
+| `arch/detect` | `fmParseConfig`, `fmModelType`, `fmLooksLlama`, `fmLooksMamba2`, `fmExpectShape`, `fmCheckHfTokenizer`, `fmJInt`, `fmJFloat`, `fmJRequired` |
+| `router` | `fmRun`: detection → `fmRunLlama` or `fmRunMamba2`, exit code 3 for an unsupported model |
+| `models/llama` | `fmRunLlama`, `fmLlamaLoad`, `fmLlamaNewChat`, `fmLlamaReset`, `fmLlamaFeed` (flash prefill of a turn, decode if it fails), `fmLlamaWarmup`, `fmLlamaReplyTo`, `fmLlamaChatLoop`, `fmLlamaPromptIds`, `fmLlamaWithBos`, `fmLlamaKvMiB`, `fmLlamaStats`, `fmCommonPrefix` |
+| `models/mamba2` | `fmRunMamba2`, `fmMambaLoadBase`, `fmMambaLoadLora`, `fmMambaPrepareGpu`, `fmMambaNewChat`, `fmMambaFeed`, `fmMambaPrefillChunk`, `fmMambaPrefillPieces`, `fmMambaTensorCores`, `fmMambaWarmup`, `fmMambaReplyTo`, `fmMambaGenerate`, `fmMambaChatLoop`, `fmMambaTurnText`, `fmMambaSetNorm`, `fmMambaStats` |
+| `sampling/sampler` | `fmNewSampler` (temp, top-p, min-p, repeat penalty, seed), `fmSample`, `fmSamplerSummary` |
+| `runtime/console` | `fmConsoleInit` (quiet mode: library fd 1/2 → `/dev/null`), `fmSay`, `fmOut`, `fmErr`, `fmQuiet`, `fmReadTurn` (multi-line `\` input), `fmLibStdout`, `fmOutIsTty`, `fmErrIsTty` |
+| `runtime/signals` | `fmOnCtrlC`, `fmStopRequested`, `fmClearStop`, `fmSetGenerating`, `fmShowProgress` / `fmEndProgress` (tok/s in the window title), `fmLiveProgress` |
+
+Environment variables the Llama route reads through `nim_inference`:
+`BYBY_FLASH_PREFILL` (default 1; 0 keeps the old prefill), `BYBY_PREFILL_CB_MS` (GPU time per
+prefill command buffer, default 300), `BYBY_DECODE_CB_MS` (a decode token is split only when it
+takes longer, default 1500), `BYBY_PREFILL_MAX_ROWS` (default 512), `BYBY_PREFILL_SESSION_MB`
+(default 1024). Command buffers are only split where `sessionPacesCommandBuffers` is true, never
+on Apple Silicon.
+
 ## Not done yet
 
 - `--ngl` accepts only values ≥ the layer count (default: all). `nim_inference`'s decode
