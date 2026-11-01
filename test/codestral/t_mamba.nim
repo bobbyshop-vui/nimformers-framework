@@ -1,5 +1,5 @@
-## t_mamba.nim — interpreter THAM CHIẾU (chỉ để test, CPU được phép) chạy bytecode
-## nhiều thread có barrier; so (1) kernel forward mới == bản gốc, (2) backward == FD.
+## t_mamba.nim — REFERENCE interpreter (test only, CPU allowed) running multi-threaded
+## bytecode with barriers; checks (1) new forward kernel == the original, (2) backward == finite differences.
 import std/[math, strutils]
 import session_vm
 import mamba2_vm_kernels as nw
@@ -20,10 +20,10 @@ proc same(name: string; pn, po: VmProgram; n, tg, total: int) =
   var diff = 0
   for i in 0 ..< total:
     if m1[i] != m2[i]: inc diff
-  echo (if diff == 0: "OK   " else: "LECH "), name, " (", diff, " phan tu lech)"
+  echo (if diff == 0: "OK   " else: "DIFF "), name, " (", diff, " elements differ)"
   if diff != 0: inc fails
 
-# ── (1) forward mới == bản gốc (bitwise) ──
+# ── (1) new forward == the original (bitwise) ──
 same("rmsgate C=8", nw.buildRmsGateProgram(8, 1e-5'f32), old.buildRmsGateProgram(8, 1e-5'f32), 8, 8, 64)
 same("rmsgate C=1", nw.buildRmsGateProgram(1, 1e-5'f32), old.buildRmsGateProgram(1, 1e-5'f32), 1, 1, 16)
 same("rmsgateLarge C=32 tg=8", nw.buildRmsGateLargeProgram(32, 1e-5'f32, 8), old.buildRmsGateLargeProgram(32, 1e-5'f32, 8), 8, 8, 128)
@@ -40,7 +40,7 @@ for K in 2 .. 5:
     nw.buildSplitConvSoftplusAt(C, cDim, H, K, 20, 30, 45, 60, 100, 150, 200),
     old.buildSplitConvSoftplusAt(C, cDim, H, K, 20, 30, 45, 60, 100, 150, 200), 8, 8, 400)
 
-# ── (2) backward == gradient sai phân số (double) ──
+# ── (2) backward == finite-difference gradient (double) ──
 let (B, T, H, D, N, G) = (2, 3, 4, 2, 3, 2)
 let HD = H * D
 let hpg = H div G
@@ -55,7 +55,7 @@ let rnd = randBuf(total, seed)
 for i in 0 ..< offState: mem[i] = rnd[i]
 for i in 0 ..< B*T*H: mem[offDt + i] = abs(rnd[offDt + i]) * 0.5'f32 + 0.1'f32
 for i in 0 ..< B*T*HD: mem[offDY + i] = rnd[offDY + i]
-let s0 = rnd                       # trạng thái đầu t=0 lấy từ rnd
+let s0 = rnd                       # initial state at t=0 taken from rnd
 
 proc ix(b, t, hd, n: int): int = ((b * (T+1) + t) * HD + hd) * N + n
 for b in 0 ..< B:
@@ -88,7 +88,7 @@ mem = withStates
 
 let prog = nw.buildMamba2BackwardFullAt(B, T, H, D, N, G, offX, offB, offC, offDt, offALog, offDSkip,
   offState, offDY, offDX, offDB, offDC, offDDt, offDALog, offDDSkip)
-# dX cố tình đổ rác để chứng minh kernel tự ghi đè (không cần zero)
+# dX deliberately filled with garbage to show the kernel overwrites it (no zeroing needed)
 for i in 0 ..< B*T*HD: mem[offDX + i] = 777'f32
 var dummy = mem
 runGrid(prog, mem, B * HD, B * HD)
@@ -98,7 +98,7 @@ proc fd(idx: int): float64 =
   var a = mem; var b2 = mem
   var d1 = mem; var d2 = mem
   a[idx] += float32(eps); b2[idx] -= float32(eps)
-  # dùng double thật cho tham số: tính lại bằng bản sao + eps nhỏ ở float32 vẫn đủ cho tolerance dưới
+  # real doubles for the parameters: recomputing from a copy + a small eps in float32 is still enough for the tolerance below
   (fwdLoss(a, false, d1) - fwdLoss(b2, false, d2)) / (2 * eps)
 
 proc chk(name: string; off, n, anOff: int) =
@@ -106,7 +106,7 @@ proc chk(name: string; off, n, anOff: int) =
   for i in 0 ..< n:
     let f = fd(off + i); let an = float64(mem[anOff + i])
     worst = max(worst, abs(f - an) / max(1.0, abs(f)))
-  echo (if worst < 2e-2: "OK   " else: "LECH "), "backward ", name, ": sai so tuong doi lon nhat = ", formatFloat(worst, ffScientific, 2)
+  echo (if worst < 2e-2: "OK   " else: "DIFF "), "backward ", name, ": max relative error = ", formatFloat(worst, ffScientific, 2)
   if worst >= 2e-2: inc fails
 chk("dX", offX, B*T*HD, offDX)
 chk("dB", offB, B*T*G*N, offDB)
@@ -115,7 +115,7 @@ chk("dDt", offDt, B*T*H, offDDt)
 chk("dALog", offALog, H, offDALog)
 chk("dDSkip", offDSkip, H, offDDSkip)
 
-# ── (3) rms-gate backward == công thức double ──
+# ── (3) rms-gate backward == the double formula ──
 block:
   let C = 24; let eps = 1e-5'f32
   let tgs = nw.rmsBwdTgSize(C)
@@ -139,10 +139,10 @@ block:
     let want = [dg * silu[i], dg * float64(ref0[i]) * (sg[i] * (1 + z * (1 - sg[i]))), float64(ref0[3*C + i]) * gated[i] * r]
     for j in 0 .. 2:
       worst = max(worst, abs(want[j] - float64(mm[(4 + j) * C + i])) / max(1.0, abs(want[j])))
-  echo (if worst < 1e-4: "OK   " else: "LECH "), "rmsgate backward: sai so = ", formatFloat(worst, ffScientific, 2)
+  echo (if worst < 1e-4: "OK   " else: "DIFF "), "rmsgate backward: error = ", formatFloat(worst, ffScientific, 2)
   if worst >= 1e-4: inc fails
 
-# ── (4) bảng idxH/idxG sinh bằng GPU == công thức ──
+# ── (4) idxH/idxG tables generated on the GPU == the formula ──
 for (H, D, G) in [(4, 2, 2), (8, 3, 2), (6, 4, 6), (5, 1, 1)]:
   let HD = H * D; let hpg = max(1, H div G)
   var tb = newSeq[float32](2 * HD)
@@ -153,5 +153,5 @@ for (H, D, G) in [(4, 2, 2), (8, 3, 2), (6, 4, 6), (5, 1, 1)]:
     if int(tb[tid]) != h or int(tb[HD + tid]) != h div hpg: inc bad
   echo (if bad == 0: "OK   " else: "LECH "), "idxTable H=", H, " D=", D, " G=", G
   if bad > 0: inc fails
-doAssert fails == 0, "co " & $fails & " kiem tra LECH"
+doAssert fails == 0, $fails & " checks DIFFER"
 echo "ALL OK"

@@ -63,11 +63,13 @@ smaller width than it was compiled for.
 
 ## Merge within the memory budget
 
-Keep `BYBY_MERGE_LORA=0` for inference. It preserves the original adapter delta
-and avoids expanding the model to FP32. FP4-KM cannot generally represent an
-arbitrary FP32 LoRA update exactly.
+Inference merges by default (`BYBY_MERGE_LORA=inplace`), because the merged
+weights match a merged checkpoint and the decode kernels drop the adapter
+fusion. `BYBY_MERGE_LORA=0` keeps the original adapter delta, which FP4-KM
+cannot generally represent exactly, and skips the merge pass entirely; the
+merge also steps aside by itself when the process has no memory headroom.
 
-If `BYBY_MERGE_LORA=1` is requested, merging still handles one tensor at a time
+Merging still handles one tensor at a time
 and requires a quantization-error check relative to the LoRA delta.
 `BYBY_MERGE_SCRATCH_MIB=256` caps the conservative estimate for temporary dense
 arrays. An oversized tensor retains its original base plus fused adapter.

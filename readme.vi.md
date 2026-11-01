@@ -19,6 +19,9 @@ Các hướng dẫn thực hành:
   NumPy, lượng tử hóa, NIMQ, micro-VM và xử lý lỗi.
 - [BybyLang thực hành](docs/bybylang-guide.vi.md): compiler, DSL/AOT, session,
   micro-kernel và C ABI.
+- [formers.n](#chạy-deepseek-hoặc-codestral-bằng-formersn-formers-cli): một
+  `formers-cli` kiểu llama.cpp cho DeepSeek/Llama và Codestral (Mamba-2, LoRA),
+  một prompt hoặc chat.
 
 Chương trình/dữ liệu theo model nằm trong `test/spectron/`,
 `test/codestral/`, `test/deepseek-inference/`; asset nằm trong `models/` của
@@ -90,9 +93,9 @@ Các repository chứa file model dùng bởi target inference:
 
 | Repository | Nội dung | Target Make |
 | --- | --- | --- |
-| [DeepSeek Coder 6.7B NimQ](https://huggingface.co/bobbydeveloper2014/deepseek-coder-6.7b-nimq) | `model.nimq`, `config.json` và tokenizer cho `test/deepseek-inference/nim_inference.nim` | `infer-deepseek` |
-| [Codestral v0.1 7B NimQ](https://huggingface.co/bobbydeveloper2014/codestral-v0.1-7b-nimq) | trọng số base Codestral, config và tokenizer Tekken/HF | base của `infer-lora` |
-| [Codestral v0.1 QLoRA LinearAttention](https://huggingface.co/bobbydeveloper2014/codestral-v0.1-nimq-qlora-linearattention) | checkpoint adapter `jamba_parallel_lora.bin`, dùng base Codestral NimQ trên | adapter của `infer-lora` |
+| [DeepSeek Coder 6.7B NimQ](https://huggingface.co/bobbydeveloper2014/deepseek-coder-6.7b-nimq) | `model.nimq`, `config.json` và tokenizer cho `test/deepseek-inference/nim_inference.nim` | `infer-deepseek`, `formers` |
+| [Codestral v0.1 7B NimQ](https://huggingface.co/bobbydeveloper2014/codestral-v0.1-7b-nimq) | trọng số base Codestral, config và tokenizer Tekken/HF | base của `infer-lora`, `formers` |
+| [Codestral v0.1 QLoRA LinearAttention](https://huggingface.co/bobbydeveloper2014/codestral-v0.1-nimq-qlora-linearattention) | checkpoint adapter `jamba_parallel_lora.bin`, dùng base Codestral NimQ trên | adapter của `infer-lora`, `formers` |
 
 
 ### Tải model
@@ -160,6 +163,132 @@ tokenizer model. Hai đối số cuối cấu hình nhánh base-Mamba fallback.
 macOS và hệ khác. Theo loại thiết bị, dGPU dùng VRAM device-local, iGPU
 dùng host-visible/shared memory. Ghi đè backend bằng
 `make infer-lora BYBY_INFER_BACKEND=metal` hoặc `BYBY_INFER_BACKEND=vulkan`.
+
+
+### Chạy DeepSeek hoặc Codestral bằng formers.n (`formers-cli`)
+
+formers.n (`other/formers.n/`) là CLI kiểu llama.cpp viết bằng BybyLang trên các
+block của nimformers. Chỉ cần trỏ vào thư mục model: nó nhận diện kiến trúc từ
+`config.json` và header `.nimq`, rồi chạy đúng nhánh với một binary và một bộ flag:
+
+| Nhận diện | Nhánh | Thư mục ví dụ |
+| --- | --- | --- |
+| Họ Llama (`LlamaForCausalLM`, DeepSeek Coder) | block transformer của `nim_inference` | `test/deepseek-inference/models` |
+| Mamba-2 (Codestral Mamba) | nhánh base-Mamba của `infer_lora` | thư mục không có LoRA `.bin` |
+| Mamba-2 + LoRA / Linear++ | nhánh checkpoint của `infer_lora` | `test/codestral/models` |
+
+#### Build
+
+```sh
+make formers-cli
+```
+
+Target này build compiler BybyLang trong `vendor/bybylang` khi cần, biên dịch AOT
+`other/formers.n/src/formers_cli.bybylang` sang Nim và ghi ra
+`other/formers.n/formers-cli`. `make build-formers` là cùng target. Chỉ cần Nim và
+trình biên dịch C; backend GPU giống các target inference khác (Metal/Vulkan).
+
+#### Chạy nhanh
+
+Tải model trước (`make download-models`), rồi từ thư mục gốc:
+
+```sh
+# Codestral + QLoRA, chat nhiều lượt
+other/formers.n/formers-cli --models test/codestral/models -cnv -n 256
+
+# DeepSeek Coder, một prompt
+other/formers.n/formers-cli --models test/deepseek-inference/models \
+  -p "Write a Python function for Fibonacci." -n 128
+
+# Chỉ in kết quả nhận diện, không nạp trọng số
+other/formers.n/formers-cli --models test/codestral/models --detect-only
+```
+
+Hoặc qua make (`make formers` tự build trước):
+
+```sh
+make formers                                              # chat với test/codestral/models
+make formers FORMERS_MODELS=test/deepseek-inference/models
+make formers ARGS='--models test/codestral/models -p "Write quicksort in Python." -n 200'
+```
+
+#### `--models` cần có gì
+
+| File | Cách tìm | Ghi đè |
+| --- | --- | --- |
+| trọng số | `.nimq` duy nhất; nếu nhiều thì lấy file ghi trong metadata `nimqPath` của LoRA, không thì `model.nimq` | `-m FILE` |
+| config | `config.json` trong thư mục hoặc thư mục con (Codestral để trong `hf/`) | `--config FILE` |
+| tokenizer | thư mục có `tokenizer.json` hoặc `tokenizer.model` | `--tokenizer DIR` |
+| LoRA (Mamba-2) | `.bin` duy nhất có header `NIMBIN1`/`NIMBIN4`; nhiều file là lỗi | `--lora FILE`, `--no-lora` |
+
+`--detect-only` in các file, kiến trúc, nhánh chạy, kích thước model, và lý do nếu
+model không được hỗ trợ (ví dụ Mamba-1 hoặc `model_type` lạ).
+
+#### Một prompt và chat
+
+- Không có `-cnv`: `-p TEXT` (hoặc `-f FILE`) được bọc trong chat template của model và
+  sinh một lần; `--system TEXT` đặt system prompt, `--raw-prompt` gửi nguyên văn.
+- `-cnv` (hoặc `-i`) mở chat: ngữ cảnh (KV cache với Llama, recurrent state với Mamba-2)
+  được giữ giữa các lượt, `-n` giới hạn mỗi câu trả lời, `-p` thành system prompt. Gõ
+  `/exit` (hoặc `/quit`, `/bye`) để thoát, kết thúc dòng bằng `\` để viết tiếp dòng sau,
+  Ctrl+C dừng câu trả lời, Ctrl+C ở dấu nhắc thì thoát.
+- `-c N` đặt kích thước context cho chat Llama (mặc định 1024 token).
+- Trong chat, mỗi câu trả lời kết thúc bằng tok/s của `prompt eval` và `eval`; một prompt
+  Llama đơn kết thúc bằng khối `Speed stats` (prefill, decode, total).
+
+Trước prompt đầu tiên, warmup biên dịch pipeline GPU và in `ready: warmup ...`;
+`--no-warmup` bỏ qua, khi đó câu trả lời đầu chịu thời gian biên dịch. Với Mamba-2,
+prompt ngắn hơn 129 token chạy bằng kernel decode đã warm; prompt dài hơn đưa các chunk
+đủ 128 token (`BYBY_PREFILL_BATCH_SIZE`) qua prefill song song.
+
+#### Merge LoRA
+
+LoRA của Mamba-2 được merge vào trọng số FP4-KM nằm sẵn trên GPU lúc khởi động
+(`infer_lora.mergeResidentLoraIfEnabled`, giống `make infer-lora`). Kernel decode khi đó
+bỏ phần adapter A/B, và output khớp với checkpoint đã merge. Merge thêm một lượt xử lý
+lúc khởi động.
+
+- `--no-merge-lora` (hoặc `BYBY_MERGE_LORA=0`) giữ adapter tách rời, fuse trong kernel.
+- Khi bật mặc định, merge tự bỏ qua nếu `BYBY_ONE_DISPATCH=1`, `BYBY_MODEL_MMAP=0` hoặc
+  tiến trình không đủ RAM (`BYBY_MEMORY_LIMIT_MB`, mặc định 7000), và inference chạy tiếp
+  bằng adapter tách rời. Tự đặt `BYBY_MERGE_LORA=inplace` thì các trường hợp đó thành lỗi.
+
+#### Log
+
+formers-cli mặc định im lặng. Log của loader, LoRA, JIT, Metal và tune kernel đi vào
+`/dev/null`; chỉ hiện dòng loading, `ready`, text sinh ra, thống kê và lỗi.
+`-v`/`--verbose` hiện mọi dòng log. Lỗi ở chế độ im lặng in thông báo và gợi ý chạy lại
+với `--verbose`.
+
+#### Flag chính
+
+| Flag | Ý nghĩa | Mặc định |
+| --- | --- | --- |
+| `-n, --n-predict N` | số token sinh (mỗi câu trả lời khi chat) | 128 |
+| `--temp T` | temperature, `0` = greedy | 0.7 |
+| `--top-p P` | nucleus sampling, `1` = tắt | 0.9 |
+| `--min-p P` | min-p, `0` = tắt | 0.05 |
+| `--repeat-penalty R`, `--repeat-last-n N` | phạt lặp và cửa sổ của nó | 1.0 (tắt), 64 |
+| `-s, --seed N` | seed sampling | ngẫu nhiên |
+| `--backend NAME` | `auto`, `metal`, `vulkan`, `cuda` (= `vulkan`) | `auto` |
+| `-ngl N` | số layer trên GPU; mọi layer chạy trên GPU, giá trị nhỏ hơn bị từ chối | tất cả |
+| `--no-progress` | không hiện tok/s trên tiêu đề cửa sổ terminal | |
+
+`formers-cli --help` liệt kê mọi flag. Mã thoát: 0 ok, 1 lỗi khi chạy, 2 sai option,
+3 model không hỗ trợ.
+
+#### Target make
+
+| Target | Làm gì |
+| --- | --- |
+| `make formers-cli` / `make build-formers` | build `other/formers.n/formers-cli` |
+| `make formers` | build rồi chat với `FORMERS_MODELS` (mặc định `test/codestral/models`); `ARGS='...'` thay toàn bộ đối số |
+| `make formers-test` | test nhận diện kiến trúc, không nạp model, không cần GPU |
+| `make formers-smoke` | tạo một Llama ngẫu nhiên tí hon và chạy end to end trên GPU |
+| `make formers-clean` | xoá build và binary của formers.n (`make clean` cũng xoá) |
+
+Chi tiết hơn (cấu trúc mã nguồn, luật nhận diện, phần chưa làm):
+[`other/formers.n/README.md`](other/formers.n/README.md).
 
 
 ### Train Spectron bằng `test/spectron/test_nimformer.nim`

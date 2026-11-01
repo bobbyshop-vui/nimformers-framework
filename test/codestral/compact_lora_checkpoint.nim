@@ -22,7 +22,7 @@ proc writeFloatArray(f: File, values: seq[float32]) =
 
 proc compactCheckpoint(input, output: string) =
   if not fileExists(input & ".lora.json"):
-    raise newException(IOError, "Khong tim thay checkpoint: " & input & ".lora.json")
+    raise newException(IOError, "Checkpoint not found: " & input & ".lora.json")
 
   echo &"[compact] Doc checkpoint streaming: {input}.lora.json"
   var model: NimformerModelJamba
@@ -73,8 +73,8 @@ proc compactCheckpoint(input, output: string) =
   f.write("},\"compactWeights\":true}")
   f.flushFile()
   f.close()
-  echo &"[compact] Da ghi {output} va {metaPath}; {blockCount} tensor block A da quantize int8."
-  echo "[compact] Checkpoint goc van duoc giu nguyen."
+  echo &"[compact] Wrote {output} and {metaPath}; {blockCount} block A tensors quantized to int8."
+  echo "[compact] The original checkpoint is unchanged."
 
 when isMainModule:
   let input = if paramCount() >= 1: paramStr(1) else: CFG_CHECKPOINT_PATH_DEFAULT

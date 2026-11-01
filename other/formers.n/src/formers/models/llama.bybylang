@@ -1,0 +1,254 @@
+# formers.n — Llama-family runner (DeepSeek-coder, TinyLlama, Llama 2/3...).
+#
+# Runs exactly what test/deepseek-inference/nim_inference.nim runs:
+#   newLlamaLConfig (config.json, every size field read from the file)
+#   -> newLlamaModelL -> loadLlamaWeightsL (mmap, Q4 kept packed)
+#   -> uploadAllResidentWeights (zero-copy resident Q4 + autotune)
+#   -> forwardStep (prefill; decode with all layers in one GPU session,
+#      falling back to one session per layer, adaptive GPU yield)
+# One prompt goes through nim_inference.generate itself (same KV sizing,
+# KV warmup, sampler, statistics). Chat keeps one KV cache across turns and
+# steps it with the same forwardStep.
+
+import nim "std/[os, times, strutils, json, random]"
+import nim "nimformers"
+import nim "backend"
+import nim "nim_inference"
+import nim "native_hf_tokenizer"
+import "../cli/options.bybylang"
+import "../arch/detect.bybylang"
+import "../sampling/sampler.bybylang"
+import "../runtime/signals.bybylang"
+import "../runtime/console.bybylang"
+
+type
+  FmLlamaChat* = object
+    ## One sequence: the KV cache and what it holds, kept across chat turns.
+    cache*: KVCacheL
+    capacity*: int
+    ids*: seq[int]                ## tokens whose K/V are in the cache
+    pending*: seq[int]            ## last sampled token, fed with the next input
+    text*: string                 ## chat-template text of ids + pending
+    messages*: JsonNode
+    sampler*: FmSampler
+  FmLlamaReply* = object
+    text*: string
+    tokens*: int
+    seconds*: float
+    contextFull*: bool
+
+const FmLlamaChatCtx = 1024
+
+function fmLlamaLoad(det: FmDetection, ctx: Backend): LlamaModelL
+    ## nim_inference main: config -> model -> weights -> resident upload -> pipeline warm matmul.
+    let cfg = newLlamaLConfig(det.files.configPath)
+    result = newLlamaModelL(cfg)
+    loadLlamaWeightsL(result, det.files.nimqPath)
+    uploadAllResidentWeights(result, ctx)
+    discard beMatmul(ctx, @[0'f32, 0, 0, 0], 2, 2, @[0'f32, 0, 0, 0], 2, 2)
+
+function fmLlamaWithBos(tok: native_hf_tokenizer.HFTokenizer, ids: seq[int]): seq[int]
+    ## Chat templates such as DeepSeek-coder's and TinyLlama's do not emit
+    ## bos_token and are encoded without special tokens; like llama.cpp, start
+    ## the sequence with BOS when the tokenizer adds one (add_bos_token).
+    result = ids
+    let specials = tok.encode("", true)
+    if tok.bosId >= 0 and specials.len > 0 and specials[0] == tok.bosId and (ids.len == 0 or ids[0] != tok.bosId):
+        result = @[tok.bosId] & ids
+
+function fmLlamaPromptIds(tok: native_hf_tokenizer.HFTokenizer, opts: FmOptions): seq[int]
+    if opts.rawPrompt:
+        result = tok.encode(opts.prompt, true)
+    else:
+        result = fmLlamaWithBos(tok, tok.applyChatTemplate(opts.prompt, opts.systemText))
+
+function fmLlamaKvMiB(m: LlamaModelL, capacity: int): int
+    ## GPU: per-head + combined K/V buffers; host: the K/V arrays of KVCacheL.
+    let perCopy = m.config.nLayers * m.config.nKVHeads * capacity * (m.config.hiddenSize div m.config.nHeads) * 4 * 2
+    result = 3 * perCopy div (1024 * 1024)
+
+function fmLlamaNewChat(m: LlamaModelL, tok: native_hf_tokenizer.HFTokenizer, ctx: Backend, opts: FmOptions, capacity: int): FmLlamaChat
+    ## KV cache + resident KV for every layer, allocated before the first
+    ## prefill exactly like nim_inference.generate.
+    let cfg = m.config
+    let headDim = cfg.hiddenSize div cfg.nHeads
+    result.capacity = capacity
+    result.cache = newKVCacheL(cfg.nLayers, cfg.nKVHeads, headDim, capacity)
+    let t0 = epochTime()
+    let be = ctx.kind.toByby()
+    for idx in 0 ..< result.cache.layers.len:
+        ensureKvResident(result.cache.layers[idx], be, m.blocks[idx].attn.nKVHeads, result.cache.maxSeqLen, m.blocks[idx].attn.headDim)
+    stderr.writeLine("[formers.n] KV: " & $capacity & " tok (~" & $fmLlamaKvMiB(m, capacity) & " MiB GPU+RAM), allocated before prefill in " & formatFloat(epochTime() - t0, ffDecimal, 3) & " s")
+    result.messages = newJArray()
+    result.sampler = fmNewSampler(opts, cfg.vocabSize)
+    for ws in ["\n", "\n\n", " ", "  ", "    ", "\t", ":\n", ":\n    "]:
+        for id in tok.encode(ws, false):
+            if id >= 0 and id < cfg.vocabSize:
+                result.sampler.noPenalty[id] = true
+    stderr.writeLine("[formers.n] sampler: " & fmSamplerSummary(result.sampler))
+
+function fmLlamaReset(chat: var FmLlamaChat)
+    ## Empty the sequence; the resident KV buffers stay allocated (every
+    ## offset is computed from seqLen).
+    chat.cache.seqLen = 0
+    for l in 0 ..< chat.cache.layers.len:
+        chat.cache.layers[l].filled = 0
+    chat.ids.setLen(0)
+    chat.pending.setLen(0)
+    chat.text = ""
+
+function fmLlamaFeed(m: LlamaModelL, ctx: Backend, chat: var FmLlamaChat, newIds: seq[int]): seq[float32]
+    ## Appends pending + newIds; returns the logits of the last token. An
+    ## empty cache takes the whole input in one prefill; later input goes
+    ## through decode steps (the prefill attends only within its own chunk).
+    let input = chat.pending & newIds
+    chat.pending.setLen(0)
+    if chat.ids.len + input.len > chat.capacity:
+        raise newException(ValueError, "[formers.n] context full: " & $(chat.ids.len + input.len) & " > " & $chat.capacity & " tok (raise -c)")
+    if chat.ids.len == 0:
+        result = m.forwardStep(input, ctx, chat.cache, true).data
+    else:
+        for id in input:
+            result = m.forwardStep(@[id], ctx, chat.cache, false).data
+    chat.ids.add(input)
+
+function fmLlamaWarmup(m: LlamaModelL, tok: native_hf_tokenizer.HFTokenizer, ctx: Backend, chat: var FmLlamaChat, opts: FmOptions)
+    ## A 4-token prefill and 2 decode steps create the prefill and decode
+    ## pipelines before the first prompt; the cache is emptied afterwards.
+    if opts.noWarmup or chat.capacity < 8:
+        return
+    var ids = tok.encode("def f():", true)
+    if ids.len > 4:
+        ids.setLen(4)
+    let t0 = epochTime()
+    discard fmLlamaFeed(m, ctx, chat, ids)
+    discard fmLlamaFeed(m, ctx, chat, @[ids[^1]])
+    let s0 = epochTime()
+    discard fmLlamaFeed(m, ctx, chat, @[ids[^1]])
+    let stepMs = (epochTime() - s0) * 1000
+    fmLlamaReset(chat)
+    fmSay("[formers.n] ready: warmup " & formatFloat(epochTime() - t0, ffDecimal, 1) & " s (decode ~" & $int(stepMs + 0.5) & " ms/tok)")
+
+function fmLlamaReplyTo(m: LlamaModelL, tok: native_hf_tokenizer.HFTokenizer, ctx: Backend, chat: var FmLlamaChat, firstLogits: seq[float32], maxNew: int, opts: FmOptions): FmLlamaReply
+    ## Samples and streams up to maxNew tokens. The last sampled token stays
+    ## in chat.pending; EOS is never fed, the chat template text supplies it.
+    var logits = firstLogits
+    var stream = initTokenStream(tok)
+    var gen: seq[int]
+    let live = fmLiveProgress(opts)
+    let t0 = epochTime()
+    fmSetGenerating(true)
+    while gen.len < maxNew and not fmStopRequested():
+        let stepStart = epochTime()
+        let id = fmSample(chat.sampler, logits, chat.ids)
+        if id == tok.eosId:
+            break
+        gen.add(id)
+        fmOut().write(stream.pushTokens([id]))
+        fmOut().flushFile()
+        if chat.ids.len + 1 >= chat.capacity:
+            result.contextFull = true
+        if gen.len >= maxNew or result.contextFull:
+            chat.pending = @[id]
+            break
+        logits = fmLlamaFeed(m, ctx, chat, @[id])
+        if live:
+            fmShowProgress(gen.len, maxNew, epochTime() - stepStart)
+    fmSetGenerating(false)
+    if live:
+        fmEndProgress()
+    fmOut().write(stream.pushTokens(newSeq[int](), true))
+    fmOut().flushFile()
+    result.seconds = epochTime() - t0
+    result.tokens = gen.len
+    result.text = tok.decode(gen)
+
+function fmLlamaStats(label: string, nTok: int, seconds: float)
+    if nTok > 0:
+        fmSay("[formers.n] " & label & ": " & $nTok & " tok / " & formatFloat(seconds, ffDecimal, 3) & " s = " & formatFloat(nTok.float / max(seconds, 1e-9), ffDecimal, 2) & " tok/s")
+
+function fmCommonPrefix(a, b: string): int
+    while result < min(a.len, b.len) and a[result] == b[result]:
+        inc result
+
+function fmLlamaChatLoop(m: LlamaModelL, tok: native_hf_tokenizer.HFTokenizer, ctx: Backend, opts: FmOptions)
+    ## llama-cli conversation mode: the model stays loaded and the KV cache
+    ## keeps every earlier turn; each turn feeds only the new template text
+    ## (end of the previous reply + the user message + assistant header).
+    let capacity = if opts.ctxSize > 0: opts.ctxSize else: min(FmLlamaChatCtx, m.config.maxPositionEmbeddings)
+    var chat = fmLlamaNewChat(m, tok, ctx, opts, capacity)
+    fmLlamaWarmup(m, tok, ctx, chat, opts)
+    if opts.systemText.len > 0:
+        chat.messages.add(%*{"role": "system", "content": opts.systemText})
+    fmSay("[formers.n] chat: context " & $capacity & " tok, at most " & $opts.nPredict & " tok per reply; /exit quits, Ctrl+C stops a reply")
+    while true:
+        fmClearStop()
+        let turn = fmReadTurn()
+        if not turn.ok:
+            break
+        if turn.text.len == 0:
+            continue
+        chat.messages.add(%*{"role": "user", "content": turn.text})
+        let full = tok.formatChatTemplate(chat.messages, true)
+        let keep = fmCommonPrefix(chat.text, full)
+        if keep < chat.text.len:
+            fmSay("[formers.n] warning: the chat template rewrote " & $(chat.text.len - keep) & " earlier characters, the context may diverge")
+        var newIds = tok.encode(full[keep .. ^1], false)
+        if chat.ids.len == 0 and chat.pending.len == 0:
+            newIds = fmLlamaWithBos(tok, newIds)
+        if chat.ids.len + chat.pending.len + newIds.len + 1 > chat.capacity:
+            fmSay("[formers.n] context full (" & $chat.ids.len & "/" & $chat.capacity & " tok): restart with a larger -c")
+            break
+        let t0 = epochTime()
+        let logits = fmLlamaFeed(m, ctx, chat, newIds)
+        let feedTime = epochTime() - t0
+        chat.text = full
+        let reply = fmLlamaReplyTo(m, tok, ctx, chat, logits, opts.nPredict, opts)
+        fmOut().write("\n")
+        fmOut().flushFile()
+        fmLlamaStats("prompt eval", newIds.len, feedTime)
+        fmLlamaStats("eval       ", reply.tokens, reply.seconds)
+        chat.text = chat.text & reply.text
+        chat.messages.add(%*{"role": "assistant", "content": reply.text})
+        if reply.contextFull:
+            fmSay("[formers.n] context full (" & $chat.capacity & " tok): restart with a larger -c")
+            break
+
+function fmRunLlama(det: FmDetection, opts: FmOptions): bool
+    backend.setForbidCpuFallback(true)
+    stderr.writeLine("[formers.n] tokenizer " & det.files.tokenizerDir)
+    let tok = native_hf_tokenizer.newHFTokenizer(det.files.tokenizerDir)
+    if tok.totalVocabSize > det.llama.vocabSize:
+        fmSay("[formers.n] error: the tokenizer has " & $tok.totalVocabSize & " tokens > vocab_size " & $det.llama.vocabSize)
+        return false
+    var promptIds: seq[int]
+    if opts.conversation:
+        # Fail on an unsupported chat template before loading the weights.
+        discard tok.formatChatTemplate(%*[{"role": "user", "content": "hi"}], true)
+    else:
+        promptIds = fmLlamaPromptIds(tok, opts)
+        if promptIds.len == 0:
+            fmSay("[formers.n] error: the prompt encodes to 0 tokens")
+            return false
+    let needed = if opts.ctxSize > 0: opts.ctxSize elif opts.conversation: min(FmLlamaChatCtx, det.llama.maxPositionEmbeddings) else: promptIds.len + opts.nPredict
+    if needed > det.llama.maxPositionEmbeddings:
+        fmSay("[formers.n] error: context " & $needed & " tok exceeds max_position_embeddings " & $det.llama.maxPositionEmbeddings)
+        return false
+    if opts.seed >= 0:
+        randomize(opts.seed)
+    let ctx = newBackend(opts.backend)
+    let m = fmLlamaLoad(det, ctx)
+    if opts.conversation:
+        fmLlamaChatLoop(m, tok, ctx, opts)
+    else:
+        if opts.minP != 0.05'f32 or opts.repeatPenalty != 1.0'f32:
+            fmSay("[formers.n] note: a single prompt runs nim_inference.generate (temp/top-p); --min-p/--repeat-penalty apply in -cnv only")
+        # nim_inference's own progress line is pinned with cursor moves and
+        # overwrites the scrollback; its statistics are printed at the end.
+        # It streams the tokens to stdout itself: unmute fd 1 for the run.
+        fmLibStdout(true)
+        try:
+            discard generate(m, tok, ctx, promptIds, opts.nPredict, opts.temperature, opts.topP, false, fmErr(), opts.verbose)
+        finally:
+            fmLibStdout(false)
+    result = true

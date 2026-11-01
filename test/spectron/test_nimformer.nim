@@ -1,23 +1,23 @@
 ## test_nimformer.nim
-## Bản đầy đủ: LinearPlusAttention (Linear++) + Mamba-2 SSD + khối Spectron
-## (gated fusion 2 nhánh) + NimformerModelSpectron (embed -> N blocks -> lm
-## head) với forward/backward ĐẦY ĐỦ cho mọi thành phần, cộng vòng lặp
-## train() (Adam) và generate() (greedy/temperature) để chạy training và
-## inference thật, không còn phần "để sau".
+## Full version: LinearPlusAttention (Linear++) + Mamba-2 SSD + the Spectron block
+## (2-branch gated fusion) + NimformerModelSpectron (embed -> N blocks -> lm
+## head) with FULL forward/backward for every component, plus a
+## train() loop (Adam) and generate() (greedy/temperature) to run real training and
+## inference, nothing left "for later".
 ##
-## Quy ước chung (giống nimformer.nim): layout activation luôn [B,T,C] hoặc
-## coi [B*T, C] khi qua Linear/LayerNorm. Mọi phép toán nặng (matmul, add,
-## sigmoid...) đi qua backend.nim (beMatmul/beAdd/beSigmoid...) để chạy đúng
-## trên backend đã chọn (cpu/metal/cuda/opencl/vulkan), KHÔNG lặng lẽ rơi về
-## vòng lặp Nim thuần cho những phép toán lớn.
+## Shared conventions (like nimformer.nim): activations are always [B,T,C] or
+## treated as [B*T, C] through Linear/LayerNorm. Every heavy op (matmul, add,
+## sigmoid...) goes through backend.nim (beMatmul/beAdd/beSigmoid...) so it runs
+## on the chosen backend (cpu/metal/cuda/opencl/vulkan), NEVER silently falling back
+## to plain Nim loops for large ops.
 ##
-## GPU-ONLY: khi ctx là GPU (isGpuCtx: Metal/Vulkan) MỌI phép tính của
-## Linear++, Mamba2SSD, khối Spectron, loss và Adam chạy trên GPU; lỗi GPU thì
-## RAISE (gpuFail), KHÔNG BAO GIỜ âm thầm tính lại trên CPU. Các hàm cpu*
-## bên dưới chỉ còn là bản tham chiếu cho backend CPU và
-## cho test đối chiếu. Phần còn lại trên host là sắp xếp dữ liệu (tách/ghép
-## slice theo head, vì Tensor.data nằm trên host) và lượng tử hoá APF
-## (customfloat chưa có kernel GPU), không phải phép tính model.
+## GPU-ONLY: when ctx is a GPU (isGpuCtx: Metal/Vulkan) EVERY computation of
+## Linear++, Mamba2SSD, the Spectron block, loss and Adam runs on the GPU; a GPU error
+## RAISES (gpuFail), it is NEVER silently recomputed on the CPU. The cpu* functions
+## below are only reference versions for the CPU backend and
+## for comparison tests. What is left on the host is data arrangement (splitting/joining
+## per-head slices, since Tensor.data lives on the host) and APF quantization
+## (customfloat has no GPU kernel yet), not model computation.
 
 import std/[math, random, strformat, os, strutils, json, tables]
 import customfloat
@@ -25,7 +25,7 @@ import backend
 import quant
 import nimformer
 import mamba2_ssm_gpu   # kernel GPU Linear++ train (forward+backward), runMicroVm, CE/Adam GPU
-from fp4_gemv_vm import buildLinearPlusStepProgram   # kernel GPU Linear++ 1 token (cung kernel infer)
+from fp4_gemv_vm import buildLinearPlusStepProgram   # Linear++ 1-token GPU kernel (same kernel as infer)
 import fp4_gemv_vm as lpvm                            # lpvm.lpLayout(C, H): layout [proj|y|z|S]
 import gpu_layers  # encodeEluPlus1 / encodeEluPlus1Backward for GPU-only Linear++  # Tensor, Linear, LayerNorm, FeedForward, Embedding, addT,
                    # transpose, flatten2D, newTensor, randnTensor,
@@ -33,7 +33,7 @@ import gpu_layers  # encodeEluPlus1 / encodeEluPlus1Backward for GPU-only Linear
                    # newFeedForward, newEmbedding
 
 # ═══════════════════════════════════════════════════════════════
-# CONFIG - SỬA Ở ĐÂY CHO DỄ, KHÔNG PHẢI LỤC XUỐNG main BÊN DƯỚI
+# CONFIG - EDIT HERE, NO NEED TO DIG INTO main BELOW
 # ═══════════════════════════════════════════════════════════════
 const
   CFG_EMBED_DIM* = 64
@@ -42,12 +42,12 @@ const
   CFG_FF_MULT* = 4
   CFG_SEQ_LEN* = 128
   CFG_BATCH_SIZE* = 32
-  CFG_NUM_MERGES* = 500        # vocab cuoi = 256 + merges (dung som neu het cap lap)
-  CFG_N_STEPS* = 6_000        # so buoc train demo
+  CFG_NUM_MERGES* = 500        # final vocab = 256 + merges (stops early when no pairs are left)
+  CFG_N_STEPS* = 6_000        # demo training steps
   CFG_LR* = 3e-4'f32
-  CFG_REQUANTIZE_EVERY* = 50   # xem giai thich trong trainStep ben duoi
-  CFG_LOG_EVERY* = 100         # log loss moi bao nhieu buoc
-  CFG_BPE_TRAIN_CHARS* = 300_000  # so ky tu dau corpus dung de train BPE
+  CFG_REQUANTIZE_EVERY* = 50   # see the explanation in trainStep below
+  CFG_LOG_EVERY* = 100         # log the loss every N steps
+  CFG_BPE_TRAIN_CHARS* = 300_000  # number of leading corpus chars used to train BPE
   CFG_CORPUS_PATH* = "test/spectron/databricks-dolly-15k.jsonl"
   CFG_CODE_CORPUS_PATHS* = [
     "test/spectron/nim_python_code_dataset_mega.jsonl",
@@ -62,59 +62,59 @@ const
   CFG_GEN_TEMPERATURE* = 0'f32
   CFG_GEN_PROMPT* = "When did Virgin Australia start operating?"
   CFG_CHECKPOINT_PATH* = "test/spectron/models/finetune.nimq"
-  CFG_CHECKPOINT_EVERY* = 5    # luu checkpoint moi bao nhieu buoc train
+  CFG_CHECKPOINT_EVERY* = 5    # save a checkpoint every N training steps
 
 # ═══════════════════════════════════════════════════════════════
-# GPU-ONLY: loi GPU -> raise, KHONG tinh lai tren CPU (truoc day
-# warnFallbackOnce roi ve cpuMamba2Forward/cpuLinearPlusForward).
+# GPU-ONLY: a GPU error -> raise, NOT recomputed on the CPU (this used to be
+# warnFallbackOnce then cpuMamba2Forward/cpuLinearPlusForward).
 # ═══════════════════════════════════════════════════════════════
 proc gpuFail(what: string; backend: GpuBackend) {.noreturn.} =
   let detail = sessionGetLastError(backend)
   raise newException(CatchableError,
-    "[test_nimformer] GPU " & what & " that bai tren " & $backend &
-    (if detail.len > 0: ": " & detail else: "") & " (GPU-only: khong roi ve CPU)")
+    "[test_nimformer] GPU " & what & " failed on " & $backend &
+    (if detail.len > 0: ": " & detail else: "") & " (GPU-only: no CPU fallback)")
 
 # ═══════════════════════════════════════════════════════════════
-# BPE TOKENIZER RIÊNG CHO SPECTRON (byte-level BPE, tự train trên corpus
-# của chính project này - KHÔNG dùng lại tokenizer.json của model 32256-vocab
-# trong nim_inference.nim, đó là 2 model khác nhau hoàn toàn).
+# SPECTRON'S OWN BPE TOKENIZER (byte-level BPE, trained on this
+# project's own corpus - does NOT reuse the 32256-vocab model's tokenizer.json
+# in nim_inference.nim, those are 2 entirely different models).
 #
-# Thuật toán chuẩn GPT-2 style byte-level BPE:
-#   - 256 token cơ sở = 256 giá trị byte (0..255), luôn biểu diễn được MỌI
-#     chuỗi byte bất kỳ (không bao giờ có "unknown token").
-#   - Lặp lại numMerges lần: đếm tần suất mọi cặp token liền kề trong toàn
-#     corpus, chọn cặp xuất hiện nhiều nhất, gộp thành 1 token mới
-#     id = 256 + bước, ghi lại rule (a,b)->newId theo ĐÚNG thứ tự tạo ra.
-#   - Encode văn bản mới: bắt đầu từ byte thô, áp lần lượt các merge rule
-#     theo đúng thứ tự đã train (đây là điểm mấu chốt để BPE decode được
-#     xác định/deterministic).
-#   - Decode: mở ngược newId -> (a,b) -> ... -> byte thô.
+# Standard GPT-2 style byte-level BPE algorithm:
+#   - 256 base tokens = the 256 byte values (0..255), which can always represent ANY
+#     byte string (there is never an "unknown token").
+#   - Repeat numMerges times: count the frequency of every adjacent token pair in the whole
+#     corpus, pick the most frequent pair, merge it into 1 new token
+#     id = 256 + step, record the rule (a,b)->newId in EXACT creation order.
+#   - Encoding new text: start from raw bytes and apply the merge rules
+#     in the trained order (this is the key to BPE decoding being
+#     deterministic).
+#   - Decode: unfold newId -> (a,b) -> ... -> raw bytes.
 # ═══════════════════════════════════════════════════════════════
 type
   BPETokenizer* = object
-    ## Tokenizer subword kiểu GPT-2/Llama THẬT (byte-level BPE + pre-tokenizer
-    ## theo từ/số/dấu câu), KHÔNG phải "1 byte = 1 token" nữa:
-    ##   1) byte-to-unicode: map 256 giá trị byte sang 256 ký tự Unicode LUÔN
-    ##      in được (đúng thuật toán bytes_to_unicode() của GPT-2 gốc - xem
-    ##      newGpt2ByteEncoder bên dưới) -> vocab/merges là CHUỖI, đọc được,
-    ##      xuất ra tokenizer.json giống hệt format thật của HF/tokenizers.
-    ##   2) pre-tokenize: cắt câu thành các mẩu (chữ dính khoảng trắng đầu,
-    ##      số, dấu câu, khoảng trắng) TRƯỚC khi BPE - giống regex GPT-2
-    ##      (\p{L}+, \p{N}+, dấu câu, ...) - để token không bao giờ "nhảy"
-    ##      qua ranh giới từ/số/dấu câu như BPE-thô-trên-toàn-file.
-    ##   3) BPE thật sự chỉ merge bên TRONG từng mẩu pre-token.
+    ## A REAL GPT-2/Llama-style subword tokenizer (byte-level BPE + pre-tokenizer
+    ## by words/numbers/punctuation), no longer "1 byte = 1 token":
+    ##   1) byte-to-unicode: maps the 256 byte values to 256 ALWAYS printable
+    ##      Unicode characters (the original GPT-2 bytes_to_unicode() algorithm - see
+    ##      newGpt2ByteEncoder below) -> vocab/merges are readable STRINGS,
+    ##      exported to tokenizer.json in the same format as real HF/tokenizers.
+    ##   2) pre-tokenize: split text into pieces (words with a leading space,
+    ##      numbers, punctuation, whitespace) BEFORE BPE - like the GPT-2 regex
+    ##      (\p{L}+, \p{N}+, punctuation, ...) - so tokens never "jump"
+    ##      across word/number/punctuation boundaries like raw whole-file BPE.
+    ##   3) Real BPE merges only INSIDE each pre-token piece.
     vocab*: Table[string, int]        # subword string -> id
     id2tok*: seq[string]              # id -> subword string
-    merges*: seq[(string, string)]    # theo đúng thứ tự train (rank = index)
+    merges*: seq[(string, string)]    # in exact training order (rank = index)
     mergeRank*: Table[(string, string), int]
-    byteEncoder*: array[256, string]  # byte thô -> ký tự unicode (bytes_to_unicode)
-    byteDecoder*: Table[string, int]  # ký tự unicode -> byte thô (chiều ngược)
+    byteEncoder*: array[256, string]  # raw byte -> unicode char (bytes_to_unicode)
+    byteDecoder*: Table[string, int]  # unicode char -> raw byte (reverse direction)
 
 proc newGpt2ByteEncoder(): array[256, string] =
-  ## Y hệt bytes_to_unicode() trong encoder.py gốc của OpenAI GPT-2: mọi
-  ## byte "in được" (33..126, 161..172, 174..255) giữ nguyên chính nó, các
-  ## byte còn lại (control char, whitespace, ...) được dồn ra dải unicode
-  ## 256.. để KHÔNG BAO GIỜ có ký tự vô hình/mơ hồ trong vocab.
+  ## Exactly bytes_to_unicode() in OpenAI GPT-2's original encoder.py: every
+  ## "printable" byte (33..126, 161..172, 174..255) maps to itself, the
+  ## remaining bytes (control chars, whitespace, ...) are moved to the unicode range
+  ## 256.. so the vocab NEVER contains invisible/ambiguous characters.
   var bs: seq[int] = @[]
   for b in ord('!') .. ord('~'): bs.add(b)
   for b in 0xA1 .. 0xAC: bs.add(b)
@@ -130,7 +130,7 @@ proc newGpt2ByteEncoder(): array[256, string] =
     if cp < 0x80:
       result = $char(cp)
     else:
-      # cp luôn < 0x800 (n tối đa ~68) nên chỉ cần UTF-8 2 byte.
+      # cp is always < 0x800 (n is at most ~68) so 2-byte UTF-8 is enough.
       result = newString(2)
       result[0] = char(0xC0 or (cp shr 6))
       result[1] = char(0x80 or (cp and 0x3F))
@@ -142,11 +142,11 @@ proc isAsciiDigit(c: char): bool = c in {'0'..'9'}
 proc isAsciiSpace(c: char): bool = c in {' ', '\t', '\n', '\r'}
 
 proc gpt2PreTokenize(s: string): seq[string] =
-  ## Cắt thô theo tinh thần regex GPT-2
+  ## Rough split in the spirit of the GPT-2 regex
   ## ( 's| 't| 're| 've| 'm| 'll| 'd| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+ )
-  ## viết tay bằng scanner ASCII (đủ dùng cho demo, không cần thư viện regex
-  ## Unicode - byte>=128 được coi như 1 "chữ cái" đơn lẻ/dấu câu tùy ngữ
-  ## cảnh, vẫn encode/decode ĐÚNG nhờ byte-level fallback ở bước sau).
+  ## hand-written as an ASCII scanner (enough for the demo, no Unicode regex
+  ## library needed - bytes >=128 are treated as a single "letter"/punctuation depending
+  ## on context, still encoded/decoded CORRECTLY thanks to the byte-level fallback later).
   result = @[]
   var i = 0
   let n = s.len
@@ -179,29 +179,29 @@ proc gpt2PreTokenize(s: string): seq[string] =
       start = i
       while i < n and isAsciiSpace(s[i]):
         if i + 1 < n and s[i] == ' ' and not isAsciiSpace(s[i + 1]) and i > start:
-          break   # để lại 1 space làm "leading space" cho mẩu tiếp theo
+          break   # leave 1 space as the "leading space" of the next piece
         inc i
       result.add(s[start ..< i])
     elif i < n:
       if not hasLeadingSpace: start = i
-      # 1 byte non-ascii/dấu câu = 1 mẩu (an toàn cho UTF-8 đa byte lẫn dấu câu)
+      # 1 non-ascii/punctuation byte = 1 piece (safe for multi-byte UTF-8 and punctuation)
       inc i
       result.add(s[start ..< i])
     else:
       if hasLeadingSpace: result.add(" ")
 
 proc toByteEncodedChars(enc: array[256, string], s: string): seq[string] =
-  ## Mỗi BYTE thô của chuỗi (không phải mỗi ký tự Unicode) -> 1 "ký tự cơ
-  ## sở" trong bảng byte-encoder - đây chính là "byte-level" của GPT-2/Llama:
-  ## luôn biểu diễn được MỌI chuỗi byte bất kỳ, không có unknown-token.
+  ## Each raw BYTE of the string (not each Unicode character) -> 1 "base
+  ## character" in the byte-encoder table - this is the "byte-level" of GPT-2/Llama:
+  ## it can always represent ANY byte string, no unknown token.
   result = newSeq[string](s.len)
   for i in 0 ..< s.len:
     result[i] = enc[uint8(s[i]).int]
 
 proc bpeMergeWord(tokens: seq[string], mergeRank: Table[(string, string), int]): seq[string] =
-  ## BPE chuẩn kiểu HF: lặp lại tìm cặp liền kề có RANK NHỎ NHẤT (tạo sớm
-  ## nhất khi train) trong 1 pre-token rồi gộp, tới khi không còn cặp nào
-  ## nằm trong bảng merge.
+  ## Standard HF-style BPE: repeatedly find the adjacent pair with the LOWEST RANK (created
+  ## earliest in training) inside 1 pre-token and merge it, until no pair
+  ## is in the merge table.
   var word = tokens
   while word.len > 1:
     var bestRank = int.high
@@ -231,9 +231,9 @@ proc trainBPE*(corpusText: string, numMerges: int): BPETokenizer =
   result.byteDecoder = initTable[string, int]()
   for b in 0 .. 255: result.byteDecoder[result.byteEncoder[b]] = b
 
-  # pre-tokenize 1 lần, giữ nguyên dạng seq[seq[string]] (mỗi pre-token là
-  # 1 seq ký tự byte-encoded) để đếm tần suất cặp liền kề CHỈ trong từng
-  # pre-token (không bao giờ merge xuyên ranh giới từ/số/dấu câu).
+  # pre-tokenize once, keeping the seq[seq[string]] form (each pre-token is
+  # a seq of byte-encoded chars) so adjacent pairs are counted ONLY within each
+  # pre-token (never merging across word/number/punctuation boundaries).
   let pretoks = gpt2PreTokenize(corpusText)
   var words = newSeq[seq[string]](pretoks.len)
   for i, pt in pretoks:
@@ -277,8 +277,8 @@ proc trainBPE*(corpusText: string, numMerges: int): BPETokenizer =
   result.merges = merges
   result.mergeRank = mergeRank
 
-  # Dựng vocab: 256 byte cơ sở trước (đúng thứ tự byte 0..255), rồi tới
-  # từng merge (256+step) - giống hệt quy ước GPT-2/Llama.
+  # Build the vocab: the 256 base bytes first (in byte order 0..255), then
+  # each merge (256+step) - exactly the GPT-2/Llama convention.
   result.id2tok = newSeq[string](256 + merges.len)
   result.vocab = initTable[string, int]()
   for b in 0 .. 255:
@@ -298,9 +298,9 @@ proc encodeBPE*(tok: BPETokenizer, s: string): seq[int] =
     let baseChars = toByteEncodedChars(tok.byteEncoder, pt)
     let merged = bpeMergeWord(baseChars, tok.mergeRank)
     for piece in merged:
-      # piece luôn có trong vocab vì mọi merge đều được đăng ký lúc train;
-      # phòng hờ piece lạ (model chưa từng thấy tổ hợp này khi train) thì
-      # rơi về từng byte-encoded char gốc (vẫn luôn có trong vocab).
+      # piece is always in the vocab since every merge is registered at training;
+      # just in case of an unknown piece (a combination never seen in training)
+      # fall back to the original byte-encoded chars (always in the vocab).
       if piece in tok.vocab:
         result.add(tok.vocab[piece])
       else:
@@ -315,8 +315,8 @@ proc decodeBPEStr*(tok: BPETokenizer, ids: seq[int]): string =
   for id in ids:
     if id >= 0 and id < tok.id2tok.len:
       unicodeStr.add(tok.id2tok[id])
-  # unicodeStr hiện là chuỗi ký tự byte-encoded (mỗi ký tự = 1-2 byte UTF-8
-  # đại diện 1 byte gốc) - giải mã ngược lại byte gốc rồi ghép thành string.
+  # unicodeStr is now a string of byte-encoded chars (each char = 1-2 UTF-8 bytes
+  # representing 1 original byte) - decode back to the original bytes and join into a string.
   var outBytes: seq[uint8] = @[]
   var i = 0
   while i < unicodeStr.len:
@@ -339,10 +339,10 @@ proc decodeBPE*(tok: BPETokenizer, ids: seq[int]): seq[uint8] =
   for i in 0 ..< s.len: result[i] = uint8(s[i])
 
 proc saveBPE*(tok: BPETokenizer, path: string) =
-  ## Lưu ĐÚNG schema kiểu tokenizer.json thật của HF/tokenizers (model BPE):
+  ## Saves EXACTLY the real HF/tokenizers tokenizer.json schema (BPE model):
   ## {"vocab_size", "vocab": {token_string: id}, "merges": ["a b", ...]}.
-  ## export_to_nimq.py cũng xuất theo đúng schema này (xem sửa đổi ở đó) để
-  ## 2 bên tương thích, load qua lại được.
+  ## export_to_nimq.py also exports this exact schema (see the change there) so
+  ## the 2 sides are compatible and can load each other's files.
   var vocabJson = newJObject()
   for k, v in tok.vocab: vocabJson[k] = %v
   var mergesJson = newJArray()
@@ -376,11 +376,11 @@ proc loadBPE*(path: string): BPETokenizer =
 const BPE_TOKENIZER_PATH = "test/spectron/models/spectron_bpe_tokenizer.json"
 
 proc getOrTrainBPE*(corpusText: string, numMerges: int): BPETokenizer =
-  ## Nếu đã train trước đó (file tồn tại) thì nạp lại cho nhanh/nhất quán
-  ## giữa các lần chạy; nếu chưa thì train mới trên `corpusText` rồi lưu ra
-  ## `spectron_bpe_tokenizer.json` (file riêng của Spectron, đúng schema
-  ## GPT-2/Llama-style BPE thật, KHÔNG phải bảng byte-identity giả trước
-  ## đây và KHÔNG đụng tới tokenizer.json của model khác trong repo).
+  ## If already trained (the file exists), reload it for speed/consistency
+  ## across runs; otherwise train a new one on `corpusText` and save it to
+  ## `spectron_bpe_tokenizer.json` (Spectron's own file, a real
+  ## GPT-2/Llama-style BPE schema, NOT the old fake byte-identity table,
+  ## and it does NOT touch the tokenizer.json of other models in the repo).
   if fileExists(BPE_TOKENIZER_PATH):
     result = loadBPE(BPE_TOKENIZER_PATH)
   else:
@@ -391,16 +391,16 @@ proc getOrTrainBPE*(corpusText: string, numMerges: int): BPETokenizer =
 # ═══════════════════════════════════════════════════════════════
 # LINEAR++ ATTENTION (causal linear attention, feature map elu(x)+1)
 # ═══════════════════════════════════════════════════════════════
-## Ý tưởng (Katharopoulos et al., "Transformers are RNNs"): thay vì
-## softmax(QK^T)V, dùng feature map phi(x) = elu(x)+1 (>0 luôn) rồi:
-##   S[i,j]   = phi(Q)_i . phi(K)_j          (j<=i, nhân quả)
+## Idea (Katharopoulos et al., "Transformers are RNNs"): instead of
+## softmax(QK^T)V, use the feature map phi(x) = elu(x)+1 (always >0) and then:
+##   S[i,j]   = phi(Q)_i . phi(K)_j          (j<=i, causal)
 ##   Num[i]   = sum_{j<=i} S[i,j] * V[j]
 ##   Den[i]   = sum_{j<=i} S[i,j]
 ##   Out[i]   = Num[i] / (Den[i] + eps)
-## Viết dưới dạng "quadratic form" [T,T] giống hệt Mamba2SSD bên dưới (mask
-## nhân quả a=1, KHÔNG suy giảm) - dùng chung code path/kiểm chứng được,
-## không cần kernel/scan riêng. Forward+backward đều closed-form, không
-## tham số ẩn (feature map cố định, không học thêm gì ngoài Q/K/V/out proj).
+## Written as a [T,T] "quadratic form" exactly like Mamba2SSD below (causal
+## mask a=1, NO decay) - shares a code path and is verifiable,
+## no separate kernel/scan needed. Forward+backward are both closed-form, no
+## hidden parameters (fixed feature map, nothing learned besides the Q/K/V/out projections).
 
 const LP_EPS = 1e-6'f32
 
@@ -409,7 +409,7 @@ proc eluPlus1(x: float32): float32 =
   else: exp(x)
 
 proc eluPlus1Grad(x: float32): float32 =
-  ## d/dx [elu(x)+1]: 1 nếu x>0, exp(x) nếu x<=0 (khớp forward ở trên).
+  ## d/dx [elu(x)+1]: 1 if x>0, exp(x) if x<=0 (matches the forward above).
   if x > 0'f32: 1'f32
   else: exp(x)
 
@@ -466,7 +466,7 @@ proc cpuLinearPlusBackward*(qData, kData, vData, qf, kf, den, dOutData: seq[floa
   template dIdx(b, t, h: int): int = b * T * H + t * H + h
   for h in 0 ..< H:
     for b in 0 ..< B:
-      # Bước 1: dựng lại Num[i] (cần cho dDen), rồi lan gradient theo i,j.
+      # Step 1: rebuild Num[i] (needed for dDen), then propagate the gradient over i,j.
       for i in 0 ..< T:
         let denI = den[dIdx(b, i, h)]
         let invDen = 1'f32 / (denI + LP_EPS)
@@ -479,7 +479,7 @@ proc cpuLinearPlusBackward*(qData, kData, vData, qf, kf, den, dOutData: seq[floa
             numI[d] += score * vData[idx(b, j, h, d)]
 
         # dOut_i -> dNum_i, dDen_i
-        var dDotNumDOut = 0'f32   # dOut_i . Num_i (dùng cho dDen)
+        var dDotNumDOut = 0'f32   # dOut_i . Num_i (used for dDen)
         for d in 0 ..< D:
           dDotNumDOut += dOutData[idx(b, i, h, d)] * numI[d]
         let dDen = -dDotNumDOut * invDen * invDen
@@ -488,7 +488,7 @@ proc cpuLinearPlusBackward*(qData, kData, vData, qf, kf, den, dOutData: seq[floa
           var score = 0'f32
           for d in 0 ..< D:
             score += qf[idx(b, i, h, d)] * kf[idx(b, j, h, d)]
-          # dScore từ nhánh Num: dNum_i . V_j ; từ nhánh Den: dDen (như nhau mọi j<=i)
+          # dScore from the Num branch: dNum_i . V_j ; from the Den branch: dDen (same for every j<=i)
           var dScoreNum = 0'f32
           for d in 0 ..< D:
             dScoreNum += (dOutData[idx(b, i, h, d)] * invDen) * vData[idx(b, j, h, d)]
@@ -501,7 +501,7 @@ proc cpuLinearPlusBackward*(qData, kData, vData, qf, kf, den, dOutData: seq[floa
             dQf[idx(b, i, h, d)] += dScore * kf[idx(b, j, h, d)]
             dKf[idx(b, j, h, d)] += dScore * qf[idx(b, i, h, d)]
 
-  # dQf/dKf -> dQ/dK qua đạo hàm feature map elu(x)+1
+  # dQf/dKf -> dQ/dK through the derivative of the elu(x)+1 feature map
   for i in 0 ..< dQf.len:
     result.dQ[i] = dQf[i] * eluPlus1Grad(qData[i])
     result.dK[i] = dKf[i] * eluPlus1Grad(kData[i])
@@ -509,10 +509,10 @@ proc cpuLinearPlusBackward*(qData, kData, vData, qf, kf, den, dOutData: seq[floa
 type
   LinearPlusAttention* = object
     nHeads*, headDim*, embedDim*: int
-    qkvProj*: Linear   # x -> [Q|K|V], mỗi phần embedDim
+    qkvProj*: Linear   # x -> [Q|K|V], each part embedDim
     outProj*: Linear
-    useSession*: bool  # giữ cờ cho tương thích API; ctx GPU LUÔN chạy GPU
-                        # (không còn đường CPU khi useSession=false).
+    useSession*: bool  # kept for API compatibility; a GPU ctx ALWAYS runs on the GPU
+                        # (no CPU path any more when useSession=false).
 
 proc newLinearPlusAttention*(embedDim, nHeads: int, useSession: bool = true;
                             initializeWeights = true): LinearPlusAttention =
@@ -567,8 +567,8 @@ proc forwardLinearPlusStep*(m: LinearPlusAttention,
 
   var y = newTensor(@[1, 1, C])
   if isGpuCtx(ctx):
-    # GPU: dung CHINH kernel Linear++ step cua infer (buildLinearPlusStepProgram, 1 TG/head,
-    # D lane) tren buffer [proj | y | z | S]; state host <-> GPU moi buoc.
+    # GPU: uses the infer Linear++ step kernel itself (buildLinearPlusStepProgram, 1 TG/head,
+    # D lanes) on the buffer [proj | y | z | S]; state host <-> GPU each step.
     let lay = lpvm.lpLayout(C, H)
     var buf = newSeq[float32](lay.total)
     buf.blit(lay.offProj, proj.data, 0, 3 * C)
@@ -640,7 +640,7 @@ proc forwardLinearPlus*(m: LinearPlusAttention, x: Tensor, ctx: Backend): Tensor
   let proj = m.qkvProj.forward(x, ctx)
   var y = newTensor(@[B, T, C])
   if isGpuCtx(ctx):
-    # GPU micro-kernel (train_gpu_vm): phi + causal Linear++ trong 1 session.
+    # GPU micro-kernel (train_gpu_vm): phi + causal Linear++ in 1 session.
     y.data = linearPlusForwardGpu(ctx, proj.data, B, T, m.nHeads, m.headDim)
   else:
     let (qData, kData, vData) = splitQKV(proj, B, T, C)
@@ -649,11 +649,11 @@ proc forwardLinearPlus*(m: LinearPlusAttention, x: Tensor, ctx: Backend): Tensor
   result = m.outProj.forward(y, ctx)
 
 proc forwardLinearPlusSession*(m: LinearPlusAttention, x: Tensor, ctx: Backend): Tensor =
-  ## Linear++ forward cho INFERENCE (jamba_hybrid/lora). GPU: CUNG micro-kernel
-  ## voi forwardLinearPlus (linearPlusForwardGpu: phi(x)=elu+1, scan nhan qua,
-  ## chia chuan hoa - tat ca trong 1 session GPU). Truoc day ban nay tinh phi va
-  ## phep chia tren CPU, tach slice tung head, va roi ve cpuLinearPlusForward
-  ## khi session loi; gio loi GPU -> raise. Backend khong phai GPU: ban tham chieu.
+  ## Linear++ forward for INFERENCE (jamba_hybrid/lora). GPU: the SAME micro-kernel
+  ## as forwardLinearPlus (linearPlusForwardGpu: phi(x)=elu+1, causal scan,
+  ## normalising division - all in 1 GPU session). This used to compute phi and
+  ## the division on the CPU, split per-head slices, and fall back to cpuLinearPlusForward
+  ## when the session failed; now a GPU error -> raise. Non-GPU backends: the reference version.
   let B = x.shape[0]; let T = x.shape[1]; let C = x.shape[2]
   assert C == m.embedDim
   let proj = m.qkvProj.forward(x, ctx)
@@ -673,8 +673,8 @@ proc backwardLinearPlus*(m: LinearPlusAttention, x: Tensor, dOut: Tensor, ctx: B
   var dProj = newTensor(proj.shape)
   var dOutP: tuple[dX, dW, dB: Tensor]
   if isGpuCtx(ctx):
-    # GPU: forward dựng lại + backward 2 pass trong 1 session. Cần y cho outProj.backward
-    # nên chạy forward trước (1 session), rồi backward (1 session, tự dựng lại phi/y).
+    # GPU: rebuilt forward + 2-pass backward in 1 session. outProj.backward needs y
+    # so the forward runs first (1 session), then the backward (1 session, rebuilding phi/y itself).
     y.data = linearPlusForwardGpu(ctx, proj.data, B, T, m.nHeads, m.headDim)
     dOutP = m.outProj.backward(y, dOut, ctx)
     dProj.data = linearPlusBackwardGpu(ctx, proj.data, dOutP.dX.data, B, T, m.nHeads, m.headDim)
@@ -699,7 +699,7 @@ proc backwardLinearPlus*(m: LinearPlusAttention, x: Tensor, dOut: Tensor, ctx: B
   result = (dQkvP.dX, dQkvP.dW, dQkvP.dB, dOutP.dW, dOutP.dB)
 
 # ═══════════════════════════════════════════════════════════════
-# TRANSFORMER BLOCK LINEAR++ (Pre-LN, giống khuôn TransformerBlock)
+# LINEAR++ TRANSFORMER BLOCK (Pre-LN, same shape as TransformerBlock)
 # ═══════════════════════════════════════════════════════════════
 type
   TransformerBlockLinearPP* = object
@@ -736,7 +736,7 @@ proc backward*(blk: TransformerBlockLinearPP, x: Tensor, dOut: Tensor, ctx: Back
 
   let dAttn = backwardLinearPlus(blk.attn, x1, dX2Total, ctx)
   let dLN1 = blk.ln1.backward(x, dAttn.dX, ctx)
-  let dX0 = addT(ctx, dLN1.dX, dX2Total)      # residual gốc
+  let dX0 = addT(ctx, dLN1.dX, dX2Total)      # original residual
 
   result = (
     dX0,
@@ -750,7 +750,7 @@ proc backward*(blk: TransformerBlockLinearPP, x: Tensor, dOut: Tensor, ctx: Back
 # ═══════════════════════════════════════════════════════════════
 
 proc buildDecayMask(T: int, a: float32): seq[float32] =
-  ## L[i,j] = a^(i-j) nếu i>=j, else 0.
+  ## L[i,j] = a^(i-j) if i>=j, else 0.
   result = newSeq[float32](T * T)
   for i in 0 ..< T:
     var v = 1'f32
@@ -841,15 +841,15 @@ proc splitXgBC(proj: Tensor, B, T, C: int): tuple[xg, b, c, gate: seq[float32]] 
 proc mamba2SsdGpu*(ctx: Backend; xgData, bData, cData, dYData: seq[float32];
                   B, H, T, D: int; aVals: seq[float32]):
     tuple[y, dXg, dB, dC: seq[float32]] =
-  ## SSD dang "quadratic" tren GPU, 1 session cho moi (b, h):
-  ##   S  = M o (C B^T)          (M = mask suy giam a^(i-j), j <= i)
+  ## "Quadratic" SSD on the GPU, 1 session per (b, h):
+  ##   S  = M o (C B^T)          (M = decay mask a^(i-j), j <= i)
   ##   Y  = S Xg
-  ## Neu dYData khac rong (backward), them:
+  ## If dYData is not empty (backward), also:
   ##   dXg = S^T dY,  S^T = M^T o (B C^T)
   ##   dS  = M o (dY Xg^T)  -> dC = dS B
   ##   dS^T = M^T o (Xg dY^T) -> dB = dS^T C
-  ## Moi tich A B^T dung sessionMatmulNT (khong transpose tren host). Tach slice
-  ## [T,D] theo head chi la sap xep du lieu. Loi GPU -> raise.
+  ## Every A B^T product uses sessionMatmulNT (no transpose on the host). Splitting [T,D]
+  ## slices per head is only data arrangement. GPU error -> raise.
   let backend = ctx.kind.toByby()
   let C = H * D
   let bwd = dYData.len > 0
@@ -1016,7 +1016,7 @@ proc concatLastDim*(a, b: Tensor; ctx: Backend): Tensor =
       result.data[i * 2 * C + C + c] = b.data[i * C + c]
 
 proc splitLastDim*(x: Tensor, C: int; ctx: Backend): tuple[a, b: Tensor] =
-  ## Ngược lại concatLastDim: [B,T,2C] -> 2 x [B,T,C].
+  ## Inverse of concatLastDim: [B,T,2C] -> 2 x [B,T,C].
   let B = x.shape[0]; let T = x.shape[1]
   result.a = newTensor(@[B, T, C])
   result.b = newTensor(@[B, T, C])
@@ -1058,7 +1058,7 @@ proc backward*(blk: TransformerBlockSpectron, x: Tensor, dOut: Tensor, ctx: Back
     dLn1G, dLn1B, dLn2G, dLn2B: Tensor] =
   let C = x.shape[2]
 
-  # ---- forward lại để có mọi activation trung gian ----
+  # ---- forward again to get every intermediate activation ----
   let x1 = blk.ln1.forward(x, ctx)
   let attnOut = forwardLinearPlus(blk.attn, x1, ctx)
   let mambaOut = forwardMamba2(blk.mamba, x1, ctx)
@@ -1090,14 +1090,14 @@ proc backward*(blk: TransformerBlockSpectron, x: Tensor, dOut: Tensor, ctx: Back
   dAttnOutTotal.data = beAdd(ctx, dAttnOutPartial, dAttnOutFuse.data)
   dMambaOutTotal.data = beAdd(ctx, dMambaOutPartial, dMambaOutFuse.data)
 
-  # ---- backward 2 nhánh (attn Linear++ và Mamba2) ----
+  # ---- backward of the 2 branches (Linear++ attn and Mamba2) ----
   let dAttn = backwardLinearPlus(blk.attn, x1, dAttnOutTotal, ctx)
   let dMamba = backwardMamba2(blk.mamba, x1, dMambaOutTotal, ctx)
 
   let dX1Total = addT(ctx, dAttn.dX, dMamba.dX)
 
   let dLN1 = blk.ln1.backward(x, dX1Total, ctx)
-  let dX0 = addT(ctx, dLN1.dX, dX2)    # residual gốc x2 = x + combined
+  let dX0 = addT(ctx, dLN1.dX, dX2)    # original residual x2 = x + combined
 
   result = (
     dX0,
@@ -1146,10 +1146,10 @@ proc forward*(m: NimformerModelSpectron, ids: seq[int], ctx: Backend): Tensor =
 
 type
   SpectronGrads* = object
-    ## Gom toàn bộ gradient của model theo đúng thứ tự ta sẽ cập nhật -
-    ## mảng "phẳng" các cặp (Tensor tham số, Tensor gradient) để train()
-    ## có thể lặp qua và gọi apfAdamStep cho từng cái mà không cần biết
-    ## cấu trúc chi tiết bên trong từng block.
+    ## Collects all model gradients in the exact order they will be updated -
+    ## a "flat" array of (param Tensor, gradient Tensor) pairs so train()
+    ## can loop over them and call apfAdamStep on each without knowing
+    ## the inner structure of each block.
     dOutProjW*, dOutProjB*: Tensor
     dFinalNormG*, dFinalNormB*: Tensor
     dBlocks*: seq[tuple[
@@ -1201,14 +1201,14 @@ proc backward*(m: NimformerModelSpectron, ids: seq[int], dLoss: Tensor, ctx: Bac
   result = m.backwardBatch(@[ids], dLossBatch, ctx)
 
 # ═══════════════════════════════════════════════════════════════
-# LOSS: softmax cross-entropy (batch), trả về loss trung bình + dLogits
+# LOSS: softmax cross-entropy (batch), returns the mean loss + dLogits
 # ═══════════════════════════════════════════════════════════════
 proc softmaxCrossEntropy*(logits: Tensor, targets: seq[seq[int]], ctx: Backend):
     tuple[loss: float32, dLogits: Tensor] =
-  ## logits: [B,T,V]. targets: [B][T] token id kế tiếp (next-token).
+  ## logits: [B,T,V]. targets: [B][T] next token id (next-token).
   let B = logits.shape[0]; let T = logits.shape[1]; let V = logits.shape[2]
   if isGpuCtx(ctx):
-    # GPU: softmax + loss + dLogits trong 1 micro-kernel chain (chia trung binh B*T).
+    # GPU: softmax + loss + dLogits in 1 micro-kernel chain (mean over B*T).
     var tgt = newSeq[float32](B * T)
     for b in 0 ..< B:
       for t in 0 ..< T: tgt[b * T + t] = float32(targets[b][t])
@@ -1234,7 +1234,7 @@ proc softmaxCrossEntropy*(logits: Tensor, targets: seq[seq[int]], ctx: Backend):
   result = (totalLoss, dLogits)
 
 # ═══════════════════════════════════════════════════════════════
-# ADAM STATE CHO TOÀN BỘ MODEL + 1 BƯỚC train()
+# ADAM STATE FOR THE WHOLE MODEL + 1 train() STEP
 # ═══════════════════════════════════════════════════════════════
 type
   ModelAdamState* = object
@@ -1278,13 +1278,13 @@ proc newModelAdamState*(m: NimformerModelSpectron): ModelAdamState =
     )
 
 # ═══════════════════════════════════════════════════════════════
-# CHECKPOINT (.nimq) - DÙNG LẠI ĐÚNG format nhị phân NIMQ2 đã có sẵn trong
-# quant.nim (saveQuantStateDict/loadQuantStateDict - cùng hàm export_to_nimq.py
-# dùng để xuất model.nimq cho model lớn). Ở đây lưu từng tensor dạng
-# qkFp32Raw (KHÔNG nén) vì model demo nhỏ, ưu tiên đúng số hơn tiết kiệm
-# dung lượng. Adam state (m/v/step) CHƯA được lưu - resume sẽ reset lại
-# momentum Adam, nhưng trọng số (phần quan trọng nhất để không mất công
-# train) được giữ nguyên 100%.
+# CHECKPOINT (.nimq) - REUSES the existing NIMQ2 binary format in
+# quant.nim (saveQuantStateDict/loadQuantStateDict - the same functions export_to_nimq.py
+# uses to export model.nimq for large models). Each tensor is saved here as
+# qkFp32Raw (NOT compressed) because the demo model is small, favouring exact numbers over
+# disk space. The Adam state (m/v/step) is NOT saved yet - resuming resets
+# the Adam momentum, but the weights (the most important part, so no training
+# effort is lost) are kept 100%.
 # ═══════════════════════════════════════════════════════════════
 
 proc modelToStateDict(m: NimformerModelSpectron): seq[(string, QuantTensor)] =
@@ -1327,7 +1327,7 @@ proc stateDictToModel(sd: seq[(string, QuantTensor)],
     if name in lookup:
       t.data = dequantizeTensor(lookup[name])
     else:
-      stderr.writeLine("[CANH BAO] Checkpoint thieu tensor '" & name & "' - giu nguyen gia tri khoi tao ngau nhien")
+      stderr.writeLine("[WARNING] Checkpoint is missing tensor '" & name & "' - keeping its random initial value")
   restore("embed.weight", result.embed.weight)
   restore("outProj.weight", result.outProj.weight)
   restore("outProj.bias", result.outProj.bias)
@@ -1336,7 +1336,7 @@ proc stateDictToModel(sd: seq[(string, QuantTensor)],
   let hasNormG = "finalNorm.gamma" in lookup
   let hasNormB = "finalNorm.beta" in lookup
   if hasNormG != hasNormB:
-    raise newException(ValueError, "Checkpoint thieu mot tensor finalNorm")
+    raise newException(ValueError, "Checkpoint is missing a finalNorm tensor")
   result.useFinalNorm = hasNormG
   if result.useFinalNorm:
     restore("finalNorm.gamma", result.finalNorm.gamma)
@@ -1363,15 +1363,15 @@ proc stateDictToModel(sd: seq[(string, QuantTensor)],
     restore(p & "ln2.beta", result.blocks[i].ln2.beta)
 
 const MetaStepKey = "__meta_step__"
-  ## Tên tensor "giả" (shape [1], kind qkFp32Raw) dùng để giấu số step đã
-  ## train vào trong state dict - KHÔNG cần đổi format nhị phân NIMQ2, file
-  ## cũ (chưa có key này) vẫn load được bình thường (step mặc định = 0).
+  ## A "fake" tensor name (shape [1], kind qkFp32Raw) used to hide the trained step
+  ## count in the state dict - NO need to change the NIMQ2 binary format, old
+  ## files (without this key) still load normally (step defaults to 0).
 
 proc saveCheckpoint*(m: NimformerModelSpectron, path: string, step: int = 0) =
-  ## arch = [vocab, embedDim, nHeads, nLayers, ffMult] - đúng array[5,int]
-  ## mà saveQuantStateDict yêu cầu (không cần định dạng riêng).
-  ## `step` = số bước train đã hoàn thành TÍNH ĐẾN checkpoint này, được lưu
-  ## kèm theo để resume đúng số step thay vì luôn quay lại step 1.
+  ## arch = [vocab, embedDim, nHeads, nLayers, ffMult] - exactly the array[5,int]
+  ## saveQuantStateDict expects (no separate format needed).
+  ## `step` = the number of training steps completed UP TO this checkpoint, saved
+  ## alongside so resume uses the right step instead of always going back to step 1.
   let ffMult = m.blocks[0].ff.fc1.outF div m.embed.dim
   let arch = [m.vocab, m.embed.dim, m.blocks[0].attn.nHeads, m.blocks.len, ffMult]
   var sd = modelToStateDict(m)
@@ -1395,29 +1395,29 @@ proc trainStep*(m: var NimformerModelSpectron, adam: var ModelAdamState,
                  idsBatch: seq[seq[int]], targetsBatch: seq[seq[int]],
                  ctx: Backend, lr: float32 = 3e-4'f32,
                  requantizeEvery: int = 50): float32 =
-  ## Một bước train đầy đủ: forward -> loss -> backward -> Adam update.
-  ## Trả về loss (đã average theo batch*seq) để log.
+  ## One full training step: forward -> loss -> backward -> Adam update.
+  ## Returns the loss (averaged over batch*seq) for logging.
   ##
-  ## LƯU Ý QUAN TRỌNG về `requantizeEvery`: apfAdamStep (trong nimformer.nim)
-  ## mặc định requantizeEvery=1, tức là RE-QUANTIZE trọng số về CustomFloat
-  ## (APF) NGAY SAU MỖI bước Adam. Ở vài chục bước đầu, độ lớn update còn
-  ## rất nhỏ so với độ phân giải mantissa mà buildCustomDtypeForTensor chọn
-  ## -> update vừa cộng vào bị làm tròn mất NGAY trong cùng bước, trọng số
-  ## coi như bị đóng băng ở gần giá trị khởi tạo. Hậu quả: logits ~ 0 suốt
-  ## quá trình train -> softmax ~ đều -> loss ~ ln(vocab_size) và đứng yên y
-  ## hệt (ví dụ vocab=756 thì ln(756)=6.628 - đúng triệu chứng "loss đứng ở
-  ## 6.62-6.63 mãi" quan sát được). Để vẫn DÙNG APF (theo yêu cầu) nhưng
-  ## không giết tín hiệu gradient, ta chỉ requantize định kỳ mỗi
-  ## `requantizeEvery` bước (kiểu quantization-aware training thật: train ở
-  ## fp32 đầy đủ giữa các lần, rồi mới ép về APF để giữ weight trong dải
-  ## biểu diễn được khi export) thay vì mỗi bước 1 lần.
+  ## IMPORTANT NOTE on `requantizeEvery`: apfAdamStep (in nimformer.nim)
+  ## defaults to requantizeEvery=1, i.e. it RE-QUANTIZES the weights to CustomFloat
+  ## (APF) RIGHT AFTER EVERY Adam step. In the first few dozen steps the update magnitude is
+  ## still tiny compared to the mantissa resolution buildCustomDtypeForTensor picks
+  ## -> the update just added is rounded away IN THE SAME step, and the weights
+  ## are effectively frozen near their initial values. Result: logits ~ 0 throughout
+  ## training -> softmax ~ uniform -> loss ~ ln(vocab_size) and stuck exactly
+  ## there (e.g. vocab=756 gives ln(756)=6.628 - exactly the observed "loss stuck at
+  ## 6.62-6.63 forever" symptom). To still USE APF (as required) without
+  ## killing the gradient signal, requantization only happens every
+  ## `requantizeEvery` steps (real quantization-aware training: train in
+  ## full fp32 in between, then snap to APF to keep the weights in the
+  ## representable range for export) instead of once per step.
   let logits = m.forwardBatch(idsBatch, ctx)
   let (loss, dLogits) = softmaxCrossEntropy(logits, targetsBatch, ctx)
   let grads = m.backwardBatch(idsBatch, dLogits, ctx)
 
-  # GPU: Adam 1 micro-kernel / tham so (adamStepFusedGpu). Chi buoc requantize APF
-  # dinh ky (moi `requantizeEvery` step) con chay tren host - customfloat chua co
-  # kernel GPU. Backend khong phai GPU: apfAdamStep goc.
+  # GPU: Adam is 1 micro-kernel / parameter (adamStepFusedGpu). Only the periodic APF
+  # requantize step (every `requantizeEvery` steps) still runs on the host - customfloat has no
+  # GPU kernel yet. Non-GPU backends: the original apfAdamStep.
   let gpu = isGpuCtx(ctx)
   proc apfAdamStep(param: var Tensor, grad: Tensor, state: var ApfAdamState,
                    lr: float32, requantizeEvery: int): CustomFloat {.used.} =
@@ -1491,9 +1491,9 @@ proc sampleFromLogits(logits: seq[float32], temperature: float32, rng: var Rand)
 
 proc generate*(m: NimformerModelSpectron, promptIds: seq[int], maxNewTokens: int,
                ctx: Backend, temperature: float32 = 0'f32, seed: int64 = 1234): seq[int] =
-  ## Sinh văn bản autoregressive đơn giản (không KV-cache: forward lại toàn
-  ## bộ chuỗi mỗi bước - đủ dùng cho demo/test; muốn nhanh hơn cho chuỗi dài
-  ## thì thêm KV-cache sau, không đổi kết quả).
+  ## Simple autoregressive text generation (no KV cache: the whole sequence is
+  ## re-run each step - enough for the demo/test; for long sequences a KV cache
+  ## can be added later without changing the result).
   var rng = initRand(seed)
   result = promptIds
   for _ in 0 ..< maxNewTokens:
@@ -1503,29 +1503,29 @@ proc generate*(m: NimformerModelSpectron, promptIds: seq[int], maxNewTokens: int
     let lastLogits = logits.data[(T - 1) * V ..< T * V]
     let nextId =
       if isGpuCtx(ctx) and temperature <= 0'f32:
-        int(beArgmaxIndexGpu(ctx, lastLogits, 1, V, 1).idx[0])   # greedy tren GPU
+        int(beArgmaxIndexGpu(ctx, lastLogits, 1, V, 1).idx[0])   # greedy on the GPU
       else: sampleFromLogits(lastLogits, temperature, rng)
     result.add(nextId)
 
 # ═══════════════════════════════════════════════════════════════
-# DEMO: train tren Dolly + Python code JSONL (byte-level tokenizer)
-# rồi sinh thử vài token - chạy được bằng `make run` từ thư mục gốc.
+# DEMO: train on Dolly + Python code JSONL (byte-level tokenizer)
+# then generate a few tokens - runs with `make run` from the repo root.
 # ═══════════════════════════════════════════════════════════════
 when isMainModule:
   randomize(1234)
   createDir("test/spectron/models")
   let ctx = newBackend()
 
-  # ---- Nap corpus tho (text) tu file co san trong repo, fallback neu thieu ----
+  # ---- Load the raw text corpus from files in the repo, fallback when missing ----
   proc loadCorpusText(path: string): string =
     if fileExists(path):
       result = readFile(path)
     else:
-      stderr.writeLine("[corpus] Khong tim thay " & path)
+      stderr.writeLine("[corpus] Not found: " & path)
 
   proc loadCodeCorpusText(path: string, maxExamples: int): string =
     if not fileExists(path):
-      stderr.writeLine("[corpus] Khong tim thay " & path)
+      stderr.writeLine("[corpus] Not found: " & path)
       return
     var examples = newSeqOfCap[string](maxExamples)
     var seen = 0
@@ -1569,37 +1569,37 @@ when isMainModule:
     if part.len == 0: continue
     if rawCorpus.len > 0: rawCorpus.add('\n')
     rawCorpus.add(part)
-    # Chon mot doan tu tung nguon de tokenizer hoc ca hoi thoai va Python,
-    # khong de file Dolly dung truoc chiem het gioi han train BPE.
+    # Take a slice from each source so the tokenizer learns both dialogue and Python,
+    # without the first Dolly file eating the whole BPE training budget.
     bpeTrainSlice.add(part[0 ..< min(part.len, perSourceBpeChars)])
     bpeTrainSlice.add('\n')
   if rawCorpus.len == 0:
     rawCorpus = "Nimformer Spectron demo corpus. ".repeat(200)
     bpeTrainSlice = rawCorpus[0 ..< min(rawCorpus.len, CFG_BPE_TRAIN_CHARS)]
-  echo "== Dang train BPE tokenizer (hoac nap lai neu da co) =="
+  echo "== Training the BPE tokenizer (or reloading it if present) =="
   let tok = getOrTrainBPE(bpeTrainSlice, CFG_NUM_MERGES)
   let vocab = tok.vocabSize
-  echo &"Tokenizer: vocab_size = {vocab} (256 byte co so + {tok.merges.len} merge)"
+  echo &"Tokenizer: vocab_size = {vocab} (256 base bytes + {tok.merges.len} merges)"
 
   var model: NimformerModelSpectron
-  var startStep = 0   # step da train xong tinh den checkpoint duoc nap (0 neu train tu dau)
+  var startStep = 0   # steps trained up to the loaded checkpoint (0 when training from scratch)
   if fileExists(CFG_CHECKPOINT_PATH):
-    echo &"== Tim thay checkpoint {CFG_CHECKPOINT_PATH} -> nap lai de resume train =="
+    echo &"== Found checkpoint {CFG_CHECKPOINT_PATH} -> reloading to resume training =="
     (model, startStep) = loadCheckpoint(CFG_CHECKPOINT_PATH)
-    echo &"  -> resume tu step {startStep + 1} (checkpoint da train {startStep} step)"
+    echo &"  -> resuming from step {startStep + 1} (checkpoint trained {startStep} steps)"
     if not model.useFinalNorm:
       model.useFinalNorm = true
-      echo "  -> bat final LayerNorm truoc lm head de on dinh logits cua checkpoint cu"
+      echo "  -> enabling the final LayerNorm before the lm head to stabilise the old checkpoint's logits"
   else:
     model = newNimformerModelSpectron(vocab, CFG_EMBED_DIM, CFG_N_HEADS, CFG_N_LAYERS,
                                         CFG_FF_MULT, useSession = true)
   var adam = newModelAdamState(model)
   if startStep > 0:
-    echo "  [resume] Adam moments chua duoc luu; optimizer bat dau lai tu step 0"
+    echo "  [resume] Adam moments were not saved; the optimizer restarts from step 0"
 
-  # Encode toan bo corpus 1 lan bang BPE da train, dung chung cho sampling.
+  # Encode the whole corpus once with the trained BPE, shared by sampling.
   let corpusIds = encodeBPE(tok, rawCorpus)
-  doAssert corpusIds.len > CFG_SEQ_LEN + 1, "Corpus qua ngan de train demo"
+  doAssert corpusIds.len > CFG_SEQ_LEN + 1, "The corpus is too short for the training demo"
 
   proc sampleBatch(ids: seq[int], B, T: int, rng: var Rand):
       tuple[ids, targets: seq[seq[int]]] =
@@ -1616,9 +1616,9 @@ when isMainModule:
       result.targets[b] = tgt
 
   var rng = initRand(42)
-  echo &"== Bat dau train demo: {CFG_N_STEPS} buoc (tu step {startStep + 1}), batch={CFG_BATCH_SIZE}, seq={CFG_SEQ_LEN} =="
-  # SUA: vong lap chay CFG_N_STEPS buoc TIEP THEO ke tu startStep (khong phai
-  # luon quay lai step 1) - resume dung so step da luu trong checkpoint.
+  echo &"== Starting demo training: {CFG_N_STEPS} steps (from step {startStep + 1}), batch={CFG_BATCH_SIZE}, seq={CFG_SEQ_LEN} =="
+  # The loop runs the NEXT CFG_N_STEPS steps after startStep (not
+  # always back to step 1) - resume uses the step count saved in the checkpoint.
   var lossSum = 0.0
   var lossCount = 0
   for step in (startStep + 1) .. (startStep + CFG_N_STEPS):
@@ -1636,12 +1636,12 @@ when isMainModule:
     if step mod CFG_CHECKPOINT_EVERY == 0:
       saveCheckpoint(model, CFG_CHECKPOINT_PATH, step)
       if step mod CFG_LOG_EVERY == 0 or step == startStep + CFG_CHECKPOINT_EVERY:
-        echo &"  [checkpoint] da luu {CFG_CHECKPOINT_PATH} (step {step})"
+        echo &"  [checkpoint] saved {CFG_CHECKPOINT_PATH} (step {step})"
 
   saveCheckpoint(model, CFG_CHECKPOINT_PATH, startStep + CFG_N_STEPS)
-  echo &"== Da luu checkpoint cuoi cung: {CFG_CHECKPOINT_PATH} =="
+  echo &"== Saved the final checkpoint: {CFG_CHECKPOINT_PATH} =="
 
-  echo "== Sinh thu (greedy) tu 1 cau moi =="
+  echo "== Test generation (greedy) from a new sentence =="
   let promptIds = encodeBPE(tok, CFG_GEN_PROMPT)
   let outIds = model.generate(promptIds, maxNewTokens = CFG_GEN_MAX_NEW_TOKENS, ctx = ctx,
                                temperature = CFG_GEN_TEMPERATURE)

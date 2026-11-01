@@ -14,7 +14,7 @@ C_API_CHECK_NIMCACHE := nimcache/c-api-check
 
 TEST_SRC  := test/spectron/test_nimformer.nim
 
-# ── Nhận diện OS ──
+# ── OS detection ──
 ifeq ($(OS),Windows_NT)
     IS_WINDOWS := yes
     IS_MACOS := no
@@ -57,7 +57,7 @@ endif
 
 TEST_BIN  := test_nimformer$(EXE_EXT)
 
-# ── Cac binary lien quan Mamba: graft / finetune (LoRA) / inference ──
+# ── Mamba binaries: graft / finetune (LoRA) / inference ──
 GRAFT_SRC       := test/codestral/graft_attention.nim
 FINETUNE_SRC    := test/codestral/finetune_lora.nim
 INFER_LORA_SRC  := test/codestral/infer_lora.nim
@@ -82,7 +82,8 @@ CLEAN_BINS      := $(TEST_BIN) $(GRAFT_BIN) $(FINETUNE_BIN) $(INFER_LORA_BIN) $(
         build-graft build-finetune build-infer-lora build-compact-lora \
         build-migrate-lora build-nim-inference build-spectron build-for-python \
         python-test python-example c-example bybylang-test bench-gflops \
-        graft finetune-mamba infer-lora infer-mamba infer-deepseek run-spectron mamba-pipeline
+        graft finetune-mamba infer-lora infer-mamba infer-deepseek run-spectron mamba-pipeline \
+        build-formers formers-cli formers formers-test formers-smoke formers-clean
 
 all: build run
 
@@ -106,7 +107,7 @@ ifeq ($(IS_MACOS),yes)
 	$(NIM) c $(NIMFLAGS) -d:backend=metal $(TEST_SRC)
 	./test/spectron/$(TEST_BIN)
 else
-	@echo "Metal chi ho tro tren macOS"
+	@echo "Metal is only supported on macOS"
 endif
 
 run-opencl:
@@ -123,6 +124,7 @@ else
 	$(RM_F) $(CLEAN_BINS) $(addsuffix .exe,$(CLEAN_BINS))
 	$(RM_RF) nimcache
 	$(RM_F) model_*.nimq
+	$(RM_RF) other/formers.n/build $(FORMERS_CLI)
 endif
 run-cuda:
 	$(NIM) check $(NIMFLAGS) -d:backend=cuda $(TEST_SRC)
@@ -157,44 +159,44 @@ download-datasets:
 	curl -fL --retry 3 -C - https://huggingface.co/datasets/bobbydeveloper2014/mega-nim-python-code/resolve/main/nim_python_code_dataset_mega.jsonl -o test/spectron/nim_python_code_dataset_mega.jsonl
 
 # ══════════════════════════════════════════════════════════════════
-# Mamba: graft (cay Attention vao checkpoint Mamba-only) / finetune LoRA /
-# inference. Moi target BUILD RoI TU DONG CHAY LUON voi mac dinh hop ly neu
-# khong truyen ARGS - luon in log truoc khi chay (dang dung gia tri gi,
-# mac dinh hay ARGS) va in huong dan argument neu file can thiet chua co.
+# Mamba: graft (Attention grafted into a Mamba-only checkpoint) / LoRA finetune /
+# inference. Every target BUILDS AND THEN RUNS with sensible defaults when
+# no ARGS are given - it always logs what it runs (which values,
+# defaults or ARGS) and prints argument help when a required file is missing.
 # ══════════════════════════════════════════════════════════════════
 
-# Mac dinh cho tung target (ghi de qua bien moi truong hoac make graft ARGS="...")
+# Per-target defaults (override with environment variables or make graft ARGS="...")
 # GRAFT_DEFAULT_OLD = GRAFT_DEFAULT_OUT = test/codestral/models/codestral_mamba_only.nimq:
-# CHU DINH - file .nimq nay la output cua quantize_codestral.nim (xem usage
-# doc trong file do) VA DONG THOI la CFG_NIMQ_PATH_DEFAULT ma finetune_lora.nim
-# doc lai (finetune-mamba mac dinh khong argv). Graft ghi DE LEN CHINH file
-# do (doc toan bo vao RAM truoc, moi ghi lai sau - an toan voi jamba_hybrid.
-# loadCheckpoint/saveCheckpoint hien tai) de finetune-mamba luon thay dung
-# file "da cay" ma khong can doi ten. Neu ban muon giu ban goc, truyen ARGS
-# voi ten out khac.
+# DELIBERATE - this .nimq is the output of quantize_codestral.nim (see the usage
+# in that file) AND ALSO the CFG_NIMQ_PATH_DEFAULT that finetune_lora.nim
+# reads back (finetune-mamba defaults to no argv). Graft OVERWRITES that very file
+# (it reads everything into RAM first, then writes - safe with the current jamba_hybrid.
+# loadCheckpoint/saveCheckpoint) so finetune-mamba always sees the
+# "grafted" file without renaming. To keep the original, pass ARGS
+# with another output name.
 GRAFT_DEFAULT_OLD     := test/codestral/models/codestral_mamba_only.nimq
 GRAFT_DEFAULT_PATTERN := $(shell python3 -c "print('MMMA'*16)" 2>/dev/null || echo MMMA)
 GRAFT_DEFAULT_OUT     := test/codestral/models/codestral_mamba_only.nimq
 
 INFER_LORA_DEFAULT_CKPT  := test/codestral/models/jamba_parallel_lora.bin
-# Template "[INST] ...[/INST] " dung cho Codestral (Mistral tokenizer V3),
-# khong phai ChatML "<|user|>/<|assistant|>" (xem
-# finetune_lora.nim/lineToText va infer_lora.nim). Giu khoang trang sau
-# "[/INST]" cho khop phan phoi luc train (xem comment trong infer_lora.nim).
+# The "[INST] ...[/INST] " template is for Codestral (Mistral tokenizer V3),
+# not ChatML "<|user|>/<|assistant|>" (see
+# finetune_lora.nim/lineToText and infer_lora.nim). The space after
+# "[/INST]" is kept to match the training distribution (see the comment in infer_lora.nim).
 INFER_LORA_DEFAULT_PROMPT:= [INST] Xin chao[/INST] 
 INFER_LORA_DEFAULT_TEMP  := 0.7
-# THEM: infer_lora.nim (nhanh fallback "khong co checkpoint LoRA") van load
-# tokenizer THAT qua newHfTokenizer(hfDir) VA doc trong so goc qua nimqPath -
-# 2 gia tri nay TRUOC DAY khong duoc Makefile truyen, nen se roi vao
-# CFG_HF_DIR_DEFAULT/CFG_NIMQ_PATH_DEFAULT hard-code RIENG trong infer_lora.nim
-# (truoc day moi binary co mot default path khac nhau); dat lai o day cho khop
-# voi tokenizer va base checkpoint dang nam trong test/codestral/models/.
+# ADDED: infer_lora.nim (the "no LoRA checkpoint" fallback branch) still loads
+# the REAL tokenizer through newHfTokenizer(hfDir) AND reads the base weights through nimqPath -
+# the Makefile did NOT pass these 2 values BEFORE, so they fell back to the
+# CFG_HF_DIR_DEFAULT/CFG_NIMQ_PATH_DEFAULT hard-coded SEPARATELY in infer_lora.nim
+# (each binary used to have its own default path); set here to match
+# the tokenizer and base checkpoint in test/codestral/models/.
 INFER_LORA_DEFAULT_HFDIR := test/codestral/models/hf
 INFER_LORA_DEFAULT_NIMQ  := $(GRAFT_DEFAULT_OUT)
 
-# infer-deepseek (nim_inference.nim) KHONG lien quan pipeline Mamba/LoRA -
-# la inference rieng cho 1 model GPTQ khac (deepseek-coder). Backend mac
-# dinh la "auto" giong newBackend() khong tham so dung khap noi trong repo.
+# infer-deepseek (nim_inference.nim) is NOT part of the Mamba/LoRA pipeline -
+# it is separate inference for another, GPTQ model (deepseek-coder). The default
+# backend is "auto", like the parameterless newBackend() used across the repo.
 INFER_DEEPSEEK_DEFAULT_MODEL   := test/deepseek-inference/models
 INFER_DEEPSEEK_DEFAULT_NIMQ    := test/deepseek-inference/models/model.nimq
 INFER_DEEPSEEK_DEFAULT_BACKEND := auto
@@ -284,128 +286,162 @@ bybylang-test:
 bench-gflops: build-for-python
 	$(PYTHON) benchmarks/bench_gflops.py
 
-# ── graft: build + TU DONG CHAY. Khong truyen ARGS -> dung mac dinh
-# GRAFT_DEFAULT_*. Neu file old.bin/.nimq mac dinh chua ton tai, IN HUONG
-# DAN roi dung (khong chay bua). ──
-# vd tuy chinh: make graft ARGS="checkpoint.bin MMAMMSM out.bin"
+# ── graft: build + RUN AUTOMATICALLY. No ARGS -> the GRAFT_DEFAULT_*
+# defaults. If the default old.bin/.nimq does not exist, PRINTS HELP
+# and stops (does not run blindly). ──
+# custom example: make graft ARGS="checkpoint.bin MMAMMSM out.bin"
 graft: build-graft
 ifeq ($(strip $(ARGS)),)
-	@echo "[graft] Khong truyen ARGS -> dung mac dinh:"
+	@echo "[graft] No ARGS -> using the defaults:"
 	@echo "[graft]   old     = $(GRAFT_DEFAULT_OLD)"
 	@echo "[graft]   pattern = $(GRAFT_DEFAULT_PATTERN)"
 	@echo "[graft]   out     = $(GRAFT_DEFAULT_OUT)"
 	@if [ "$(GRAFT_DEFAULT_OLD)" = "$(GRAFT_DEFAULT_OUT)" ]; then \
-		echo "[graft] LUU Y: out trung ten voi old (chu dinh, xem comment GRAFT_DEFAULT_* trong Makefile) - $(GRAFT_DEFAULT_OLD) se bi GHI DE sau khi cay xong."; \
+		echo "[graft] NOTE: out has the same name as old (deliberate, see the GRAFT_DEFAULT_* comment in the Makefile) - $(GRAFT_DEFAULT_OLD) will be OVERWRITTEN after grafting."; \
 	fi
 	@if [ ! -f "$(GRAFT_DEFAULT_OLD)" ]; then \
-		echo "[graft] LOI: khong thay $(GRAFT_DEFAULT_OLD)."; \
-		echo "[graft] File nay phai co truoc (output cua test/codestral/quantize_codestral_bin <hf_dir> $(GRAFT_DEFAULT_OLD))."; \
-		echo "[graft] Huong dan: make graft ARGS=\"<old.bin> <pattern vd MMAMMSM> <out.bin>\""; \
-		echo "[graft]         hoac: make graft ARGS=\"--from-hf <hf.bin> <vocab> <embedDim> <nHeads> <ffMult> <nLayers> <pattern> <out.bin>\""; \
+		echo "[graft] ERROR: $(GRAFT_DEFAULT_OLD) not found."; \
+		echo "[graft] This file must exist first (output of test/codestral/quantize_codestral_bin <hf_dir> $(GRAFT_DEFAULT_OLD))."; \
+		echo "[graft] Usage: make graft ARGS=\"<old.bin> <pattern vd MMAMMSM> <out.bin>\""; \
+		echo "[graft]         or: make graft ARGS=\"--from-hf <hf.bin> <vocab> <embedDim> <nHeads> <ffMult> <nLayers> <pattern> <out.bin>\""; \
 		exit 1; \
 	fi
-	@echo "[graft] Dang chay: $(RUN_PREFIX)$(GRAFT_BIN) $(GRAFT_DEFAULT_OLD) $(GRAFT_DEFAULT_PATTERN) $(GRAFT_DEFAULT_OUT)"
+	@echo "[graft] Running: $(RUN_PREFIX)$(GRAFT_BIN) $(GRAFT_DEFAULT_OLD) $(GRAFT_DEFAULT_PATTERN) $(GRAFT_DEFAULT_OUT)"
 	$(RUN_PREFIX)$(GRAFT_BIN) $(GRAFT_DEFAULT_OLD) $(GRAFT_DEFAULT_PATTERN) $(GRAFT_DEFAULT_OUT)
 else
-	@echo "[graft] Dang chay voi ARGS truyen vao: $(RUN_PREFIX)$(GRAFT_BIN) $(ARGS)"
+	@echo "[graft] Running with the given ARGS: $(RUN_PREFIX)$(GRAFT_BIN) $(ARGS)"
 	$(RUN_PREFIX)$(GRAFT_BIN) $(ARGS)
 endif
 
-# ── finetune-mamba: finetune_lora.nim GIO DOC DUOC ARGV (tuy chon), fallback
-# ve config cung (CFG_*_DEFAULT trong finetune_lora.nim) neu khong truyen gi.
-# Thu tu argv: initMode oldCheckpoint hfDir hfSource nimqPath outCheckpointPath ──
-# vd tuy chinh: make finetune-mamba ARGS="codestral - test/codestral/models/hf nimq test/codestral/models/codestral_mamba_only.nimq test/codestral/models/my_lora.bin"
-# (dung "-" cho tham so muon giu mac dinh nhung van can set tham so sau no)
+# ── finetune-mamba: finetune_lora.nim NOW READS ARGV (optional) and falls back
+# to its fixed config (CFG_*_DEFAULT in finetune_lora.nim) when nothing is given.
+# argv order: initMode oldCheckpoint hfDir hfSource nimqPath outCheckpointPath ──
+# custom example: make finetune-mamba ARGS="codestral - test/codestral/models/hf nimq test/codestral/models/codestral_mamba_only.nimq test/codestral/models/my_lora.bin"
+# (use "-" for a parameter that keeps its default when a later one must be set)
 finetune-mamba: build-finetune
 ifeq ($(strip $(ARGS)),)
-	@echo "[finetune-mamba] Khong truyen ARGS -> dung DUNG config cung trong finetune_lora.nim (CFG_*_DEFAULT)."
-	@echo "[finetune-mamba] Dang chay: $(RUN_PREFIX)$(FINETUNE_BIN)"
+	@echo "[finetune-mamba] No ARGS -> using the fixed config in finetune_lora.nim (CFG_*_DEFAULT)."
+	@echo "[finetune-mamba] Running: $(RUN_PREFIX)$(FINETUNE_BIN)"
 	$(RUN_PREFIX)$(FINETUNE_BIN)
 else
-	@echo "[finetune-mamba] Dang chay voi ARGS truyen vao: $(RUN_PREFIX)$(FINETUNE_BIN) $(ARGS)"
+	@echo "[finetune-mamba] Running with the given ARGS: $(RUN_PREFIX)$(FINETUNE_BIN) $(ARGS)"
 	$(RUN_PREFIX)$(FINETUNE_BIN) $(ARGS)
 endif
 
-# ── infer-lora: khong truyen ARGS -> dung mac dinh INFER_LORA_DEFAULT_*.
-# Neu checkpoint mac dinh chua ton tai, in huong dan roi dung. ──
-# argv day du: ckptPath prompt temperature hfDir nimqPath (2 tham so cuoi MOI
-# them - infer_lora.nim can ca hfDir (tokenizer that) LAN nimqPath (trong so
-# goc, dung khi fallback ve Mamba thuan luc chua co checkpoint LoRA nao)).
-# vd tuy chinh: make infer-lora ARGS="test/codestral/models/jamba_lora.bin '[INST] Xin chao[/INST] ' 0.7 test/codestral/models/hf test/codestral/models/codestral_mamba_only.nimq"
+# ── infer-lora: no ARGS -> the INFER_LORA_DEFAULT_* defaults.
+# If the default checkpoint does not exist, prints help and stops. ──
+# full argv: ckptPath prompt temperature hfDir nimqPath (the last 2 are NEW -
+# infer_lora.nim needs both hfDir (the real tokenizer) AND nimqPath (the base
+# weights, used when falling back to pure Mamba with no LoRA checkpoint yet)).
+# custom example: make infer-lora ARGS="test/codestral/models/jamba_lora.bin '[INST] Xin chao[/INST] ' 0.7 test/codestral/models/hf test/codestral/models/codestral_mamba_only.nimq"
 infer-lora: build-infer-lora
 ifeq ($(strip $(ARGS)),)
-	@echo "[infer-lora] Khong truyen ARGS -> dung mac dinh:"
-	@echo "[infer-lora]   checkpoint prefix (ten dat)  = $(INFER_LORA_DEFAULT_CKPT)"
-	@echo "[infer-lora]   adapter LoRA (neu co)        = $(INFER_LORA_DEFAULT_CKPT)"
+	@echo "[infer-lora] No ARGS -> using the defaults:"
+	@echo "[infer-lora]   checkpoint prefix (name)     = $(INFER_LORA_DEFAULT_CKPT)"
+	@echo "[infer-lora]   LoRA adapter (if any)        = $(INFER_LORA_DEFAULT_CKPT)"
 	@echo "[infer-lora]   prompt      = $(INFER_LORA_DEFAULT_PROMPT)"
 	@echo "[infer-lora]   temperature = $(INFER_LORA_DEFAULT_TEMP)"
 	@echo "[infer-lora]   hfDir       = $(INFER_LORA_DEFAULT_HFDIR)"
 	@echo "[infer-lora]   nimqPath    = $(INFER_LORA_DEFAULT_NIMQ)"
 	@if [ -f "$(INFER_LORA_DEFAULT_CKPT)" ]; then \
-		echo "[infer-lora] Tim thay $(INFER_LORA_DEFAULT_CKPT) -> se dung LoRA da train."; \
+		echo "[infer-lora] Found $(INFER_LORA_DEFAULT_CKPT) -> using the trained LoRA."; \
 	else \
-		echo "[infer-lora] KHONG tim thay $(INFER_LORA_DEFAULT_CKPT) - infer_lora.nim se TU DONG"; \
-		echo "[infer-lora] fallback ve Mamba THUAN tu base pretrain (khong loi, xem loadPureMambaForInfer)."; \
-		echo "[infer-lora] Chay 'make finetune-mamba' truoc neu muon dung ban da fine-tune."; \
+		echo "[infer-lora] $(INFER_LORA_DEFAULT_CKPT) NOT found - infer_lora.nim will AUTOMATICALLY"; \
+		echo "[infer-lora] fall back to PURE Mamba from the pretrained base (no error, see loadPureMambaForInfer)."; \
+		echo "[infer-lora] Run 'make finetune-mamba' first to use a fine-tuned version."; \
 	fi
 	@if [ ! -f "$(INFER_LORA_DEFAULT_NIMQ)" ]; then \
-		echo "[infer-lora] CANH BAO: khong thay $(INFER_LORA_DEFAULT_NIMQ) - can 'make graft' (hoac quantize_codestral_bin) truoc."; \
+		echo "[infer-lora] WARNING: $(INFER_LORA_DEFAULT_NIMQ) not found - run 'make graft' (or quantize_codestral_bin) first."; \
 	fi
-	@echo "[infer-lora] Dang chay: $(RUN_PREFIX)$(INFER_LORA_BIN) $(INFER_LORA_DEFAULT_CKPT) \"$(INFER_LORA_DEFAULT_PROMPT)\" $(INFER_LORA_DEFAULT_TEMP) \"$(INFER_LORA_DEFAULT_HFDIR)\" $(INFER_LORA_DEFAULT_NIMQ)"
+	@echo "[infer-lora] Running: $(RUN_PREFIX)$(INFER_LORA_BIN) $(INFER_LORA_DEFAULT_CKPT) \"$(INFER_LORA_DEFAULT_PROMPT)\" $(INFER_LORA_DEFAULT_TEMP) \"$(INFER_LORA_DEFAULT_HFDIR)\" $(INFER_LORA_DEFAULT_NIMQ)"
 	$(RUN_PREFIX)$(INFER_LORA_BIN) "$(INFER_LORA_DEFAULT_CKPT)" "$(INFER_LORA_DEFAULT_PROMPT)" "$(INFER_LORA_DEFAULT_TEMP)" "$(INFER_LORA_DEFAULT_HFDIR)" "$(INFER_LORA_DEFAULT_NIMQ)"
 else
-	@echo "[infer-lora] Dang chay voi ARGS truyen vao: $(RUN_PREFIX)$(INFER_LORA_BIN) $(ARGS)"
+	@echo "[infer-lora] Running with the given ARGS: $(RUN_PREFIX)$(INFER_LORA_BIN) $(ARGS)"
 	$(RUN_PREFIX)$(INFER_LORA_BIN) $(ARGS)
 endif
 
-# ── infer-mamba: ALIAS cua infer-lora - day moi la inference DUNG cho
-# pipeline Mamba (graft -> finetune-mamba -> infer-mamba), dung checkpoint
-# DA FINE-TUNE (base .bin + adapter .lora.json) qua infer_lora_bin, KHONG
-# phai model GPTQ rieng biet. Neu ban muon inference model deepseek GPTQ
-# khong lien quan Mamba, dung 'make infer-deepseek'. ──
+# ── infer-mamba: ALIAS of infer-lora - the RIGHT inference for the
+# Mamba pipeline (graft -> finetune-mamba -> infer-mamba), using the
+# FINE-TUNED checkpoint (base .bin + .lora.json adapter) through infer_lora_bin, NOT
+# a separate GPTQ model. For the deepseek GPTQ model,
+# unrelated to Mamba, use 'make infer-deepseek'. ──
 infer-mamba: infer-lora
 
-# ── infer-deepseek: inference qua nim_inference.nim - day la 1 model GPTQ
-# (deepseek-coder) HOAN TOAN RIENG, KHONG dung chung pipeline graft/finetune
-# Mamba. Backend mac dinh "auto" (giong newBackend() khong tham so dung
-# khap repo - tu chon GPU co san, raise loi neu khong co GPU thay vi am
-# tham roi ve CPU). ──
-# vd tuy chinh: make infer-deepseek ARGS="test/deepseek-inference/models test/deepseek-inference/models/model.nimq auto"
+# ── infer-deepseek: inference through nim_inference.nim - a COMPLETELY SEPARATE GPTQ model
+# (deepseek-coder), NOT sharing the Mamba graft/finetune
+# pipeline. Default backend "auto" (like the parameterless newBackend() used
+# across the repo - picks an available GPU, raises if there is none instead of
+# silently falling back to the CPU). ──
+# custom example: make infer-deepseek ARGS="test/deepseek-inference/models test/deepseek-inference/models/model.nimq auto"
 infer-deepseek: build-nim-inference
 ifeq ($(strip $(ARGS)),)
-	@echo "[infer-deepseek] Khong truyen ARGS -> dung mac dinh:"
+	@echo "[infer-deepseek] No ARGS -> using the defaults:"
 	@echo "[infer-deepseek]   modelPath = $(INFER_DEEPSEEK_DEFAULT_MODEL)"
 	@echo "[infer-deepseek]   nimqPath  = $(INFER_DEEPSEEK_DEFAULT_NIMQ)"
 	@echo "[infer-deepseek]   backend   = $(INFER_DEEPSEEK_DEFAULT_BACKEND)"
 	@if [ ! -f "$(INFER_DEEPSEEK_DEFAULT_NIMQ)" ]; then \
-		echo "[infer-deepseek] CANH BAO: khong thay $(INFER_DEEPSEEK_DEFAULT_NIMQ) trong thu muc hien tai - se loi khi load weights."; \
-		echo "[infer-deepseek] Huong dan: make infer-deepseek ARGS=\"<modelPath> <nimqPath> <backend> <prompt> <maxNewTokens> <temperature> <topP> <systemText>\""; \
+		echo "[infer-deepseek] WARNING: $(INFER_DEEPSEEK_DEFAULT_NIMQ) not found in the current directory - loading the weights will fail."; \
+		echo "[infer-deepseek] Usage: make infer-deepseek ARGS=\"<modelPath> <nimqPath> <backend> <prompt> <maxNewTokens> <temperature> <topP> <systemText>\""; \
 	fi
-	@echo "[infer-deepseek] Dang chay: $(RUN_PREFIX)$(NIM_INFER_BIN) $(INFER_DEEPSEEK_DEFAULT_MODEL) $(INFER_DEEPSEEK_DEFAULT_NIMQ) $(INFER_DEEPSEEK_DEFAULT_BACKEND)"
+	@echo "[infer-deepseek] Running: $(RUN_PREFIX)$(NIM_INFER_BIN) $(INFER_DEEPSEEK_DEFAULT_MODEL) $(INFER_DEEPSEEK_DEFAULT_NIMQ) $(INFER_DEEPSEEK_DEFAULT_BACKEND)"
 	$(RUN_PREFIX)$(NIM_INFER_BIN) "$(INFER_DEEPSEEK_DEFAULT_MODEL)" "$(INFER_DEEPSEEK_DEFAULT_NIMQ)" "$(INFER_DEEPSEEK_DEFAULT_BACKEND)"
 else
-	@echo "[infer-deepseek] Dang chay voi ARGS truyen vao: $(RUN_PREFIX)$(NIM_INFER_BIN) $(ARGS)"
+	@echo "[infer-deepseek] Running with the given ARGS: $(RUN_PREFIX)$(NIM_INFER_BIN) $(ARGS)"
 	$(RUN_PREFIX)$(NIM_INFER_BIN) $(ARGS)
 endif
 
+# ── formers.n (other/formers.n): llama.cpp-style framework written in BybyLang;
+# detects Llama / Mamba-2 / Mamba-2 + LoRA/Linear++ -> formers-cli ──
+#   make formers-cli                      build other/formers.n/formers-cli
+#   make formers                          build, then chat with FORMERS_MODELS
+#   make formers FORMERS_MODELS=test/deepseek-inference/models
+#   make formers ARGS='--models test/codestral/models -p "..." -n 128'
+FORMERS_CLI    := other/formers.n/formers-cli
+FORMERS_MODELS ?= test/codestral/models
+
+build-formers:
+	$(MAKE) -C other/formers.n build
+
+formers-cli: build-formers
+
+formers: build-formers
+ifeq ($(strip $(ARGS)),)
+	@if [ ! -d "$(FORMERS_MODELS)" ]; then \
+		echo "[formers] $(FORMERS_MODELS) not found - run make download-models, or pass FORMERS_MODELS=<dir> / ARGS='--models <dir> ...'"; \
+		exit 1; \
+	fi
+	$(FORMERS_CLI) --models "$(FORMERS_MODELS)" -cnv
+else
+	$(FORMERS_CLI) $(ARGS)
+endif
+
+formers-test:
+	$(MAKE) -C other/formers.n test
+
+formers-smoke:
+	$(MAKE) -C other/formers.n smoke
+
+formers-clean:
+	$(MAKE) -C other/formers.n clean
+
 run-spectron: build-spectron
-	@echo "[run-spectron] Dang chay: $(RUN_PREFIX)$(SPECTRON_BIN) $(ARGS)"
+	@echo "[run-spectron] Running: $(RUN_PREFIX)$(SPECTRON_BIN) $(ARGS)"
 	$(RUN_PREFIX)$(SPECTRON_BIN) $(ARGS)
 
-# ── mamba-pipeline: chay toan bo finetunemamba.sh (bien env co san se
-# tu dong SKIP_TO_FINETUNE neu da co checkpoint adaptive - xem script) ──
+# ── mamba-pipeline: runs the whole finetunemamba.sh (existing env variables
+# set SKIP_TO_FINETUNE automatically when an adaptive checkpoint exists - see the script) ──
 mamba-pipeline:
-	@echo "[mamba-pipeline] Dang chay ./test/codestral/finetunemamba.sh (dat bien env truoc make de tuy chinh, vd: SKIP_TO_FINETUNE=1 make mamba-pipeline)"
+	@echo "[mamba-pipeline] Running ./test/codestral/finetunemamba.sh (set env variables before make to customise, e.g. SKIP_TO_FINETUNE=1 make mamba-pipeline)"
 	./test/codestral/finetunemamba.sh
-# ── Bien dich toan bo shader Vulkan (.comp -> .spv). Can glslc (Vulkan SDK / brew install shaderc).
-# Dung: make shaders   (them -B de ep build lai)
+# ── Compiles every Vulkan shader (.comp -> .spv). Needs glslc (Vulkan SDK / brew install shaderc).
+# Usage: make shaders   (add -B to force a rebuild)
 VK_KERNEL_DIR := vendor/bybylang/backends/vulkan/kernels
 shaders:
-	@command -v glslc >/dev/null || { echo "[shaders] Khong thay glslc - brew install shaderc (hoac cai Vulkan SDK)"; exit 1; }
+	@command -v glslc >/dev/null || { echo "[shaders] glslc not found - brew install shaderc (or install the Vulkan SDK)"; exit 1; }
 	@for f in $(VK_KERNEL_DIR)/*.comp; do \
 		out=$${f%.comp}.spv; \
 		if [ ! -f "$$out" ] || [ "$$f" -nt "$$out" ]; then \
 			echo "[shaders] glslc $$f"; glslc "$$f" -o "$$out" || exit 1; \
 		fi; \
 	done
-	@echo "[shaders] xong."
+	@echo "[shaders] done."

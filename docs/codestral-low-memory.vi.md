@@ -60,7 +60,8 @@ Kernel reduction không âm thầm dispatch ở width nhỏ hơn width đã comp
 
 ## Merge trong ngân sách bộ nhớ
 
-Giữ `BYBY_MERGE_LORA=0` khi inference để bảo toàn delta adapter và tránh
+Inference merge theo mặc định (`BYBY_MERGE_LORA=inplace`). Đặt
+`BYBY_MERGE_LORA=0` khi muốn bảo toàn delta adapter và tránh
 mở rộng model sang FP32. FP4-KM nhìn chung không biểu diễn chính xác mọi
 cập nhật LoRA FP32.
 

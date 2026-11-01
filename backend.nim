@@ -1,7 +1,7 @@
 ## backend.nim
-## Lớp chọn backend tính toán cho Nimformer dựa hoàn toàn vào BybyLang trong vendor.
-## Loại bỏ toàn bộ các kernel tự viết ngoài, thống nhất mọi backend (CPU, Metal, CUDA, OpenCL)
-## qua duy nhất BybyLang để tối ưu hoá hiệu năng, tránh trùng lặp mã nguồn.
+## Backend selection layer for Nimformer, built entirely on the vendored BybyLang.
+## All separate hand-written kernels removed; every backend (CPU, Metal, CUDA, OpenCL)
+## goes through BybyLang only, for performance and no duplicated source.
 
 import vendor/bybylang/gpubackend as byby
 import customfloat
@@ -18,7 +18,7 @@ export byby.GpuBackend, byby.SessionHandle, byby.sessionBegin, byby.sessionUploa
        byby.gpuPermute, byby.gpuSplitSlice, byby.gpuConcat, byby.sessionGetLastError,
        byby.sessionAttentionDecodeAllHeadsEnc, byby.sessionRecoverQueue, byby.sessionCommitContinue
 
-# -d:backend=cpu|metal|cuda|opencl|vulkan|auto — mặc định "auto" (tự dò lúc runtime).
+# -d:backend=cpu|metal|cuda|opencl|vulkan|auto — default "auto" (detected at run time).
 const backend* {.strdefine.} = "auto"
 
 type
@@ -48,9 +48,9 @@ proc resolveBackendKind(want: string): BackendKind =
     stderr.writeLine "[Framework] backend 'cuda' is deprecated/disabled; redirecting to Vulkan"
     bkVulkan
   of "opencl": bkVulkan
-  of "vulkan": bkVulkan   # "opencl" da duoc thay bang Vulkan lam backend GPU
-                          # da nen tang fallback (xem toByby: bkVulkan -> gbVulkan)
-                          # - chap nhan ca 2 ten string de tuong thich nguoc.
+  of "vulkan": bkVulkan   # "opencl" was replaced by Vulkan as the cross-platform
+                          # fallback GPU backend (see toByby: bkVulkan -> gbVulkan)
+                          # - both names are accepted for backward compatibility.
   of "auto":
     # "auto" -> detect the best available backend. When no GPU is present the
     # runtime now falls back to the SIMD CPU backend instead of failing.
@@ -63,27 +63,27 @@ proc resolveBackendKind(want: string): BackendKind =
       stderr.writeLine "[Framework] no GPU detected; using the CPU backend"
       bkCpu
   else:
-    raise newException(ValueError, "backend khong duoc ho tro: " & want)
+    raise newException(ValueError, "unsupported backend: " & want)
 
 proc newBackend*(force: string = backend): Backend =
-  ## Khởi tạo backend mới. Tự động liên kết và chọn thiết bị phù hợp nhất.
+  ## Creates a new backend. Picks and links the most suitable device automatically.
   let kind = resolveBackendKind(force)
-  stderr.writeLine "== [Framework] Backend đã chọn: " & $kind & " =="
+  stderr.writeLine "== [Framework] Backend selected: " & $kind & " =="
   result = Backend(kind: kind)
 
 proc closeBackend*(b: Backend) =
   discard
 
 proc setForbidCpuFallback*(forbid: bool) =
-  ## Mặc định TRUE: nếu backend GPU đã chọn (cuda/metal/opencl) lỗi lúc
-  ## chạy, chương trình sẽ raise lỗi thay vì âm thầm rơi về CPU và tiếp tục
-  ## train (CPU chậm hơn GPU rất nhiều lần và người dùng thường không để ý vì
-  ## chỉ có 1 dòng log stderr). Chỉ set false nếu bạn CHỦ ĐỘNG muốn cho phép
-  ## chạy CPU (vd. demo/test trên máy không có GPU).
+  ## Default TRUE: if the chosen GPU backend (cuda/metal/opencl) fails at
+  ## run time, the program raises instead of silently falling back to the CPU and
+  ## continuing to train (the CPU is many times slower and users often miss it because
+  ## it is only one stderr log line). Set false only if you DELIBERATELY want to allow
+  ## running on the CPU (e.g. a demo/test on a machine without a GPU).
   byby.setForbidCpuFallback(forbid)
 
 # ─────────────────────────────────────────────────────────────
-# API Hợp Nhất Các Phép Toán Ma Trận và Lớp Kích Hoạt qua BybyLang
+# Unified matrix and activation operations through BybyLang
 # ─────────────────────────────────────────────────────────────
 
 proc beMatmul*(ctx: Backend, a: openArray[float32], M, K: int,
@@ -101,10 +101,10 @@ proc beMatmulQ4*(ctx: Backend, a: openArray[float32], wq: openArray[uint8],
   let zerosSeq = @zeros
   result = byby.gpuMatmulQ4(ctx.kind.toByby(), aSeq, wqSeq, scalesSeq, zerosSeq,
                              M, K, N, groupSize, nGroupsPerRow)
-  # === FIX: LUÔN ĐẢM BẢO KÍCH THƯỚC ĐÚNG ===
+  # === FIX: ALWAYS MAKE SURE THE SIZE IS RIGHT ===
   let expectedSize = M * N
   if result.len != expectedSize:
-    # Tạo mảng mới đúng size, copy phần có sẵn, phần còn lại 0
+    # New array of the right size, copy the existing part, the rest is 0
     var fixed = newSeq[float32](expectedSize)
     let copyLen = min(result.len, expectedSize)
     for i in 0 ..< copyLen:
@@ -113,8 +113,8 @@ proc beMatmulQ4*(ctx: Backend, a: openArray[float32], wq: openArray[uint8],
 
 proc beResidentUploadQ4*(ctx: Backend, wq: openArray[uint8], scales, zeros: openArray[float32],
                           k, n, groupSize, nGroupsPerRow: int): ResidentWeightHandle =
-  ## Upload 1 weight int4 lên GPU MỘT LẦN (lúc load model). Gọi 1 lần/Linear,
-  ## giữ kết quả lại (vd. trong Linear.residentW) suốt vòng đời process.
+  ## Uploads one int4 weight to the GPU ONCE (at model load). Call once per Linear,
+  ## keep the result (e.g. in Linear.residentW) for the process lifetime.
   byby.residentUploadQ4(ctx.kind.toByby(), @wq, @scales, @zeros, k, n, groupSize, nGroupsPerRow)
 
 proc beResidentUploadQ4Mapped*(ctx: Backend, wq: pointer, wqBytes: int,
@@ -142,10 +142,10 @@ proc beResidentWrapFp32*(ctx: Backend, data: pointer, bytes: int): tuple[h: Sess
     result.h = byby.sessionUploadPrivatePtr(be, data, bytes)
 
 proc beResidentLinearQ4*(ctx: Backend, x: openArray[float32], w: ResidentWeightHandle, M: int): seq[float32] =
-  ## Forward Linear dùng weight ĐÃ resident (w từ beResidentUploadQ4): mỗi
-  ## lần gọi hàm này chỉ upload activation `x` (nhỏ, đổi mỗi token) - KHÔNG
-  ## đụng lại tới bytes weight. Trả về seq rỗng nếu backend không hỗ trợ
-  ## (caller phải tự fallback về beMatmulQ4 khi đó).
+  ## Linear forward with an ALREADY resident weight (w from beResidentUploadQ4): each
+  ## call uploads only the activation `x` (small, changes every token) - the weight
+  ## bytes are NOT touched again. Returns an empty seq if the backend does not support it
+  ## (the caller must then fall back to beMatmulQ4).
   let be = ctx.kind.toByby()
   if not sessionBegin(be): return @[]
   var hA = sessionUpload(be, @x)
@@ -165,38 +165,38 @@ proc beResidentFreeQ4*(w: var ResidentWeightHandle) =
   byby.residentFreeQ4(w)
 
 # ─────────────────────────────────────────────────────────────
-# FIX HIỆU NĂNG: resident fp32 CHUNG cho MỌI weight không đi được đường
-# int4-asymmetric (qkInt8, qkInt4 symmetric, hoặc Linear fp32 thường/tied-
-# embedding). TRƯỚC ĐÂY các weight này KHÔNG có "resident", nên
-# Linear.forward() ở nimformer.nim phải dequantizeTensorTransposed() /
-# transpose() lại TOÀN BỘ ma trận trên CPU MỖI TOKEN (chạy 224+ lần dequant
-# full-size mỗi bước decode) -> đây là nguyên nhân chính khiến tốc độ chỉ
-# ~4s/token dù có GPU (Metal/OpenCL) - chậm hơn cả llama.cpp chạy CPU thuần,
-# vì phần dequant CPU đơn luồng, không tối ưu, đã nuốt hết thời gian trước
-# khi kịp chạy matmul GPU.
-# Fix: dequant + transpose MỘT LẦN duy nhất lúc load model (giống hệt cách
-# residentUploadQ4 làm cho đường "fallbackFp32"), upload thẳng lên GPU giữ
-# resident qua sessionUpload thường, mỗi token chỉ upload activation (nhỏ)
-# + sessionMatmul - không đụng lại bytes weight nữa.
+# PERFORMANCE FIX: a SHARED resident fp32 path for EVERY weight that cannot use the
+# int4-asymmetric path (qkInt8, symmetric qkInt4, or plain fp32/tied-
+# embedding Linears). BEFORE, these weights had NO "resident" copy, so
+# Linear.forward() in nimformer.nim had to dequantizeTensorTransposed() /
+# transpose() the WHOLE matrix on the CPU EVERY TOKEN (224+ full-size dequants
+# per decode step) -> the main reason the speed was only
+# ~4s/token despite the GPU (Metal/OpenCL) - slower than llama.cpp on a plain CPU,
+# because the unoptimised single-threaded CPU dequant ate all the time before
+# the GPU matmul could run.
+# Fix: dequant + transpose ONCE at model load (exactly like
+# residentUploadQ4 does for its "fallbackFp32" path), upload straight to the GPU and keep it
+# resident through a normal sessionUpload; each token uploads only the (small) activation
+# + sessionMatmul - the weight bytes are not touched again.
 proc beResidentUploadFp32*(ctx: Backend, wT: openArray[float32]): SessionHandle =
-  ## wT: weight đã dequant + transpose sẵn, dạng [K, N] phẳng. Gọi 1
-  ## LẦN/Linear lúc load model (xem uploadResident trong nimformer.nim),
-  ## KHÔNG gọi trong vòng lặp decode.
-  ## SỬA: dùng sessionUploadPrivate (không phải sessionUpload/Shared) - đây
-  ## là weight RESIDENT cho model int8/int4-symmetric/tied-embedding (đường
-  ## đi khi model KHÔNG phải Q4-per-group) - CPU không đụng lại sau lúc
-  ## upload này, nên nên dùng Private trên Metal giống hệt lý do áp dụng cho
-  ## Q4 (residentUploadQ4) - đảm bảo model int8 cũng được hưởng tối ưu
-  ## Private/Shared hybrid, không chỉ riêng Q4.
+  ## wT: the weight already dequantized + transposed, flat [K, N]. Call ONCE
+  ## per Linear at model load (see uploadResident in nimformer.nim),
+  ## NOT inside the decode loop.
+  ## CHANGED: uses sessionUploadPrivate (not sessionUpload/Shared) - these are
+  ## the RESIDENT weights of int8/int4-symmetric/tied-embedding models (the path
+  ## used when the model is NOT Q4-per-group) - the CPU never touches them after this
+  ## upload, so Private is right on Metal for exactly the same reason as for
+  ## Q4 (residentUploadQ4) - so int8 models also get the
+  ## Private/Shared hybrid optimisation, not only Q4.
   let wTSeq = @wT
   result = byby.sessionUploadPrivate(ctx.kind.toByby(), wTSeq)
 
 proc beResidentLinearFp32*(ctx: Backend, x: openArray[float32], w: SessionHandle,
                             M, K, N: int): seq[float32] =
-  ## Forward Linear dùng weight fp32 ĐÃ resident (w từ beResidentUploadFp32):
-  ## mỗi lần gọi chỉ upload activation `x` (nhỏ, đổi mỗi token) - KHÔNG đụng
-  ## lại tới bytes weight. Trả về seq rỗng nếu backend không mở được session
-  ## (caller tự fallback về đường cũ khi đó).
+  ## Linear forward with an ALREADY resident fp32 weight (w from beResidentUploadFp32):
+  ## each call uploads only the activation `x` (small, changes every token) - the weight
+  ## bytes are NOT touched again. Returns an empty seq if the backend cannot open a session
+  ## (the caller then falls back to the old path).
   let be = ctx.kind.toByby()
   if not byby.sessionBegin(be): return @[]
   var hA = byby.sessionUpload(be, @x)
@@ -244,13 +244,13 @@ proc beRelu*(ctx: Backend, x: openArray[float32]): seq[float32] =
   result = byby.gpuRelu(ctx.kind.toByby(), @x)
 
 # ─────────────────────────────────────────────────────────────
-# GATHER / ARGMAX-INDEX / COMPARE / DROPOUT-RNG - GPU HOÁ THẬT (vòng 2, xem
-# tensor_ops.nim mục 3/4/7 và dropout): permute/concat/split/stack đi qua
-# beGatherGpu (kernel gather_kernel.cu/.comp/.metal); argmax trả cả giá trị
-# lẫn chỉ số cùng lúc trên GPU qua beArgmaxIndexGpu; so sánh (gt/lt/eq/ge/le)
-# xuất bitmask thẳng từ compare_kernel qua beCompareGpuOp; dropout mask sinh
-# bằng RNG chạy trên GPU (xorshift32 counter-based) qua beDropoutMaskGpu -
-# không còn std/random phía host nữa.
+# GATHER / ARGMAX-INDEX / COMPARE / DROPOUT-RNG - REAL GPU PORT (round 2, see
+# tensor_ops.nim sections 3/4/7 and dropout): permute/concat/split/stack go through
+# beGatherGpu (kernel gather_kernel.cu/.comp/.metal); argmax returns both value
+# and index at once on the GPU through beArgmaxIndexGpu; comparisons (gt/lt/eq/ge/le)
+# produce a bitmask directly from compare_kernel through beCompareGpuOp; dropout masks are generated
+# by an RNG running on the GPU (counter-based xorshift32) through beDropoutMaskGpu -
+# no more host-side std/random.
 # ─────────────────────────────────────────────────────────────
 
 proc beGatherGpu*(ctx: Backend, src: seq[float32], idx: seq[int32]): seq[float32] =
@@ -276,9 +276,9 @@ proc beConcatGpu*(ctx: Backend, flatSrc: seq[float32], srcBase, srcDimSize, srcD
   byby.gpuConcat(ctx.kind.toByby(), flatSrc, srcBase, srcDimSize, srcDimOffset, totalDim, inner, n)
 
 proc beSqrt*(ctx: Backend, x: openArray[float32]): seq[float32] =
-  ## MỚI THÊM: sqrt từng phần tử (dùng cho Adam optimizer bias-correction
-  ## trong nimformer.nim, không phải đường nóng suy luận). Xem gpuSqrt/
-  ## cpuSqrt trong gpubackend.nim.
+  ## NEW: element-wise sqrt (used for the Adam optimizer bias correction
+  ## in nimformer.nim, not an inference hot path). See gpuSqrt/
+  ## cpuSqrt in gpubackend.nim.
   result = byby.gpuSqrt(ctx.kind.toByby(), @x)
 
 proc beExp*(ctx: Backend, x: openArray[float32]): seq[float32] =
@@ -304,16 +304,16 @@ proc beLayernorm*(ctx: Backend, x: openArray[float32], gamma, beta: openArray[fl
 
 proc beAddLayernormFused*(ctx: Backend, a, b: openArray[float32], gamma, beta: openArray[float32],
                            rows, cols: int, eps: float32): tuple[summed, normed: seq[float32]] =
-  ## Gộp "residual add rồi layernorm ngay sau" (đúng pattern lặp lại 2
-  ## lần/layer trong TransformerBlock.forward) vào 1 session GPU duy nhất -
-  ## 1 lần upload/commit/wait thay vì 2 lần riêng biệt (beAdd rồi
-  ## beLayernorm, mỗi cái tự alloc buffer + command buffer + wait). Trả về
-  ## CẢ HAI: `summed` (a+b thô, dùng làm residual cho lần cộng cuối block)
-  ## VÀ `normed` (đã qua layernorm) - để caller không phải cộng lại lần 2.
-  ## CHỈ có lợi thật trên backend đã có sessionLayernormEnc (hiện tại:
-  ## Metal). Nếu backend không hỗ trợ (CUDA/OpenCL/CPU hiện tại, hoặc
-  ## encode lỗi lúc chạy) -> rơi về ĐÚNG đường cũ (beAdd rồi beLayernorm),
-  ## không đổi hành vi/độ chính xác, chỉ mất phần tăng tốc.
+  ## Merges "residual add then layernorm right after" (the pattern repeated 2
+  ## times/layer in TransformerBlock.forward) into one GPU session -
+  ## one upload/commit/wait instead of two (beAdd then
+  ## beLayernorm, each allocating its own buffer + command buffer + wait). Returns
+  ## BOTH: `summed` (raw a+b, the residual for the final add of the block)
+  ## AND `normed` (after layernorm) - so the caller does not add again.
+  ## ONLY really helps on backends with sessionLayernormEnc (currently:
+  ## Metal). If the backend does not support it (CUDA/OpenCL/CPU currently, or
+  ## an encode error at run time) -> falls back to EXACTLY the old path (beAdd then beLayernorm),
+  ## no change in behaviour/precision, only the speedup is lost.
   let be = ctx.kind.toByby()
   let n = rows * cols
   block fused:
@@ -335,7 +335,7 @@ proc beAddLayernormFused*(ctx: Backend, a, b: openArray[float32], gamma, beta: o
     sessionFree(be, hA); sessionFree(be, hB); sessionFree(be, hGamma)
     sessionFree(be, hBeta); sessionFree(be, hSum); sessionFree(be, hOut)
     return
-  # Fallback: đường cũ, 2 lệnh GPU riêng biệt.
+  # Fallback: the old path, 2 separate GPU commands.
   result.summed = beAdd(ctx, a, b)
   result.normed = beLayernorm(ctx, result.summed, gamma, beta, rows, cols, eps)
 
@@ -361,7 +361,7 @@ proc beAttentionFusedBackward*(ctx: Backend, q, k, v, s_matrix, dy: openArray[fl
   return (r.dq, r.dk, r.dv)
 
 # ─────────────────────────────────────────────────────────────
-# APF & Custom Float helpers (tương thích ngược hoàn hảo)
+# APF & Custom Float helpers (fully backward compatible)
 # ─────────────────────────────────────────────────────────────
 
 proc beCustomfloatEncode*(ctx: Backend, arr: openArray[float32], cf: CustomFloat): seq[uint8] =

@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # download_codestral.sh
-# Tai mistralai/Mamba-Codestral-7B-v0.1 vao test/codestral/models/hf (hoac thu muc
-# truyen vao argv 1) trong project.
+# Downloads mistralai/Mamba-Codestral-7B-v0.1 into test/codestral/models/hf (or the directory
+# given as argv 1) in the project.
 #
-# Model nay o dang safetensors CHIA SHARD (model-0000X-of-0000Y.safetensors
-# + model.safetensors.index.json) - KHONG phai 1 file .bin duy nhat nhu
-# Mamba-Chat-2.8B cu, nen pytorch_bin_loader.nim ban goc (loadAllHFTensors
-# nhan 1 path file) KHONG doc thang duoc - xem sharded_hf_loader.nim di kem.
+# This model is SHARDED safetensors (model-0000X-of-0000Y.safetensors
+# + model.safetensors.index.json) - NOT a single .bin file like
+# the old Mamba-Chat-2.8B, so the original pytorch_bin_loader.nim (loadAllHFTensors
+# takes one file path) CANNOT read it directly - see the accompanying sharded_hf_loader.nim.
 #
-# YEU CAU: `pip install -U "huggingface_hub[cli]"` truoc khi chay.
+# REQUIRES: `pip install -U "huggingface_hub[cli]"` before running.
 
 set -euo pipefail
 
@@ -22,18 +22,18 @@ mkdir -p "$DEST"
 huggingface-cli download "$REPO" \
   --local-dir "$DEST" \
   --exclude "*.pt" "consolidated*" \
-  # giu lai: *.safetensors, *.json, tokenizer*, params.json
+  # keep: *.safetensors, *.json, tokenizer*, params.json
 
-echo "[download_codestral] XONG. Kiem tra shard:"
+echo "[download_codestral] DONE. Checking shards:"
 ls -lh "$DEST" | grep -i safetensors || true
 
 if [[ ! -f "$DEST/model.safetensors.index.json" ]]; then
-  echo "[download_codestral] CANH BAO: khong thay model.safetensors.index.json -" \
-       "co the model chi co 1 shard duy nhat (model.safetensors) - van OK," \
-       "sharded_hf_loader.nim tu xu ly ca 2 truong hop."
+  echo "[download_codestral] WARNING: model.safetensors.index.json not found -" \
+       "the model may have a single shard only (model.safetensors) - still OK," \
+       "sharded_hf_loader.nim handles both cases."
 fi
 
 echo
-echo "Buoc tiep theo (chay tu project root):"
+echo "Next step (run from the project root):"
 echo "  nim c --path:. --path:test/codestral --path:test/spectron --path:kernelfortest -d:release --hints:off -o:test/codestral/quantize_codestral_bin test/codestral/quantize_codestral.nim"
 echo "  ./test/codestral/quantize_codestral_bin \"$DEST\" test/codestral/models/codestral_mamba_only.nimq"

@@ -1,0 +1,111 @@
+# formers.n — terminal output and chat input, llama-cli style.
+#
+# Quiet by default: the libraries formers.n builds on (loader, LoRA, JIT,
+# Metal NSLog, kernel tuning, prefill profiles) write straight to fd 1 and 2,
+# so fmConsoleInit points both at /dev/null and formers.n writes through
+# duplicates of the real terminal fds (fmOut/fmErr). --verbose leaves fd 1/2
+# alone and every line shows.
+#
+#   > line           one user turn
+#   > first \        a line ending in "\" continues on the next line
+#   > /exit          (or /quit, or end of input) leaves the chat
+
+import nim "std/strutils"
+import nim "std/posix"
+
+type
+  FmConsole* = object
+    quiet*: bool
+    outFd*, errFd*, nullFd*: cint
+    outF*, errF*: File
+  FmTurn* = object
+    ok*: bool                     ## false: leave the chat
+    text*: string
+
+function fmConsoleState(): ptr FmConsole
+    var st {.global.}: FmConsole
+    result = addr st
+
+function fmConsoleInit(verbose: bool)
+    let st = fmConsoleState()
+    st.outFd = 1
+    st.errFd = 2
+    st.outF = stdout
+    st.errF = stderr
+    if verbose:
+        return
+    stdout.flushFile()
+    stderr.flushFile()
+    let o = posix.dup(1)
+    let e = posix.dup(2)
+    let devnull = posix.open("/dev/null", O_WRONLY)
+    if o < 0 or e < 0 or devnull < 0:
+        return
+    var fo, fe: File
+    if not open(fo, FileHandle(o), fmWrite) or not open(fe, FileHandle(e), fmWrite):
+        return
+    discard posix.dup2(devnull, 1)
+    discard posix.dup2(devnull, 2)
+    st.quiet = true
+    st.outFd = o
+    st.errFd = e
+    st.nullFd = devnull
+    st.outF = fo
+    st.errF = fe
+
+function fmQuiet(): bool
+    result = fmConsoleState().quiet
+
+function fmOut(): File
+    ## Generated text and the chat prompt.
+    let st = fmConsoleState()
+    result = if st.outF == nil: stdout else: st.outF
+
+function fmErr(): File
+    ## formers.n's own messages: errors, statistics, ready lines.
+    let st = fmConsoleState()
+    result = if st.errF == nil: stderr else: st.errF
+
+function fmErrFd(): cint
+    let st = fmConsoleState()
+    result = if st.errF == nil: 2.cint else: st.errFd
+
+function fmOutIsTty(): bool
+    let st = fmConsoleState()
+    result = posix.isatty(if st.outF == nil: 1.cint else: st.outFd) != 0
+
+function fmErrIsTty(): bool
+    result = posix.isatty(fmErrFd()) != 0
+
+function fmSay(msg: string)
+    ## Always shown, also in quiet mode.
+    fmErr().writeLine(msg)
+    fmErr().flushFile()
+
+function fmLibStdout(on: bool)
+    ## Quiet mode only: lets a library write to the real stdout (a generation
+    ## loop that streams its tokens there itself), or mutes it again.
+    let st = fmConsoleState()
+    if not st.quiet:
+        return
+    stdout.flushFile()
+    fmOut().flushFile()
+    discard posix.dup2(if on: st.outFd else: st.nullFd, 1)
+
+function fmReadTurn(): FmTurn
+    var lines: seq[string]
+    fmOut().write("\n> ")
+    fmOut().flushFile()
+    while true:
+        var line: string
+        if not stdin.readLine(line):
+            return FmTurn(ok: false)
+        if line.endsWith("\\"):
+            lines.add(line[0 ..< line.len - 1])
+            continue
+        lines.add(line)
+        break
+    let text = lines.join("\n").strip()
+    if text in ["/exit", "/quit", "/bye"]:
+        return FmTurn(ok: false)
+    result = FmTurn(ok: true, text: text)

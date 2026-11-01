@@ -78,7 +78,7 @@ proc main() =
     for i in 0 ..< refOut.len:
       if refOut[i] != got[i]: inc diff
     echo &"  u{unroll} vs tuned: {diff}/{refOut.len} values differ"
-    doAssert diff * 20 <= refOut.len, "unroll khong khop (FMA order sai)"
+    doAssert diff * 20 <= refOut.len, "unroll does not match (wrong FMA order)"
 
   for rows in [4, 6]:
     let kn = vmKernelForBe(buildFp4KmGemmVecProgram(k, n, 32, rows),
@@ -113,7 +113,7 @@ proc main() =
       mag = max(mag, abs(float(refOut[i])))
     let rel = err / max(mag, 1e-9)
     echo &"  vec rows={rows} vs tuned: maxAbsErr={err:.3g} rel={rel:.3g}"
-    doAssert rel < 1e-5, "vec khong khop"
+    doAssert rel < 1e-5, "vec does not match"
 
   block:
     let kn = vmKernelForBe(buildFp4KmGemm2ColProgram(k, n, 32, 8),
@@ -147,7 +147,7 @@ proc main() =
       mag = max(mag, abs(float(refOut[i])))
     let rel = err / max(mag, 1e-9)
     echo &"  2col vs tuned: maxAbsErr={err:.3g} rel={rel:.3g}"
-    doAssert rel < 1e-5, "2col khong khop"
+    doAssert rel < 1e-5, "2col does not match"
 
   for rows in [4]:
     let kn = vmKernelForBe(buildFp4KmGemmTunedProgram(k, n, 32, rows),

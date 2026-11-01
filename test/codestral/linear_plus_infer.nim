@@ -25,7 +25,7 @@ type
 proc newLinearPlusInferState*(embedDim, nHeads: int): LinearPlusInferState =
   if embedDim <= 0 or nHeads <= 0 or embedDim mod nHeads != 0:
     raise newException(ValueError,
-      "LinearPlusInferState: embedDim phai chia het cho nHeads")
+      "LinearPlusInferState: embedDim must be divisible by nHeads")
   result.embedDim = embedDim
   result.nHeads = nHeads
   result.headDim = embedDim div nHeads
@@ -50,20 +50,20 @@ proc forwardLinearFp4InferStep*(lin: var Linear, name: string,
   ## matrices on every token. Adds the Linear bias exactly once.
   if x.data.len != lin.inF:
     raise newException(ValueError,
-      "forwardLinearFp4InferStep: input dim khong khop " & name)
+      "forwardLinearFp4InferStep: input dim mismatch " & name)
   if name notin gFp4CacheGpu or not gFp4CacheGpu[name].residentReady:
-    ## Tren Metal KHONG duoc silently roi ve Linear.forward(): nhanh fallback
-    ## co the dequant toan bo FP4 weight moi token va lam cham hang chuc giay.
-    ## prepareHybridFp4Weights() phai chuan bi tat ca matrix lon truoc decode.
+    ## On Metal it must NOT silently fall back to Linear.forward(): that fallback
+    ## may dequantize all FP4 weights every token and cost tens of seconds.
+    ## prepareHybridFp4Weights() must prepare every large matrix before decode.
     if ctx.kind == bkMetal:
       raise newException(CatchableError,
-        "[infer] FP4 weight chua resident cho " & name &
-        "; dung fallback Linear.forward se rat cham")
+        "[infer] FP4 weight not resident for " & name &
+        "; the Linear.forward fallback would be very slow")
     return lin.forward(x, ctx)
   let yData = fp4GemvGpu(ctx, name, x.data, 1)
   if yData.len != lin.outF:
     raise newException(ValueError,
-      "forwardLinearFp4InferStep: output len khong khop " & name &
+      "forwardLinearFp4InferStep: output len mismatch " & name &
       " (got=" & $yData.len & ", expected=" & $lin.outF & ")")
   var outShape = x.shape
   outShape[^1] = lin.outF
@@ -77,20 +77,20 @@ proc forwardLinearPlusInferStep*(qkvProj, outProj: var Linear,
                                  x: Tensor, ctx: Backend): Tensor =
   if x.shape.len != 3 or x.shape[0] != 1 or x.shape[1] != 1:
     raise newException(ValueError,
-      "forwardLinearPlusInferStep: chi chap nhan input [1,1,C]")
+      "forwardLinearPlusInferStep: only accepts input [1,1,C]")
   let C = x.shape[2]
   if C != qkvProj.inF or qkvProj.outF != 3 * C:
     raise newException(ValueError,
-      "forwardLinearPlusInferStep: QKV shape khong khop embedDim")
+      "forwardLinearPlusInferStep: QKV shape does not match embedDim")
   if state.embedDim != C or state.nHeads != nHeads or state.headDim * nHeads != C:
     raise newException(ValueError,
-      "forwardLinearPlusInferStep: state shape khong khop block Attention")
+      "forwardLinearPlusInferStep: state shape does not match the Attention block")
 
   let proj = forwardLinearFp4InferStep(qkvProj, qkvName, x, ctx)
   let D = state.headDim
   var y = newTensor(@[1, 1, C])
 
-  ## proj = [Q | K | V], moi phan C phan tu.
+  ## proj = [Q | K | V], C elements each.
   for h in 0 ..< nHeads:
     let base = h * D
     let zOff = base

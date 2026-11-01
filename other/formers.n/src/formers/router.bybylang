@@ -1,0 +1,26 @@
+# formers.n — route a detection to its runner.
+#
+#   frLlama      -> models/llama.bybylang   (nim_inference transformer blocks)
+#   frMamba2Base -> models/mamba2.bybylang  (base Mamba-2, like infer_lora's base-Mamba path)
+#   frMamba2Lora -> models/mamba2.bybylang  (LoRA/Linear++ checkpoint, like infer_lora)
+#   frNone       -> false: unknown or inconsistent architecture
+
+import "cli/options.bybylang"
+import "arch/detect.bybylang"
+import "models/llama.bybylang"
+import "models/mamba2.bybylang"
+import "runtime/console.bybylang"
+
+function fmRun(det: FmDetection, opts: FmOptions): bool
+    var reason = ""
+    if not fmCheckRun(det, opts, reason):
+        fmSay("[formers.n] not running: " & reason)
+        return false
+    case det.route
+    of frLlama:
+        result = fmRunLlama(det, opts)
+    of frMamba2Base, frMamba2Lora:
+        result = fmRunMamba2(det, opts)
+    of frNone:
+        fmSay("[formers.n] unsupported architecture")
+        result = false

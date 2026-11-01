@@ -1,5 +1,5 @@
-## mamba2_ssm_gpu.nim — microVM only (KHÔNG kernel Metal mới).
-## 1 session/token: encode only, không sessionRead giữa layer.
+## mamba2_ssm_gpu.nim — microVM only (NO new Metal kernels).
+## 1 session/token: encode only, no sessionRead between layers.
 
 import std/tables
 import std/bitops
@@ -16,7 +16,7 @@ import prefill_profile   # BYBY_PREFILL_PROFILE: vm.upload / vm.gpu / vm.read
 import mamba2_full_vm
 import fp4_gemv_gpu
 import vendor/bybylang/backends/vulkan/vulkan_driver as vkDrv
-import nimformer     # Tensor, ApfAdamState, apfAdamStepGpu (cho apfAdamStepFused)
+import nimformer     # Tensor, ApfAdamState, apfAdamStepGpu (for apfAdamStepFused)
 import customfloat
 
 type
@@ -43,9 +43,9 @@ type
     totalLen: int
 
 var gShapeCache = initTable[string, Mamba2SsmShapeInfo]()
-var gSsmAtCache = initTable[string, VmProgram]()  # scan chay thang tren hWork, khong qua hScratch
+var gSsmAtCache = initTable[string, VmProgram]()  # the scan runs directly on hWork, not through hScratch
 var gGpuLayers* = initTable[int, Mamba2GpuLayer]()
-var gProfileLastT: float = 0.0   # MOI: dung rieng cho profileLayerStepByIdx (do timing giua cac buoc)
+var gProfileLastT: float = 0.0   # NEW: used only by profileLayerStepByIdx (timing between steps)
 var gCodeBufCache = initTable[string, byby.SessionHandle]()
 var gJitCache = jit_vm.initJitCache(jit_vm.JitConfig(
   hotThreshold: 0, enableMetalJit: true, enableVulkanJit: true,
@@ -54,13 +54,13 @@ var gJitCache = jit_vm.initJitCache(jit_vm.JitConfig(
 proc shapeKey(H, D, N, G: int): string = $H & "_" & $D & "_" & $N & "_" & $G
 
 proc getSsmAtProgram(H, D, N, G, C: int; o: LayerOff): VmProgram =
-  ## TOI UU (gop dispatch): buildMamba2StepAt nhan offset lam THAM SO nen doc/ghi
-  ## THANG tren hWork tai vi tri that (o.offXBC/offB/offC/offSsm/offY...), khong
-  ## can 9 lan sessionCopyInto qua/ve hScratch nhu getShapeInfo(...).program ban
-  ## goc - trong do 2 lan copy state (HD*N phan tu, phan lon nhat trong toan bo
-  ## buoc) la nguon overhead chinh (matmul-adjacent memcpy). Cache theo shapeKey
-  ## vi cac layer cung H,D,N,G trong 1 model dung chung C/cDim/K/G nen offset
-  ## computeOff() giong het nhau.
+  ## OPTIMISATION (merged dispatches): buildMamba2StepAt takes the offsets as PARAMETERS, so it reads/writes
+  ## DIRECTLY on hWork at the real positions (o.offXBC/offB/offC/offSsm/offY...), no
+  ## 9 sessionCopyInto calls to/from hScratch like the original getShapeInfo(...).program
+  ## - of which the 2 state copies (HD*N elements, the largest part of the whole
+  ## step) were the main overhead (matmul-adjacent memcpy). Cached by shapeKey
+  ## because layers with the same H,D,N,G in one model share C/cDim/K/G, so the offsets
+  ## from computeOff() are identical.
   let key = shapeKey(H, D, N, G)
   if key in gSsmAtCache: return gSsmAtCache[key]
   result = buildMamba2StepAt(H, D, N, G,
@@ -69,7 +69,7 @@ proc getSsmAtProgram(H, D, N, G, C: int; o: LayerOff): VmProgram =
   gSsmAtCache[key] = result
 
 proc blit*(dst: var seq[float32]; dOff: int; src: openArray[float32]; sOff, n: int) =
-  ## Chép khối float32 bằng copyMem (marshalling dữ liệu, KHÔNG phải phép tính).
+  ## Copies a float32 block with copyMem (data marshalling, NOT computation).
   if n > 0:
     copyMem(addr dst[dOff], unsafeAddr src[sOff], n * sizeof(float32))
 
@@ -94,7 +94,7 @@ proc computeOff(C, cDim, H, D, N, G, K: int): LayerOff =
   result.total = result.offNormed + C
 
 proc kernelNameFor*(ctx: Backend; program: VmProgram; tag: string): string =
-  ## Tinh ten kernel (hash bytecode GPU) NGOAI session. Tag chi la namespace;
+  ## Computes the kernel name (GPU bytecode hash) OUTSIDE a session. The tag is only a namespace;
   ## Vulkan uses the same static-per-program lowering strategy as Metal, but
   ## emits GLSL/SPIR-V instead of MSL. Never hand a Metal pipeline name to it.
   if ctx.kind == bkVulkan:
@@ -105,8 +105,8 @@ proc kernelNameFor*(ctx: Backend; program: VmProgram; tag: string): string =
 proc encodeMicroVm*(ctx: Backend; program: VmProgram; hMem: byby.SessionHandle;
                     nThreads: int; tgBytes = 4; tag = "mvm"; tgSize = 0;
                     preKname = "") =
-  ## tgSize > 0: ÉP số lane/threadgroup (kernel kiểu "1 threadgroup / token" cần đúng giá trị này;
-  ## nếu GPU không cho đủ thì RAISE thay vì âm thầm hạ xuống).
+  ## tgSize > 0: FORCES the lanes/threadgroup ("1 threadgroup / token" kernels need exactly this value;
+  ## if the GPU cannot provide it, RAISE instead of silently lowering it).
   if program.words.len == 0 or nThreads <= 0:
     raise newException(CatchableError, "encodeMicroVm: bad args")
   let be = ctx.kind.toByby()
@@ -129,9 +129,9 @@ proc encodeMicroVm*(ctx: Backend; program: VmProgram; hMem: byby.SessionHandle;
       raise newException(CatchableError, "encodeMicroVm[" & tag & "]: Vulkan JIT dispatch failed")
     return
 
-  # preKname: ten kernel da tinh TRUOC khi mo session. Ham nay chay TRONG session dang mo nen KHONG
-  # duoc mo session rieng de hash GPU (metal_session_begin tu choi session long nhau) ->
-  # dispatchProgramNoSession (dung key da nho, hoac key fallback khong can GPU).
+  # preKname: the kernel name computed BEFORE opening the session. This function runs INSIDE an open session, so it must
+  # NOT open its own session for GPU hashing (metal_session_begin refuses nested sessions) ->
+  # dispatchProgramNoSession (uses the remembered key, or a fallback key that needs no GPU).
   let useJit = kname.len > 0 and kname != "micro_vm_kernel"
   let pipeName = if useJit: kname else: "micro_vm_kernel"
   if not sessionPipeline(pipeName):
@@ -163,26 +163,26 @@ proc encodeMicroVm*(ctx: Backend; program: VmProgram; hMem: byby.SessionHandle;
       discard sessionBindInt(5, tgFloats)
   discard sessionSetThreadgroupBytes(0, max(tgBytes, 4))
   when defined(macosx):
-    # FIX token rac (bug #9): metal_enc_dispatch_threads AM THAM ha tgSize
-    # xuong maxTotalThreadsPerThreadgroup neu ta xin nhieu hon. Voi kernel
-    # KHONG dung threadgroup memory (tgBytes<=4, moi thread doc lap) thi vo
-    # hai - chi la chia grid ra nhieu threadgroup. Nhung voi kernel CO
-    # reduction (tgBytes>4: rms/rmsL) thi cuc ky nguy hiem: program duoc
-    # SINH RA voi tgSize nuong theo gia tri ta xin (buoc nhay idx, cay
-    # reduction stride, va R0 = thread_position_in_GRID dung lam chi so vao
-    # threadgroup memory) - neu Metal chia thanh nhieu threadgroup thi moi
-    # threadgroup co VUNG NHO RIENG, phan lon o nho khong ai ghi, barrier
-    # chi dong bo trong tung nhom -> tong sai -> ket qua RAC ma KHONG BAO LOI.
+    # FIX for garbage tokens (bug #9): metal_enc_dispatch_threads SILENTLY lowers tgSize
+    # to maxTotalThreadsPerThreadgroup if we ask for more. For kernels
+    # WITHOUT threadgroup memory (tgBytes<=4, independent threads) that is
+    # harmless - the grid is just split into more threadgroups. But for kernels WITH
+    # a reduction (tgBytes>4: rms/rmsL) it is very dangerous: the program is
+    # GENERATED for the requested tgSize (index step, reduction tree
+    # stride, and R0 = thread_position_in_GRID used as the index into
+    # threadgroup memory) - if Metal splits it into several threadgroups, each
+    # threadgroup has its OWN MEMORY, most slots are never written, barriers
+    # only sync within each group -> wrong sums -> GARBAGE results WITHOUT AN ERROR.
     let maxTG = sessionMaxTgThreads()
     if maxTG > 0 and tg > maxTG:
       if tgBytes > 4 or tgSize > 0:
         raise newException(CatchableError,
-          "encodeMicroVm[" & tag & "]: kernel reduction can " & $tg &
-          " thread/threadgroup nhung pipeline '" & pipeName & "' chi cho toi da " &
-          $maxTG & " tren GPU nay. Neu cu dispatch, Metal se tao " &
-          $((nThreads + maxTG - 1) div maxTG) & " threadgroup rieng biet va ket qua " &
-          "SE LA RAC. Dung rmsTgSizeFor() de build program voi tgSize=" & $maxTG &
-          " (hoac dat BYBY_RMS_TG=" & $maxTG & ").")
+          "encodeMicroVm[" & tag & "]: reduction kernel needs " & $tg &
+          " threads/threadgroup but pipeline '" & pipeName & "' allows at most " &
+          $maxTG & " on this GPU. Dispatching anyway, Metal would create " &
+          $((nThreads + maxTG - 1) div maxTG) & " separate threadgroups and the result " &
+          "WOULD BE GARBAGE. Use rmsTgSizeFor() to build the program with tgSize=" & $maxTG &
+          " (or set BYBY_RMS_TG=" & $maxTG & ").")
       else:
         tg = maxTG
   if not sessionDispatch(nThreads, tg):
@@ -209,7 +209,7 @@ proc mamba2ScanStep*(L: M2Lay; ctx: Backend; forceParallel = false): MvmStep =
 
 proc encodeSteps(ctx: Backend; steps: openArray[MvmStep]; names: openArray[string];
                  h: byby.SessionHandle) =
-  ## đệ quy đuôi thay cho `for st in steps` (không vòng lặp host)
+  ## tail recursion instead of `for st in steps` (no host loop)
   if steps.len == 0: return
   encodeMicroVm(ctx, steps[0].prog, h, steps[0].nThreads, steps[0].tgBytes, steps[0].tag,
                 steps[0].tgSize, names[0])
@@ -312,9 +312,9 @@ var gTgCapReady = false
 var gTgCapBackend: BackendKind
 
 proc ensureTgCap*(ctx: Backend) =
-  ## Đặt gTgCap (mamba2_full_vm) = pow2 lớn nhất <= maxTotalThreadsPerThreadgroup THẬT của GPU.
-  ## Gọi trước khi build bất kỳ program reduction nào (rmsTg / rmsRowTg / lpPhiTg).
-  ## BYBY_RMS_TG=<n> ép tay. Backend không phải Metal: giữ 1024.
+  ## Sets gTgCap (mamba2_full_vm) = the largest pow2 <= the REAL maxTotalThreadsPerThreadgroup of the GPU.
+  ## Call before building any reduction program (rmsTg / rmsRowTg / lpPhiTg).
+  ## BYBY_RMS_TG=<n> forces it. Non-Metal backends: keeps 1024.
   if gTgCapReady and gTgCapBackend == ctx.kind: return
   var cap = 1024
   var queried = true
@@ -338,9 +338,9 @@ proc ensureTgCap*(ctx: Backend) =
           if v > 0: cap = min(cap, v); queried = true
         except ValueError:
           discard
-  # Pipeline JIT dùng nhiều thanh ghi hơn micro_vm_kernel nên giới hạn thật THẤP hơn
-  # (Iris 640: micro_vm_kernel 512, kernel JIT chỉ 448). Không biết trước khi biên dịch,
-  # nên chặn ở 256 (đủ cho reduction, mọi GPU Mac đều chạy được). BYBY_RMS_TG ép tay.
+  # JIT pipelines use more registers than micro_vm_kernel, so the real limit is LOWER
+  # (Iris 640: micro_vm_kernel 512, JIT kernels only 448). Unknown before compiling,
+  # so it is capped at 256 (enough for reductions, runs on every Mac GPU). BYBY_RMS_TG forces it.
   if ctx.kind != bkVulkan and getEnv("BYBY_RMS_TG").len == 0: cap = min(cap, 256)
   let requested = getEnv("BYBY_RMS_TG")
   if requested.len > 0:
@@ -349,34 +349,34 @@ proc ensureTgCap*(ctx: Backend) =
   cap = 1 shl fastLog2(max(cap, 32))
   gTgCap = cap
   if not queried:
-    # Dang trong session khac / chua truy van duoc: dung tam 256 (<= moi GPU Mac), thu lai lan sau.
+    # In another session / not queryable yet: use 256 for now (<= every Mac GPU), retry later.
     gTgCap = min(cap, 256)
     return
   gTgCapReady = true
   gTgCapBackend = ctx.kind
-  stderr.writeLine "[tgcap] gioi han threadgroup cho kernel reduction = " & $cap
+  stderr.writeLine "[tgcap] threadgroup limit for reduction kernels = " & $cap
 
 var gRmsTgSize = initTable[string, int]()
 
 proc rmsTgSizeFor*(ctx: Backend; C: int): int =
-  ## FIX token rac (bug #9). Chon so thread/threadgroup cho kernel rmsGate
-  ## (gated RMSNorm CUOI mixer - chay MOI block, MOI token) sao cho Metal
-  ## chay DUNG 1 threadgroup duy nhat.
+  ## FIX for garbage tokens (bug #9). Picks the threads/threadgroup of the rmsGate kernel
+  ## (the gated RMSNorm at the END of the mixer - runs in EVERY block, EVERY token) so Metal
+  ## runs EXACTLY ONE threadgroup.
   ##
-  ## Truoc day cho cung 1024 (buildRmsGateLargeProgram(C, eps, 1024) +
-  ## dispatch 1024 thread). 1024 vuot qua maxTotalThreadsPerThreadgroup cua
-  ## GPU tich hop (Intel Iris Plus 640 thuong chi 256) -> shim ha xuong 256
-  ## -> Metal tao 4 threadgroup, moi cai co threadgroup memory RIENG, trong
-  ## khi program dung R0 = thread_position_in_GRID (0..1023) lam chi so vao
-  ## vung nho do va reduce tu stride 512. Ket qua: phan lon o nho khong bao
-  ## gio duoc ghi, tong sum-of-squares sai, invStd sai -> dau ra mixer RAC o
-  ## moi block, moi token (nhat quan, lap lai y het moi lan chay).
+  ## It used to hardcode 1024 (buildRmsGateLargeProgram(C, eps, 1024) +
+  ## dispatch 1024 threads). 1024 exceeds the maxTotalThreadsPerThreadgroup of
+  ## integrated GPUs (Intel Iris Plus 640 usually only 256) -> the shim lowered it to 256
+  ## -> Metal created 4 threadgroups, each with its OWN threadgroup memory, while
+  ## the program used R0 = thread_position_in_GRID (0..1023) as the index into
+  ## that memory and reduced from stride 512. Result: most slots were never
+  ## written, the sum of squares was wrong, invStd was wrong -> GARBAGE mixer output in
+  ## every block, every token (consistent, repeated exactly on every run).
   ##
-  ## Ep buoc tay: BYBY_RMS_TG=<n>.
+  ## Force it by hand: BYBY_RMS_TG=<n>.
   let cacheKey = $ctx.kind & "_" & $C
   if cacheKey in gRmsTgSize: return gRmsTgSize[cacheKey]
-  # Chọn tgSize = luỹ thừa 2 lớn nhất <= min(1024, C, giới hạn GPU) VÀ chia hết C.
-  # Công thức đóng (bit trick) thay cho 2 vòng `while t > ...: t = t div 2`.
+  # Picks tgSize = the largest power of 2 <= min(1024, C, the GPU limit) AND dividing C.
+  # Closed form (bit trick) instead of 2 `while t > ...: t = t div 2` loops.
   let t0 = 1 shl fastLog2(min(1024, C))
   var bound = 1024
   if ctx.kind == bkVulkan: bound = vkDrv.vulkanMaxTgThreads()
@@ -395,18 +395,18 @@ proc rmsTgSizeFor*(ctx: Backend; C: int): int =
   when defined(macosx):
     if t < t0 and t < 32:
       raise newException(CatchableError,
-        "rmsTgSizeFor: khong tim duoc tgSize hop le cho C=" & $C &
-        " voi gioi han " & $bound & " thread/threadgroup")
-    stderr.writeLine "[rmsgate] tgSize=" & $t & " cho C=" & $C &
-      " (GPU cho toi da " & $bound & " thread/threadgroup) - FIX bug #9"
+        "rmsTgSizeFor: no valid tgSize found for C=" & $C &
+        " with a limit of " & $bound & " threads/threadgroup")
+    stderr.writeLine "[rmsgate] tgSize=" & $t & " for C=" & $C &
+      " (the GPU allows at most " & $bound & " threads/threadgroup) - FIX bug #9"
   gRmsTgSize[cacheKey] = t
   result = t
 
 proc runMicroVm*(ctx: Backend; program: VmProgram; memF32: var seq[float32];
                  nThreads: int; tgBytes = 4; tag = "mvm"; tgSize = 0): bool =
-  ## Host-driven microVM: moi lan 1 session rieng (begin→encode→end→read).
-  ## Retry timeout chỉ áp dụng cho buffer scratch được upload từ host ở đây;
-  ## KHÔNG replay các API encode trực tiếp trên state recurrent resident.
+  ## Host-driven microVM: one session per call (begin→encode→end→read).
+  ## Timeout retries apply only to the scratch buffer uploaded from the host here;
+  ## the encode APIs working directly on resident recurrent state are NOT replayed.
   let be = ctx.kind.toByby()
   if be == byby.gbCpu:
     let ts = if tgSize > 0: tgSize else: max(1, min(nThreads, 256))
@@ -415,7 +415,7 @@ proc runMicroVm*(ctx: Backend; program: VmProgram; memF32: var seq[float32];
       raise newException(CatchableError, "CPU microVM failed: " & cpu.cpuLastErrorMessage())
     return true
   checkVmScratchCapacity(ctx, memF32.len, tag)
-  let kn = kernelNameFor(ctx, program, tag)   # hash/JIT truoc sessionBegin
+  let kn = kernelNameFor(ctx, program, tag)   # hash/JIT before sessionBegin
   for attempt in 0 .. 1:
     beginVmSession(be, "runMicroVm tag=" & tag)
     var h: byby.SessionHandle
@@ -473,10 +473,10 @@ proc runMicroVmStepsSeparated(ctx: Backend; steps: openArray[MvmStep]; index: in
   result = runMicroVmStepsSeparated(ctx, steps, index + 1, memF32)
 
 proc runMicroVmChain*(ctx: Backend; steps: openArray[MvmStep]; memF32: var seq[float32]): bool =
-  ## NHIỀU kernel liên tiếp trên CÙNG 1 buffer trong 1 session: upload 1 lần, đọc lại 1 lần
-  ## (không quay về host giữa các stage). Dùng cho forward/backward cả lớp Mamba2.
-  ## Nếu command buffer timeout, cả chain được replay từ bản scratch host gốc;
-  ## không dùng cơ chế này cho persistent recurrent state.
+  ## SEVERAL consecutive kernels on the SAME buffer in one session: upload once, read back once
+  ## (no return to the host between stages). Used for the whole-layer Mamba2 forward/backward.
+  ## If the command buffer times out, the whole chain is replayed from the original host scratch;
+  ## not used for persistent recurrent state.
   let be = ctx.kind.toByby()
   if be == byby.gbCpu:
     for step in steps:
@@ -486,7 +486,7 @@ proc runMicroVmChain*(ctx: Backend; steps: openArray[MvmStep]; memF32: var seq[f
         raise newException(CatchableError, "CPU microVM chain failed: " & cpu.cpuLastErrorMessage())
     return true
   checkVmScratchCapacity(ctx, memF32.len, "stage chain")
-  let names = steps.mapIt(kernelNameFor(ctx, it.prog, it.tag))   # truoc sessionBegin
+  let names = steps.mapIt(kernelNameFor(ctx, it.prog, it.tag))   # before sessionBegin
   for attempt in 0 .. 1:
     beginVmSession(be, "runMicroVmChain")
     var h: byby.SessionHandle
@@ -541,12 +541,12 @@ proc runMicroVmChain*(ctx: Backend; steps: openArray[MvmStep]; memF32: var seq[f
 
 proc runMicroVmChainGroups*(ctx: Backend; groups: openArray[seq[MvmStep]];
                             memF32: var seq[float32]): bool =
-  ## Bang goi runMicroVmChain lan luot cho tung nhom, nhung buffer chi upload 1 lan
-  ## va doc lai 1 lan. Moi nhom van la 1 command buffer rieng (thoi gian GPU moi
-  ## command buffer giu nguyen nhu cu -> khong tang nguy co watchdog timeout).
-  ## Loi/timeout o bat ky nhom nao -> bo ket qua GPU, chay lai TU DAU tung nhom bang
-  ## runMicroVmChain tu ban host goc (kernel co atomic cong don, khong replay giua chung).
-  ## BYBY_VM_GROUPS=0 -> duong cu (moi nhom 1 lan upload/doc).
+  ## Calls runMicroVmChain for each group in turn, but the buffer is uploaded only once
+  ## and read back once. Each group is still its own command buffer (the GPU time per
+  ## command buffer stays as before -> no higher watchdog-timeout risk).
+  ## An error/timeout in any group -> the GPU result is dropped and every group is rerun FROM THE START
+  ## with runMicroVmChain from the original host copy (the kernels accumulate atomically, no replay in the middle).
+  ## BYBY_VM_GROUPS=0 -> the old path (one upload/read per group).
   if getEnv("BYBY_VM_GROUPS", "1") == "0" or groups.len <= 1:
     for g in groups:
       discard runMicroVmChain(ctx, g, memF32)
@@ -563,7 +563,7 @@ proc runMicroVmChainGroups*(ctx: Backend; groups: openArray[seq[MvmStep]];
   checkVmScratchCapacity(ctx, memF32.len, "stage chain groups")
   var names: seq[seq[string]]
   for g in groups:
-    names.add g.mapIt(kernelNameFor(ctx, it.prog, it.tag))   # truoc sessionBegin
+    names.add g.mapIt(kernelNameFor(ctx, it.prog, it.tag))   # before sessionBegin
   var h: byby.SessionHandle
   var uploaded = false
   var ended = true
@@ -598,12 +598,12 @@ proc runMicroVmChainGroups*(ctx: Backend; groups: openArray[seq[MvmStep]];
     if uploaded:
       sessionFree(be, h)
       uploaded = false
-    # Giong runMicroVmChain: CHI timeout GPU moi chay lai; loi khac raise ngay.
+    # Like runMicroVmChain: ONLY a GPU timeout reruns; other errors raise right away.
     if not (e.msg.startsWith(VmTimeoutRetryMarker) or
             (timeoutDetail.len > 0 and isVmGpuTimeout(timeoutDetail))):
       raise
     stderr.writeLine("[microvm] chain groups timeout (" & e.msg &
-      "); chay lai tung nhom tu ban host goc")
+      "); rerunning each group from the original host copy")
   if uploaded: sessionFree(be, h)
   if ok:
     memF32 = output
@@ -615,14 +615,14 @@ proc runMicroVmChainGroups*(ctx: Backend; groups: openArray[seq[MvmStep]];
 proc runMicroVmChainSparse*(ctx: Backend; steps: openArray[MvmStep]; totalLen: int;
                             head: seq[float32];
                             reads: openArray[tuple[off, len: int]]): seq[seq[float32]] =
-  ## Nhu runMicroVmChain nhung KHONG di qua ca buffer tren host: cap scratch GPU
-  ## totalLen float (buffer Metal/Vulkan moi cap phat = 0), chi upload `head` vao
-  ## [0, head.len), chay chain, roi chi doc lai cac doan `reads` (gom vao 1 buffer
-  ## nho bang copy device-to-device). Dung cho prefill suy luan: scratch Mamba2
-  ## ~57MB/block nhung host chi can normedOut + state cuoi (~4MB).
-  ## Caller PHAI dam bao: moi vung >= head.len ma kernel DOC deu do chinh chain GHI
-  ## truoc (khong co cong don/atomic). Loi/timeout -> raise (khong retry); caller
-  ## tu fallback ve runMicroVmChain.
+  ## Like runMicroVmChain but WITHOUT passing the whole buffer through the host: allocates a GPU scratch of
+  ## totalLen floats (a newly allocated Metal/Vulkan buffer = 0), uploads only `head` into
+  ## [0, head.len), runs the chain, then reads back only the `reads` slices (gathered into one small
+  ## buffer with device-to-device copies). Used for inference prefill: the Mamba2 scratch is
+  ## ~57MB/block but the host only needs normedOut + the final state (~4MB).
+  ## The caller MUST guarantee: every region >= head.len that a kernel READS is WRITTEN by the chain
+  ## itself first (no accumulation/atomics). An error/timeout -> raises (no retry); the caller
+  ## falls back to runMicroVmChain itself.
   let be = ctx.kind.toByby()
   if be == byby.gbCpu:
     var mem = newSeq[float32](totalLen)
@@ -641,7 +641,7 @@ proc runMicroVmChainSparse*(ctx: Backend; steps: openArray[MvmStep]; totalLen: i
   for r in reads:
     doAssert r.off >= 0 and r.len > 0 and r.off + r.len <= totalLen
     outLen += r.len
-  let names = steps.mapIt(kernelNameFor(ctx, it.prog, it.tag))   # truoc sessionBegin
+  let names = steps.mapIt(kernelNameFor(ctx, it.prog, it.tag))   # before sessionBegin
   beginVmSession(be, "runMicroVmChainSparse")
   var hHead, hMem, hOut: byby.SessionHandle
   var ended = false
@@ -681,7 +681,7 @@ proc runMicroVmChainSparse*(ctx: Backend; steps: openArray[MvmStep]; totalLen: i
     sessionFree(be, hHead)
 
 proc axpyGpu*(ctx: Backend; dst: var seq[float32]; src: openArray[float32]; scale: float32) =
-  ## dst[i] += scale * src[i] trên GPU (thay vòng `for i: dst[i] += src[i]*s` của LoRA)
+  ## dst[i] += scale * src[i] on the GPU (replaces LoRA's `for i: dst[i] += src[i]*s` loop)
   let n = min(dst.len, src.len)
   if n == 0: return
   var buf = newSeq[float32](2 * n)
@@ -702,7 +702,7 @@ proc buildShapeInfo(ctx: Backend; H, D, N, G: int): Mamba2SsmShapeInfo =
   result.offIdxH = result.offY + HD
   result.offIdxG = result.offIdxH + HD
   result.totalLen = result.offIdxG + HD
-  # idxH/idxG sinh bằng GPU (buildIdxTableProgram) — không còn for h/for d trên CPU
+  # idxH/idxG generated on the GPU (buildIdxTableProgram) — no more for h/for d on the CPU
   var tab = newSeq[float32](2 * HD)
   discard runMicroVm(ctx, buildIdxTableProgram(H, D, G), tab, HD, 4, "idxtab")
   result.idxH = tab[0 ..< HD]
@@ -749,17 +749,17 @@ proc ensureGpuLayer*(ctx: Backend; blockIdx, H, D, N, G, C, cDim, K, hidden: int
   result = gGpuLayers[blockIdx]
 
 proc resetGpuLayerState*(ctx: Backend; blockIdx: int): bool =
-  ## FIX token rac (bug #12): xoa ve 0 TRANG THAI THUONG TRU cua 1 layer
-  ## (convState + ssmState nam trong hWork). Bat buoc goi sau warmup, vi
-  ## warmupJambaKernelsOnce chay encodeLayerStepByIdx TREN CHINH
-  ## gGpuLayers[0] that (khong phai ban sao): voi x=0 thi proj=0 nen z=0 va
-  ## xBC=0, NHUNG conv1d van ra silu(convBias) != 0 -> ssmState cua block 0
-  ## bi ghi gia tri tu mot token GIA truoc khi prefill bat dau. Cac block
-  ## 1..63 thi sach -> hong bat doi xung, rat kho phat hien.
-  ## PHAI goi TRONG mot session dang mo (dung sessionCopyInto nhu moi buoc
-  ## khac trong file nay).
+  ## FIX for garbage tokens (bug #12): zeroes the RESIDENT STATE of one layer
+  ## (convState + ssmState in hWork). Must be called after warmup, because
+  ## warmupJambaKernelsOnce runs encodeLayerStepByIdx ON the REAL
+  ## gGpuLayers[0] itself (not a copy): with x=0, proj=0 so z=0 and
+  ## xBC=0, BUT conv1d still gives silu(convBias) != 0 -> block 0's ssmState
+  ## got values from a FAKE token before prefill started. Blocks
+  ## 1..63 were clean -> an asymmetric corruption, very hard to spot.
+  ## MUST be called INSIDE an open session (uses sessionCopyInto like every other
+  ## step in this file).
   if blockIdx notin gGpuLayers: return false
-  var layer = gGpuLayers[blockIdx]   # copy cua struct; hWork la handle nen van tro cung 1 MTLBuffer
+  var layer = gGpuLayers[blockIdx]   # a copy of the struct; hWork is a handle, so it still points to the same MTLBuffer
   if not layer.ready: return false
   let be = layer.be
   let o = layer.off
@@ -767,7 +767,7 @@ proc resetGpuLayerState*(ctx: Backend; blockIdx: int): bool =
   let nSsm = layer.HD * layer.N
   let nMax = max(nConv, nSsm)
   if nMax <= 0: return true
-  # upload zero THAT SU (khong dua vao gia dinh buffer moi da duoc zero)
+  # uploads REAL zeros (does not rely on a new buffer being zeroed)
   let hZero = sessionUpload(be, newSeq[float32](nMax))
   result = true
   if nConv > 0:
@@ -847,7 +847,7 @@ proc splitProjGpu*(ctx: Backend; C, cDim, H: int; proj: seq[float32]):
 proc rmsGateGpu*(ctx: Backend; C: int; eps: float32; yPre, z, w: seq[float32];
                  nGroups = 1): seq[float32] =
   if nGroups <= 0 or C mod nGroups != 0:
-    raise newException(ValueError, "rmsGateGpu: C phai chia het nGroups")
+    raise newException(ValueError, "rmsGateGpu: C must be divisible by nGroups")
   var buf = newSeq[float32](4 * C)
   buf.blit(0, yPre, 0, C); buf.blit(C, z, 0, C); buf.blit(2 * C, w, 0, C)
   let groupLen = C div nGroups
@@ -870,7 +870,7 @@ proc encodeLayerStep*(ctx: Backend; layer: var Mamba2GpuLayer;
                       hResidual: byby.SessionHandle;
                       hOut: var byby.SessionHandle) =
   if not gPatchMarkerV3Printed:
-    stderr.writeLine "[PATCH_MARKER_V3] encodeLayerStep FIX (convState slide) DANG CHAY"
+    stderr.writeLine "[PATCH_MARKER_V3] encodeLayerStep FIX (convState slide) RUNNING"
     gPatchMarkerV3Printed = true
   doAssert layer.ready
   let be = layer.be
@@ -884,17 +884,17 @@ proc encodeLayerStep*(ctx: Backend; layer: var Mamba2GpuLayer;
   if not sessionCopyInto(be, hProj, layer.hWork, 0, 0, o.P):
     raise newException(CatchableError, "copy proj failed")
 
-  # SUA (gop kernel - hoc theo fusedNormQKVRoPE/fusedResidualNormFFN cua
-  # nim_inference.nim, model 6.7B THAT khong lag tren cung phan cung, dung
-  # micro-VM CO SAN - KHONG viet .metal tay): TRUOC DAY day la 3 dispatch
-  # rieng (split/conv/softplus) + 4 sessionCopyInto rieng chuyen xBC/dt
-  # qua lai giua buffer moi layer - moi layer x 64 layer x moi token la rat
-  # nhieu lan bind-pipeline/dispatch nho le, day chinh la nguon lag he
-  # thong (khong phai do commitContinue/QoS/yield - nhung cai do chi la
-  # vá trieu chung). GIO gop thanh 1 dispatch DUY NHAT qua
-  # buildFusedSplitConvSoftplusProgram - AN TOAN de gop vi conv1d o day la
-  # depthwise theo thoi gian (xem giai thich day du trong ham do), khong
-  # thread nao can du lieu cua thread khac nen khong can threadgroup_barrier.
+  # CHANGED (merged kernels - following fusedNormQKVRoPE/fusedResidualNormFFN of
+  # nim_inference.nim, whose REAL 6.7B model does not lag on the same hardware, using the
+  # EXISTING micro-VM - NO hand-written .metal): BEFORE, these were 3 separate
+  # dispatches (split/conv/softplus) + 4 separate sessionCopyInto moving xBC/dt
+  # back and forth between buffers per layer - per layer x 64 layers x every token that is a great
+  # many small pipeline binds/dispatches, the real source of the system
+  # lag (not commitContinue/QoS/yield - those only patch
+  # symptoms). NOW merged into ONE dispatch through
+  # buildFusedSplitConvSoftplusProgram - SAFE to merge because the conv1d here is
+  # depthwise in time (see the full explanation in that function), no
+  # thread needs another thread's data, so no threadgroup_barrier is needed.
   var hScratch = layer.hScratch
   let fP = C + cDim + H
   let fOffOutZ = fP
@@ -915,21 +915,21 @@ proc encodeLayerStep*(ctx: Backend; layer: var Mamba2GpuLayer;
   discard sessionCopyInto(be, hScratch, layer.hWork, fOffOutZ, o.offZ, C)
   discard sessionCopyInto(be, hScratch, layer.hWork, fOffOutXBC, o.offXBC, cDim)
   discard sessionCopyInto(be, hScratch, layer.hWork, fOffOutDt, o.offDt, H)
-  # SUA (fix bug conv1d dong bang - xem bao cao debug): TRUOC DAY comment o
-  # day ghi "convState KHONG duoc ghi lai, kernel goc cung khong cap nhat
-  # no" - SAI: doc lai buildConv1dIncProgram (dong 194-206) thi ban GOC CO
-  # phan "slide state" cap nhat convState, chi la bi BO SOT luc gop thanh
-  # buildFusedSplitConvSoftplusProgram. Da them lai output offOutConvSt o
-  # kernel do - copy ve o.offConvSt O DAY de convState THUC SU truot qua
-  # tung token (truoc day dong bang tu sau buoc dau, lam sai tin hieu cuc
-  # bo dua vao SSM moi layer, moi token).
+  # CHANGED (fix for the frozen conv1d bug - see the debug report): BEFORE, the comment here
+  # said "convState is NOT written back, the original kernel does not update
+  # it either" - WRONG: reading buildConv1dIncProgram again (lines 194-206), the ORIGINAL DID
+  # have a "slide state" part updating convState, it was only DROPPED when merged into
+  # buildFusedSplitConvSoftplusProgram. The offOutConvSt output was added back to
+  # that kernel - copied back to o.offConvSt HERE so convState REALLY slides over
+  # each token (before it froze after the first step, corrupting the local signal
+  # fed to the SSM of every layer, every token).
   let fOffOutConvSt = fOffOutDt + H
   discard sessionCopyInto(be, hScratch, layer.hWork, fOffOutConvSt, o.offConvSt, cDim * (K - 1))
 
-  # TOI UU (gop dispatch, xem getSsmAtProgram o tren): scan SSM chay THANG
-  # tren hWork bang buildMamba2StepAt, khong qua hScratch nua - bo 9 lan
-  # sessionCopyInto/lan/layer/token, trong do 2 lan copy state HD*N (buffer
-  # lon nhat trong buoc) la phan dat nhat. dtEnc: 1 dispatch, 0 copy phu.
+  # OPTIMISATION (merged dispatches, see getSsmAtProgram above): the SSM scan runs DIRECTLY
+  # on hWork through buildMamba2StepAt, no more hScratch - drops 9
+  # sessionCopyInto per layer per token, of which the 2 HD*N state copies (the largest
+  # buffer of the step) were the most expensive. dtEnc: 1 dispatch, 0 extra copies.
   let ssmProg = getSsmAtProgram(H, D, N, G, C, o)
   encodeMicroVm(ctx, ssmProg, layer.hWork, HD, 4, shapeKey(H, D, N, G) & "_at")
 
@@ -969,16 +969,16 @@ proc profileLayerStepByIdx*(ctx: Backend; blockIdx: int;
                             hX: byby.SessionHandle;
                             fp4InName, fp4OutName: string;
                             hResidual: byby.SessionHandle): byby.SessionHandle =
-  ## MOI - CHI DE DO (chay 1 LAN, KHONG dung cho hot path binh thuong):
-  ## lap lai CHINH XAC cac buoc cua encodeLayerStep, nhung chen 1 lan
-  ## sessionEnd() (cho THAT, do THAT gio GPU) + sessionBegin() lai giua
-  ## MOI buoc - day la CACH DUY NHAT do dung thoi gian GPU THAT cho tung
-  ## kernel rieng le, vi CPU timestamp quanh lenh encode KHONG phan anh gi
-  ## (commit la bat dong bo - GPU co the chua chay gi luc CPU "encode xong").
-  ## Chap nhan CHAY CHAM HON BINH THUONG rat nhieu (moi buoc them 1 lan
-  ## waitUntilCompleted THAT, dung nhu ly do lam cham o lan flush-moi-N-layer
-  ## truoc day) - DAY LA DANH DOI CO Y, chi chay 1 LAN de lay so lieu that,
-  ## khong phai duong chay san xuat. Bat bang BYBY_JAMBA_PROFILE_STEPS=1.
+  ## NEW - FOR MEASUREMENT ONLY (runs ONCE, NOT for the normal hot path):
+  ## repeats EXACTLY the steps of encodeLayerStep, but inserts a
+  ## sessionEnd() (a REAL wait, measuring REAL GPU time) + sessionBegin() again between
+  ## EVERY step - the ONLY way to measure the REAL GPU time of each
+  ## kernel, because CPU timestamps around encode calls reflect nothing
+  ## (commit is asynchronous - the GPU may not have run anything when the CPU "finished encoding").
+  ## It is accepted to run MUCH SLOWER than normal (each step adds a REAL
+  ## waitUntilCompleted, the same reason the earlier flush-every-N-layers was slow)
+  ## - a DELIBERATE trade-off, run only ONCE to get real numbers,
+  ## not the production path. Enable with BYBY_JAMBA_PROFILE_STEPS=1.
   doAssert blockIdx in gGpuLayers
   var layer = gGpuLayers[blockIdx]
   doAssert layer.ready
@@ -988,11 +988,11 @@ proc profileLayerStepByIdx*(ctx: Backend; blockIdx: int;
   let C = layer.C; let cDim = layer.cDim; let K = layer.K; let HD = layer.HD
 
   proc lap(label: string) =
-    discard sessionEnd(be)   # cho THAT - danh gia GPU da chay xong buoc truoc
+    discard sessionEnd(be)   # a REAL wait - the GPU has finished the previous step
     let t = epochTime()
     stderr.writeLine &"[PROFILE block{blockIdx}] {label}: {(t - gProfileLastT)*1000:.1f} ms"
     gProfileLastT = t
-    discard sessionBegin(be)  # mo lai NGAY - handle (hWork/hScratch...) van song, khong mat gi
+    discard sessionBegin(be)  # reopened RIGHT AWAY - the handles (hWork/hScratch...) stay alive, nothing lost
 
   gProfileLastT = epochTime()
   discard sessionBegin(be)
@@ -1086,9 +1086,9 @@ proc fp4GemvGpuHandle*(ctx: Backend; name: string; x: seq[float32]; M: int): byb
 proc backwardRmsGateGpu*(ctx: Backend; C: int; eps: float32;
                           yPre, z, w, dNormedOut: seq[float32]):
     tuple[dYpre, dZ, dNormWeight: seq[float32]] =
-  ## Backward RMSNorm + SiLU gate - 1 micro-kernel, 1 dispatch. Mọi phép tính
-  ## (sigmoid, gated, 2 reduction sum/dot, dGated, dSilu...) chạy trên GPU; host chỉ
-  ## chép dữ liệu vào/ra buffer (copyMem).
+  ## RMSNorm + SiLU gate backward - one micro-kernel, one dispatch. All the math
+  ## (sigmoid, gated, 2 sum/dot reductions, dGated, dSilu...) runs on the GPU; the host only
+  ## copies data into/out of the buffer (copyMem).
   let tgN = rmsBwdTgSize(C)
   var buf = newSeq[float32](7 * C)
   buf.blit(0, yPre, 0, C); buf.blit(C, z, 0, C)
@@ -1184,8 +1184,8 @@ proc selectiveScanBackwardGpu*(ctx: Backend; B, T, H, D, N, G: int;
   buf.blit(offState, states, 0, B * (T + 1) * HD * N)
   # dYpre
   buf.blit(offDY, dYpre, 0, B * T * HD)
-  # Gradient cộng dồn atomic cần zero: newSeq đã zero-init, kernel tự ghi đè dX.
-  # h/g suy ra NGAY TRONG kernel (không còn bảng idxH/idxG precompute trên CPU).
+  # Atomically accumulated gradients need zeros: newSeq zero-initialises, the kernel overwrites dX itself.
+  # h/g are derived RIGHT IN THE KERNEL (no more idxH/idxG tables precomputed on the CPU).
   
   # Build and run the FULL backward kernel (single dispatch)
   let prog = buildMamba2BackwardFullAt(B, T, H, D, N, G,
@@ -1206,7 +1206,7 @@ proc selectiveScanBackwardGpu*(ctx: Backend; B, T, H, D, N, G: int;
   result = (dXPart, dBMat, dCMat, dDt, dALog, dDSkip)
 
 # ═════════════════════════════════════════════════════════════
-# HOST WRAPPER KERNEL TRAIN (RMSNorm, Linear++, softmax-CE, Adam gộp)
+# TRAINING KERNEL HOST WRAPPERS (RMSNorm, Linear++, softmax-CE, fused Adam)
 # ═════════════════════════════════════════════════════════════
 proc isGpuCtx*(ctx: Backend): bool =
   ctx.kind in {bkMetal, bkCuda, bkVulkan}
@@ -1226,7 +1226,7 @@ proc rmsNormBackwardGpu*(ctx: Backend; x, gamma, dOut: seq[float32]; rows, C: in
                          eps: float32): tuple[dX, dGamma: seq[float32]] =
   ensureTgCap(ctx)
   let L = rmsLayout(rows, C, eps)
-  var buf = newSeq[float32](L.total)          # vùng dGamma = 0 cho atomic
+  var buf = newSeq[float32](L.total)          # dGamma region = 0 for the atomics
   buf.blit(L.x, x, 0, rows * C); buf.blit(L.gamma, gamma, 0, C)
   buf.blit(L.dy, dOut, 0, rows * C)
   let tg = rmsRowTg(C)
@@ -1272,7 +1272,7 @@ proc linearPlusForwardSteps*(L: LpLay): seq[MvmStep] =
 
 proc linearPlusForwardGpu*(ctx: Backend; qkv: seq[float32]; B, T, H, D: int): seq[float32] =
   ensureTgCap(ctx)
-  ## qkv: [B*T, 3C] (q|k|v mỗi token). Trả y [B*T, C].
+  ## qkv: [B*T, 3C] (q|k|v per token). Returns y [B*T, C].
   let L = lpLayout(B, T, H, D)
   var buf = newSeq[float32](L.total)
   buf.blit(L.qkv, qkv, 0, L.BT * 3 * L.C)
@@ -1281,10 +1281,10 @@ proc linearPlusForwardGpu*(ctx: Backend; qkv: seq[float32]; B, T, H, D: int): se
 
 proc linearPlusBackwardGpu*(ctx: Backend; qkv, dY: seq[float32]; B, T, H, D: int): seq[float32] =
   ensureTgCap(ctx)
-  ## Dựng lại forward trong cùng session rồi backward 2 pass. Trả dQKV [B*T, 3C]
-  ## (đúng layout dProj cho qkvProj.backward).
+  ## Rebuilds the forward in the same session, then a 2-pass backward. Returns dQKV [B*T, 3C]
+  ## (exactly the dProj layout for qkvProj.backward).
   let L = lpLayout(B, T, H, D)
-  var buf = newSeq[float32](L.total)          # vùng trạng thái scan = 0; dQKV được ghi đè
+  var buf = newSeq[float32](L.total)          # scan state region = 0; dQKV is overwritten
   buf.blit(L.qkv, qkv, 0, L.BT * 3 * L.C)
   buf.blit(L.dY, dY, 0, L.BT * L.C)
   var steps = linearPlusForwardSteps(L)
@@ -1297,7 +1297,7 @@ proc linearPlusBackwardGpu*(ctx: Backend; qkv, dY: seq[float32]; B, T, H, D: int
 
 proc softmaxCrossEntropyGpu*(ctx: Backend; logits: seq[float32]; targets: seq[float32];
                              rows, V, nValid: int): tuple[loss: float32, dLogits: seq[float32]] =
-  ## targets[r] < 0 => bỏ qua. nValid = số hàng hợp lệ (chia loss/gradient cho nValid).
+  ## targets[r] < 0 => skipped. nValid = number of valid rows (loss/gradient divided by nValid).
   if nValid == 0: return (0'f32, newSeq[float32](rows * V))
   ensureTgCap(ctx)
   let L = ceLayout(rows, V)
@@ -1310,13 +1310,13 @@ proc softmaxCrossEntropyGpu*(ctx: Backend; logits: seq[float32]; targets: seq[fl
     (buildCeSumProgram(L), 1, 4, 1, "@ce_sum_" & $rows)], buf)
   result = (buf[L.sum], buf[L.dLogits ..< L.dLogits + rows * V])
 
-const AdamChunk = 8 * 1024 * 1024     ## phần tử / lần dispatch (chia hết AdamTg)
+const AdamChunk = 8 * 1024 * 1024     ## elements per dispatch (a multiple of AdamTg)
 
 proc adamStepFusedGpu*(ctx: Backend; param: var seq[float32]; grad: seq[float32];
                        m, v: var seq[float32]; step: int; lr: float32;
                        b1: float32 = 0.9'f32; b2: float32 = 0.999'f32;
                        eps: float32 = 1e-8'f32) =
-  ## Adam 1 kernel / chunk (thay ~14 phép be* rời). `step` đã tăng (>=1) trước khi gọi.
+  ## Adam, 1 kernel per chunk (replacing ~14 separate be* ops). `step` is already incremented (>=1) before the call.
   let n = param.len
   let ibc1 = 1'f32 / (1'f32 - pow(b1, float32(step)))
   let ibc2 = 1'f32 / (1'f32 - pow(b2, float32(step)))
@@ -1338,8 +1338,8 @@ proc adamStepFusedGpu*(ctx: Backend; param: var seq[float32]; grad: seq[float32]
 proc apfAdamStepFused*(ctx: Backend; param: var Tensor; grad: Tensor; state: var ApfAdamState;
                        lr: float32 = 1e-3'f32; b1: float32 = 0.9'f32; b2: float32 = 0.999'f32;
                        eps: float32 = 1e-8'f32; requantizeEvery: int = 1): CustomFloat =
-  ## Drop-in cho apfAdamStepGpu: Adam 1 micro-kernel. Nếu requantizeEvery hữu hạn (APF
-  ## requantize CustomFloat) thì giữ đường cũ vì bước requantize nằm ngoài kernel này.
+  ## Drop-in for apfAdamStepGpu: Adam as one micro-kernel. With a finite requantizeEvery (APF
+  ## CustomFloat requantization) the old path is kept because requantization is outside this kernel.
   if requantizeEvery > 0 and requantizeEvery != int.high:
     return apfAdamStepGpu(ctx, param, grad, state, lr, b1, b2, eps, requantizeEvery)
   inc state.step

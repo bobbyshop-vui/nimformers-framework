@@ -93,7 +93,10 @@ prefill on a T4/M-series GPU, where the whole GEMM is a few hundred ms.
 make infer-lora BYBY_MERGE_LORA=inplace
 ```
 
-`1` is an alias for `inplace`; `0` keeps separate LoRA (the default).
+`inplace` is the default, `1` is an alias for it, and `0` keeps separate LoRA.
+On by default the merge steps aside when it cannot run (`BYBY_ONE_DISPATCH=1`,
+`BYBY_MODEL_MMAP=0`, no memory headroom) and inference continues with the
+separate adapters; requested by hand, those cases are errors instead.
 `1`/`inplace` reproduce the original merge from commit 24111a9: dequantize,
 add each LoRA rank in order, then run the same FP4-KM scale search and packing.
 GPU kernels compute both passes over 32-weight groups, including LoRA, scale
@@ -117,7 +120,7 @@ Linux KiB and macOS byte RSS measurements are normalized before checking.
 This is a process RAM guard; discrete GPU VRAM has separate accounting.
 
 The existing FP4 requantization behavior is retained. Use `BYBY_MERGE_LORA=0`
-to keep separate LoRA. The former CPU `safe` mode is not accepted by the GPU
+(formers.n: `--no-merge-lora`) to keep separate LoRA. The former CPU `safe` mode is not accepted by the GPU
 inference path. The log reports each tensor's GPU merge time, the number
 merged and peak RSS. Non-FP4 tensors keep their adapters.
 

@@ -10,7 +10,7 @@ import mamba2_ssm_gpu
 import fp4_gemv_vm
 import lora
 import quant
-import finetune_lora   # trainStepGraftStreaming (import an toan - when isMainModule cua no khong chay khi import)
+import finetune_lora   # trainStepGraftStreaming (safe import - its when isMainModule does not run on import)
 
 proc loraObjective(a, b, g: seq[float32], scale: float32): float64 =
   ## CPU float64 oracle: <G, scale * B @ A>. Deliberately independent of
@@ -733,11 +733,11 @@ when isMainModule:
                                    mambaRealNGroups = 1, mambaRealConvKernel = 3,
                                    mambaRealExpand = 2)
 
-  # ── model B: BAT DAU TU CUNG WEIGHT HET (copy tu mA), roi "quant-hoa"
-  # bang qkFp32Raw (KHONG mat mat gi - dequant = y het gia tri goc) de tach
-  # rieng "logic streaming dung khong" khoi "fp4 mat mat bao nhieu" (da test
-  # rieng o test_nimq_roundtrip.nim / test_lut.nim roi) ──────────────
-  var mB = mA   # Nim object gan = deep-copy (khong phai ref) - 2 model doc lap
+  # ── model B: STARTS FROM EXACTLY THE SAME WEIGHTS (copied from mA), then "quantized"
+  # with qkFp32Raw (LOSSLESS - dequant = the original values) to separate
+  # "is the streaming logic right" from "how lossy is fp4" (tested
+  # separately in test_nimq_roundtrip.nim / test_lut.nim) ──────────────
+  var mB = mA   # a Nim object assignment = deep copy (not a ref) - 2 independent models
 
   var quantWeights = initTable[string, QuantTensor]()
   var loraTargetsA: seq[string] = @[]
@@ -760,14 +760,14 @@ when isMainModule:
   var loA = attachLora(mA, loraTargetsA, r = 4, alpha = 8'f32)
   var loB = attachLoraQuantResident(mB, quantWeights, loraTargetsA, r = 4, alpha = 8'f32)
   bindQuantBaseToLinears(mB, loB)
-  # ep A/B cua loB GIONG HET loA (random-init khac nhau moi lan goi newLoraAdapter)
+  # force loB's A/B to be IDENTICAL to loA (newLoraAdapter random-inits differently each call)
   for name in loA.adapters.keys:
     loB.adapters[name].A.data = loA.adapters[name].A.data
     loB.adapters[name].B.data = loA.adapters[name].B.data
 
   var newBlockAdamA = initTable[string, ApfAdamState]()
   for (name, t) in paramList(mA):
-    if "block1." in name or "block3." in name:   # block 'A' o vi tri 1,3 trong "RARA"
+    if "block1." in name or "block3." in name:   # 'A' blocks at positions 1,3 of "RARA"
       newBlockAdamA[name] = newApfAdamState(t[].data.len)
   var stateA = newLoraTrainState(loA, lr = 1e-2'f32)
   var stateB = newLoraTrainState(loB, lr = 1e-2'f32)
@@ -831,8 +831,8 @@ when isMainModule:
     let streamed = attnStoreB.loadW(name, t[].data.len)
     for i in 0 ..< t[].data.len:
       maxNewBlockDiff = max(maxNewBlockDiff, abs(t[].data[i] - streamed[i]))
-  echo &"chenh lech LoRA A/B sau 1 buoc Adam = {maxAdapterDiff:.6f}"
-  echo &"chenh lech new-block sau 1 buoc Adam = {maxNewBlockDiff:.6f}"
+  echo &"LoRA A/B difference after 1 Adam step = {maxAdapterDiff:.6f}"
+  echo &"new-block difference after 1 Adam step = {maxNewBlockDiff:.6f}"
 
   var quantFlagMismatch = false
   for name, enabled in paramQuantFlags(mB):
@@ -841,7 +841,7 @@ when isMainModule:
 
   if abs(lossA-lossB) < 1e-3'f32 and maxAdapterDiff < 1e-3'f32 and
      maxNewBlockDiff < 1e-3'f32 and not quantFlagMismatch:
-    echo "PASS - streaming cho ket qua GIONG HET non-streaming"
+    echo "PASS - streaming gives EXACTLY the same result as non-streaming"
   else:
-    echo "FAIL - streaming SAI, can xem lai"
+    echo "FAIL - streaming is WRONG, needs a look"
     quit(1)

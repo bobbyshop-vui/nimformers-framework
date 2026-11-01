@@ -131,7 +131,7 @@ proc forwardMambaMixerInfer(mamba: Mamba2Real; x: Tensor; ctx: Backend):
   if useSparse:
     let projection = pfExpr("blk.inProj", mamba.inProj.forward(x, ctx))
     let pfVm0 = getMonoTimeIfPf()
-    var head = newSeq[float32](L.states + L.HD * L.N)   # duoi = state[0] = 0
+    var head = newSeq[float32](L.states + L.HD * L.N)   # tail = state[0] = 0
     head.blit(L.proj, projection.data, 0, L.BT * L.P)
     head.blit(L.convW, mamba.convWeight.data, 0, cDim * K)
     head.blit(L.convB, mamba.convBias.data, 0, cDim)
@@ -151,7 +151,7 @@ proc forwardMambaMixerInfer(mamba: Mamba2Real; x: Tensor; ctx: Backend):
         [(off: L.normedOut, len: L.BT * C), (off: L.states + T * L.HD * L.N, len: L.HD * L.N)])
     except CatchableError as e:
       ok = false
-      stderr.writeLine "[prefill] sparse Mamba2 chain loi -> dung full buffer: " & e.msg
+      stderr.writeLine "[prefill] sparse Mamba2 chain failed -> using the full buffer: " & e.msg
     if ok:
       pfAddIf("blk.mamba2Vm", pfVm0)
       let normed = Tensor(shape: @[B, T, C], data: outs[0])
@@ -175,20 +175,20 @@ proc forwardMambaMixerInfer(mamba: Mamba2Real; x: Tensor; ctx: Backend):
 
 type
   LoraGradSpec* = object
-    ## Adapter LoRA cua 1 Linear: A [r, inF], B [outF, r] (row-major, nhu LoraAdapter).
+    ## LoRA adapter of one Linear: A [r, inF], B [outF, r] (row-major, like LoraAdapter).
     A*, B*: seq[float32]
     r*: int
     scale*: float32
 
-## Backward LoRA-aware (train LoRA): trainStep dang ky adapter theo TEN tham so
-## (vd "block7.mambaReal.inProj.weight") truoc backwardBlock va xoa sau do. Voi
-## Linear co dang ky, backward KHONG tinh dW day du [outF, inF] (19.5 GMAC + doc/ghi
-## ~300MB cho inProj) roi rut gon qua gradToAB, ma tinh thang:
+## LoRA-aware backward (LoRA training): trainStep registers adapters by parameter NAME
+## (e.g. "block7.mambaReal.inProj.weight") before backwardBlock and removes them afterwards. For
+## a registered Linear the backward does NOT compute the full dW [outF, inF] (19.5 GMAC + reading/writing
+## ~300MB for inProj) and then reduce it with gradToAB; it computes directly:
 ##   dB = s * dY^T (X A^T)      [outF, r]
 ##   dA = s * (dY B)^T X        [r, inF]
-## - dung bang toan hoc voi gradToAB(dW = dY^T X). Grad ghi vao grads[key & "::loraA"]
-## va grads[key & "::loraB"]; dX van = dY @ W_eff (weight da merge LoRA) nhu cu.
-## Bang rong (mac dinh, moi duong infer/khac) -> giu nguyen duong backward cu.
+## - mathematically the same as gradToAB(dW = dY^T X). Grads go to grads[key & "::loraA"]
+## and grads[key & "::loraB"]; dX is still dY @ W_eff (weights with LoRA merged) as before.
+## An empty table (the default, every infer/other path) -> keeps the old backward path.
 var gLoraGradRequest* = initTable[string, LoraGradSpec]()
 
 proc linearBackwardLoraAware*(l: Linear; x, dOut: Tensor; spec: LoraGradSpec;
@@ -198,12 +198,12 @@ proc linearBackwardLoraAware*(l: Linear; x, dOut: Tensor; spec: LoraGradSpec;
   let outF = l.outF
   let r = spec.r
   doAssert cols == inF and dOut.shape[^1] == outF and dOut.data.len == rows * outF,
-    &"LoRA-aware backward: x.shape={x.shape} dOut.shape={dOut.shape} khong khop Linear {inF}->{outF}"
+    &"LoRA-aware backward: x.shape={x.shape} dOut.shape={dOut.shape} do not match Linear {inF}->{outF}"
   doAssert l.weight.data.len == outF * inF,
-    "LoRA-aware backward can weight fp32 da merge LoRA trong l.weight.data"
+    "LoRA-aware backward needs fp32 weights with LoRA merged in l.weight.data"
   doAssert r > 0 and spec.A.len == r * inF and spec.B.len == outF * r,
-    "LoRA-aware backward: A/B sai kich thuoc"
-  # dX = dOut @ W_eff  ([rows,outF] @ [outF,inF]) - giong nhanh dX cua Linear.backward.
+    "LoRA-aware backward: A/B have the wrong size"
+  # dX = dOut @ W_eff  ([rows,outF] @ [outF,inF]) - like the dX branch of Linear.backward.
   result.dX = Tensor(shape: x.shape,
                      data: beMatmul(ctx, dOut.data, rows, outF, l.weight.data, outF, inF))
   # XAt[t,k] = sum_i x[t,i] * A[k,i]
@@ -247,8 +247,8 @@ proc linearBackwardLoraAware*(l: Linear; x, dOut: Tensor; spec: LoraGradSpec;
 
 proc linearBackwardMaybeLora(l: Linear; key: string; x, dOut: Tensor; ctx: Backend;
                              grads: var Table[string, Tensor]; biasKey: string): Tensor =
-  ## Linear co adapter dang ky -> LoRA-aware (grads[key::loraA/::loraB]); khong thi
-  ## Linear.backward day du nhu cu (grads[key] = dW).
+  ## A Linear with a registered adapter -> LoRA-aware (grads[key::loraA/::loraB]); otherwise
+  ## the full Linear.backward as before (grads[key] = dW).
   if key in gLoraGradRequest:
     let g = linearBackwardLoraAware(l, x, dOut, gLoraGradRequest[key], ctx)
     grads[key & "::loraA"] = g.dA
@@ -284,8 +284,8 @@ proc backwardMambaMixerKernel(mamba: Mamba2Real; x: Tensor;
   var buf = cache.buf
   buf.blit(L.dNormedOut, dNormed.data, 0, L.BT * C)
   let tgR = rmsTg(L)
-  # Moi nhom = 1 command buffer nhu truoc, nhung buf chi upload/doc lai 1 lan cho ca
-  # rms_bwd + 16 chunk scan_bwd + dt/conv (truoc: 18 lan upload + 18 lan doc ca scratch).
+  # Each group = one command buffer as before, but buf is uploaded/read back only once for the whole
+  # rms_bwd + 16 scan_bwd chunks + dt/conv (before: 18 uploads + 18 reads of the whole scratch).
   var groups: seq[seq[MvmStep]]
   groups.add @[(buildM2RmsBwdProgram(L), L.BT * L.normGroups * tgR, tgR * 4, tgR,
       "@m2_rms_bwd_" & m2Tag(L))]
@@ -375,10 +375,10 @@ proc forwardRBlockKernel*(mamba: Mamba2Real; x, normGamma: Tensor;
                           exportTerminalState = false):
     tuple[y: Tensor, cache: HybridBlockKernelCache] =
   ## Complete R block: norm, Mamba2Real mixer, and residual.
-  ## cache.mambaY = mixer output TRƯỚC residual (để đo rms(mambaY)/rms(x)).
+  ## cache.mambaY = mixer output BEFORE the residual (to measure rms(mambaY)/rms(x)).
   let xNorm = pfExpr("blk.rms", blockRmsForward(x, normGamma, normEps, ctx))
   if exportTerminalState and not saveBackwardCache:
-    # Suy luan (prefill): khong can backward cache -> mixer khong dua scratch ve host.
+    # Inference (prefill): no backward cache needed -> the mixer does not bring the scratch back to the host.
     let mi = forwardMambaMixerInfer(mamba, xNorm, ctx)
     result.y = pfExpr("blk.residual", addT(ctx, x, mi.y))
     result.cache = HybridBlockKernelCache(xNorm: xNorm, hasLinearPlus: false,

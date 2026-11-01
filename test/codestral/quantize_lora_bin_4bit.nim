@@ -1,29 +1,29 @@
 ## quantize_lora_bin_4bit.nim
-## Chuyển checkpoint LoRA .bin (fp32 thô, rawbin) sang bản QLoRA 4-bit
-## để giảm kích thước đĩa/RAM (~8GB fp32 -> ~1–1.5GB tùy số block Attention).
+## Converts a LoRA .bin checkpoint (raw fp32, rawbin) into a 4-bit QLoRA version
+## to reduce disk/RAM size (~8GB fp32 -> ~1–1.5GB depending on the number of Attention blocks).
 ##
-## Quy ước:
-##   - Adapter LoRA A/B: GIỮ fp32 (rank thấp, nhỏ, cần precision khi train/merge).
-##   - newBlock::* (weight block Attention full-train): quantize 4-bit
-##     (mặc định qkInt4Asymmetric per-group 128, gần Q4_K_M).
-##   - Meta + format magic mới "NIMBIN4\0" để load nhận ra và dequant đúng lúc cần.
-##   - GHI ĐÈ được: truyền cùng path nguồn/đích (ghi file .tmp rồi rename an toàn).
+## Conventions:
+##   - LoRA adapters A/B: KEPT in fp32 (low rank, small, need precision for training/merging).
+##   - newBlock::* (fully trained Attention block weights): quantized to 4 bits
+##     (default qkInt4Asymmetric per-group 128, close to Q4_K_M).
+##   - Meta + a new format magic "NIMBIN4\0" so the loader recognises it and dequantizes when needed.
+##   - CAN OVERWRITE: pass the same source/destination path (writes a .tmp file and renames safely).
 ##
-## Dùng:
+## Usage:
 ##   nim c -d:release quantize_lora_bin_4bit.nim
-##   ./quantize_lora_bin_4bit jamba_lora.bin              # GHI ĐÈ cùng file
+##   ./quantize_lora_bin_4bit jamba_lora.bin              # OVERWRITES the same file
 ##   ./quantize_lora_bin_4bit jamba_lora.bin jamba_lora.bin
-##   ./quantize_lora_bin_4bit jamba_lora.bin out_qlora4.bin  # ra file khác
+##   ./quantize_lora_bin_4bit jamba_lora.bin out_qlora4.bin  # to another file
 ##
-## Sau khi có file 4-bit:
-##   - finetune_lora / infer_lora đã được bổ sung load path nhận magic NIMBIN4
-##     (SUA: newBlock giữ nguyên dạng nén QuantTensor, gộp vào lora.quantBase
-##     cùng base .nimq - dequant-on-the-fly + giải phóng qua mergeIn()/
-##     restoreBase() trong lora.nim, KHÔNG còn dequant hết về fp32 lúc load
-##     nữa; adapter A/B vẫn fp32 như cũ, dùng loadQLora4Bin thay vì
-##     loadQLora4BinDequant - hàm cũ vẫn còn, không ai gọi nữa).
-##   - Muốn train/infer nhẹ hơn nữa: giữ quant-resident cho base Mamba qua .nimq
-##     như pipeline codestral hiện có (đã có sẵn).
+## Once the 4-bit file exists:
+##   - finetune_lora / infer_lora have a load path for the NIMBIN4 magic
+##     (CHANGED: newBlock stays compressed as a QuantTensor, merged into lora.quantBase
+##     together with the base .nimq - dequant on the fly + release through mergeIn()/
+##     restoreBase() in lora.nim, NO longer fully dequantized to fp32 at load
+##     time; adapters A/B stay fp32 as before, loaded with loadQLora4Bin instead of
+##     loadQLora4BinDequant - the old function still exists but nobody calls it).
+##   - For even lighter training/inference: keep the base Mamba quant-resident through a .nimq
+##     like the existing codestral pipeline (already available).
 
 import std/[os, strformat, strutils, tables, math, streams]
 
@@ -37,7 +37,7 @@ const
   MAGIC_QLORA4* = "NIMBIN4\0"
   DefaultGroupSize = 128
 
-# ── Ghi/đọc QuantTensor thô vào stream (tương thích layout quant.nim) ─────
+# ── Raw QuantTensor read/write on a stream (compatible with the quant.nim layout) ─────
 
 proc writeI32(s: Stream, v: int32) =
   var x = v
@@ -60,7 +60,7 @@ proc writeQuantTensorRaw(s: Stream, qt: QuantTensor) =
   writeI32(s, int32(qt.scale.len))
   if qt.scale.len > 0:
     s.writeData(unsafeAddr qt.scale[0], qt.scale.len * 4)
-  # zero_point cùng số phần tử với scale (layout quant.nim)
+  # zero_point has as many elements as scale (quant.nim layout)
   var zp = qt.zero_point
   if zp.len != qt.scale.len:
     zp = newSeq[float32](qt.scale.len)
@@ -75,16 +75,16 @@ proc writeQuantTensorRaw(s: Stream, qt: QuantTensor) =
 
 proc quantizeNewBlock*(data: seq[float32], shape: seq[int],
                       kind: QuantKind, groupSize: int): QuantTensor =
-  ## Chọn đường quant tốt nhất có sẵn trong quant.nim.
+  ## Picks the best quantization path available in quant.nim.
   case kind
   of qkInt4Asymmetric:
-    # per-tensor asymmetric trước; nếu 2D và groupSize>0 thì dùng path per-group
-    # (quantizeInt4Asymmetric hiện tại là per-tensor; per-group nằm ở
-    # dequantize path / export_to_nimq). Để đơn giản + ổn định: quantize
-    # per-row nếu 2D (mỗi hàng 1 scale) — tốt hơn per-tensor rất nhiều.
+    # per-tensor asymmetric first; if 2D and groupSize>0 the per-group path is used
+    # (the current quantizeInt4Asymmetric is per-tensor; per-group lives in the
+    # dequantize path / export_to_nimq). For simplicity + stability: quantize
+    # per row when 2D (one scale per row) — much better than per-tensor.
     if shape.len == 2 and shape[0] > 0 and shape[1] > 0:
-      # Layout khớp dequantizeInt4Asymmetric (per-row): mỗi hàng pad lên
-      # bytesPerRow = ceil(cols/2), scale/zp theo hàng.
+      # Layout matches dequantizeInt4Asymmetric (per-row): each row is padded to
+      # bytesPerRow = ceil(cols/2), scale/zp per row.
       let rows = shape[0]
       let cols = shape[1]
       let bytesPerRow = (cols + 1) div 2
@@ -124,11 +124,11 @@ proc quantizeNewBlock*(data: seq[float32], shape: seq[int],
   of qkInt4:
     result = quantizeInt4(data, shape)
   of qkFp4KM:
-    # cols phải chia hết groupSize
+    # cols must be divisible by groupSize
     if shape.len == 2 and shape[1] mod groupSize == 0:
       result = quantizeFp4KM(data, shape, groupSize = groupSize)
     else:
-      echo "[qlora4] qkFp4KM yêu cầu cols chia hết groupSize; fallback int4 asymmetric"
+      echo "[qlora4] qkFp4KM requires cols divisible by groupSize; falling back to int4 asymmetric"
       result = quantizeNewBlock(data, shape, qkInt4Asymmetric, groupSize)
   else:
     result = quantizeInt4Asymmetric(data, shape)
@@ -136,16 +136,16 @@ proc quantizeNewBlock*(data: seq[float32], shape: seq[int],
 proc saveQLora4Bin*(path: string, meta: Table[string, string],
                     fp32Tensors: seq[RawBinTensor],
                     quantTensors: seq[(string, QuantTensor)]) =
-  ## Magic NIMBIN4:
-  ##   meta (giống NIMBIN1) + nFp32 + [fp32 tensors] + nQuant + [quant tensors]
+  ## NIMBIN4 magic:
+  ##   meta (like NIMBIN1) + nFp32 + [fp32 tensors] + nQuant + [quant tensors]
   ##
-  ## QUAN TRỌNG CHO TRAIN/RESUME: ghi vào .tmp rồi rename sau khi close.
-  ## Không được ghi thẳng vào checkpoint đích, vì nếu process bị kill/OOM
-  ## trong lúc save thì checkpoint cũ phải còn nguyên để lần sau resume.
+  ## IMPORTANT FOR TRAINING/RESUME: writes to .tmp and renames after closing.
+  ## Never write straight into the target checkpoint: if the process is killed/OOMs
+  ## while saving, the old checkpoint must stay intact for the next resume.
   let tmpPath = path & ".tmp"
   var f = newFileStream(tmpPath, fmWrite)
   if f == nil:
-    raise newException(IOError, "Không thể ghi: " & tmpPath)
+    raise newException(IOError, "Cannot write: " & tmpPath)
   try:
     f.write(MAGIC_QLORA4)
     writeI32(f, int32(meta.len))
@@ -166,12 +166,12 @@ proc saveQLora4Bin*(path: string, meta: Table[string, string],
       writeQuantTensorRaw(f, qt)
   finally:
     f.close()
-  # POSIX/macOS: rename là atomic ở mức pathname -> reader thấy checkpoint cũ
-  # hoặc checkpoint mới hoàn chỉnh, không thấy file nửa chừng.
+  # POSIX/macOS: rename is atomic at the pathname level -> readers see the old checkpoint
+  # or the complete new one, never a half-written file.
   if cRename(tmpPath.cstring, path.cstring) != 0:
     try: removeFile(tmpPath)
     except OSError: discard
-    raise newException(IOError, "Khong the commit checkpoint atomic: " & tmpPath & " -> " & path)
+    raise newException(IOError, "Cannot commit the checkpoint atomically: " & tmpPath & " -> " & path)
 
 proc isQLora4Bin*(path: string): bool =
   var f = newFileStream(path, fmRead)
@@ -183,15 +183,15 @@ proc isQLora4Bin*(path: string): bool =
 
 proc loadQLora4BinDequant*(path: string): tuple[meta: Table[string, string],
                                                  tensors: seq[RawBinTensor]] =
-  ## Load NIMBIN4 và dequant toàn bộ newBlock về fp32 (adapters vốn đã fp32).
-  ## Kết quả tương thích loadRawBin / loadCheckpointLoraBin cũ.
+  ## Loads NIMBIN4 and dequantizes every newBlock to fp32 (the adapters are already fp32).
+  ## The result is compatible with the old loadRawBin / loadCheckpointLoraBin.
   var f = newFileStream(path, fmRead)
   if f == nil:
-    raise newException(IOError, "Không đọc được: " & path)
+    raise newException(IOError, "Cannot read: " & path)
   defer: f.close()
   var magic = newString(8)
   if f.readData(addr magic[0], 8) != 8 or magic != MAGIC_QLORA4:
-    raise newException(IOError, "Không phải NIMBIN4: " & path)
+    raise newException(IOError, "Not NIMBIN4: " & path)
 
   proc readI32Local(): int32 =
     var x: int32 = 0
@@ -232,7 +232,7 @@ proc loadQLora4BinDequant*(path: string): tuple[meta: Table[string, string],
   let nQuant = readI32Local().int
   for i in 0 ..< nQuant:
     let name = readStrLocal()
-    # Đọc QuantTensor (layout giống quant.nim writeQuantTensor)
+    # Reads a QuantTensor (same layout as quant.nim writeQuantTensor)
     var qt: QuantTensor
     var kindByte: uint8
     if f.readData(addr kindByte, 1) != 1:
@@ -262,28 +262,28 @@ proc loadQLora4BinDequant*(path: string): tuple[meta: Table[string, string],
 proc loadQLora4Bin*(path: string): tuple[meta: Table[string, string],
                                           fp32Tensors: seq[RawBinTensor],
                                           quantWeights: Table[string, QuantTensor]] =
-  ## SUA (bug RAM): loadQLora4BinDequant (phia tren) dequant TOAN BO newBlock
-  ## ve fp32 NGAY LUC LOAD roi giu resident SUOT doi song process - dung y
-  ## het van de ma quant-resident (quantBase/mergeIn/restoreBase trong
-  ## lora.nim) da giai quyet cho base Mamba, chi khac la ap dung nham cho
-  ## newBlock. Ham nay: doc dung 1 lan tu dia (khong doi dinh dang file),
-  ## nhung KHONG goi dequantizeTensor - tra newBlock ve dang QuantTensor
-  ## (con nen) trong bang rieng `quantWeights`, key la TEN THAT cua tham so
-  ## (da bo tien to "newBlock::") de khop truc tiep voi paramList(m)/byName.
-  ## Ben goi (loadBinaryLoraForInfer/loadCheckpointLoraBin) chi can gop bang
-  ## nay vao lora.quantBase (cung bang voi quantResident cua base .nimq) -
-  ## roi mergeIn()/restoreBase() (hoac forwardStepJambaWithLora cho pattern
-  ## thuan 'R') se TU DEQUANT-ON-THE-FLY + GIAI PHONG y het nhu base, khong
-  ## can code rieng. newBlock chi con nam trong RAM o dang fp32 trong LUC
-  ## thuc su forward (mergeIn...restoreBase), khong con "song" tu luc load
-  ## cho toi khi thoat chuong trinh nua.
+  ## CHANGED (RAM bug): loadQLora4BinDequant (above) dequantizes ALL of newBlock
+  ## to fp32 RIGHT AT LOAD and keeps it resident for the WHOLE process lifetime - exactly
+  ## the problem quant-resident (quantBase/mergeIn/restoreBase in
+  ## lora.nim) solved for the base Mamba, only wrongly applied to
+  ## newBlock. This function: reads the disk once (same file format),
+  ## but does NOT call dequantizeTensor - returns newBlock still as QuantTensors
+  ## (compressed) in a separate `quantWeights` table, keyed by the REAL parameter NAME
+  ## (the "newBlock::" prefix removed) to match paramList(m)/byName directly.
+  ## The caller (loadBinaryLoraForInfer/loadCheckpointLoraBin) only needs to merge this table
+  ## into lora.quantBase (the same table as the base .nimq quantResident) -
+  ## then mergeIn()/restoreBase() (or forwardStepJambaWithLora for an all-'R'
+  ## pattern) DEQUANTIZE ON THE FLY + RELEASE exactly like the base, no
+  ## separate code needed. newBlock lives in RAM as fp32 only WHILE
+  ## really running forward (mergeIn...restoreBase), no longer from load
+  ## until the program exits.
   var f = newFileStream(path, fmRead)
   if f == nil:
-    raise newException(IOError, "Không đọc được: " & path)
+    raise newException(IOError, "Cannot read: " & path)
   defer: f.close()
   var magic = newString(8)
   if f.readData(addr magic[0], 8) != 8 or magic != MAGIC_QLORA4:
-    raise newException(IOError, "Không phải NIMBIN4: " & path)
+    raise newException(IOError, "Not NIMBIN4: " & path)
 
   proc readI32Local(): int32 =
     var x: int32 = 0
@@ -326,9 +326,9 @@ proc loadQLora4Bin*(path: string): tuple[meta: Table[string, string],
   for i in 0 ..< nQuant:
     let name = readStrLocal()
     if name in result.quantWeights:
-      raise newException(IOError, "NIMBIN4 co quant tensor trung ten: " & name)
-    # Doc QuantTensor (layout giong quant.nim writeQuantTensor) - GIU NGUYEN
-    # dang nen, KHONG dequantizeTensor o day (khac loadQLora4BinDequant).
+      raise newException(IOError, "NIMBIN4 has a duplicate quant tensor name: " & name)
+    # Reads a QuantTensor (same layout as quant.nim writeQuantTensor) - KEPT
+    # compressed, NO dequantizeTensor here (unlike loadQLora4BinDequant).
     var qt: QuantTensor
     var kindByte: uint8
     if f.readData(addr kindByte, 1) != 1:
@@ -352,8 +352,8 @@ proc loadQLora4Bin*(path: string): tuple[meta: Table[string, string],
     qt.data = newSeq[uint8](dlen)
     if dlen > 0 and f.readData(addr qt.data[0], dlen) != dlen:
       raise newException(IOError, "EOF quant data: " & name)
-    # name luu trong file la "newBlock::<ten that>" (xem convert()) - bo tien
-    # to de khop paramList(m)/byName nhu quantResident cua base .nimq.
+    # the name stored in the file is "newBlock::<real name>" (see convert()) - the prefix
+    # is removed to match paramList(m)/byName like the base .nimq quantResident.
     let realName = if name.startsWith("newBlock::"): name[10 .. ^1] else: name
     result.quantWeights[realName] = qt
 
@@ -365,13 +365,13 @@ proc humanSize(bytes: int64): string =
 
 proc convert*(src, dst: string, kind: QuantKind = qkInt4Asymmetric, groupSize: int = DefaultGroupSize) =
   if not fileExists(src):
-    raise newException(IOError, "Không tìm thấy: " & src)
+    raise newException(IOError, "Not found: " & src)
   if isQLora4Bin(src):
-    echo "[qlora4] File nguồn đã là NIMBIN4 — bỏ qua (đã quantize rồi)."
+    echo "[qlora4] The source file is already NIMBIN4 — skipping (already quantized)."
     return
 
   let overwrite = (absolutePath(src) == absolutePath(dst))
-  echo &"[qlora4] Đọc checkpoint fp32: {src}" & (if overwrite: " (sẽ GHI ĐÈ cùng file)" else: "")
+  echo &"[qlora4] Reading the fp32 checkpoint: {src}" & (if overwrite: " (will OVERWRITE the same file)" else: "")
   let srcSz = getFileSize(src)
   let loaded = loadRawBin(src)
   var meta = loaded.meta
@@ -384,16 +384,16 @@ proc convert*(src, dst: string, kind: QuantKind = qkInt4Asymmetric, groupSize: i
 
   for t in loaded.tensors:
     if t.name.startsWith("adapter::"):
-      # Giữ fp32 cho A/B
+      # Keep A/B in fp32
       fp32Keep.add(t)
     elif t.name.startsWith("newBlock::"):
       if t.data.len == 0:
-        echo &"[qlora4] Bỏ qua tensor rỗng: {t.name}"
+        echo &"[qlora4] Skipping empty tensor: {t.name}"
         continue
-      # FIX: 1-D (bias/gamma/beta) giữ fp32 raw, chỉ 2-D chia hết 32 mới quantize 4-bit
-      # tránh sai số lượng tử 13-15% RMS làm hỏng LayerNorm.
-      # SUA2: attn.* / fuseGate.* train full từ 0 với lr nhỏ → giá trị gần nhiễu
-      # FP4-KM; giữ fp32 raw (format mixed vẫn hỗ trợ FP4-KM cho tensor khác).
+      # FIX: 1-D (bias/gamma/beta) stays raw fp32, only 2-D tensors divisible by 32 are quantized to 4 bits,
+      # avoiding the 13-15% RMS quantization error that broke LayerNorm.
+      # CHANGED2: attn.* / fuseGate.* are trained fully from 0 with a small lr → values close to the FP4-KM
+      # noise; kept raw fp32 (the mixed format still supports FP4-KM for other tensors).
       let bare = if t.name.startsWith("newBlock::"): t.name[10 .. ^1] else: t.name
       let isSensitiveFullTrain =
         bare.contains(".attn.") or bare.contains(".fuseGate.")
@@ -407,25 +407,25 @@ proc convert*(src, dst: string, kind: QuantKind = qkInt4Asymmetric, groupSize: i
         fp32Keep.add(t)
         let reason = if isSensitiveFullTrain: "attn/fuseGate full-train (fp32)"
                      else: "1D/bias/gamma"
-        echo &"[qlora4]   {t.name}: shape={t.shape}  giữ nguyên FP32 raw ({reason})"
+        echo &"[qlora4]   {t.name}: shape={t.shape}  kept as raw FP32 ({reason})"
     else:
-      # Giữ nguyên (an toàn)
+      # Kept as is (safe)
       fp32Keep.add(t)
 
-  # Ghi đè an toàn: luôn ghi file tạm rồi rename → tránh hỏng file giữa chừng
+  # Safe overwrite: always writes a temporary file then renames → no half-written file
   let outPath = if overwrite: dst & ".qlora4.tmp" else: dst
-  echo &"[qlora4] Ghi {outPath} (adapters fp32={fp32Keep.len}, newBlock 4bit={quantList.len})"
+  echo &"[qlora4] Writing {outPath} (fp32 adapters={fp32Keep.len}, 4-bit newBlock={quantList.len})"
   saveQLora4Bin(outPath, meta, fp32Keep, quantList)
 
   if overwrite:
     moveFile(outPath, dst)
-    echo &"[qlora4] Đã GHI ĐÈ {dst}"
+    echo &"[qlora4] OVERWROTE {dst}"
   let dstSz = getFileSize(dst)
-  echo &"[qlora4] Xong. {humanSize(srcSz)} -> {humanSize(dstSz)} (giảm ~{(1.0 - dstSz.float/max(srcSz.float,1.0))*100:.0f}%)"
-  echo "[qlora4] Magic NIMBIN4 — finetune/infer load được ngay."
+  echo &"[qlora4] Done. {humanSize(srcSz)} -> {humanSize(dstSz)} (about {(1.0 - dstSz.float/max(srcSz.float,1.0))*100:.0f}% smaller)"
+  echo "[qlora4] NIMBIN4 magic — finetune/infer can load it right away."
 
 when isMainModule:
-  # Mặc định ghi đè cùng file:
+  # Default: overwrite the same file:
   #   ./quantize_lora_bin_4bit jamba_lora.bin
   #   ./quantize_lora_bin_4bit jamba_lora.bin jamba_lora.bin
   let src = if paramCount() >= 1: paramStr(1) else: "jamba_lora.bin"

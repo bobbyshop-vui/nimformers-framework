@@ -1,14 +1,14 @@
-## gpu_layers.nim — các lớp còn lại của đường infer 100% GPU, 1 command buffer / token.
+## gpu_layers.nim — the remaining layers of the 100% GPU infer path, 1 command buffer / token.
 ##
-## Mọi kernel ở đây là BYTECODE micro-VM (fp4_gemv_vm.nim) đi qua jit_vm
-## (lower -> compile JIT 1 lần / shape -> cache). KHÔNG có MSL nhúng trong Nim.
+## Every kernel here is micro-VM BYTECODE (fp4_gemv_vm.nim) going through jit_vm
+## (lower -> JIT compile once / shape -> cache). NO MSL embedded in Nim.
 ##
-##   * GpuLora        : delta LoRA  y += scale * B (A x)   (2 gemv fp32 nhỏ)
-##   * GpuLin         : Linear của block A (fp4 resident hoặc fp32) + bias + LoRA
+##   * GpuLora        : LoRA delta  y += scale * B (A x)   (2 small fp32 gemvs)
+##   * GpuLin         : a block-A Linear (resident fp4 or fp32) + bias + LoRA
 ##   * GpuAttnLayer   : block A = LN1 -> QKV -> Linear++ step -> out -> +res
 ##                                -> LN2 -> FC1+APFLU -> FC2 -> +res
 ##
-## Tất cả encode vào session đang mở; không sessionRead giữa chừng.
+## Everything is encoded into the open session; no sessionRead in between.
 
 import std/[tables, os, strutils, math, monotimes, times, algorithm, strformat]
 import backend
@@ -24,7 +24,7 @@ when defined(macosx):
 import quant      # QuantTensor, QuantKind
 import nimformer   # Linear (weightQ/useQuant/weight/bias/loraA..)
 
-# ── JIT cache riêng cho kernel infer (compile NGAY, hotThreshold=0) ─────
+# ── Separate JIT cache for the infer kernels (compiled RIGHT AWAY, hotThreshold=0) ─────
 var gVmCache = jit_vm.initJitCache(jit_vm.JitConfig(
   hotThreshold: 0, enableMetalJit: true, enableVulkanJit: true,
   enableCpuJit: false, maxCacheEntries: 1024))
@@ -33,29 +33,29 @@ var gVmCache = jit_vm.initJitCache(jit_vm.JitConfig(
 var gJitV2* = gVmCache
 
 proc vmKernel*(p: VmProgram; tag: string): string =
-  ## Lower bytecode -> Metal (jit_vm) -> compile -> tên pipeline. Gọi NGOÀI
-  ## session (lúc prepare) để việc compile không nằm trong hot path.
-  ## Program dùng op U-* KHÔNG có đường interpreter -> compile fail = raise ngay
-  ## (thay vì rơi vào micro_vm_kernel rồi ra kết quả rác im lặng).
+  ## Lowers bytecode -> Metal (jit_vm) -> compile -> pipeline name. Called OUTSIDE
+  ## a session (during prepare) so compilation is not in the hot path.
+  ## Programs using U-* ops have NO interpreter path -> a compile failure raises right away
+  ## (instead of falling back to micro_vm_kernel and silently giving garbage).
   let kn = jit_vm.dispatchProgram(gVmCache, p, tag)
   if kn.len == 0 or kn == "micro_vm_kernel":
     raise newException(CatchableError,
-      "vmKernel[" & tag & "]: JIT Metal THAT BAI (program dung op U-*, khong co " &
-      "duong interpreter). Bat BYBY_JIT_DUMP_SOURCE=1 de xem source + loi compile.")
+      "vmKernel[" & tag & "]: Metal JIT FAILED (the program uses U-* ops, there is no " &
+      "interpreter path). Set BYBY_JIT_DUMP_SOURCE=1 to see the source + compile error.")
   kn
 
 proc vmKernelForBe*(p: VmProgram; tag: string; be: byby.GpuBackend): string =
-  ## Chọn Metal MSL vs Vulkan GLSL theo backend.
+  ## Picks Metal MSL or Vulkan GLSL by backend.
   if be == byby.gbVulkan:
     result = jit_vm.kernelNameFor(gJitV2, p, tag)
   else:
     result = jit_vm.dispatchProgramNoSession(gJitV2, p, tag)
   if result.len == 0 or result == "micro_vm_kernel":
-    raise newException(CatchableError, "vmKernelForBe[" & tag & "]: JIT that bai")
+    raise newException(CatchableError, "vmKernelForBe[" & tag & "]: JIT failed")
 
-# ── buffer dummy: kernel JIT luôn khai báo buffer(1..3) -> bind slot trống ─
-# Per-backend: một gDummy toàn cục gây nil handle khi process chuyển Metal↔Vulkan
-# (bisect/sweep) vì gDummyReady chỉ set 1 lần.
+# ── dummy buffers: JIT kernels always declare buffer(1..3) -> bind the empty slots ─
+# Per backend: a single global gDummy gave nil handles when the process switched Metal↔Vulkan
+# (bisect/sweep) because gDummyReady was set only once.
 var gDummyMetal: byby.SessionHandle
 var gDummyVulkan: byby.SessionHandle
 var gDummyMetalReady = false
@@ -82,7 +82,7 @@ template gDummy*: byby.SessionHandle =
   else: gDummyMetal
 
 proc bindOr(idx: int; h: byby.SessionHandle; offElems: int) =
-  ## API chung: route theo h.kind.
+  ## Shared API: routes by h.kind.
   let isVk = h.kind == byby.gbVulkan
   let dummy = gDummyFor(if isVk: byby.gbVulkan else: byby.gbMetal)
   let mbuf = if h.metalHandle != nil: h.metalHandle
@@ -100,9 +100,9 @@ proc encodeVmKernel*(kname: string; nThreads, tgSize, tgBytes: int;
   let glslSrc = if isVk: jit_vm.cachedGlslSource(gJitV2, kname) else: ""
   if isVk and glslSrc.len == 0:
     raise newException(CatchableError,
-      "encodeVmKernel[" & kname & "]: khong co GLSL source (can kernelNameFor truoc)")
+      "encodeVmKernel[" & kname & "]: no GLSL source (call kernelNameFor first)")
   if not sessionEncPipeline(isVk, kname, glslSrc):
-    raise newException(CatchableError, "encodeVmKernel: khong bind duoc pipeline " & kname)
+    raise newException(CatchableError, "encodeVmKernel: cannot bind pipeline " & kname)
   if isVk:
     bindOr(0, memOut, memOff)
     bindOr(1, wU8, 0)
@@ -118,11 +118,11 @@ proc encodeVmKernel*(kname: string; nThreads, tgSize, tgBytes: int;
   let maxTG = sessionEncMaxTg(isVk)
   if maxTG > 0 and tgSize > maxTG:
     raise newException(CatchableError,
-      "encodeVmKernel[" & kname & "]: can " & $tgSize & " tg nhung max=" & $maxTG)
+      "encodeVmKernel[" & kname & "]: needs " & $tgSize & " tg but max=" & $maxTG)
   if not sessionEncDispatch(isVk, nThreads, tgSize, tgBytes):
-    raise newException(CatchableError, "encodeVmKernel[" & kname & "]: dispatch that bai")
+    raise newException(CatchableError, "encodeVmKernel[" & kname & "]: dispatch failed")
 
-# ── kernel dùng chung (không phụ thuộc shape) ───────────────────────────
+# ── shared kernels (shape independent) ───────────────────────────
 var gKnBias = ""
 var gKnBiasApflu = ""
 var gEluPlus1Kn = ""
@@ -130,8 +130,8 @@ var gEluPlus1BackwardKn = ""
 var gGpuKernelsReady = false
 var gGpuKernelsBe: byby.GpuBackend
 proc ensureGpuKernels*(be: byby.GpuBackend) =
-  ## Compile bias kernels CHO DUNG backend. Neu doi Metal<->Vulkan phai compile lai
-  ## (ten kernel + GLSL/MSL cache khac nhau).
+  ## Compiles the bias kernels FOR THE RIGHT backend. Switching Metal<->Vulkan needs a recompile
+  ## (different kernel names + GLSL/MSL caches).
   if gGpuKernelsReady and gGpuKernelsBe == be: return
   ensureDummy(be)
   gKnBias = vmKernelForBe(buildBiasActProgram(false), "bias", be)
@@ -167,7 +167,7 @@ proc encodeEluPlus1Backward*(ctx: Backend; hInput, hOutput: byby.SessionHandle; 
   encodeVmKernel(gEluPlus1BackwardKn, n, min(n, 256), 16,
                  hOutput, 0, gDummy, gDummy, hInput, 0)
 
-# ── LoRA trên GPU ──────────────────────────────────────────────────────
+# ── LoRA on the GPU ──────────────────────────────────────────────────────
 type
   GpuLora* = object
     aBuf*, bBuf*: byby.SessionHandle
@@ -175,14 +175,14 @@ type
     r*, inF*, outF*: int
     scale*: float32
     knA*, knB*: string
-    bSmallK*: bool                   ## knB dùng kernel 1-thread/hàng (r <= 32)
+    bSmallK*: bool                   ## knB uses the 1-thread/row kernel (r <= 32)
     ready*: bool
 
 var gLoraGpu* = initTable[string, GpuLora]()
 
 proc prepareLoraGpu*(ctx: Backend; name: string; loraA, loraB: openArray[float32];
                      r, inF, outF: int; scale: float32): bool =
-  ## Upload A [r,inF] và B [outF,r] (fp32, nhỏ) 1 lần. Kernel = 2 gemv bytecode.
+  ## Uploads A [r,inF] and B [outF,r] (fp32, small) once. Kernels = 2 bytecode gemvs.
   if r <= 0 or loraA.len != r * inF or loraB.len != outF * r: return false
   if name in gLoraGpu and gLoraGpu[name].ready: return true
   let be = ctx.kind.toByby()
@@ -192,14 +192,14 @@ proc prepareLoraGpu*(ctx: Backend; name: string; loraA, loraB: openArray[float32
   g.scale = scale
   g.aBuf = byby.sessionUploadPrivate(be, @(loraA))
   g.bBuf = byby.sessionUploadPrivate(be, @(loraB))
-  g.hT = byby.sessionUploadPrivate(be, newSeq[float32](max(r, 64)))   # ghi được: kernel ghi vào memF32
-  # Vulkan: kernelNameFor + cache GLSL (encodeVmKernel can cachedGlslSource).
-  # Metal: vmKernel / dispatch MSL. Truoc day luon vmKernel(Metal) -> Vulkan warmup fail.
+  g.hT = byby.sessionUploadPrivate(be, newSeq[float32](max(r, 64)))   # writable: the kernel writes into memF32
+  # Vulkan: kernelNameFor + GLSL cache (encodeVmKernel needs cachedGlslSource).
+  # Metal: vmKernel / MSL dispatch. It always used vmKernel(Metal) before -> the Vulkan warmup failed.
   let progA = buildF32GemvProgram(inF, r, 1.0'f32, false)
   g.knA = vmKernelForBe(progA, "lora_a", be)
-  # B là [outF, r]: K = r (bé) và N = outF. Với r <= 32, kernel 32-lane ở
-  # trên tiêu 5 barrier chỉ cho một dot-product 4..16 phần tử; kernel
-  # 1-thread-1-hàng (không reduction) rẻ hơn hẳn.
+  # B is [outF, r]: K = r (small) and N = outF. With r <= 32 the 32-lane kernel
+  # above spends 5 barriers on a 4..16-element dot product; the
+  # 1-thread-per-row kernel (no reduction) is much cheaper.
   if r <= 32:
     let progB = buildF32GemvSmallKProgram(r, outF, scale, true)
     g.knB = vmKernelForBe(progB, "lora_b_sk", be)
@@ -213,14 +213,14 @@ proc prepareLoraGpu*(ctx: Backend; name: string; loraA, loraB: openArray[float32
   true
 
 var gDisableLora* = false
-  ## chan doan (bisect): true = bo qua MOI delta LoRA luc encode -> model goc.
+  ## diagnostics (bisect): true = skip EVERY LoRA delta while encoding -> the base model.
 
 proc encodeLoraDelta*(name: string; hIn: byby.SessionHandle; inOff: int;
                       hOut: byby.SessionHandle; outOff: int): bool =
   ## hOut[outOff ..< +outF] += scale * B (A hIn[inOff ..< +inF])
   if gDisableLora: return false
   if name notin gLoraGpu:
-    # Trước đây return false im lặng → LoRA bị bỏ, logits lệch mà không log.
+    # It used to return false silently → the LoRA was dropped and the logits drifted without a log.
     if getEnv("BYBY_LORA_VERBOSE", "0") != "0":
       stderr.writeLine "[encodeLoraDelta] name missing in gLoraGpu: " & name
     return false
@@ -266,13 +266,13 @@ proc uploadInt4WeightOnce(ctx: Backend; name: string; qt: QuantTensor; K, N: int
   let be = ctx.kind.toByby()
   let groupSize = qt.groupSize
   doAssert int4AsymSupported(K, groupSize),
-    "uploadInt4WeightOnce " & name & ": K=" & $K & " groupSize=" & $groupSize & " khong ho tro tren GPU"
+    "uploadInt4WeightOnce " & name & ": K=" & $K & " groupSize=" & $groupSize & " not supported on the GPU"
   var c: Int4LinCacheGpu
   c.wBuf = sessionUploadBytesShared(be, qt.bytes)
   c.knName = vmKernelForBe(buildInt4AsymGemvProgram(K, N, groupSize),
     "int4_gemv_" & $K & "x" & $N & "_g" & $groupSize, be)
   c.N = N; c.groupSize = groupSize
-  # scale + zero_point nối tiếp nhau (khớp buildInt4AsymGemvProgram: [scale(N*nG) | zp(N*nG)])
+  # scale + zero_point back to back (matching buildInt4AsymGemvProgram: [scale(N*nG) | zp(N*nG)])
   var scZp = newSeq[float32](qt.scale.len + qt.zero_point.len)
   for i in 0 ..< qt.scale.len: scZp[i] = qt.scale[i]
   for i in 0 ..< qt.zero_point.len: scZp[qt.scale.len + i] = qt.zero_point[i]
@@ -283,7 +283,7 @@ proc uploadInt4WeightOnce(ctx: Backend; name: string; qt: QuantTensor; K, N: int
 proc markFp4Lin*(ctx: Backend; name: string; bias: seq[float32]; K, N: int): GpuLin
 proc uploadBiasOrRaise(name: string; bias: seq[float32]; N: int): seq[float32]
 
-var gLinCache* = initTable[string, GpuLin]()   ## 1 nguon su that duy nhat: MOI Linear (R lan A, moi kind) tra qua day.
+var gLinCache* = initTable[string, GpuLin]()   ## the single source of truth: EVERY Linear (R and A, every kind) goes through here.
 
 type Fp4Plan = object
   kn, label: string
@@ -396,14 +396,14 @@ proc tuneFp4Plan(ctx: Backend; c: Fp4LinCacheGpu; batch: int): Fp4Plan =
   echo &"[gpu-tune] FP4 {c.cols}x{c.rows} M={batch}: {result.label}, {bestMs:.3f}ms (GPU parity checked)"
 
 proc prepareGpuLinForLinear*(ctx: Backend; name: string; lin: var Linear): GpuLin =
-  ## Chuẩn bị GPU Linear cho MỌI dạng weight (R lẫn A: fp4-KM resident,
-  ## int4-asymmetric resident, hoặc fp32 fallback random-init lúc chưa load).
-  ## Dùng CHUNG bytecode-gemv (khong MSL) cho ca 3 nhanh, va LUON ghi ket qua
-  ## vao gLinCache[name] - day la NGUON SU THAT DUY NHAT ma encodeLinByName
-  ## (dung cho R qua fp4GemvAt) tra cuu. Truoc ban nay co 2 bang rieng
-  ## (gFp4CacheGpu/gInt4CacheGpu) va nhanh fallback fp32 KHONG duoc dang ky o
-  ## dau ca -> encodeLinByName tra ve false -> crash "chua prepareGpuLinForLinear"
-  ## dung luc warmup, dung o block dau tien roi vao nhanh fp32/fallback.
+  ## Prepares a GPU Linear for EVERY weight form (R and A: resident fp4-KM,
+  ## resident int4-asymmetric, or the random-init fp32 fallback before loading).
+  ## The SAME gemv bytecode (no MSL) for all 3 branches, and the result is ALWAYS written
+  ## to gLinCache[name] - the SINGLE SOURCE OF TRUTH that encodeLinByName
+  ## (used by R through fp4GemvAt) looks up. Before this version there were 2 separate tables
+  ## (gFp4CacheGpu/gInt4CacheGpu) and the fp32 fallback branch was NOT registered
+  ## anywhere -> encodeLinByName returned false -> a "prepareGpuLinForLinear not called" crash
+  ## during warmup, exactly at the first block that hit the fp32/fallback branch.
   if name in gLinCache and gLinCache[name].ready:
     return gLinCache[name]
   let be = ctx.kind.toByby()
@@ -413,14 +413,14 @@ proc prepareGpuLinForLinear*(ctx: Backend; name: string; lin: var Linear): GpuLi
     if name notin gFp4CacheGpu or not gFp4CacheGpu[name].residentReady:
       let lut = fp4_gemv_gpu.buildFp4KmLutQ(lin.weightQ)
       let gsz = if lin.weightQ.groupSize > 0: lin.weightQ.groupSize else: 32
-      # Kernel gemv fp4-KM = bytecode micro-VM -> JIT compile 1 lan / shape (NGOAI session).
-      # jitName PHAI la ten pipeline that; rong => sessionPipeline("") that bai luc encode.
+      # The fp4-KM gemv kernel = micro-VM bytecode -> JIT compiled once / shape (OUTSIDE a session).
+      # jitName MUST be a real pipeline name; empty => sessionPipeline("") fails at encode time.
       # The paired-row specialization assumes both an even output-row count
       # and the kernel's 32-wide input-group layout. Keep odd/non-multiple
       # shapes on the general implementation instead of failing at JIT time.
       let pairRows = gsz == 32 and K mod 32 == 0 and N mod 2 == 0
-      # BYBY_GEMV_VARIANT: 0 = 2 hang, 1 = nap rong 32-bit, 2 = 4 hang/threadgroup (mac dinh).
-      # Bien the khong ap dung duoc cho shape nay -> tu ve kernel 2 hang. Do bang bench_gemv_variants.nim.
+      # BYBY_GEMV_VARIANT: 0 = 2 rows, 1 = 32-bit wide loads, 2 = 4 rows/threadgroup (default).
+      # A variant not applicable to this shape -> falls back to the 2-row kernel. Measured with bench_gemv_variants.nim.
       let variantSetting = getEnv("BYBY_GEMV_VARIANT", "auto")
       let variant = (try: parseInt(variantSetting) except ValueError: 2)
       let useWide = variant == 1 and pairRows and fp4KmGemvWideSupported(K, N)
@@ -440,7 +440,7 @@ proc prepareGpuLinForLinear*(ctx: Backend; name: string; lin: var Linear): GpuLi
         var c = gFp4CacheGpu[name]
         c.glslSrc = jit_vm.glslSourceFor(gJitV2, prog, tag)
         gFp4CacheGpu[name] = c
-      # Prefill MBLOCK=4: weight doc 1 lan / 4 token (nhu matmul_q4_batched)
+      # Prefill MBLOCK=4: weights read once per 4 tokens (like matmul_q4_batched)
       if gsz == 32 and K mod 32 == 0 and name in gFp4CacheGpu:
         let m4prog = buildFp4KmGemmM4Program(K, N)
         let m4tag = "fp4km_m4_" & $K & "x" & $N
@@ -461,12 +461,12 @@ proc prepareGpuLinForLinear*(ctx: Backend; name: string; lin: var Linear): GpuLi
           let plan = tuneFp4Plan(ctx, c, 8)
           c.m8JitName = plan.kn; c.m8TgSize = plan.tg
         gFp4CacheGpu[name] = c
-    lin.weightQ.clearPayload()   # host trung -> giai phong, GPU da giu ban Shared
+    lin.weightQ.clearPayload()   # duplicate on the host -> freed, the GPU keeps the Shared copy
     lin.gpuCacheName = name
     result = markFp4Lin(ctx, name, lin.bias.data, K, N)
   elif lin.useQuant and lin.weightQ.kind == qkInt4Asymmetric and int4AsymSupported(K, lin.weightQ.groupSize):
     uploadInt4WeightOnce(ctx, name, lin.weightQ, K, N)
-    lin.weightQ.clearPayload()   # host trung -> giai phong, GPU da giu ban Shared
+    lin.weightQ.clearPayload()   # duplicate on the host -> freed, the GPU keeps the Shared copy
     result.name = name; result.K = K; result.N = N
     result.knF32 = gInt4CacheGpu[name].knName
     result.wF32 = gInt4CacheGpu[name].scZpBuf
@@ -477,18 +477,18 @@ proc prepareGpuLinForLinear*(ctx: Backend; name: string; lin: var Linear): GpuLi
     result.int4WBuf = gInt4CacheGpu[name].wBuf
     result.isInt4 = true
   elif lin.useQuant and lin.weightQ.kind == qkInt4Asymmetric:
-    raise newException(ValueError, "prepareGpuLinForLinear " & name & ": weightQ la int4-asymmetric " &
-      "nhung K=" & $K & " groupSize=" & $lin.weightQ.groupSize & " khong thoa int4AsymSupported " &
-      "(can K%64==0, groupSize=0 hoac luy thua 2 >=64). KHONG fallback fp32.")
+    raise newException(ValueError, "prepareGpuLinForLinear " & name & ": weightQ is int4-asymmetric " &
+      "but K=" & $K & " groupSize=" & $lin.weightQ.groupSize & " does not satisfy int4AsymSupported " &
+      "(needs K%64==0, groupSize=0 or a power of 2 >=64). NO fp32 fallback.")
   else:
-    # FP32 master: block G attn/fuseGate train full. Chi chap nhan weight.len==K*N.
+    # FP32 master: block G attn/fuseGate are trained fully. Only weight.len==K*N is accepted.
     let expected = K * N
     if expected <= 0 or lin.weight.floatValues.len != expected:
       raise newException(ValueError, "prepareGpuLinForLinear " & name &
         ": lin.useQuant=" & $lin.useQuant &
         (if lin.useQuant: " weightQ.kind=" & $lin.weightQ.kind else: "") &
         " weight.len=" & $lin.weight.floatValues.len & " expected=" & $expected &
-        " - khong quant hop le va khong co FP32 master.")
+        " - no valid quantization and no FP32 master.")
     let prog = buildF32GemvProgram(K, N, 1.0'f32, false)
     let kn = vmKernelForBe(prog, "f32_gemv_" & $K & "x" & $N, be)
     result.name = name; result.K = K; result.N = N
@@ -515,25 +515,25 @@ proc prepareGpuLinForLinear*(ctx: Backend; name: string; lin: var Linear): GpuLi
   gLinCache[name] = result
 
 proc uploadBiasOrRaise(name: string; bias: seq[float32]; N: int): seq[float32] =
-  ## Truoc day bias.len != N -> am tham newSeq[float32](N) = 0.
-  ## fuseGate.bias init=4; neu bi 0 -> sigmoid(0)=0.5 thay vi ~0.98 -> sidecar
-  ## chiem 50% residual -> token rac. outProj/bias-less co the bias.len==0 hop le.
+  ## Before, bias.len != N silently became newSeq[float32](N) = 0.
+  ## fuseGate.bias inits to 4; if it became 0 -> sigmoid(0)=0.5 instead of ~0.98 -> the sidecar
+  ## took 50% of the residual -> garbage tokens. outProj/bias-less Linears may validly have bias.len==0.
   if bias.len == N:
     return bias
   if bias.len == 0:
-    # Linear khong co bias (hoac chua restore). fuseGate BAT BUOC co bias=4.
+    # Linear without a bias (or not restored yet). fuseGate REQUIRES bias=4.
     if "fuseGate" in name:
       raise newException(ValueError,
-        "uploadBiasOrRaise[" & name & "]: fuseGate.bias rong (len=0) nhung can N=" &
-        $N & ". Bias bi mat khi restore -> gate=sigmoid(0)=0.5 -> token rac. " &
-        "Kiem tra load checkpoint / byName / paramList co fuseGate.bias.")
+        "uploadBiasOrRaise[" & name & "]: fuseGate.bias is empty (len=0) but needs N=" &
+        $N & ". The bias was lost on restore -> gate=sigmoid(0)=0.5 -> garbage tokens. " &
+        "Check that the checkpoint load / byName / paramList has fuseGate.bias.")
     return newSeq[float32](N)
   raise newException(ValueError,
     "uploadBiasOrRaise[" & name & "]: bias.len=" & $bias.len & " != N=" & $N &
-    " (shape lech, KHONG zero-pad im lang).")
+    " (shape mismatch, NO silent zero padding).")
 
 proc markFp4Lin*(ctx: Backend; name: string; bias: seq[float32]; K, N: int): GpuLin =
-  ## Weight đã nằm trong gFp4CacheGpu[name] (uploadFp4WeightOnce).
+  ## The weight is already in gFp4CacheGpu[name] (uploadFp4WeightOnce).
   let be = ctx.kind.toByby()
   ensureGpuKernels(be)
   result.name = name; result.K = K; result.N = N; result.isFp4 = true
@@ -547,22 +547,22 @@ proc encodeLin*(l: GpuLin; hIn: byby.SessionHandle; inOff: int;
 
 proc encodeLinByName*(name: string; hIn: byby.SessionHandle; inOff: int;
                       hOut: byby.SessionHandle; outOff: int): bool =
-  ## Dung cho R-block (mamba2_fused_step.encodeLayerV2 goi qua fp4GemvAt).
-  ## Tra cuu DUY NHAT qua gLinCache (xem prepareGpuLinForLinear) - khong con
-  ## doan rieng fp4-vs-int4-vs-fp32 o day nua (do la nguon bug truoc: nhanh
-  ## fp32-fallback khong duoc dang ky o bang nao ca).
+  ## Used by R blocks (mamba2_fused_step.encodeLayerV2 calls it through fp4GemvAt).
+  ## Looked up ONLY through gLinCache (see prepareGpuLinForLinear) - no more
+  ## separate fp4-vs-int4-vs-fp32 guessing here (that was the earlier bug source: the
+  ## fp32-fallback branch was not registered in any table).
   if name notin gLinCache or not gLinCache[name].ready: return false
-  encodeLin(gLinCache[name], hIn, inOff, hOut, outOff, bias = false)  # R: khong cong bias (giu dung hanh vi cu)
+  encodeLin(gLinCache[name], hIn, inOff, hOut, outOff, bias = false)  # R: no bias added (keeps the old behaviour)
   true
 
 proc encodeLin*(l: GpuLin; hIn: byby.SessionHandle; inOff: int;
                 hOut: byby.SessionHandle; outOff: int;
                 bias = true; apflu = false) =
-  ## y = W x (+ LoRA) (+ bias) (+ APFLU). Thứ tự khớp Linear.forward():
-  ## base -> cộng delta LoRA -> cộng bias.
+  ## y = W x (+ LoRA) (+ bias) (+ APFLU). Same order as Linear.forward():
+  ## base -> add the LoRA delta -> add the bias.
   if l.isFp4:
     if not encodeFp4Gemv(gFp4CacheGpu[l.name], hIn, inOff, hOut, outOff):
-      raise newException(CatchableError, "encodeLin: fp4 gemv that bai " & l.name)
+      raise newException(CatchableError, "encodeLin: fp4 gemv failed " & l.name)
   elif l.isInt4:
     encodeVmKernel(l.knF32, l.N * GemvTg, GemvTg, int4GemvTgBytes(),
                    hOut, outOff, l.int4WBuf, l.wF32, hIn, inOff)
@@ -573,9 +573,9 @@ proc encodeLin*(l: GpuLin; hIn: byby.SessionHandle; inOff: int;
   if bias and l.hasBias:
     encodeBias(hOut, outOff, l.biasH, l.N, apflu)
   elif apflu:
-    raise newException(CatchableError, "encodeLin: apflu can bias kernel (" & l.name & " khong co bias)")
+    raise newException(CatchableError, "encodeLin: apflu needs the bias kernel (" & l.name & " has no bias)")
 
-# ── Scratch dùng chung mọi block A ──────────────────────────────────────
+# ── Scratch shared by every A block ──────────────────────────────────────
 type
   AttnScratch* = object
     hAttn*: byby.SessionHandle    ## [hidden]
@@ -598,16 +598,16 @@ proc ensureAttnScratch*(be: byby.GpuBackend; hidden, ffDim: int) =
 type
   GpuAttnLayer* = object
     lay*: LpLayout
-    hWork*: byby.SessionHandle          ## [proj | y | z | S] (state nằm trên GPU)
+    hWork*: byby.SessionHandle          ## [proj | y | z | S] (the state lives on the GPU)
     knStep*: string
     qkv*, outp*, fc1*, fc2*: GpuLin
     gate*: GpuLin
     hGateInput*, hGateLogit*, hGateProb*, hGateComplement*, hGateOnes*: byby.SessionHandle
-    ## Snapshot truoc mul in-place (chi cap khi BYBY_G_DIAGNOSTICS): de in mean mamba/attn/mix
+    ## Snapshot before the in-place mul (allocated only with BYBY_G_DIAGNOSTICS): to print the mamba/attn/mix means
     hDiagMamba*, hDiagAttn*: byby.SessionHandle
     gated*: bool
     ln1G*, ln1B*, ln2G*, ln2B*: byby.SessionHandle
-    ln1Ones*: byby.SessionHandle        ## gamma=1 (preset "-unit": doc checkpoint train bang trainer cu)
+    ln1Ones*: byby.SessionHandle        ## gamma=1 (preset "-unit": reads checkpoints trained with the old trainer)
     hidden*, ffDim*, nHeads*: int
     eps*: float32
     ready*: bool
@@ -623,10 +623,10 @@ proc initAttnLayer*(ctx: Backend; hidden, nHeads, ffDim: int;
   let be = ctx.kind.toByby()
   ensureGpuKernels(be)
   if hidden mod nHeads != 0:
-    raise newException(ValueError, "initAttnLayer: hidden khong chia het nHeads")
+    raise newException(ValueError, "initAttnLayer: hidden is not divisible by nHeads")
   if hidden mod 64 != 0:
     raise newException(ValueError,
-      "initAttnLayer: hidden phai chia het 64 (offset buffer can 256 byte tren Intel)")
+      "initAttnLayer: hidden must be divisible by 64 (buffer offsets need 256 bytes on Intel)")
   result.lay = lpLayout(hidden, nHeads)
   result.hWork = byby.sessionUploadPrivate(be, newSeq[float32](result.lay.total))
   result.knStep = vmKernelForBe(buildLinearPlusStepProgram(result.lay, 1e-6'f32),
@@ -656,7 +656,7 @@ proc initAttnLayer*(ctx: Backend; hidden, nHeads, ffDim: int;
   ensureAttnScratch(be, hidden, ffDim)
 
 proc resetAttnLayerState*(ctx: Backend; blockIdx: int): bool =
-  ## Xoá z và S (bắt đầu chuỗi mới). PHẢI gọi trong session đang mở.
+  ## Clears z and S (starts a new sequence). MUST be called inside an open session.
   if blockIdx notin gAttnLayers: return false
   let be = ctx.kind.toByby()
   let lp = addr gAttnLayers[blockIdx]
@@ -673,16 +673,16 @@ proc encodeLinearPlusBranch*(ctx: Backend; blockIdx: int;
                              hOut: byby.SessionHandle;
                              useRms = false; unitGamma = false;
                              inputPreNormalized = false) =
-  ## Chỉ tính nhánh Linear++ từ hidden đầu vào; không cộng residual/FFN.
+  ## Computes only the Linear++ branch from the input hidden; no residual/FFN added.
   ##
-  ## Norm dau vao PHAI giong nhanh R cung khoi: luc train khoi P tinh MOT dau ra
-  ## chuan hoa x1 = rms1(x) roi dua cho CA Mamba lan Linear++ (jamba_hybrid.forwardBlock).
-  ##   useRms=true  : RMSNorm chi gamma (preset rms-*; la cai train hien tai dung)
-  ##   useRms=false : LayerNorm gamma+beta (preset ln-*; khoi 'A' thuan luon the nay)
-  ##   unitGamma    : gamma=1 (chi preset "-unit", doc checkpoint cu)
-  ## Truoc day ham nay LUON LayerNorm -> sidecar P o infer nhan dau vao khac hang so
-  ## so voi luc train (tru mean + beta thay vi chia rms) trong khi nhanh R theo preset.
-  doAssert blockIdx in gAttnLayers, "encodeAttnLayer: chua initAttnLayer(" & $blockIdx & ")"
+  ## The input norm MUST match the R branch of the same block: in training a P block computes ONE
+  ## normalised output x1 = rms1(x) and feeds it to BOTH Mamba and Linear++ (jamba_hybrid.forwardBlock).
+  ##   useRms=true  : RMSNorm with gamma only (rms-* presets; what current training uses)
+  ##   useRms=false : LayerNorm gamma+beta (ln-* presets; plain 'A' blocks always do this)
+  ##   unitGamma    : gamma=1 (only the "-unit" preset, for reading old checkpoints)
+  ## This function used to ALWAYS use LayerNorm -> the P sidecar at inference got an input of a different scale
+  ## than in training (mean + beta subtracted instead of dividing by rms) while the R branch followed the preset.
+  doAssert blockIdx in gAttnLayers, "encodeAttnLayer: initAttnLayer(" & $blockIdx & ") not called"
   let lp = addr gAttnLayers[blockIdx]
   template L: untyped = lp[]
   let be = ctx.kind.toByby()
@@ -691,17 +691,17 @@ proc encodeLinearPlusBranch*(ctx: Backend; blockIdx: int;
     if useRms:
       let gam = if unitGamma: L.ln1Ones else: L.ln1G
       if not sessionRmsnormEnc(be, hInput, gam, hNorm, 1, L.hidden, L.eps):
-        raise newException(CatchableError, "encodeLinearPlusBranch: rmsnorm ln1 that bai")
+        raise newException(CatchableError, "encodeLinearPlusBranch: rmsnorm ln1 failed")
     else:
       if not sessionLayernormEnc(be, hInput, L.ln1G, L.ln1B, hNorm, 1, L.hidden, L.eps):
-        raise newException(CatchableError, "encodeLinearPlusBranch: layernorm ln1 that bai")
+        raise newException(CatchableError, "encodeLinearPlusBranch: layernorm ln1 failed")
   encodeLin(L.qkv, hNorm, 0, L.hWork, lay.offProj)               # proj = [Q|K|V]
-  encodeVmKernel(L.knStep, lay.H * lay.D, lay.D, 16,             # Linear++ step (state tai cho)
+  encodeVmKernel(L.knStep, lay.H * lay.D, lay.D, 16,             # Linear++ step (state in place)
                  L.hWork, 0, gDummy, gDummy, gDummy, 0)
   encodeLin(L.outp, L.hWork, lay.offY, hOut, 0)
 
 proc encodeAttnLayer*(ctx: Backend; blockIdx: int;
-                      hRes: byby.SessionHandle;          ## [hidden] vào + ra (in-place)
+                      hRes: byby.SessionHandle;          ## [hidden] in + out (in-place)
                       hNorm: var byby.SessionHandle) =   ## [hidden] scratch
   let lp = addr gAttnLayers[blockIdx]
   template L: untyped = lp[]
@@ -711,24 +711,24 @@ proc encodeAttnLayer*(ctx: Backend; blockIdx: int;
   encodeLinearPlusBranch(ctx, blockIdx, hRes, hNorm, hA)
   var hDst = hRes
   if not sessionVecOp(be, "add", hRes, hA, hDst, L.hidden):
-    raise newException(CatchableError, "encodeAttnLayer: residual attn that bai")
+    raise newException(CatchableError, "encodeAttnLayer: residual attn failed")
 
   # ── FFN ──
   if not sessionLayernormEnc(be, hRes, L.ln2G, L.ln2B, hNorm, 1, L.hidden, L.eps):
-    raise newException(CatchableError, "encodeAttnLayer: layernorm ln2 that bai")
+    raise newException(CatchableError, "encodeAttnLayer: layernorm ln2 failed")
   encodeLin(L.fc1, hNorm, 0, hF, 0, bias = true, apflu = true)   # APFLU(0.1, 1.0) co bias
   encodeLin(L.fc2, hF, 0, hA, 0)
   if not sessionVecOp(be, "add", hRes, hA, hDst, L.hidden):
-    raise newException(CatchableError, "encodeAttnLayer: residual ffn that bai")
+    raise newException(CatchableError, "encodeAttnLayer: residual ffn failed")
 
 proc lpStepSelfCheck*(ctx: Backend; blockIdx: int; T = 4): string =
-  ## KIEM TRA 100% GPU - KHONG tinh toan model tren CPU. Chay THANG kernel Linear++
-  ## step (cung kernel/buffer/state cua infer) voi [Q|K|V] tu tao, doi chieu voi
-  ## dang thuc GIAI TICH cua linear attention:
-  ##   (1) K, V co dinh qua T token       => y_t = V               (trong so chuan hoa = 1)
-  ##   (2) K co dinh, V xen ke a,b,a,b    => y_t = trung binh chay cua V
-  ## Sai offset head (h*D), cong don S/z, barrier giua cac lane hay chuan hoa deu lam lech.
-  if blockIdx notin gAttnLayers: return "chua init khoi A " & $blockIdx
+  ## 100% GPU CHECK - NO model computation on the CPU. Runs the Linear++
+  ## step kernel DIRECTLY (the same kernel/buffer/state as inference) with a made-up [Q|K|V] and compares with
+  ## the ANALYTIC identities of linear attention:
+  ##   (1) K, V fixed over T tokens       => y_t = V               (normalised weights = 1)
+  ##   (2) K fixed, V alternating a,b,a,b    => y_t = running mean of V
+  ## A wrong head offset (h*D), S/z accumulation, barrier between lanes or normalisation all break it.
+  if blockIdx notin gAttnLayers: return "block A " & $blockIdx & " not initialised"
   let be = ctx.kind.toByby()
   let lp = addr gAttnLayers[blockIdx]
   let lay = lp.lay
@@ -750,9 +750,9 @@ proc lpStepSelfCheck*(ctx: Backend; blockIdx: int; T = 4): string =
     for i in 0 ..< C: qs[t][i] = rnd()
   var worst = [0.0, 0.0]
   for mode in 1 .. 2:
-    if not sessionBegin(be): return "sessionBegin that bai (reset)"
+    if not sessionBegin(be): return "sessionBegin failed (reset)"
     discard resetAttnLayerState(ctx, blockIdx)
-    if not sessionEnd(be): return "sessionEnd that bai (reset)"
+    if not sessionEnd(be): return "sessionEnd failed (reset)"
     for t in 0 ..< T:
       var proj = newSeq[float32](3 * C)
       for i in 0 ..< C:
@@ -763,7 +763,7 @@ proc lpStepSelfCheck*(ctx: Backend; blockIdx: int; T = 4): string =
       var hw = lp.hWork
       if not sessionBegin(be):
         sessionFree(be, hP)
-        return "sessionBegin that bai"
+        return "sessionBegin failed"
       discard sessionCopyInto(be, hP, hw, 0, lay.offProj, 3 * C)
       var err = ""
       try:
@@ -772,13 +772,13 @@ proc lpStepSelfCheck*(ctx: Backend; blockIdx: int; T = 4): string =
         err = e.msg
       let okEnd = sessionEnd(be)
       sessionFree(be, hP)
-      if err.len > 0: return "encode loi: " & err
-      if not okEnd: return "sessionEnd that bai: " & sessionGetLastError(be)
+      if err.len > 0: return "encode error: " & err
+      if not okEnd: return "sessionEnd failed: " & sessionGetLastError(be)
       let all = sessionRead(be, hw, lay.offY + C)
       var mx = 0.0
       var md = 0.0
-      let na = t div 2 + 1          # so token a trong 0..t
-      let nb = (t + 1) div 2        # so token b trong 0..t
+      let na = t div 2 + 1          # number of a tokens in 0..t
+      let nb = (t + 1) div 2        # number of b tokens in 0..t
       for i in 0 ..< C:
         let want: float64 =
           if mode == 1: float64(va[i])
@@ -788,7 +788,7 @@ proc lpStepSelfCheck*(ctx: Backend; blockIdx: int; T = 4): string =
       worst[mode - 1] = max(worst[mode - 1], md / max(mx, 1e-12))
   let tol = 2e-3
   result = "kernel Linear++ step (khoi A #" & $blockIdx & ", " & $T & " token): " &
-           "K,V co dinh sai=" & $worst[0] &
-           " | V xen ke sai=" & $worst[1] &
-           (if worst[0] < tol and worst[1] < tol: "  => KHOP dang thuc giai tich"
-            else: "  => LECH: kernel Linear++ step tren GPU sai (offset head/cong don state/barrier)")
+           "K,V fixed error=" & $worst[0] &
+           " | V alternating error=" & $worst[1] &
+           (if worst[0] < tol and worst[1] < tol: "  => MATCHES the analytic identity"
+            else: "  => DIFFERS: the Linear++ step kernel on the GPU is wrong (head offset/state accumulation/barrier)")

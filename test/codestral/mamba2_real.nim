@@ -1,13 +1,13 @@
 ## mamba2_real.nim
-## Bản Mamba2 ĐÚNG công thức gốc (khác Mamba2SSD "linear-attention-có-decay-
-## đơn-giản-hoá" trong test_nimformer.nim). Khớp kiến trúc HF `Mamba2Mixer`
-## mà mistralai/Mamba-Codestral-7B-v0.1 dùng, để weight pretrain map 1-1.
+## A Mamba2 with the CORRECT original formula (unlike the "simplified linear attention
+## with decay" Mamba2SSD in test_nimformer.nim). Matches the HF `Mamba2Mixer` architecture
+## used by mistralai/Mamba-Codestral-7B-v0.1, so the pretrained weights map 1-1.
 ##
-## Toán học (mỗi timestep t, head h, channel d trong head, state n):
+## Math (per timestep t, head h, channel d within the head, state n):
 ##   proj            = inProj(x)
 ##   z, xBC, dt_in   = split(proj)
 ##   xBC_conv        = SiLU(CausalConv1dDepthwise(xBC))
-##   x, B, C         = split(xBC_conv)          # B, C dùng chung theo GROUP
+##   x, B, C         = split(xBC_conv)          # B, C shared per GROUP
 ##   A_h             = -exp(A_log[h])
 ##   dt_t,h          = softplus(dt_in_t,h + dt_bias[h])
 ##   dA_t,h          = exp(dt_t,h * A_h)
@@ -16,19 +16,19 @@
 ##   gated           = y * SiLU(z)
 ##   normed          = RMSNorm(gated) * normWeight
 ##   out             = outProj(normed)
-## g(h) = h div (numHeads div nGroups)  (B/C share theo group, kiểu GQA).
+## g(h) = h div (numHeads div nGroups)  (B/C shared per group, GQA style).
 ##
-## HIỆU NĂNG: backward là BPTT TUẦN TỰ qua từng timestep (đúng toán, không
-## dùng thuật chunked-SSD song song của paper gốc) - cache state đầy đủ nên
-## tốn RAM O(T*H*headDim*dState). Dùng tốt cho verify + finetune seq ngắn/
-## batch nhỏ; seq dài trên 7B thật cần viết thêm bản chunked sau.
+## PERFORMANCE: the backward is a SEQUENTIAL BPTT over every timestep (correct math, not
+## the parallel chunked-SSD of the original paper) - the full state is cached, so
+## it takes O(T*H*headDim*dState) RAM. Fine for verification + finetuning short sequences/
+## small batches; long sequences on a real 7B need a chunked version later.
 
 import std/[math, tables, os, strutils, strformat]
 import backend
 import nimformer   # Tensor, Linear, newLinear, randnTensor, newTensor
-import fp4_gemv_gpu  # fp4GemvGpu - dùng khi fp4InName/fp4OutName != "" (goi tu lora.nim)
-import mamba2_ssm_gpu  # mamba2StepGpu - dùng khi useGpuSsm=true
-import mamba2_full_vm  # forward/backward cả lớp bằng micro-kernel
+import fp4_gemv_gpu  # fp4GemvGpu - used when fp4InName/fp4OutName != "" (called from lora.nim)
+import mamba2_ssm_gpu  # mamba2StepGpu - used when useGpuSsm=true
+import mamba2_full_vm  # whole-layer forward/backward with micro-kernels
 
 type
   Mamba2Real* = object
@@ -37,7 +37,7 @@ type
     convWeight*: Tensor    # [convDim, convKernel]
     convBias*: Tensor      # [convDim]
     aLog*: Tensor          # [numHeads]
-    dSkip*: Tensor         # [numHeads]  (= "D" trong HF)
+    dSkip*: Tensor         # [numHeads]  (= "D" in HF)
     dtBias*: Tensor        # [numHeads]
     normWeight*: Tensor    # [intermediateSize]
     outProj*: Linear
@@ -48,8 +48,8 @@ proc convDim*(m: Mamba2Real): int = m.intermediateSize + 2 * m.nGroups * m.dStat
 proc newMamba2Real*(hiddenSize, intermediateSize, numHeads, dState, nGroups: int,
                      convKernel: int = 4, normEps: float32 = 1e-5'f32;
                      initializeWeights = true): Mamba2Real =
-  assert intermediateSize mod numHeads == 0, "intermediateSize phai chia het numHeads"
-  assert numHeads mod nGroups == 0, "numHeads phai chia het nGroups"
+  assert intermediateSize mod numHeads == 0, "intermediateSize must be divisible by numHeads"
+  assert numHeads mod nGroups == 0, "numHeads must be divisible by nGroups"
   result.hiddenSize = hiddenSize
   result.intermediateSize = intermediateSize
   result.numHeads = numHeads
@@ -72,9 +72,9 @@ proc newMamba2Real*(hiddenSize, intermediateSize, numHeads, dState, nGroups: int
   result.outProj = newLinear(intermediateSize, hiddenSize, initializeWeights)
 
 proc inProjSsmRowRange*(intermediateSize, nGroups, dState, numHeads: int): (int, int) =
-  ## Hàng [lo, hi) của inProj.weight thuộc nhánh SSM (xBC + dt), không gồm z-gate.
-  ## Layout out của inProj: [z(C) | xBC(C + 2*G*N) | dt(H)].
-  ## Dùng khi LoRA chỉ muốn đụng phần nuôi SSM (tránh poison dt/B/C qua z).
+  ## Rows [lo, hi) of inProj.weight belonging to the SSM branch (xBC + dt), without the z gate.
+  ## Output layout of inProj: [z(C) | xBC(C + 2*G*N) | dt(H)].
+  ## Used when LoRA should only touch what feeds the SSM (avoids poisoning dt/B/C through z).
   let C = intermediateSize
   let cDim = C + 2 * nGroups * dState
   (C, C + cDim + numHeads)
@@ -84,25 +84,25 @@ proc inProjSsmRowRange*(m: Mamba2Real): (int, int) =
 
 type
   Mamba2RealCache* = object
-    ## Toàn bộ trung gian forward nằm trong MỘT buffer GPU (layout M2Lay) — backward dùng lại
-    ## đúng buffer này, không dựng lại gì trên CPU.
+    ## Every forward intermediate lives in ONE GPU buffer (layout M2Lay) — the backward reuses
+    ## exactly that buffer, nothing is rebuilt on the CPU.
     B*, T*: int
     buf*: seq[float32]
     lay*: M2Lay
     proj*: Tensor
 
 proc sliceTensor(buf: seq[float32]; off, n: int; shape: seq[int]): Tensor =
-  ## Chép 1 vùng buffer GPU ra Tensor (copyMem, không tính toán)
+  ## Copies a region of the GPU buffer into a Tensor (copyMem, no computation)
   result = Tensor(shape: shape, data: newSeq[float32](n))
   result.data.blit(0, buf, off, n)
 
 proc forwardMamba2Real*(m: Mamba2Real, x: Tensor, ctx: Backend):
                         tuple[y: Tensor, cache: Mamba2RealCache] =
-  ## inProj / outProj: GEMM trên GPU (Linear.forward). Phần còn lại (conv1d+SiLU + softplus dt,
-  ## selective scan mọi timestep, gated RMSNorm) = 3 micro-kernel chạy liên tiếp trong 1 session
-  ## trên cùng 1 buffer; scan dùng affine prefix song song theo T nếu T<=64 và
-  ## threadgroup hợp lệ, còn lại dùng recurrence tuần tự. Backward vẫn dùng scan ngược tuần tự.
-  ensureTgCap(ctx)   # tgSize reduction phai <= gioi han GPU (Iris 640: 256)
+  ## inProj / outProj: GEMMs on the GPU (Linear.forward). The rest (conv1d+SiLU + softplus dt,
+  ## selective scan over every timestep, gated RMSNorm) = 3 micro-kernels run back to back in one session
+  ## on the same buffer; the scan uses a parallel affine prefix over T if T<=64 and the
+  ## threadgroup is valid, otherwise a sequential recurrence. The backward still uses a sequential reverse scan.
+  ensureTgCap(ctx)   # the reduction tgSize must be <= the GPU limit (Iris 640: 256)
   let B = x.shape[0]; let T = x.shape[1]
   assert x.shape[2] == m.hiddenSize
   let H = m.numHeads; let D = m.headDim; let N = m.dState; let G = m.nGroups
@@ -152,13 +152,13 @@ proc backwardMamba2Real*(m: Mamba2Real, x: Tensor, cache: Mamba2RealCache,
   grads[prefix & ".outProj.bias"] = dOutProjB
 
   # ---- RMSNormGated + selective scan + softplus-dt + conv1d/SiLU backward: 4 kernel GPU ----
-  var buf = cache.buf                       # vùng d* trong cache.buf còn 0 -> an toàn cho atomic
+  var buf = cache.buf                       # the d* regions of cache.buf are still 0 -> safe for the atomics
   buf.blit(L.dNormedOut, dNormedOutFull.data, 0, L.BT * C)
   let tgR = rmsTg(L)
   discard runMicroVmChain(ctx, [
     (buildM2RmsBwdProgram(L), L.BT * L.normGroups * tgR, tgR * 4, tgR, "@m2_rms_bwd_" & m2Tag(L))], buf)
-  # scan backward: chia n thành các đoạn, MỖI đoạn 1 command buffer riêng (watchdog GPU Intel
-  # giết command buffer > vài giây). Atomic cộng dồn nên tổng các đoạn == chạy 1 lần.
+  # scan backward: n is split into chunks, EACH chunk its own command buffer (the Intel GPU watchdog
+  # kills command buffers > a few seconds). The atomics accumulate, so the sum of the chunks == one run.
   var nChunk = 16
   let envC = getEnv("BYBY_SCAN_NCHUNK")
   if envC.len > 0:
@@ -184,7 +184,7 @@ proc backwardMamba2Real*(m: Mamba2Real, x: Tensor, cache: Mamba2RealCache,
   grads[prefix & ".convWeight"] = sliceTensor(buf, L.dConvW, cDim * K, @[cDim, K])
   grads[prefix & ".convBias"] = sliceTensor(buf, L.dConvB, cDim, @[cDim])
 
-  # ---- inProj backward (GEMM GPU); dProj đã được kernel ghép sẵn [dZ | dXBC | dDtPre] ----
+  # ---- inProj backward (GPU GEMM); dProj is already assembled by the kernel [dZ | dXBC | dDtPre] ----
   let dProj = sliceTensor(buf, L.dProj, L.BT * L.P, cache.proj.shape)
   let (dX, dInProjW, dInProjB) = m.inProj.backward(x, dProj, ctx)
   grads[prefix & ".inProj.weight"] = dInProjW
@@ -192,7 +192,7 @@ proc backwardMamba2Real*(m: Mamba2Real, x: Tensor, cache: Mamba2RealCache,
   result = dX
 
 # ─────────────────────────────────────────────────────────────
-# Param registry (giong convention paramList trong jamba_hybrid.nim)
+# Param registry (same convention as paramList in jamba_hybrid.nim)
 # ─────────────────────────────────────────────────────────────
 
 proc paramListMamba2Real*(m: var Mamba2Real, prefix: string): seq[(string, ptr Tensor)] =
@@ -209,60 +209,60 @@ proc paramListMamba2Real*(m: var Mamba2Real, prefix: string): seq[(string, ptr T
   result.add((prefix & ".outProj.bias", addr m.outProj.bias))
 
 # ─────────────────────────────────────────────────────────────
-# Map ten tensor HF (mistralai/Mamba-Codestral-7B-v0.1, mixer cua 1 layer)
-# -> ten tham so cua Mamba2Real. Dung voi loadAllHFTensors (pytorch_bin_loader)
-# hoac loadAllHFTensorsSharded (sharded_hf_loader) de nap TRUC TIEP weight
-# pretrain that vao struct nay - CHUYEN VOI Mamba2SSD cu, cai nay map 1-1
-# DUNG NGHIA vi cung 1 cong thuc toan.
-# LUU Y: kiem tra lai ten chinh xac qua manifest (pytorch_bin_loader --export
-# hoac listStateDictInfo) vi HF co the doi ten giua cac phien ban transformers
-# (vd "mixer.dt_bias" vs "mixer.dt_proj.bias", "mixer.D" vs "mixer.dSkip").
+# Maps the HF tensor names (mistralai/Mamba-Codestral-7B-v0.1, the mixer of one layer)
+# -> the Mamba2Real parameter names. Used with loadAllHFTensors (pytorch_bin_loader)
+# or loadAllHFTensorsSharded (sharded_hf_loader) to load the REAL pretrained weights
+# DIRECTLY into this struct - UNLIKE the old Mamba2SSD, this maps 1-1
+# MEANINGFULLY because it is the same math.
+# NOTE: check the exact names in the manifest (pytorch_bin_loader --export
+# or listStateDictInfo) because HF may rename them between transformers versions
+# (e.g. "mixer.dt_bias" vs "mixer.dt_proj.bias", "mixer.D" vs "mixer.dSkip").
 # ─────────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────
-# STATE INCREMENTAL (MOI) - cho INFER 1-token-moi-buoc, O(1)/token thay vi
-# O(T) chay lai tu dau (forwardMamba2Real o tren). Cong thuc doi chieu DUNG
-# tu source HF that (transformers/models/mamba2/modeling_mamba2.py, ham
-# `mamba2_selective_state_update` + phan cap nhat conv_state trong
-# `cuda_kernels_forward`/`torch_forward` nhanh "cached_start"), KHONG tu bien:
+# INCREMENTAL STATE (NEW) - for 1-new-token-per-step INFERENCE, O(1)/token instead of
+# O(T) rerun from scratch (forwardMamba2Real above). Formulas checked EXACTLY
+# against the real HF source (transformers/models/mamba2/modeling_mamba2.py, the
+# `mamba2_selective_state_update` function + the conv_state update in
+# `cuda_kernels_forward`/`torch_forward`, the "cached_start" branch), NOT invented:
 #   dt[h]      = softplus(dtPre[h] + dtBias[h])
 #   dA[h]      = exp(dt[h] * A_h),  A_h = -exp(aLog[h])
 #   state[h,d,n] = state[h,d,n]*dA[h] + dt[h]*B[g,n]*x[h,d]
 #   y[h,d]     = sum_n( C[g,n] * state[h,d,n] ) + D[h]*x[h,d]
-# conv1d: giu convState = K-1 buoc xBCPre GAN NHAT (rolling window), moi
-# buoc conv = sum_k convWeight[c,k]*window[k] (window = convState + xBCPre
-# moi, K phan tu), roi truot convState (bo phan tu cu nhat, them xBCPre moi).
-# CHI dung cho B=1, T=1 (1 chuoi, sinh tung token) - dung y generate().
+# conv1d: convState keeps the K-1 MOST RECENT xBCPre steps (rolling window), each
+# conv step = sum_k convWeight[c,k]*window[k] (window = convState + the new xBCPre,
+# K elements), then convState slides (drops the oldest element, adds the new xBCPre).
+# ONLY for B=1, T=1 (one sequence, token by token) - exactly what generate() needs.
 # ─────────────────────────────────────────────────────────────
 
 type
   Mamba2RealState* = object
-    ## convState: [convDim, convKernel-1] - K-1 buoc xBCPre GAN NHAT (truoc
-    ## SiLU, truoc khi tach x/B/C) - CHINH XAC thu HF luu trong
+    ## convState: [convDim, convKernel-1] - the K-1 MOST RECENT xBCPre steps (before
+    ## SiLU, before splitting x/B/C) - EXACTLY what HF stores in
     ## `cache_params.conv_states[layer_idx]`.
-    ## ssmState: [numHeads, headDim, dState] - CHINH XAC thu HF luu trong
-    ## `cache_params.ssm_states[layer_idx]` (goi la recurrent_state).
+    ## ssmState: [numHeads, headDim, dState] - EXACTLY what HF stores in
+    ## `cache_params.ssm_states[layer_idx]` (called recurrent_state).
     convState*: seq[float32]
     ssmState*: seq[float32]
 
 proc newMamba2RealState*(m: Mamba2Real): Mamba2RealState =
-  ## Zero-init - dung y het "s_{-1}=0" / "conv_state=0" luc bat dau 1 chuoi
-  ## moi (chua co token nao truoc do).
+  ## Zero-init - exactly "s_{-1}=0" / "conv_state=0" at the start of a new
+  ## sequence (no token before it).
   result.convState = newSeq[float32](m.convDim * (m.convKernel - 1))
   result.ssmState = newSeq[float32](m.numHeads * m.headDim * m.dState)
 
 proc forwardStepMamba2Real*(m: Mamba2Real, x: Tensor, state: var Mamba2RealState,
                              ctx: Backend, fp4InName: string = "", fp4OutName: string = "",
                              useGpuSsm: bool = true): Tensor =
-  ## x: [1,1,hiddenSize] - DUNG 1 token moi. Cap nhat state TAI CHO (var),
-  ## tra ve y: [1,1,hiddenSize]. KHONG giu cache backward (chi dung infer).
-  ## fp4InName/fp4OutName: xem ghi chu cu.
-  ## useGpuSsm: true (mac dinh) -> SSM + softplus + (RMS khi C<=1024) qua
+  ## x: [1,1,hiddenSize] - EXACTLY one new token. Updates the state IN PLACE (var),
+  ## returns y: [1,1,hiddenSize]. NO backward cache (inference only).
+  ## fp4InName/fp4OutName: see the old note.
+  ## useGpuSsm: true (default) -> SSM + softplus + (RMS when C<=1024) through the
   ## microVM (mamba2StepGpu / buildRmsGateProgram / buildConv1dIncProgram).
-  ## Interpreter da co du opcode tren Metal/CUDA/Vulkan. Conv1d + RMS lon
-  ## van co the fallback host neu kernel chua wire day du; goi site phai
-  ## sessionBegin truoc de ghep session.
-  assert x.shape == @[1, 1, m.hiddenSize], "forwardStepMamba2Real: chi nhan B=1,T=1"
+  ## The interpreter has every opcode on Metal/CUDA/Vulkan. Conv1d + large RMS
+  ## may still fall back to the host if a kernel is not fully wired; the call site must
+  ## sessionBegin first to merge the session.
+  assert x.shape == @[1, 1, m.hiddenSize], "forwardStepMamba2Real: accepts only B=1,T=1"
   let H = m.numHeads; let D = m.headDim; let N = m.dState; let G = m.nGroups
   let hpg = H div G
   let cDim = m.convDim
@@ -271,11 +271,11 @@ proc forwardStepMamba2Real*(m: Mamba2Real, x: Tensor, state: var Mamba2RealState
 
   var proj: Tensor
   if fp4InName.len > 0:
-    let projData = fp4GemvGpu(ctx, fp4InName, x.data, 1)   # 100% GPU, khong materialize
+    let projData = fp4GemvGpu(ctx, fp4InName, x.data, 1)   # 100% GPU, nothing materialised
     proj = newTensor(@[1, 1, 2*C + 2*G*N + H])
     proj.data = projData
-    # LoRA inProj: delta PHAI cong VAO proj TRUOC conv/SSM (W'=W+BA), khong
-    # the cong sau SSM. Linear.forward() da lam viec nay khi khong dung FP4.
+    # LoRA inProj: the delta MUST be added INTO proj BEFORE conv/SSM (W'=W+BA), it cannot
+    # be added after the SSM. Linear.forward() does this when FP4 is not used.
     if m.inProj.loraR > 0 and m.inProj.loraA.len == m.inProj.loraR * m.inProj.inF and
        m.inProj.loraB.len == m.inProj.outF * m.inProj.loraR:
       let r = m.inProj.loraR
@@ -285,8 +285,8 @@ proc forwardStepMamba2Real*(m: Mamba2Real, x: Tensor, state: var Mamba2RealState
       let delta = beMatmul(ctx, xA, 1, r, Bt.data, r, m.inProj.outF)
       axpyGpu(ctx, proj.data, delta, m.inProj.loraScale)   # GPU: proj += scale*delta
   else:
-    proj = m.inProj.forward(x, ctx)   # [1,1, 2C+2GN+H] - path CPU/resident (co LoRA neu gan)
-  # ---- 100% GPU path (microVM) — useGpuSsm mặc định true, không CPU ----
+    proj = m.inProj.forward(x, ctx)   # [1,1, 2C+2GN+H] - CPU/resident path (with LoRA if attached)
+  # ---- 100% GPU path (microVM) — useGpuSsm defaults to true, no CPU ----
   var z: seq[float32]
   var xBCPre: seq[float32]
   var dtPre: seq[float32]
@@ -300,9 +300,9 @@ proc forwardStepMamba2Real*(m: Mamba2Real, x: Tensor, state: var Mamba2RealState
 
   if not useGpuSsm:
     raise newException(CatchableError,
-      "forwardStepMamba2Real: useGpuSsm=false bị CẤM — framework yêu cầu 100% GPU microVM")
+      "forwardStepMamba2Real: useGpuSsm=false is FORBIDDEN — the framework requires 100% GPU microVM")
   if true:
-    # 0) split proj trên GPU
+    # 0) split proj on the GPU
     let spl = splitProjGpu(ctx, C, cDim, H, proj.data)
     z = spl.z
     xBCPre = spl.xBC
@@ -311,13 +311,13 @@ proc forwardStepMamba2Real*(m: Mamba2Real, x: Tensor, state: var Mamba2RealState
     # 1) conv1d
     xBCConv = conv1dIncGpu(ctx, cDim, K, xBCPre, state.convState,
                            m.convWeight.data, m.convBias.data)
-    # xBCConv layout đã là [xPart | B | C] — slice zero-copy view qua openArray
-    # mamba2StepGpuFromXbc pack trên GPU buffer (không for host)
+    # the xBCConv layout is already [xPart | B | C] — a zero-copy slice view through openArray
+    # mamba2StepGpuFromXbc packs on the GPU buffer (no host for loop)
     dt = softplusDtGpu(ctx, H, dtPre, m.dtBias.data)
     yPre = mamba2StepGpuFromXbc(ctx, H, D, N, G, C, xBCConv, dt,
                                 m.aLog.data, m.dSkip.data, state.ssmState)
 
-    # 4) RMS+gate 100% GPU (kể cả C=8192)
+    # 4) RMS+gate 100% on the GPU (including C=8192)
     let outData = rmsGateGpu(ctx, C, m.normEps, yPre, z, m.normWeight.data, G)
     normedOut = newTensor(@[1, 1, C])
     normedOut.data = outData
@@ -325,8 +325,8 @@ proc forwardStepMamba2Real*(m: Mamba2Real, x: Tensor, state: var Mamba2RealState
     let outData = fp4GemvGpu(ctx, fp4OutName, normedOut.data, 1)
     result = newTensor(@[1, 1, m.hiddenSize])
     result.data = outData
-    # LoRA outProj: activation = normedOut [1,1,C] (C=intermediate, vd 8192),
-    # KHONG phai x/ln1 (hidden 4096).
+    # LoRA outProj: activation = normedOut [1,1,C] (C=intermediate, e.g. 8192),
+    # NOT x/ln1 (hidden 4096).
     if m.outProj.loraR > 0 and m.outProj.loraA.len == m.outProj.loraR * m.outProj.inF and
        m.outProj.loraB.len == m.outProj.outF * m.outProj.loraR:
       let r = m.outProj.loraR
@@ -342,7 +342,7 @@ proc hfNameMapMamba2*(layerIdx: int): Table[string, string] =
   result = initTable[string, string]()
   let p = "backbone.layers." & $layerIdx & ".mixer."
   result["inProj.weight"] = p & "in_proj.weight"
-  result["inProj.bias"]   = p & "in_proj.bias"      # co the KHONG ton tai (Mamba2 goc thuong bias=False)
+  result["inProj.bias"]   = p & "in_proj.bias"      # may NOT exist (the original Mamba2 usually has bias=False)
   result["convWeight"]    = p & "conv1d.weight"
   result["convBias"]      = p & "conv1d.bias"
   result["aLog"]          = p & "A_log"
@@ -350,11 +350,11 @@ proc hfNameMapMamba2*(layerIdx: int): Table[string, string] =
   result["dtBias"]        = p & "dt_bias"
   result["normWeight"]    = p & "norm.weight"
   result["outProj.weight"] = p & "out_proj.weight"
-  result["outProj.bias"]   = p & "out_proj.bias"    # thuong KHONG ton tai
-  # FIX token rac (bug #7): pre-norm CUA CA BLOCK (ln1 trong Nim) tuong duong
-  # Mamba2Block.norm ben HF, nam NGOAI submodule .mixer nen KHONG dung `p`
-  # (trong `p` da co san ".mixer."). Truoc day THIEU HAN key nay -> ln1.gamma
-  # khong bao gio duoc nap tu checkpoint, giu nguyen gamma=1.0 (identity mac
-  # dinh cua newLayerNorm) cho MOI block, MOI lan chay -> scale sai truoc
-  # mixer o ca 64 block -> token rac.
+  result["outProj.bias"]   = p & "out_proj.bias"    # usually does NOT exist
+  # FIX for garbage tokens (bug #7): the pre-norm OF THE WHOLE BLOCK (ln1 in Nim) corresponds to
+  # Mamba2Block.norm in HF, OUTSIDE the .mixer submodule, so `p` is NOT used
+  # (`p` already contains ".mixer."). This key used to be MISSING entirely -> ln1.gamma
+  # was never loaded from the checkpoint and stayed gamma=1.0 (the default identity
+  # of newLayerNorm) for EVERY block on EVERY run -> wrong scaling before
+  # the mixer in all 64 blocks -> garbage tokens.
   result["ln1Weight"] = "backbone.layers." & $layerIdx & ".norm.weight"

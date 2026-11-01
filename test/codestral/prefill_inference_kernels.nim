@@ -27,7 +27,7 @@ proc emitToken(p: var VmProgram; T: int) =
   p.emitSub(2, 1, 2)                    # R2 = t
 
 proc emitDecodeBHD(p: var VmProgram; L: M2Lay) =
-  ## R0 = tid. Kết quả: U0=b, U1=hd, U2=h, U3=g.
+  ## R0 = tid. Result: U0=b, U1=hd, U2=h, U3=g.
   let hpg = L.H div L.G
   p.emitAddConst(1, 0, 0.5'f32); p.emitLoadConstF32(2, float32(L.HD)); p.emitDiv(1, 1, 2)
   p.emitRToU(0, 1)                                 # U0 = b
@@ -45,7 +45,7 @@ proc buildPrefixConvProgram*(L: M2Lay; historyOffset = -1): VmProgram =
   p.emitToken(L.T)
   p.emitUMulK(3, 0, uint32(P))                    # U3 = token*P
   p.emitUMulK(4, 0, uint32(cDim))                 # U4 = token*cDim
-  p.emitLoadConstF32(4, float32((cDim + M2Tg - 1) div M2Tg))   # số vòng e (HẰNG)
+  p.emitLoadConstF32(4, float32((cDim + M2Tg - 1) div M2Tg))   # number of e iterations (CONSTANT)
   p.emitLoadConstF32(5, 0.0'f32)                  # e
   p.emitLoadConstF32(12, float32(K - 1))
   p.emitLoadConstF32(13, float32(K))
@@ -57,11 +57,11 @@ proc buildPrefixConvProgram*(L: M2Lay; historyOffset = -1): VmProgram =
       p.emitRToU(5, 6)                            # U5 = c
       p.emitULoadF32(8, 5, uint32(L.convB))       # acc = bias[c]
       p.emitUAdd(6, 3, 5); p.emitUAddK(6, 6, uint32(L.C))
-      p.emitUAddK(6, 6, uint32(0xFFFFFFFF'u32 - uint32((K - 1) * P) + 1))   # x ptr tại k=0
+      p.emitUAddK(6, 6, uint32(0xFFFFFFFF'u32 - uint32((K - 1) * P) + 1))   # x ptr at k=0
       p.emitUMulK(7, 5, uint32(K))                # w ptr
       p.emitAddConst(11, 2, 0.0'f32)              # R11 = t + k
       sessionVmForGpu(p, 13):
-        p.emitCmpLt(14, 11, 12)                   # t+k < K-1 -> tap ngoài biên
+        p.emitCmpLt(14, 11, 12)                   # t+k < K-1 -> tap outside the edge
         p.emitLoadConstF32(15, 1.0'f32); p.emitSub(15, 15, 14)
         if historyOffset >= 0:
           sessionVmIfGpu(p, 14):

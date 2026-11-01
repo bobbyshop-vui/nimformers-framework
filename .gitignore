@@ -67,3 +67,7 @@ test/bybylang_test/*_bin.nim
 test/bybylang_test/nim.cfg
 .gitignore
 
+
+# formers.n build outputs
+other/formers.n/build/
+other/formers.n/formers-cli

@@ -1,21 +1,21 @@
-## onedispatch.nim — "1 DISPATCH / TOKEN cho ca N layer Mamba2 (R-block)" — micro-kernel only, KHONG MSL tay.
+## onedispatch.nim — "1 DISPATCH / TOKEN for all N Mamba2 layers (R blocks)" — micro-kernels only, NO hand-written MSL.
 ## ─────────────────────────────────────────────────────────────────────────────────────────
-## TRANG THAI: viet KHONG co compiler/GPU trong tay -> CHUA compile, CHUA chay. Doc ONE_DISPATCH_PLAN.md.
+## STATUS: written WITHOUT a compiler/GPU at hand -> NOT compiled, NOT run. Read ONE_DISPATCH_PLAN.md.
 ##
-## Y TUONG
+## IDEA
 ##   * 1 VmProgram = FOR layer (GPU) { rms | in_proj(+LoRA) | fsc | ssm | rmsg | out_proj(+LoRA) | residual }
-##   * Moi stage nam trong khoi OP_VTG_BEGIN/END (threadgroup AO, lap persistent) va cach nhau bang
-##     OP_GRID_BARRIER (barrier PHAN MEM toan grid: Metal khong co). Vi 1 TG khong du bang thong cho GEMV,
-##     ta chay ntg TG (mac dinh 16, env BYBY_OD_TG) va dung barrier phan mem.
-##   * Moi layer co "vung" rieng trong 1 buffer float (memF32) + 1 slot meta (offset). OP_BASE_F32/U8/LUT/IN
-##     doi con tro goc theo layer -> TAI SU DUNG NGUYEN builder cu (progFsc/progSsm/progRms/gemv2row),
-##     chi can ghep, khong sua mot dong bytecode cua chung.
+##   * Each stage sits in an OP_VTG_BEGIN/END block (VIRTUAL threadgroups, persistent loop) and the stages are separated by
+##     OP_GRID_BARRIER (a grid-wide SOFTWARE barrier: Metal has none). One TG does not have enough bandwidth for a GEMV,
+##     so ntg TGs run (default 16, env BYBY_OD_TG) with the software barrier.
+##   * Each layer has its own "region" in one float buffer (memF32) + one meta slot (offset). OP_BASE_F32/U8/LUT/IN
+##     move the base pointers per layer -> the old builders are REUSED AS-IS (progFsc/progSsm/progRms/gemv2row),
+##     only composed, not a single line of their bytecode changed.
 ##
 ## 4 BUFFER / DISPATCH (Metal slot): 1 memF32 | 2 weight fp4 packed | 3 meta+LUT+LoRA | 4 = memF32 (alias, input)
 ##
-## RANG BUOC (eligible): moi block la bkMambaReal, fp4-KM groupSize 32, RMSNorm (khong LayerNorm), khong bias,
-##   hidden % 256 == 0, (C / nGroups) % 256 == 0, P chan, LoRA rank <= 32 dong nhat cac layer, tong weight < 4 GiB.
-##   Khong du -> odBegin/odAddLayer raise ValueError(ly do) -> caller fallback path cu.
+## CONSTRAINTS (eligibility): every block is bkMambaReal, fp4-KM groupSize 32, RMSNorm (no LayerNorm), no bias,
+##   hidden % 256 == 0, (C / nGroups) % 256 == 0, P even, LoRA rank <= 32 and uniform across layers, total weights < 4 GiB.
+##   Otherwise -> odBegin/odAddLayer raise ValueError(reason) -> the caller falls back to the old path.
 
 import std/[math, os, strutils]
 import backend
@@ -30,7 +30,7 @@ import od_core
 export od_core
 
 const
-  OdSlotWords* = 16            ## uint32 / layer trong bang meta
+  OdSlotWords* = 16            ## uint32 per layer in the meta table
   OdSubStrideReal* = 336       ## float tgF32 / sub-TG 32-lane: LUT 272 + 2 vung reduce 32
   OdTgBytes* = 8 * OdSubStrideReal * 4   ## 8 sub-TG / TG vat ly 256
 
@@ -38,11 +38,11 @@ static: doAssert OdSubStrideReal >= Fp4KmLutLen + 2 * GemvTg
 
 type
   OdLayerSlot* = object
-    fBase*: int                 ## float offset vung layer trong memF32
-    wIn*, wOut*: int            ## byte offset trong memU8
-    lutIn*, lutOut*: int        ## float offset trong buffer 3
+    fBase*: int                 ## float offset of the layer region in memF32
+    wIn*, wOut*: int            ## byte offset in memU8
+    lutIn*, lutOut*: int        ## float offset in buffer 3
     loraAIn*, loraBIn*, loraAOut*, loraBOut*: int
-    hasLoraIn*, hasLoraOut*: bool  ## layer KHONG co adapter (vd B=0 da bo luc nap) -> kernel bo qua stage LoRA
+    hasLoraIn*, hasLoraOut*: bool  ## the layer has NO adapter (e.g. B=0 dropped at load) -> the kernel skips its LoRA stage
 
   OdShape* = object
     hidden*, P*, C*, cDim*, H*, D*, N*, G*, K*, HD*: int
@@ -61,18 +61,18 @@ type
     kname*: string
     prog*: VmProgram
     hMem*, hZero*: byby.SessionHandle
-    hLutSeg*: seq[byby.SessionHandle]          ## bang meta: MOI DOAN 1 ban (hang ctrl [start,count] da dat san) -> khong can copy luc dispatch
-    hWSeg*: seq[byby.SessionHandle]            ## trong so fp4: MOI DOAN 1 buffer (Metal toi da ~2GB/buffer)
+    hLutSeg*: seq[byby.SessionHandle]          ## meta table: ONE copy PER SEGMENT (the ctrl row [start,count] set in advance) -> no copy at dispatch
+    hWSeg*: seq[byby.SessionHandle]            ## fp4 weights: ONE buffer PER SEGMENT (Metal allows ~2GB/buffer at most)
     ready*: bool
-    # staging (giai phong sau odFinish)
+    # staging (freed after odFinish)
     memInit: seq[float32]
     lutStage: seq[float32]
-    wBytes: seq[seq[uint8]]                    ## staging trong so theo doan
+    wBytes: seq[seq[uint8]]                    ## weight staging per segment
     slots*: seq[OdLayerSlot]
     idxH, idxG: seq[float32]
-    # --- hybrid R/G: chi cac block R nam trong OD; block G/khac chay path cu xen giua ---
-    slotOfBlock*: seq[int]                     ## chi so block mo hinh -> slot OD (-1 = khong thuoc OD)
-    segs*: seq[tuple[start, count: int]]       ## cac doan slot R lien tiep (moi doan 1 dispatch)
+    # --- hybrid R/G: only the R blocks are in OD; G/other blocks run the old path in between ---
+    slotOfBlock*: seq[int]                     ## model block index -> OD slot (-1 = not in OD)
+    segs*: seq[tuple[start, count: int]]       ## runs of consecutive R slots (one dispatch per run)
 
 proc odAlign(x, a: int): int {.inline.} = ((x + a - 1) div a) * a
 
@@ -107,28 +107,28 @@ proc odConvStateOff*(sh: OdShape; blockIdx: int): int = sh.odLayerBase(blockIdx)
 proc odSsmStateOff*(sh: OdShape; blockIdx: int): int = sh.odLayerBase(blockIdx) + sh.off.offSsm
 
 # ════════════════════════════════════════════════════════════════════════
-# A2/A3. Pack weight FP4 + LUT + LoRA + state (staging tren host)
+# A2/A3. Pack FP4 weights + LUT + LoRA + state (staging on the host)
 # ════════════════════════════════════════════════════════════════════════
 proc odBegin*(ctx: Backend; hidden, C, cDim, H, D, N, G, K, nLayers, normGroups: int;
               eps: float32; rIn, rOut: int; scaleIn, scaleOut: float32): OdState =
-  ## Kiem tra dieu kien + cap phat staging. Raise ValueError neu khong eligible.
-  if hidden mod OdTg != 0: odFail("hidden=" & $hidden & " phai chia het " & $OdTg)
-  if normGroups < 1 or C mod normGroups != 0: odFail("C phai chia het normGroups")
+  ## Checks the conditions + allocates staging. Raises ValueError if not eligible.
+  if hidden mod OdTg != 0: odFail("hidden=" & $hidden & " must be divisible by " & $OdTg)
+  if normGroups < 1 or C mod normGroups != 0: odFail("C must be divisible by normGroups")
   if (C div normGroups) mod OdTg != 0:
-    odFail("groupLen=" & $(C div normGroups) & " phai chia het " & $OdTg & " (rmsg chay dung 1 TG vat ly/nhom)")
-  if (C + cDim + H) mod 2 != 0 or hidden mod 2 != 0: odFail("P va hidden phai chan (gemv 2 hang/TG)")
-  if C mod 32 != 0 or hidden mod 32 != 0: odFail("K (hidden, C) phai chia het 32 (fp4-KM group32)")
+    odFail("groupLen=" & $(C div normGroups) & " must be divisible by " & $OdTg & " (rmsg runs exactly 1 physical TG per group)")
+  if (C + cDim + H) mod 2 != 0 or hidden mod 2 != 0: odFail("P and hidden must be even (gemv 2 rows/TG)")
+  if C mod 32 != 0 or hidden mod 32 != 0: odFail("K (hidden, C) must be divisible by 32 (fp4-KM group32)")
   if K < 2 or K > 8: odFail("convKernel ngoai [2,8]")
-  if rIn < 0 or rOut < 0 or rIn > 32 or rOut > 32: odFail("LoRA rank phai 0..32")
+  if rIn < 0 or rOut < 0 or rIn > 32 or rOut > 32: odFail("LoRA rank must be 0..32")
   result.be = ctx.kind.toByby()
   result.sh = odLayout(hidden, C, cDim, H, D, N, G, K, nLayers, normGroups, eps, rIn, rOut, scaleIn, scaleOut)
-  if result.sh.regionStride >= 16_000_000: odFail("vung layer qua lon cho dia chi float R[] (>2^24)")
-  if result.sh.totalF32 >= 0x7FFF_FFFF: odFail("tong float memF32 vuot 2^31")
+  if result.sh.regionStride >= 16_000_000: odFail("layer region too large for float R[] addresses (>2^24)")
+  if result.sh.totalF32 >= 0x7FFF_FFFF: odFail("total memF32 floats exceed 2^31")
   result.memInit = newSeq[float32](result.sh.totalF32)
-  # bang meta o DAU buffer 3
-  # +1 hang dieu khien (ctrl row) o cuoi bang meta: [start, count] cua doan dang chay
+  # meta table at the START of buffer 3
+  # +1 control row (ctrl row) at the end of the meta table: [start, count] of the running segment
   result.lutStage = newSeq[float32](odAlign(nLayers * OdSlotWords + OdSlotWords, 64))
-  # bang chi so h/g (cung 1 bang cho moi layer) — CPU, khop buildIdxTableProgram
+  # h/g index table (one table for every layer) — CPU, matching buildIdxTableProgram
   let HD = H * D
   let hpg = max(1, H div G)
   result.idxH = newSeq[float32](HD)
@@ -152,7 +152,7 @@ proc odSegOfSlot*(st: OdState; slot: int): int =
   0
 
 proc appendW(st: var OdState; seg: int; w: openArray[uint8]): int =
-  ## offset TUONG DOI trong buffer cua doan `seg` (moi doan dispatch bind buffer rieng).
+  ## RELATIVE offset within the buffer of segment `seg` (each segment dispatch binds its own buffer).
   while st.wBytes.len <= seg: st.wBytes.add @[]
   result = st.wBytes[seg].len
   for b in w: st.wBytes[seg].add b
@@ -165,24 +165,24 @@ proc odAddLayer*(st: var OdState; blockIdx: int;
                  inW: openArray[uint8]; inLut: seq[float32];
                  outW: openArray[uint8]; outLut: seq[float32];
                  loraAIn, loraBIn, loraAOut, loraBOut: seq[float32] = @[]) =
-  ## Layer PHAI duoc them theo thu tu 0,1,2,... (slot = chi so khoi).
+  ## Layers MUST be added in order 0,1,2,... (slot = block index).
   let sh = st.sh
-  if blockIdx != st.slots.len: odFail("odAddLayer: layer " & $blockIdx & " khong theo thu tu (can " & $st.slots.len & ")")
-  if blockIdx >= sh.nLayers: odFail("odAddLayer: vuot nLayers")
-  if inW.len != odFp4Bytes(sh.hidden, sh.P): odFail("in_proj bytes=" & $inW.len & " != " & $odFp4Bytes(sh.hidden, sh.P) & " (khong phai fp4-KM group32?)")
+  if blockIdx != st.slots.len: odFail("odAddLayer: layer " & $blockIdx & " out of order (expected " & $st.slots.len & ")")
+  if blockIdx >= sh.nLayers: odFail("odAddLayer: exceeds nLayers")
+  if inW.len != odFp4Bytes(sh.hidden, sh.P): odFail("in_proj bytes=" & $inW.len & " != " & $odFp4Bytes(sh.hidden, sh.P) & " (not fp4-KM group32?)")
   if outW.len != odFp4Bytes(sh.C, sh.hidden): odFail("out_proj bytes=" & $outW.len & " != " & $odFp4Bytes(sh.C, sh.hidden))
-  if inLut.len != Fp4KmLutLen or outLut.len != Fp4KmLutLen: odFail("LUT phai dai " & $Fp4KmLutLen)
+  if inLut.len != Fp4KmLutLen or outLut.len != Fp4KmLutLen: odFail("LUT must have length " & $Fp4KmLutLen)
   if ln1Gamma.len != sh.hidden: odFail("ln1Gamma.len != hidden")
-  # LoRA theo TUNG layer: rank/scale (sh.rIn/rOut) dong nhat, nhung layer co the KHONG co
-  # adapter (mang rong) -> co meta = 0, kernel bo qua stage LoRA cua layer do.
+  # LoRA PER layer: rank/scale (sh.rIn/rOut) are uniform, but a layer may have NO
+  # adapter (empty arrays) -> flag = 0 in the meta, the kernel skips that layer's LoRA stage.
   if sh.rIn == 0 and loraAIn.len > 0 or sh.rOut == 0 and loraAOut.len > 0:
-    odFail("layer " & $blockIdx & " co LoRA nhung OdShape rank = 0")
-  if loraAIn.len > 0 and (loraAIn.len != sh.rIn * sh.hidden or loraBIn.len != sh.P * sh.rIn): odFail("LoRA in sai kich thuoc")
-  if loraAOut.len > 0 and (loraAOut.len != sh.rOut * sh.C or loraBOut.len != sh.hidden * sh.rOut): odFail("LoRA out sai kich thuoc")
+    odFail("layer " & $blockIdx & " has LoRA but OdShape rank = 0")
+  if loraAIn.len > 0 and (loraAIn.len != sh.rIn * sh.hidden or loraBIn.len != sh.P * sh.rIn): odFail("LoRA in has the wrong size")
+  if loraAOut.len > 0 and (loraAOut.len != sh.rOut * sh.C or loraBOut.len != sh.hidden * sh.rOut): odFail("LoRA out has the wrong size")
 
   let o = sh.off
   let base = sh.odLayerBase(blockIdx)
-  # vung layer: giong initLayerV2 (+ gamma). convState / ssmState = 0 (dau chuoi).
+  # layer region: like initLayerV2 (+ gamma). convState / ssmState = 0 (start of the sequence).
   st.memInit.putAt(base + o.offALog, aLog)
   st.memInit.putAt(base + o.offDSkip, dSkip)
   st.memInit.putAt(base + o.offDtBias, dtBias)
@@ -195,7 +195,7 @@ proc odAddLayer*(st: var OdState; blockIdx: int;
 
   var s: OdLayerSlot
   s.fBase = base
-  if st.segs.len == 0: st.segs.add (start: 0, count: sh.nLayers)   # caller nen dat segs TRUOC odAddLayer
+  if st.segs.len == 0: st.segs.add (start: 0, count: sh.nLayers)   # the caller should set segs BEFORE odAddLayer
   let segK = st.odSegOfSlot(blockIdx)
   s.wIn = st.appendW(segK, inW)
   s.wOut = st.appendW(segK, outW)
@@ -208,11 +208,11 @@ proc odAddLayer*(st: var OdState; blockIdx: int;
   st.slots.add s
 
 # ════════════════════════════════════════════════════════════════════════
-# B. Bytecode: pre-norm RMS, residual, va ghep 1 program cho moi layer
+# B. Bytecode: pre-norm RMS, residual, and one program combining every layer
 # ════════════════════════════════════════════════════════════════════════
 proc buildOdRmsNorm*(hidden: int; eps: float32; gX, gNorm: int): VmProgram =
-  ## hNorm = hRes * rsqrt(mean(hRes^2) + eps) * gamma.  1 TG vat ly (256 lane) lam het.
-  ## memF32 base = 0 (goc); gamma doc qua inF32 (BASE_IN = gamma cua layer).
+  ## hNorm = hRes * rsqrt(mean(hRes^2) + eps) * gamma.  One physical TG (256 lanes) does it all.
+  ## memF32 base = 0 (original); gamma read through inF32 (BASE_IN = the layer's gamma).
   doAssert hidden mod OdTg == 0
   let ept = hidden div OdTg
   var p: VmProgram
@@ -262,17 +262,17 @@ proc buildOdResidual*(gX, gMix: int): VmProgram =
 proc cdiv(a, b: int): uint32 = uint32((a + b - 1) div b)
 
 proc buildOdProgram*(sh: OdShape): VmProgram =
-  ## 1 program cho TOAN BO nLayers. U-reg ngoai: U0 = layer, U1 tmp, U2 fBase, U3 wIn, U4 wOut,
-  ## U5 lutIn, U6 lutOut, U7 laAIn, U8 lbAIn(B in), U9 laOut, U14 lbOut, U10 = 0 (goc), U11 gNorm,
-  ## U12 gMix, U13 gScr, U15 tmp dia chi.
+  ## One program for ALL nLayers. Outer U-regs: U0 = layer, U1 tmp, U2 fBase, U3 wIn, U4 wOut,
+  ## U5 lutIn, U6 lutOut, U7 laAIn, U8 lbAIn(B in), U9 laOut, U14 lbOut, U10 = 0 (original), U11 gNorm,
+  ## U12 gMix, U13 gScr, U15 tmp address.
   let o = sh.off
   var p: VmProgram
   p.emitUConst(10, 0'u32)
   p.emitUConst(11, uint32(sh.gNorm))
   p.emitUConst(12, uint32(sh.gMix))
   p.emitUConst(13, uint32(sh.gScr))
-  # Doan layer [start, start+count) doc tu hang ctrl cua bang meta (moi doan chi doi 2 so,
-  # KHONG can compile lai kernel): U0 = start, R5 = count.
+  # The layer range [start, start+count) is read from the ctrl row of the meta table (each segment only changes 2 numbers,
+  # NO kernel recompile): U0 = start, R5 = count.
   p.emitUConst(15, uint32(sh.nLayers * OdSlotWords))
   p.emitULoadMeta(0, 15, 0)
   p.emitULoadMeta(1, 15, 1)
@@ -289,9 +289,9 @@ proc buildOdProgram*(sh: OdShape): VmProgram =
   p.emitULoadMeta(9, 1, 7)       # loraAOut
   p.emitULoadMeta(14, 1, 8)      # loraBOut
   if sh.rIn > 0 or sh.rOut > 0:
-    # Co LoRA theo layer (R ngoai: R5 = so vong for layer, R6/R7 = co in/out). Dieu kien dong
-    # nhat tren MOI thread cua layer -> cac grid barrier ben trong if bi bo qua dong deu
-    # (gbEpoch cua moi TG van khop nhau).
+    # Per-layer LoRA flags (outer R: R5 = layer loop count, R6/R7 = in/out flags). The condition is uniform
+    # across EVERY thread of the layer -> the grid barriers inside the if are skipped uniformly
+    # (the gbEpoch of every TG still agrees).
     p.emitULoadMeta(15, 1, 9);  p.emitUToR(6, 15)
     p.emitULoadMeta(15, 1, 10); p.emitUToR(7, 15)
 
@@ -323,14 +323,14 @@ proc buildOdProgram*(sh: OdShape): VmProgram =
   odStage(p, progFsc, 2, cdiv(fscThreads, OdTg), uint32(fscThreads))
   p.emitGridBarrier(0)
 
-  # 4) SSM step (state tai cho)
+  # 4) SSM step (state in place)
   let progSsm = buildMamba2StepAt(sh.H, sh.D, sh.N, sh.G,
     o.offXBC, o.offXBC + sh.C, o.offXBC + sh.C + sh.G * sh.N, o.offDt,
     o.offALog, o.offDSkip, o.offSsm, o.offY, o.offIdxH, o.offIdxG)
   odStage(p, progSsm, 2, cdiv(sh.HD, OdTg), uint32(sh.HD))
   p.emitGridBarrier(0)
 
-  # 5) gated RMSNorm theo nhom (moi nhom = 1 TG ao = 1 TG vat ly 256)
+  # 5) grouped gated RMSNorm (each group = 1 virtual TG = 1 physical TG of 256)
   let progRms = buildRmsGateGroupedAt(sh.C, sh.normGroups, OdTg, sh.eps,
     o.offY, o.offZ, o.offNormW, o.offNormed)
   odStage(p, progRms, 0, uint32(sh.normGroups), 0)
@@ -370,12 +370,12 @@ proc setU32(v: var seq[float32]; i: int; x: int) =
   copyMem(addr v[i], addr u, 4)
 
 proc odFinish*(ctx: Backend; st: var OdState) =
-  ## Dieu kien: da odAddLayer du nLayers. Upload 3 buffer + zero buf, JIT compile program.
+  ## Requires: odAddLayer called for all nLayers. Uploads 3 buffers + zeroes buf, JIT-compiles the program.
   let sh = st.sh
-  if st.slots.len != sh.nLayers: odFail("odFinish: moi co " & $st.slots.len & "/" & $sh.nLayers & " layer")
+  if st.slots.len != sh.nLayers: odFail("odFinish: only " & $st.slots.len & "/" & $sh.nLayers & " layers")
   for k in 0 ..< st.wBytes.len:
     if st.wBytes[k].len >= 2_000_000_000:
-      odFail("doan " & $k & " co " & $st.wBytes[k].len & " byte >= 2GB (gioi han buffer Metal): can chia doan nho hon")
+      odFail("segment " & $k & " has " & $st.wBytes[k].len & " bytes >= 2GB (Metal buffer limit): use smaller segments")
   for i, s in st.slots:
     let b = i * OdSlotWords
     st.lutStage.setU32(b + 0, s.fBase)
@@ -395,8 +395,8 @@ proc odFinish*(ctx: Backend; st: var OdState) =
     st.hWSeg.add sessionUploadBytesShared(be, st.wBytes[k])
   st.hZero = byby.sessionUploadPrivate(be, newSeq[float32](max(sh.cDim * max(sh.K - 1, 1), sh.HD * sh.N)))
   if st.segs.len == 0: st.segs.add (start: 0, count: sh.nLayers)
-  # Moi doan co ban bang meta RIENG voi hang ctrl [start,count] ghi san luc upload:
-  # KHONG con lenh copy ngay truoc dispatch (tranh phu thuoc thu tu blit->compute).
+  # Each segment has its OWN meta table copy with the ctrl row [start,count] written at upload:
+  # NO copy command right before dispatch (avoids a blit->compute ordering dependency).
   let ctrl = sh.nLayers * OdSlotWords
   for k, sg in st.segs:
     st.lutStage.setU32(ctrl + 0, sg.start)
@@ -420,7 +420,7 @@ proc odFinish*(ctx: Backend; st: var OdState) =
 var gOdState*: OdState   ## 1 model / process
 
 proc odResetLayerState*(st: OdState; blockIdx: int): bool =
-  ## Zero convState + ssmState cua layer (PHAI trong session dang mo). Tuong duong resetLayerStateV2.
+  ## Zeroes the convState + ssmState of a layer (MUST be inside an open session). Equivalent to resetLayerStateV2.
   if not st.ready: return false
   let sh = st.sh
   var hm = st.hMem
@@ -429,7 +429,7 @@ proc odResetLayerState*(st: OdState; blockIdx: int): bool =
   if not sessionCopyInto(st.be, st.hZero, hm, 0, sh.odSsmStateOff(blockIdx), sh.HD * sh.N): result = false
 
 proc odImportState*(st: OdState; blockIdx: int; hConv, hSsm: byby.SessionHandle): bool =
-  ## Cho prefill song song: chep state da tinh vao vung layer (thay cho ghi vao l.hWork cu).
+  ## For parallel prefill: copies the computed state into the layer region (instead of writing to the old l.hWork).
   if not st.ready: return false
   let sh = st.sh
   var hm = st.hMem
@@ -438,39 +438,39 @@ proc odImportState*(st: OdState; blockIdx: int; hConv, hSsm: byby.SessionHandle)
   if not sessionCopyInto(st.be, hSsm, hm, 0, sh.odSsmStateOff(blockIdx), sh.HD * sh.N): result = false
 
 proc odEncodeSegment*(st: OdState; segIdx: int; hRes: byby.SessionHandle) =
-  ## Chay DOAN R thu segIdx (cac layer R lien tiep) bang DUNG 1 compute dispatch.
-  ## hRes = gHXPersist. Block G nam giua cac doan duoc caller chay bang path cu.
-  if not st.ready: raise newException(CatchableError, "odEncodeSegment: chua odFinish")
-  if segIdx < 0 or segIdx >= st.segs.len: raise newException(CatchableError, "odEncodeSegment: segIdx sai")
+  ## Runs R segment segIdx (consecutive R layers) in EXACTLY one compute dispatch.
+  ## hRes = gHXPersist. G blocks between the segments are run by the caller on the old path.
+  if not st.ready: raise newException(CatchableError, "odEncodeSegment: odFinish not called")
+  if segIdx < 0 or segIdx >= st.segs.len: raise newException(CatchableError, "odEncodeSegment: invalid segIdx")
   let sh = st.sh
   var hm = st.hMem
   var hr = hRes
   if not sessionCopyInto(st.be, hr, hm, 0, sh.gX, sh.hidden):
-    raise newException(CatchableError, "odEncodeSegment: copy hRes -> pack that bai")
+    raise newException(CatchableError, "odEncodeSegment: copy hRes -> pack failed")
   odDispatch(st.kname, st.hMem, st.hWSeg[segIdx], st.hLutSeg[segIdx], st.ntg, OdTgBytes)
   if not sessionCopyInto(st.be, hm, hr, sh.gX, 0, sh.hidden):
-    raise newException(CatchableError, "odEncodeSegment: copy pack -> hRes that bai")
+    raise newException(CatchableError, "odEncodeSegment: copy pack -> hRes failed")
 
 proc odEncodeToken*(st: OdState; hRes: byby.SessionHandle) =
-  ## hRes = gHXPersist (da chua embedding). Ghi lai ket qua vao hRes. DUNG 1 compute dispatch.
-  if not st.ready: raise newException(CatchableError, "odEncodeToken: chua odFinish")
+  ## hRes = gHXPersist (already holds the embedding). Writes the result back into hRes. EXACTLY one compute dispatch.
+  if not st.ready: raise newException(CatchableError, "odEncodeToken: odFinish not called")
   let sh = st.sh
   var hm = st.hMem
   var hr = hRes
   if not sessionCopyInto(st.be, hr, hm, 0, sh.gX, sh.hidden):
-    raise newException(CatchableError, "odEncodeToken: copy hRes -> pack that bai")
+    raise newException(CatchableError, "odEncodeToken: copy hRes -> pack failed")
   for k in 0 ..< st.segs.len:
     odDispatch(st.kname, st.hMem, st.hWSeg[k], st.hLutSeg[k], st.ntg, OdTgBytes)
   if not sessionCopyInto(st.be, hm, hr, sh.gX, 0, sh.hidden):
-    raise newException(CatchableError, "odEncodeToken: copy pack -> hRes that bai")
+    raise newException(CatchableError, "odEncodeToken: copy pack -> hRes failed")
 
 proc odCheckErr*(st: OdState): uint32 =
-  ## SAU sessionEnd: doc lastErr (float idx 3). != 0 => spin het gioi han (TG khong dong thoi resident).
+  ## AFTER sessionEnd: reads lastErr (float idx 3). != 0 => spun past the limit (TGs not resident at the same time).
   let v = sessionRead(st.be, st.hMem, 4)
   copyMem(addr result, unsafeAddr v[3], 4)
 
 proc odResetHookImpl(blockIdx: int): bool {.nimcall.} =
-  # blockIdx = chi so block MO HINH -> doi sang slot OD
+  # blockIdx = MODEL block index -> converted to the OD slot
   if blockIdx < 0 or blockIdx >= gOdState.slotOfBlock.len or gOdState.slotOfBlock[blockIdx] < 0: return false
   odResetLayerState(gOdState, gOdState.slotOfBlock[blockIdx])
 
@@ -478,7 +478,7 @@ proc odOwnsHookImpl(blockIdx: int): bool {.nimcall.} =
   blockIdx >= 0 and blockIdx < gOdState.slotOfBlock.len and gOdState.slotOfBlock[blockIdx] >= 0
 
 proc odInstall*(st: OdState) =
-  ## Goi SAU odFinish: dat state toan cuc + hook reset (resetLayerStateV2 -> pack).
+  ## Call AFTER odFinish: sets the global state + reset hook (resetLayerStateV2 -> pack).
   gOdState = st
   gOdResetHook = odResetHookImpl
   gOdOwnsHook = odOwnsHookImpl

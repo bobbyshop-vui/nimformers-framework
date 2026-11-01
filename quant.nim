@@ -1,9 +1,9 @@
 ## quant.nim
-## Lượng tử hoá tensor cho Nimformer: int8, int4, fp8 (e4m3/e5m2), và "auto"
-## (APF tự build CustomFloat theo tensor — dùng lại customfloat.nim).
-## Kèm định dạng file nhị phân đơn giản để lưu/tải state dict đã lượng tử hoá.
+## Tensor quantization for Nimformer: int8, int4, fp8 (e4m3/e5m2), and "auto"
+## (APF builds a CustomFloat from the tensor itself — reusing customfloat.nim).
+## Plus a simple binary file format to save/load quantized state dicts.
 ##
-## Không có main/test ở đây — đây là thư viện thuần, import vào chỗ khác dùng.
+## No main/test here — a pure library, imported elsewhere.
 
 import std/math
 import mapped_weights
@@ -12,33 +12,33 @@ import customfloat
 
 type
   QuantKind* = enum
-    qkFp32Raw   ## không nén, giữ nguyên float32 (dùng cho bias/layernorm — nhạy sai số)
+    qkFp32Raw   ## uncompressed, plain float32 (for bias/layernorm — error sensitive)
     qkInt8      ## symmetric int8, scale = max(|x|)/127
-    qkInt4      ## symmetric int4 (pack 2 giá trị/byte), scale = max(|x|)/7
+    qkInt4      ## symmetric int4 (2 values packed per byte), scale = max(|x|)/7
     qkInt4Asymmetric  ## THÊM: asymmetric int4 (Q4_K_M style), scale=(max-min)/15, zero_point
-    qkFp8E4M3   ## CustomFloat(4,3) — dùng customfloat.nim
+    qkFp8E4M3   ## CustomFloat(4,3) — uses customfloat.nim
     qkFp8E5M2   ## CustomFloat(5,2)
-    qkCustom    ## CustomFloat tuỳ ý do người dùng khai (bao nhiêu bit cũng được)
-    qkAuto      ## APF: tự build CustomFloat theo chính tensor (buildCustomDtypeForTensor)
-    qkFp4KM     ## MỚI — "Q4_K_M nhưng FP4": E2M1 CHUẨN OCP (không phí mã cho
-                ## inf/nan, round-to-nearest) + 1 scale FP8-E4M3 cho MỖI NHÓM 32
-                ## phần tử + 1 scale FP32 per-tensor. KHÔNG có zero_point vì FP4
-                ## đã có bit dấu -> rẻ hơn Q4_K_M đúng 0.25 bit/weight.
-                ## 4 + 8/32 = 4.25 bit/weight. Xem quantizeFp4KM.
+    qkCustom    ## any user-declared CustomFloat (any number of bits)
+    qkAuto      ## APF: builds a CustomFloat from the tensor itself (buildCustomDtypeForTensor)
+    qkFp4KM     ## NEW — "Q4_K_M but FP4": STANDARD OCP E2M1 (no codes wasted on
+                ## inf/nan, round-to-nearest) + one FP8-E4M3 scale per GROUP of 32
+                ## elements + one per-tensor FP32 scale. NO zero_point because FP4
+                ## already has a sign bit -> exactly 0.25 bit/weight cheaper than Q4_K_M.
+                ## 4 + 8/32 = 4.25 bits/weight. See quantizeFp4KM.
 
   QuantTensor* = object
     kind*: QuantKind
     shape*: seq[int]
-    scale*: seq[float32]      ## THÊM: mảng - len=1 (per-tensor), len=shape[0] (per-row),
-                              ## hoặc len=shape[0]*ceil(shape[1]/groupSize) (per-group, xem groupSize)
-    zero_point*: seq[float32] ## THÊM: mảng - song song với scale
-    groupSize*: int      ## THÊM: 0 = per-tensor/per-row (hành vi cũ, giữ nguyên tương thích).
-                         ## >0 = per-group: mỗi hàng chia thành ceil(nCols/groupSize) group,
-                         ## mỗi group 1 scale/zero_point riêng — mịn gần bằng GPTQ gốc (group=128)
-                         ## thay vì 1 scale cho NGUYÊN 1 hàng 4096 cột (--q4km cũ, sai số quá lớn
-                         ## do double-quantization thô — xem quantize_int4_asymmetric_per_group
-                         ## bên export_to_nimq.py).
-    cf*: CustomFloat     ## dùng cho qkFp8E4M3/E5M2/qkCustom/qkAuto
+    scale*: seq[float32]      ## ADDED: an array - len=1 (per-tensor), len=shape[0] (per-row),
+                              ## or len=shape[0]*ceil(shape[1]/groupSize) (per-group, see groupSize)
+    zero_point*: seq[float32] ## ADDED: an array - parallel to scale
+    groupSize*: int      ## ADDED: 0 = per-tensor/per-row (the old behaviour, still compatible).
+                         ## >0 = per-group: each row is split into ceil(nCols/groupSize) groups,
+                         ## each group with its own scale/zero_point — almost as fine as the original GPTQ (group=128)
+                         ## instead of one scale for a WHOLE 4096-column row (the old --q4km, too large an error
+                         ## from a coarse double quantization — see quantize_int4_asymmetric_per_group
+                         ## in export_to_nimq.py).
+    cf*: CustomFloat     ## used for qkFp8E4M3/E5M2/qkCustom/qkAuto
     mappedData*: MappedView[uint8]
     data*: seq[uint8]
 
@@ -54,7 +54,7 @@ proc numelQ(shape: seq[int]): int =
   for s in shape: result *= s
 
 # ─────────────────────────────────────────────────────────────
-# int8 / int4 — symmetric quantization thuần tay, không cần CustomFloat
+# int8 / int4 — plain hand-written symmetric quantization, no CustomFloat needed
 # ─────────────────────────────────────────────────────────────
 
 proc maxAbs(arr: openArray[float32]): float32 =
@@ -100,12 +100,12 @@ proc quantizeInt4*(arr: openArray[float32], shape: seq[int]): QuantTensor =
       result.data[byteIdx] = (result.data[byteIdx] and 0x0F'u8) or (nibble shl 4)
 
 proc dequantizeInt4*(qt: QuantTensor): seq[float32] =
-  ## THÊM LUT: path nay (khong phai Q4_K_M/asymmetric-per-group, xem
-  ## dequantizeInt4Asymmetric ben duoi da co LUT roi) dung 1 scale DUY
-  ## NHAT cho ca tensor -> LUT chi can xay 1 LAN cho toan bo ham (khong
-  ## phai xay lai theo group nhu ban asymmetric), re hon nua. Truoc day
-  ## moi phan tu tu lam (signed-8)*sc rieng - gio chi 16 phep tinh 1 lan
-  ## roi tra bang cho toan bo n phan tu.
+  ## ADDED LUT: this path (not Q4_K_M/asymmetric-per-group, see
+  ## dequantizeInt4Asymmetric below which already has a LUT) uses ONE
+  ## scale for the whole tensor -> the LUT is built only ONCE for the whole function (not
+  ## rebuilt per group like the asymmetric version), even cheaper. Before,
+  ## every element computed (signed-8)*sc itself - now 16 computations once
+  ## and a table lookup for all n elements.
   let sc = qt.scale[0]
   let n = numelQ(qt.shape)
   result = newSeq[float32](n)
@@ -153,22 +153,22 @@ proc quantizeInt4Asymmetric*(arr: openArray[float32], shape: seq[int]): QuantTen
       result.data[byteIdx] = (result.data[byteIdx] and 0x0F'u8) or (nibble shl 4)
 
 proc dequantizeInt4Asymmetric*(qt: QuantTensor): seq[float32] =
-  ## Hỗ trợ per-row: nếu qt.scale.len > 1 (== shape[0]), mỗi hàng dùng
-  ## scale/zero_point riêng (packed data cũng theo hàng: mỗi hàng round lên
-  ## byte riêng - xem quantize_int4_asymmetric_per_row bên export_to_nimq.py).
-  ## Hỗ trợ per-group (qt.groupSize > 0): mỗi hàng chia nhỏ hơn nữa thành
-  ## ceil(nCols/groupSize) group, mỗi group 1 scale/zero_point (xem
-  ## quantize_int4_asymmetric_per_group bên export_to_nimq.py) — mịn gần
-  ## bằng GPTQ gốc, tránh sai số double-quantization quá thô của per-row.
+  ## Per-row support: if qt.scale.len > 1 (== shape[0]), each row uses its own
+  ## scale/zero_point (the packed data is per row too: each row rounds up to
+  ## its own bytes - see quantize_int4_asymmetric_per_row in export_to_nimq.py).
+  ## Per-group support (qt.groupSize > 0): each row is split further into
+  ## ceil(nCols/groupSize) groups, one scale/zero_point per group (see
+  ## quantize_int4_asymmetric_per_group in export_to_nimq.py) — almost as fine
+  ## as the original GPTQ, avoiding the too coarse double-quantization error of per-row.
   let n = numelQ(qt.shape)
   result = newSeq[float32](n)
-  var lut: array[16, float32]   ## THÊM: bảng tra 16 giá trị (kiểu llama.cpp) — int4 chỉ có
-                                 ## đúng 16 mã khả dĩ (0..15) trong 1 hàng/group (cùng chung
-                                 ## 1 scale/zero_point), nên tính SẴN 16 giá trị 1 lần rồi TRA
-                                 ## BẢNG cho từng phần tử — nhanh hơn hẳn so với tính lại phép
-                                 ## trừ + nhân (nibble-zp)*scale cho MỖI phần tử riêng lẻ.
+  var lut: array[16, float32]   ## ADDED: a 16-value lookup table (llama.cpp style) — int4 has only
+                                 ## 16 possible codes (0..15) within a row/group (sharing
+                                 ## one scale/zero_point), so the 16 values are computed ONCE and
+                                 ## LOOKED UP per element — much faster than recomputing the
+                                 ## (nibble-zp)*scale subtract + multiply for EVERY element.
   if qt.groupSize > 0:
-    doAssert qt.shape.len == 2, "per-group int4 chỉ hỗ trợ tensor 2D"
+    doAssert qt.shape.len == 2, "per-group int4 supports only 2D tensors"
     let nRows = qt.shape[0]
     let nCols = qt.shape[1]
     let bytesPerRow = (nCols + 1) div 2
@@ -183,21 +183,21 @@ proc dequantizeInt4Asymmetric*(qt: QuantTensor): seq[float32] =
           g = gNew
           let sc = qt.scale[rowGroupOff + g]
           let zp = qt.zero_point[rowGroupOff + g]
-          for k in 0 ..< 16: lut[k] = (float32(k) - zp) * sc   # tính lại LUT chỉ khi sang group mới
+          for k in 0 ..< 16: lut[k] = (float32(k) - zp) * sc   # LUT recomputed only when entering a new group
         let byteIdx = rowByteOff + c div 2
         var nibble: uint8
         if c mod 2 == 0: nibble = qt.bytes[byteIdx] and 0x0F'u8
         else: nibble = (qt.bytes[byteIdx] shr 4) and 0x0F'u8
         result[r * nCols + c] = lut[int(nibble)]
   elif qt.scale.len > 1:
-    doAssert qt.shape.len == 2, "per-row int4 chỉ hỗ trợ tensor 2D"
+    doAssert qt.shape.len == 2, "per-row int4 supports only 2D tensors"
     let nRows = qt.shape[0]
     let nCols = qt.shape[1]
     let bytesPerRow = (nCols + 1) div 2
     for r in 0 ..< nRows:
       let sc = qt.scale[r]
       let zp = qt.zero_point[r]
-      for k in 0 ..< 16: lut[k] = (float32(k) - zp) * sc   # tính LUT 1 lần/hàng, tra bảng cho cả hàng
+      for k in 0 ..< 16: lut[k] = (float32(k) - zp) * sc   # LUT computed once per row, looked up for the whole row
       let rowByteOff = r * bytesPerRow
       for c in 0 ..< nCols:
         let byteIdx = rowByteOff + c div 2
@@ -216,38 +216,38 @@ proc dequantizeInt4Asymmetric*(qt: QuantTensor): seq[float32] =
       result[i] = (float32(nibble) - zp) * sc
 
 # ─────────────────────────────────────────────────────────────
-# fp8 / custom / auto — dựa hoàn toàn trên CustomFloat (customfloat.nim)
+# fp8 / custom / auto — built entirely on CustomFloat (customfloat.nim)
 # ─────────────────────────────────────────────────────────────
 
 proc customFloatMaxMagnitude(cf: CustomFloat): float32 =
-  ## Do bien so lon nhat CO THE bieu dien duoc boi dinh dang CustomFloat nay
-  ## (khong tinh inf/nan - exponent field = maxExp danh rieng cho inf/nan).
-  ## Dung de tinh scale truoc khi quantize - KHONG co buoc nay se lam cac
-  ## dinh dang mu-hep (vd fp4 e2m1: bias=1, maxExp=3 -> bien so lon nhat
-  ## bieu dien duoc chi ~3.0, NHO NHAT (normal) la ~1.0) am tham VE 0 toan
-  ## bo weight thuc te (thuong co magnitude << 1.0) khi khong scale truoc.
+  ## The largest magnitude this CustomFloat format CAN represent
+  ## (excluding inf/nan - exponent field = maxExp is reserved for inf/nan).
+  ## Used to compute the scale before quantizing - WITHOUT this step narrow-exponent
+  ## formats (e.g. fp4 e2m1: bias=1, maxExp=3 -> the largest representable magnitude
+  ## is only ~3.0, the SMALLEST (normal) ~1.0) silently send ALL real
+  ## weights (usually of magnitude << 1.0) to 0 when not scaled first.
   if cf.exponentBits == 0:
-    return 1'f32   # int8/int4 khong di qua duong nay (co ham quantize rieng)
-  let maxRealExp = (cf.maxExp - 1) - cf.bias   # maxExp danh cho inf/nan, exp hop le lon nhat la maxExp-1
-  let maxMantissa = 2'f32 - pow(2'f32, -float32(cf.mantissaBits))  # 1.mantissa toi da (ngu y bit dau)
+    return 1'f32   # int8/int4 do not take this path (they have their own quantize functions)
+  let maxRealExp = (cf.maxExp - 1) - cf.bias   # maxExp is for inf/nan, the largest valid exp is maxExp-1
+  let maxMantissa = 2'f32 - pow(2'f32, -float32(cf.mantissaBits))  # the maximum 1.mantissa (implicit leading bit)
   result = pow(2'f32, float32(maxRealExp)) * maxMantissa
 
 proc quantizeFloatDtype*(arr: openArray[float32], shape: seq[int], cf: CustomFloat, kind: QuantKind): QuantTensor =
-  ## SUA: THAT SU tinh scale (truoc day hard-code scale=[1.0], KHONG lam gi
-  ## ca - dinh dang mu-hep nhu fp4 se quantize gan het weight thuc ve 0, xem
-  ## giai thich trong customFloatMaxMagnitude). Gio: scale = maxAbs(arr) /
-  ## maxMagnitude(cf), chia du lieu cho scale TRUOC khi encode (dua ve dung
-  ## dai bieu dien cua dinh dang), luu scale de dequantizeTensor nhan lai.
-  ## AN TOAN NGUOC: file .nimq CU co scale=[1.0] (chua qua ham nay ban sua)
-  ## van dung dung (dequantizeTensor gio nhan qt.scale[0], 1.0 la no-op).
+  ## CHANGED: REALLY computes the scale (it used to hard-code scale=[1.0] and do NOTHING
+  ## - narrow-exponent formats like fp4 quantized almost all real weights to 0, see
+  ## the explanation in customFloatMaxMagnitude). Now: scale = maxAbs(arr) /
+  ## maxMagnitude(cf), the data is divided by scale BEFORE encoding (into the
+  ## representable range of the format), and the scale is stored so dequantizeTensor multiplies it back.
+  ## BACKWARD SAFE: OLD .nimq files with scale=[1.0] (from before this fix)
+  ## still work (dequantizeTensor now multiplies by qt.scale[0], 1.0 is a no-op).
   var buf: seq[float32]
   for v in arr: buf.add(v)
   let maxMag = customFloatMaxMagnitude(cf)
   let dataMax = maxAbs(buf)
-  # scale > 1 nghia la "thu nho du lieu lai truoc khi encode" (dataMax lon
-  # hon dai bieu dien) - scale < 1 nghia la "phong to len" (dataMax nho hon
-  # dai bieu dien, dung cho fp4 voi weight thuc te ~0.01-0.1). Neu du lieu
-  # toan 0 (dataMax=0), giu scale=1 tranh chia cho 0.
+  # scale > 1 means "shrink the data before encoding" (dataMax larger
+  # than the representable range) - scale < 1 means "enlarge" (dataMax smaller than
+  # the representable range, for fp4 with real weights ~0.01-0.1). If the data is
+  # all 0 (dataMax=0), keep scale=1 to avoid dividing by 0.
   let scale = if dataMax > 0'f32: dataMax / maxMag else: 1'f32
   if scale != 0'f32:
     for i in 0 ..< buf.len: buf[i] = buf[i] / scale
@@ -260,7 +260,7 @@ proc quantizeFloatDtype*(arr: openArray[float32], shape: seq[int], cf: CustomFlo
 
 proc quantizeAuto*(arr: openArray[float32], shape: seq[int],
                     gradArr: openArray[float32] = []): QuantTensor =
-  ## APF: tự build CustomFloat theo chính tensor (+gradient nếu có)
+  ## APF: builds a CustomFloat from the tensor itself (+gradient if any)
   var buf: seq[float32]
   for v in arr: buf.add(v)
   let cf = buildCustomDtypeForTensor(buf, gradArr)
@@ -287,47 +287,47 @@ proc dequantizeRaw*(qt: QuantTensor): seq[float32] =
     copyMem(addr result[i], unsafeAddr qt.bytes[i*4], 4)
 
 # ═════════════════════════════════════════════════════════════
-# FP4-KM  —  "Q4_K_M nhưng FP4"
+# FP4-KM  —  "Q4_K_M but FP4"
 # ═════════════════════════════════════════════════════════════
 #
-# VÌ SAO CẦN: `quantizeFloatDtype` + FP4_E2M1 (đường cũ) dùng MỘT scale cho
-# CẢ tensor, cộng với 2 khiếm khuyết của codec E2M1 trong customfloat.nim:
-#   (a) maxExp bị dành cho inf/nan -> mất 4/16 mã, độ lớn lớn nhất chỉ 3.0
-#       thay vì 6.0, dải động 4x thay vì 12x;
-#   (b) encodeArray TRUNCATE về 0 chứ không làm tròn (0.90 -> 0.00).
-# Hệ quả đo được: ~99.9% weight của ma trận 7B bị ép về đúng 0, rel-L2 0.94.
+# WHY: `quantizeFloatDtype` + FP4_E2M1 (the old path) uses ONE scale for the
+# WHOLE tensor, plus 2 flaws of the E2M1 codec in customfloat.nim:
+#   (a) maxExp is reserved for inf/nan -> 4/16 codes lost, the largest magnitude is only 3.0
+#       instead of 6.0, a dynamic range of 4x instead of 12x;
+#   (b) encodeArray TRUNCATES to 0 instead of rounding (0.90 -> 0.00).
+# Measured result: ~99.9% of the weights of a 7B matrix forced to exactly 0, rel-L2 0.94.
 #
-# FP4-KM sửa cả ba:
-#   1. Dùng tập mức E2M1 CHUẨN OCP: {0, .5, 1, 1.5, 2, 3, 4, 6} x dấu,
-#      đủ 16 mã, KHÔNG mã nào phí cho inf/nan.
-#   2. Round-to-nearest, cộng dò scale tối thiểu MSE (kiểu make_qx_quants
-#      của llama.cpp).
-#   3. Scale theo NHÓM 32 phần tử, lưu bằng 1 byte FP8-E4M3, chuẩn hoá bởi
-#      1 scale FP32 per-tensor (đúng bố cục NVFP4 của Blackwell).
+# FP4-KM fixes all three:
+#   1. Uses the STANDARD OCP E2M1 level set: {0, .5, 1, 1.5, 2, 3, 4, 6} x sign,
+#      all 16 codes, NONE wasted on inf/nan.
+#   2. Round-to-nearest, plus a minimum-MSE scale search (like llama.cpp's
+#      make_qx_quants).
+#   3. A scale per GROUP of 32 elements, stored as one FP8-E4M3 byte, normalised by
+#      one per-tensor FP32 scale (exactly Blackwell's NVFP4 layout).
 #
-# KHÁC Q4_K_M Ở ĐÂU: Q4_K_M phải lưu CẢ scale VÀ min cho mỗi sub-block vì
-# int4 không có dấu (6+6 bit / 32 phần tử = 4.5 bpw). FP4 đã có bit dấu nên
-# đối xứng quanh 0, chỉ cần scale -> 4 + 8/32 = 4.25 bpw.
+# HOW IT DIFFERS FROM Q4_K_M: Q4_K_M must store BOTH a scale AND a min per sub-block because
+# int4 has no sign (6+6 bits / 32 elements = 4.5 bpw). FP4 already has a sign bit, so it is
+# symmetric around 0 and needs only a scale -> 4 + 8/32 = 4.25 bpw.
 #
-# BỐ CỤC `data` (một khối byte phẳng, không đổi format file .nimq):
-#     [0                 , R*C/2            )  nibble, 2 phần tử/byte
-#     [R*C/2             , R*C/2 + R*nGroups)  1 byte scale E4M3 cho mỗi nhóm
-# Trong mỗi nhóm 32 phần tử, byte j (j=0..15) giữ phần tử j ở nibble THẤP và
-# phần tử j+16 ở nibble CAO — đúng kiểu llama.cpp, để lane 0..15 của một
-# simdgroup đọc đúng 16 byte liên tục (coalesced).
+# LAYOUT of `data` (one flat byte block, the .nimq file format is unchanged):
+#     [0                 , R*C/2            )  nibbles, 2 elements/byte
+#     [R*C/2             , R*C/2 + R*nGroups)  one E4M3 scale byte per group
+# Within each group of 32 elements, byte j (j=0..15) holds element j in the LOW nibble and
+# element j+16 in the HIGH nibble — llama.cpp style, so lanes 0..15 of a
+# simdgroup read 16 contiguous bytes (coalesced).
 # `qt.scale = @[globalScale]`, `qt.groupSize = 32`.
 
 const Fp4kmMags*: array[8, float32] =
   [0'f32, 0.5'f32, 1.0'f32, 1.5'f32, 2.0'f32, 3.0'f32, 4.0'f32, 6.0'f32]
 
 proc fp4kmDecodeLut*(): array[16, float32] =
-  ## nibble = (dấu shl 3) or magIdx.  magIdx = (e shl 1) or m của E2M1 chuẩn.
+  ## nibble = (sign shl 3) or magIdx.  magIdx = (e shl 1) or m of standard E2M1.
   for i in 0 ..< 8:
     result[i] = Fp4kmMags[i]
     result[8 + i] = -Fp4kmMags[i]
 
 proc fp4kmMagIndex(a: float32): int {.inline.} =
-  ## Chỉ số độ lớn GẦN NHẤT (round-to-nearest). Ngưỡng = trung điểm.
+  ## The NEAREST magnitude index (round-to-nearest). Thresholds = midpoints.
   if a < 0.25'f32: 0
   elif a < 0.75'f32: 1
   elif a < 1.25'f32: 2
@@ -355,11 +355,11 @@ proc fp4kmMaxAbs(g: openArray[float32], n: int): float32 {.inline.} =
 proc fp4kmBestScaleByte(g: openArray[float32], n: int, globalScale: float32,
                         e4m3Lut: array[256, float32], searchSteps: int):
                         tuple[b: uint8, s: float32] =
-  ## Dò scale tối thiểu MSE, NHƯNG chỉ trên tập scale THỰC SỰ lưu được
-  ## (giá trị E4M3 sau khi giải mã). Dò trên fp32 rồi mới ép về E4M3 là
-  ## VÔ ÍCH - đo thực tế cho thấy không cải thiện gì, vì bước làm tròn
-  ## scale xoá sạch kết quả dò. Đây là điểm khác biệt so với make_qx_quants
-  ## của llama.cpp (ở đó scale lưu fp16 nên gần như liên tục).
+  ## Minimum-MSE scale search, but ONLY over the scales that CAN BE STORED
+  ## (E4M3 values after decoding). Searching in fp32 and then forcing to E4M3 is
+  ## USELESS - measurements show no improvement, because rounding the
+  ## scale wipes out the search result. This is the difference from llama.cpp's make_qx_quants
+  ## (which stores the scale in fp16, almost continuous).
   let mx = fp4kmMaxAbs(g, n)
   if mx <= 0'f32 or globalScale <= 0'f32: return (0'u8, 0'f32)
   let base = mx / 6.0'f32
@@ -384,17 +384,17 @@ proc fp4kmBestScaleByte(g: openArray[float32], n: int, globalScale: float32,
 
 proc quantizeFp4KM*(arr: openArray[float32], shape: seq[int],
                     groupSize: int = 32, searchSteps: int = 8): QuantTensor =
-  doAssert shape.len == 2, "quantizeFp4KM: chỉ cho tensor 2D [rows, cols]"
+  doAssert shape.len == 2, "quantizeFp4KM: only for 2D tensors [rows, cols]"
   let R = shape[0]
   let C = shape[1]
   doAssert C mod groupSize == 0,
-    "quantizeFp4KM: cols (" & $C & ") phải chia hết groupSize (" & $groupSize & ")"
-  doAssert groupSize mod 2 == 0, "quantizeFp4KM: groupSize phải chẵn"
-  doAssert arr.len == R * C, "quantizeFp4KM: arr.len không khớp shape"
+    "quantizeFp4KM: cols (" & $C & ") must be divisible by groupSize (" & $groupSize & ")"
+  doAssert groupSize mod 2 == 0, "quantizeFp4KM: groupSize must be even"
+  doAssert arr.len == R * C, "quantizeFp4KM: arr.len does not match shape"
   let nG = C div groupSize
   let half = groupSize div 2
 
-  # ── pass 1: chỉ cần max|w| từng nhóm để chọn scale per-tensor ──
+  # ── pass 1: only max|w| per group is needed to pick the per-tensor scale ──
   var buf = newSeq[float32](groupSize)
   var maxScale = 0'f32
   for r in 0 ..< R:
@@ -406,14 +406,14 @@ proc quantizeFp4KM*(arr: openArray[float32], shape: seq[int],
       let s = mx / 6.0'f32
       if s > maxScale: maxScale = s
 
-  # ── scale per-tensor để đưa scale nhóm vào vùng "ngọt" của E4M3 ──
-  # (đúng bố cục NVFP4: 1 FP32 per-tensor + 1 FP8 per-block).
-  # 224 là giá trị E4M3 an toàn nằm dưới trần 240 của codec repo.
+  # ── per-tensor scale to bring the group scales into the "sweet spot" of E4M3 ──
+  # (exactly the NVFP4 layout: one per-tensor FP32 + one FP8 per block).
+  # 224 is a safe E4M3 value below the 240 ceiling of the repo's codec.
   let globalScale = if maxScale > 0'f32: maxScale / 224.0'f32 else: 1'f32
 
-  # ── pass 2: chọn THẲNG scale-byte E4M3 tối thiểu MSE cho từng nhóm ──
-  # Bắt buộc quantize weight theo ĐÚNG scale sẽ được lưu, không phải scale
-  # fp32 trung gian - nếu không hai bên lệch nhau.
+  # ── pass 2: picks the minimum-MSE E4M3 scale byte DIRECTLY for each group ──
+  # The weights MUST be quantized with EXACTLY the scale that will be stored, not an
+  # intermediate fp32 scale - otherwise the two would disagree.
   var scaleBytes = newSeq[uint8](R * nG)
   let e4m3Lut = buildDecodeLUT(FP8_E4M3)
   var gsReal = newSeq[float32](R * nG)
@@ -425,7 +425,7 @@ proc quantizeFp4KM*(arr: openArray[float32], shape: seq[int],
       scaleBytes[r * nG + j] = b
       gsReal[r * nG + j] = s
 
-  # ── pass 3: đóng gói nibble ──
+  # ── pass 3: pack the nibbles ──
   var data = newSeq[uint8](R * C div 2 + R * nG)
   for r in 0 ..< R:
     for j in 0 ..< nG:
@@ -450,11 +450,11 @@ proc quantizeFp4KM*(arr: openArray[float32], shape: seq[int],
   result.scale = @[globalScale]
   result.zero_point = @[0'f32]
   result.groupSize = groupSize
-  result.cf = FP8_E4M3            # ghi lại codec dùng cho scale
+  result.cf = FP8_E4M3            # records the codec used for the scale
   result.data = data
 
 proc dequantizeFp4KM*(qt: QuantTensor): seq[float32] =
-  doAssert qt.shape.len == 2, "dequantizeFp4KM: cần tensor 2D"
+  doAssert qt.shape.len == 2, "dequantizeFp4KM: needs a 2D tensor"
   let R = qt.shape[0]
   let C = qt.shape[1]
   let g = if qt.groupSize > 0: qt.groupSize else: 32
@@ -499,11 +499,11 @@ proc dequantizeTensor*(qt: QuantTensor): seq[float32] =
   of qkInt4Asymmetric: dequantizeInt4Asymmetric(qt)  # THÊM
   of qkFp4KM:   dequantizeFp4KM(qt)
   of qkFp8E4M3, qkFp8E5M2, qkCustom, qkAuto:
-    # SUA: NHAN LAI qt.scale[0] (truoc day bo qua hoan toan, luon coi nhu
-    # scale=1 - dung voi file CU (scale that su la 1.0, no-op) nhung SAI voi
-    # file MOI qua quantizeFloatDtype ban sua (co scale thuc, xem giai thich
-    # o do) - neu khong nhan lai o day, decode ra toan gia tri be xiu/0 sai
-    # hoan toan so voi weight goc.
+    # CHANGED: MULTIPLIES BACK by qt.scale[0] (it was ignored entirely, always treated as
+    # scale=1 - right for OLD files (the real scale was 1.0, a no-op) but WRONG for
+    # NEW files from the fixed quantizeFloatDtype (with a real scale, see the explanation
+    # there) - without multiplying back here, decoding gives tiny/zero values completely
+    # wrong compared to the original weights.
     let raw = decodeArray(qt.bytes, qt.cf)
     let s = if qt.scale.len > 0: qt.scale[0] else: 1'f32
     if s == 1'f32: raw
@@ -513,19 +513,19 @@ proc dequantizeTensor*(qt: QuantTensor): seq[float32] =
       res
 
 proc dequantizeTensorTransposed*(qt: QuantTensor): seq[float32] =
-  ## THÊM: dequant + transpose GỘP LÀM 1 PASS, ghi thẳng vào layout đích
-  ## [nCols, nRows] (transposed) thay vì dequantizeTensor() (ra [nRows,nCols])
-  ## rồi transpose() riêng — cách cũ cấp phát 2 mảng fp32 full-size cùng lúc
-  ## (Linear.forward gọi hàm này mỗi lần forward cho weight lớn, vd lm_head/
-  ## các q/k/v/o/gate/up/down proj của model 6.7B), giờ chỉ 1 mảng.
-  ## Dùng LUT 16 giá trị (kiểu llama.cpp) cho int4/int4-asymmetric vì mỗi
-  ## hàng/group chỉ có 16 mã khả dĩ — tính sẵn 16 giá trị rồi tra bảng cho
-  ## từng phần tử, thay vì tính lại phép trừ+nhân mỗi phần tử.
-  ## FIX: hỗ trợ tensor 1D (bias, LN gamma/beta) — coi như hàng đơn (1 x n)
-  ## để tránh crash khi Linear.useQuant=true nhưng weightQ là 1D (quantBase
-  ## chứa cả bias/gamma 1D từ checkpoint NIMBIN4).
+  ## ADDED: dequant + transpose MERGED INTO ONE PASS, written directly into the target layout
+  ## [nCols, nRows] (transposed) instead of dequantizeTensor() (giving [nRows,nCols])
+  ## and a separate transpose() — the old way allocated 2 full-size fp32 arrays at once
+  ## (Linear.forward calls this on every forward for large weights, e.g. lm_head/
+  ## the q/k/v/o/gate/up/down projections of a 6.7B model), now only 1 array.
+  ## Uses a 16-value LUT (llama.cpp style) for int4/int4-asymmetric because each
+  ## row/group has only 16 possible codes — the 16 values are precomputed and looked up for
+  ## each element, instead of recomputing the subtract+multiply per element.
+  ## FIX: supports 1D tensors (bias, LN gamma/beta) — treated as a single row (1 x n)
+  ## to avoid a crash when Linear.useQuant=true but weightQ is 1D (quantBase
+  ## holds 1D bias/gamma too from NIMBIN4 checkpoints).
   if qt.shape.len <= 1:
-    return dequantizeTensor(qt)  # 0D/1D: không cần transpose, trả về nguyên bản
+    return dequantizeTensor(qt)  # 0D/1D: no transpose needed, returned as is
   let nRows = qt.shape[0]
   let nCols = qt.shape[1]
   result = newSeq[float32](nRows * nCols)
@@ -550,7 +550,7 @@ proc dequantizeTensorTransposed*(qt: QuantTensor): seq[float32] =
           var nibble: uint8
           if c mod 2 == 0: nibble = qt.bytes[byteIdx] and 0x0F'u8
           else: nibble = (qt.bytes[byteIdx] shr 4) and 0x0F'u8
-          result[c * nRows + r] = lut[int(nibble)]   # ghi thẳng layout transposed
+          result[c * nRows + r] = lut[int(nibble)]   # written straight in the transposed layout
     elif qt.scale.len > 1:
       for r in 0 ..< nRows:
         let sc = qt.scale[r]
@@ -598,9 +598,9 @@ proc dequantizeTensorTransposed*(qt: QuantTensor): seq[float32] =
       for c in 0 ..< nCols:
         result[c * nRows + r] = float32(cast[int8](qt.bytes[rowOff + c])) * sc
   else:
-    # Hiếm gặp (fp32 raw / fp8 / custom / auto) — không phải đường nóng
-    # (đường nóng q/k/v/o/gate/up/down/lm_head luôn dùng int4 asymmetric
-    # per-group), nên chấp nhận dequant thường rồi transpose (2 mảng tạm).
+    # Rare (fp32 raw / fp8 / custom / auto) — not a hot path
+    # (the hot q/k/v/o/gate/up/down/lm_head path always uses per-group
+    # int4 asymmetric), so a normal dequant then transpose (2 temporary arrays) is acceptable.
     let flat = dequantizeTensor(qt)
     for r in 0 ..< nRows:
       let rowOff = r * nCols
@@ -608,11 +608,11 @@ proc dequantizeTensorTransposed*(qt: QuantTensor): seq[float32] =
         result[c * nRows + r] = flat[rowOff + c]
 
 # ─────────────────────────────────────────────────────────────
-# I/O nhị phân — lưu/tải 1 state dict (danh sách (tên, QuantTensor)) + kiến trúc
+# Binary I/O — saves/loads one state dict (list of (name, QuantTensor)) + the architecture
 # ─────────────────────────────────────────────────────────────
 
-const MagicStr = "NIMQ2"   ## THÊM: bump tu NIMQ1 -> NIMQ2 vi them field groupSize (per-group int4).
-                            ## File .nimq cu (NIMQ1) phai export lai bang export_to_nimq.py moi.
+const MagicStr = "NIMQ2"   ## ADDED: bumped NIMQ1 -> NIMQ2 for the groupSize field (per-group int4).
+                            ## Old .nimq files (NIMQ1) must be re-exported with the new export_to_nimq.py.
 const MagicAligned* = "NIMQ3"
   ## NIMQ2 plus an int32 payload alignment after the magic, padding up to that
   ## alignment before the arch fields, and each tensor's packed payload

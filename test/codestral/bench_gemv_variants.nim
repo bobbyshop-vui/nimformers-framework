@@ -1,12 +1,12 @@
-## bench_gemv_variants.nim — đo + kiểm đúng các biến thể kernel GEMV fp4-KM trên GPU THẬT.
-## Chạy vài giây (không nạp model). Dùng đúng cỡ thật của Codestral-7B:
+## bench_gemv_variants.nim — measures + checks the fp4-KM GEMV kernel variants on a REAL GPU.
+## Runs for a few seconds (no model loaded). Uses the real Codestral-7B sizes:
 ##   in_proj 4096->18560, out_proj 8192->4096, lm_head 4096->32768.
 ##
 ##   nim c -d:release --hints:off --mm:arc --opt:speed -o:bench_gemv_variants bench_gemv_variants.nim
-##   ./bench_gemv_variants            (BYBY_BENCH_ITERS=40 để đo kỹ hơn)
+##   ./bench_gemv_variants            (BYBY_BENCH_ITERS=40 for a longer measurement)
 ##
-## Mỗi biến thể in: µs/dispatch, GB/s đọc weight, và SAI SỐ so với biến thể 0 (cùng weight, cùng x).
-##   variant 0 = kernel 2 hàng hiện tại, 1 = nạp rộng 32-bit, 2 = 4 hàng/threadgroup.
+## Each variant prints: µs/dispatch, GB/s of weight reads and the ERROR vs variant 0 (same weights, same x).
+##   variant 0 = the current 2-row kernel, 1 = 32-bit wide loads, 2 = 4 rows/threadgroup.
 import std/[os, strutils, strformat, times, tables, math]
 import backend
 import vendor/bybylang/gpubackend as byby
@@ -32,7 +32,7 @@ proc runShape(ctx: Backend; K, N, iters: int) =
   proc nextU(): uint32 =
     seed = seed * 1664525'u32 + 1013904223'u32
     seed
-  # weight + LUT + x giả lập, DÙNG CHUNG cho mọi biến thể
+  # fake weights + LUT + x, SHARED by every variant
   var wq = newSeq[uint8]((N * K) div 2 + N * (K div 32))
   for i in 0 ..< wq.len: wq[i] = uint8(nextU() shr 16)
   var lut = newSeq[float32](Fp4KmLutLen)
@@ -47,7 +47,7 @@ proc runShape(ctx: Backend; K, N, iters: int) =
   for v in 0 .. 2:
     let (prog, tag, rows, ok) = buildVariant(v, K, N)
     if not ok:
-      echo &"  variant {v}: bo qua (shape khong ho tro)"
+      echo &"  variant {v}: skipped (shape not supported)"
       continue
     let name = &"bench_v{v}_{K}x{N}"
     let kn = gpu_layers.vmKernel(prog, tag)
@@ -58,7 +58,7 @@ proc runShape(ctx: Backend; K, N, iters: int) =
     if byby.sessionBegin(be):
       discard encodeFp4Gemv(gFp4CacheGpu[name], hX, 0, hOut, 0)
       discard byby.sessionEnd(be)
-    # kiểm đúng: 1 dispatch rồi đọc kết quả
+    # correctness: one dispatch, then read the result
     if byby.sessionBegin(be):
       discard encodeFp4Gemv(gFp4CacheGpu[name], hX, 0, hOut, 0)
       discard byby.sessionEnd(be)
@@ -71,8 +71,8 @@ proc runShape(ctx: Backend; K, N, iters: int) =
       for i in 0 ..< N:
         maxErr = max(maxErr, abs(float(outv[i]) - float(refOut[i])))
         maxRef = max(maxRef, abs(float(refOut[i])))
-      errStr = &"sai so tuong doi {maxErr / maxRef:.2e}" & (if maxErr / maxRef < 1e-3: "  OK" else: "  *** LECH ***")
-    # đo thời gian: nhiều dispatch trong 1 session
+      errStr = &"relative error {maxErr / maxRef:.2e}" & (if maxErr / maxRef < 1e-3: "  OK" else: "  *** DIFF ***")
+    # timing: many dispatches in one session
     let t0 = epochTime()
     if byby.sessionBegin(be):
       for _ in 0 ..< iters:
@@ -82,7 +82,7 @@ proc runShape(ctx: Backend; K, N, iters: int) =
     if v == 0: baseUs = us
     let gbs = weightMB / 1024.0 / (us / 1.0e6)
     let speed = if baseUs > 0: baseUs / us else: 1.0
-    echo &"  variant {v} ({rows} hang/TG): {us:9.1f} us/dispatch   {gbs:6.2f} GB/s   x{speed:.2f} so voi variant 0   {errStr}"
+    echo &"  variant {v} ({rows} rows/TG): {us:9.1f} us/dispatch   {gbs:6.2f} GB/s   x{speed:.2f} vs variant 0   {errStr}"
 
 proc main() =
   let ctx = newBackend("auto")
@@ -92,6 +92,6 @@ proc main() =
   runShape(ctx, 4096, 18560, iters)   # in_proj
   runShape(ctx, 8192, 4096, iters)    # out_proj
   runShape(ctx, 4096, 32768, max(2, iters div 4))  # lm_head
-  echo "\nChon BYBY_GEMV_VARIANT = variant nhanh nhat (va OK) khi chay infer-lora."
+  echo "\nSet BYBY_GEMV_VARIANT = the fastest (and OK) variant when running infer-lora."
 
 main()

@@ -1,40 +1,40 @@
-## fp4_gemv_vm.nim — kernel GPU cho đường infer, viết bằng BYTECODE micro-VM.
+## fp4_gemv_vm.nim — GPU kernels for the infer path, written as micro-VM BYTECODE.
 ##
-## KHÔNG có một dòng MSL nào trong file này (và không có trong lora.nim):
-## mọi kernel ở đây là VmProgram (session_vm.nim) -> jit_vm.dispatchProgram
-## lower + compile JIT một lần / shape -> pipeline cache -> encode vào session.
+## There is NOT a single line of MSL in this file (nor in lora.nim):
+## every kernel here is a VmProgram (session_vm.nim) -> jit_vm.dispatchProgram
+## lowered + JIT-compiled once per shape -> pipeline cache -> encoded into the session.
 ##
-## Quy ước buffer của kernel sau JIT (xem jit_vm.lowerBytecodeToMetal):
-##   buffer(1) memF32   : output / work (ghi, có thể có offset)
-##   buffer(2) memU8    : weight fp4 packed
-##   buffer(3) constF32 : LUT (272/256 float) hoặc weight fp32 (LoRA) hoặc bias
-##   buffer(4) inF32    : input x (chỉ khai báo khi program dùng OP_U_LOAD_IN)
+## Kernel buffer convention after JIT (see jit_vm.lowerBytecodeToMetal):
+##   buffer(1) memF32   : output / work (written, may have an offset)
+##   buffer(2) memU8    : packed fp4 weights
+##   buffer(3) constF32 : LUT (272/256 floats) or fp32 weights (LoRA) or bias
+##   buffer(4) inF32    : input x (declared only when the program uses OP_U_LOAD_IN)
 ##
-## Mọi địa chỉ weight đi qua thanh ghi số nguyên U[] (uint32) — không dùng
-## float R[] vì lm_head 32768x4096/2 = 67M byte > 2^24.
+## Every weight address goes through the integer registers U[] (uint32) — float
+## R[] is not used because lm_head 32768x4096/2 = 67M bytes > 2^24.
 
 import std/math
 import std/bitops
 import session_vm
 
 const
-  GemvTg* = 32          ## thread / threadgroup của mọi kernel gemv (1 cột output / threadgroup)
+  GemvTg* = 32          ## threads / threadgroup of every gemv kernel (1 output column / threadgroup)
   Fp4KmLutLen* = 272
   Fp4LutLen* = 256
 
 proc alignUp64*(x: int): int {.inline.} = ((x + 63) div 64) * 64
 
-# ── helper: reduction 32 lane trong threadgroup memory ──────────
+# ── helper: 32-lane reduction in threadgroup memory ──────────
 proc emitTgReduce32(p: var VmProgram; accReg: uint32; tgBase: int) =
-  ## Cộng 32 lane trong tgF32[tgBase .. tgBase+32). Kết quả nằm ở tgF32[tgBase]
-  ## (chỉ lane 0 đọc). Không dùng simd_sum -> đúng với MỌI simdWidth (Intel = 16).
-  ## Yêu cầu: R6 = float(lid) (đã set). Dùng R7,R8,R9,R10.
+  ## Sums 32 lanes in tgF32[tgBase .. tgBase+32). The result is at tgF32[tgBase]
+  ## (only lane 0 reads it). No simd_sum -> correct for ANY simdWidth (Intel = 16).
+  ## Requires: R6 = float(lid) (already set). Uses R7,R8,R9,R10.
   p.emitTgStoreF32(accReg, 6, uint32(tgBase))
   p.emitBarrierTg()
-  ## 5 bước (stride 16,8,4,2,1) là MỘT vòng FOR trên GPU, stride nằm trong R7 và
-  ## giảm đôi mỗi vòng (không còn `for s in [...]` unroll trên host).
-  ## R5 = số vòng (HẰNG trong vòng), R8 = cmp rồi addr. Tại 3 chỗ gọi, R5 đã rảnh
-  ## (acc ở R4/R12, R6 = lane).
+  ## The 5 steps (stride 16,8,4,2,1) are ONE FOR loop on the GPU, the stride lives in R7 and
+  ## halves each iteration (no more host-side `for s in [...]` unroll).
+  ## R5 = iteration count (CONSTANT in the loop), R8 = cmp then addr. At all 3 call sites R5 is free
+  ## (acc in R4/R12, R6 = lane).
   doAssert accReg != 5 and accReg != 7 and accReg != 8 and accReg != 9 and accReg != 10
   p.emitLoadConstF32(5, 5.0'f32)
   p.emitLoadConstF32(7, 16.0'f32)
@@ -46,7 +46,7 @@ proc emitTgReduce32(p: var VmProgram; accReg: uint32; tgBase: int) =
       p.emitTgLoadF32(10, 8, uint32(tgBase))
       p.emitAdd(9, 9, 10)
       p.emitTgStoreF32(9, 6, uint32(tgBase))
-    p.emitBarrierTg()                           # top-level: mọi lane cùng đi qua
+    p.emitBarrierTg()                           # top level: every lane passes through
     p.emitMulConst(7, 7, 0.5'f32)
 
 proc emitLidIsZeroIf(p: var VmProgram) =
@@ -59,21 +59,21 @@ proc fp4GemvTgBytes*(km: bool): int =
   ((if km: Fp4KmLutLen else: Fp4LutLen) + GemvTg) * 4
 
 proc fp4KmGemv2RowTgBytes*(): int =
-  ## LUT + hai vung reduction 32-lane, theo tile 2 output rows/threadgroup.
+  ## LUT + two 32-lane reduction areas, for the 2-output-rows/threadgroup tile.
   (Fp4KmLutLen + 2 * GemvTg) * 4
 
 proc buildFp4GemvProgram*(K, N: int; km: bool; groupSize = 32): VmProgram =
-  ## out[n] = sum_k x[k] * dequant(W[n,k]),  n = threadgroup id, 32 lane chia K.
-  ## km=true : FP4-KM (E2M1 + scale E4M3/nhóm 32, nibble kiểu llama.cpp):
-  ##           byte t giữ phần tử t (nibble thấp) và t+16 (nibble cao);
-  ##           LUT gộp 272: [0..15]=E2M1, [16..271]=E4M3 đã nhân globalScale.
-  ## km=false: định dạng cũ, 1 byte/phần tử, LUT 256 đã nhân scale.
+  ## out[n] = sum_k x[k] * dequant(W[n,k]),  n = threadgroup id, 32 lanes split K.
+  ## km=true : FP4-KM (E2M1 + E4M3 scale per group of 32, llama.cpp-style nibbles):
+  ##           byte t holds element t (low nibble) and t+16 (high nibble);
+  ##           merged 272 LUT: [0..15]=E2M1, [16..271]=E4M3 premultiplied by globalScale.
+  ## km=false: old format, 1 byte/element, 256 LUT premultiplied by scale.
   if K mod GemvTg != 0:
-    raise newException(ValueError, "buildFp4GemvProgram: K=" & $K & " phai chia het " & $GemvTg)
+    raise newException(ValueError, "buildFp4GemvProgram: K=" & $K & " must be divisible by " & $GemvTg)
   if km and not (groupSize == 32 or (groupSize >= 64 and groupSize mod 64 == 0)):
-    raise newException(ValueError, "buildFp4GemvProgram: FP4-KM ho tro groupSize=32 hoac boi so cua 64 (nhan " & $groupSize & ")")
+    raise newException(ValueError, "buildFp4GemvProgram: FP4-KM supports groupSize=32 or multiples of 64 (got " & $groupSize & ")")
   if km and K mod groupSize != 0:
-    raise newException(ValueError, "buildFp4GemvProgram: K=" & $K & " phai chia het groupSize=" & $groupSize)
+    raise newException(ValueError, "buildFp4GemvProgram: K=" & $K & " must be divisible by groupSize=" & $groupSize)
   let lutN = if km: Fp4KmLutLen else: Fp4LutLen
   var p: VmProgram
   p.emitUTgid(0)                                  # U0 = n
@@ -81,8 +81,8 @@ proc buildFp4GemvProgram*(K, N: int; km: bool; groupSize = 32): VmProgram =
   p.emitUToR(6, 1)                                # R6 = float(lane)
 
   # copy LUT (device) -> threadgroup: lane i, i+32, ...
-  p.emitUAddK(8, 1, 0)                            # U8 = lane (con trỏ chạy, += 32 mỗi vòng)
-  p.emitLoadConstF32(10, float32((lutN + GemvTg - 1) div GemvTg))   # số vòng (HẰNG)
+  p.emitUAddK(8, 1, 0)                            # U8 = lane (running pointer, += 32 per iteration)
+  p.emitLoadConstF32(10, float32((lutN + GemvTg - 1) div GemvTg))   # iteration count (CONSTANT)
   p.emitLoadConstF32(12, float32(lutN))
   sessionVmForGpu(p, 10):
     p.emitUToR(11, 8)
@@ -94,10 +94,10 @@ proc buildFp4GemvProgram*(K, N: int; km: bool; groupSize = 32): VmProgram =
   p.emitBarrierTg()
 
   if km and groupSize != 32:
-    ## Nhóm tổng quát (64, 128, ...). Layout đóng gói của quantizeFp4KM: nhóm g phần tử = g/2 byte,
-    ## byte t giữ phần tử t (nibble thấp) và t+g/2 (nibble cao). 32 lane quét nhóm theo g/32 lượt:
-    ## lượt s phủ phần tử s*32+lane -> nửa đầu (s < g/64): nibble thấp của byte s*32+lane;
-    ## nửa sau: nibble cao của byte (s-g/64)*32+lane. Các lượt unroll ở host (hằng số tại build).
+    ## General group (64, 128, ...). quantizeFp4KM packing: a group of g elements = g/2 bytes,
+    ## byte t holds element t (low nibble) and t+g/2 (high nibble). 32 lanes sweep a group in g/32 passes:
+    ## pass s covers element s*32+lane -> first half (s < g/64): low nibble of byte s*32+lane;
+    ## second half: high nibble of byte (s-g/64)*32+lane. Passes are unrolled on the host (build-time constants).
     let nG = K div groupSize
     let half = groupSize div 2
     let subs = groupSize div 32
@@ -109,7 +109,7 @@ proc buildFp4GemvProgram*(K, N: int; km: bool; groupSize = 32): VmProgram =
     p.emitUAddK(5, 1, 0)                          # U5 = x ptr = lane
     p.emitLoadConstF32(5, float32(nG))
     p.emitForBegin(5)
-    p.emitULoadU8(7, 3, 0)                        # scale byte của nhóm
+    p.emitULoadU8(7, 3, 0)                        # group scale byte
     p.emitUToR(2, 7)
     p.emitTgLoadF32(2, 2, 16)                     # R2 = E4M3[scale]*gs
     for sub in 0 ..< subs:
@@ -133,7 +133,7 @@ proc buildFp4GemvProgram*(K, N: int; km: bool; groupSize = 32): VmProgram =
     p.emitUMulK(3, 0, uint32(nG))                 # U3 = n*nG
     p.emitUAddK(3, 3, uint32(N * (K div 2)))      # scale ptr
     p.emitUShrK(4, 1, 4)                          # lane >> 4
-    p.emitUShlK(4, 4, 2)                          # U4 = shift (0 hoặc 4)
+    p.emitUShlK(4, 4, 2)                          # U4 = shift (0 or 4)
     p.emitUAddK(5, 1, 0)                          # U5 = x ptr = lane
     p.emitLoadConstF32(5, float32(nG))
     p.emitForBegin(5)
@@ -167,7 +167,7 @@ proc buildFp4GemvProgram*(K, N: int; km: bool; groupSize = 32): VmProgram =
     p.emitUAddK(5, 5, 32)
     p.emitForEnd()
 
-  p.emitUToR(6, 1)                                # R6 = lane (tái dùng cho reduce)
+  p.emitUToR(6, 1)                                # R6 = lane (reused for reduce)
   p.emitTgReduce32(4, lutN)
   p.emitLidIsZeroIf()
   p.emitTgLoadF32(9, 6, uint32(lutN))
@@ -177,14 +177,14 @@ proc buildFp4GemvProgram*(K, N: int; km: bool; groupSize = 32): VmProgram =
   result = p
 
 proc buildFp4KmGemv2RowProgram*(K, N: int): VmProgram =
-  ## FP4-KM group-32 GEMV, hai hàng output/threadgroup.
-  ## Lấy ý tưởng N_R0_MXFP4=2 trong llama.cpp: mỗi lane tái sử dụng x[k]
-  ## cho hai hàng weight; hai reduction độc lập dùng hai vùng TG memory.
-  ## Không dùng SIMD-width assumption: reduction vẫn là cây 32-lane như kernel cũ.
+  ## FP4-KM group-32 GEMV, two output rows/threadgroup.
+  ## Borrowed from N_R0_MXFP4=2 in llama.cpp: each lane reuses x[k]
+  ## for two weight rows; two independent reductions use two TG memory areas.
+  ## No SIMD-width assumption: the reduction is still the 32-lane tree of the old kernel.
   if K <= 0 or K mod 32 != 0:
-    raise newException(ValueError, "buildFp4KmGemv2RowProgram: K phai la boi so duong cua 32")
+    raise newException(ValueError, "buildFp4KmGemv2RowProgram: K must be a positive multiple of 32")
   if N <= 0 or N mod 2 != 0:
-    raise newException(ValueError, "buildFp4KmGemv2RowProgram: N phai duong va chia het cho 2")
+    raise newException(ValueError, "buildFp4KmGemv2RowProgram: N must be positive and divisible by 2")
   let nG = K div 32
   var p: VmProgram
   p.emitUTgid(0)                                  # output row pair
@@ -218,14 +218,14 @@ proc buildFp4KmGemv2RowProgram*(K, N: int): VmProgram =
   p.emitLoadConstF32(4, 0.0'f32)                  # row0 accumulator
   p.emitLoadConstF32(12, 0.0'f32)                 # row1 accumulator
   if nG mod 2 == 0:
-    # ── Bản NẠP TRƯỚC 2 nhóm/vòng (học từ llama.cpp: nhiều load độc lập cùng bay) ─────────
-    # Kernel này bị chặn bởi ĐỘ TRỄ bộ nhớ (đo ~3.6 GB/s = đúng định luật Little với ~170
-    # thread phần cứng), nên cần nhiều byte "đang bay" mỗi thread. Mỗi vòng: phát TẤT CẢ load
-    # (mã+scale 2 hàng x 2 nhóm, và x của 2 nhóm) TRƯỚC khi giải mã. Thứ tự cộng giữ nguyên
-    # (nhóm chẵn rồi nhóm lẻ) => kết quả giống từng bit bản cũ.
-    # U: A = U10 mã0, U11 scale0, U13 mã1, U14 scale1 | B = U3 mã0, U12 scale0, U15 mã1,
-    #    scale1 của B nạp vào U10 sau khi nhóm A xong. R3 = x nhóm A, R9 = x nhóm B.
-    p.emitLoadConstF32(5, float32(nG div 2))      # số vòng (R5 không đổi trong vòng lặp)
+    # ── PRELOAD variant, 2 groups/iteration (from llama.cpp: many independent loads in flight) ─────────
+    # This kernel is bound by memory LATENCY (measured ~3.6 GB/s = Little's law with ~170
+    # hardware threads), so each thread needs more bytes "in flight". Each iteration issues ALL loads
+    # (code+scale of 2 rows x 2 groups, and x of 2 groups) BEFORE decoding. The summation order is unchanged
+    # (even group then odd group) => bit-identical to the old version.
+    # U: A = U10 code0, U11 scale0, U13 code1, U14 scale1 | B = U3 code0, U12 scale0, U15 code1,
+    #    B's scale1 is loaded into U10 once group A is done. R3 = x of group A, R9 = x of group B.
+    p.emitLoadConstF32(5, float32(nG div 2))      # iteration count (R5 unchanged in the loop)
     p.emitForBegin(5)
     p.emitULoadU8(10, 5, 0)
     p.emitULoadU8(11, 6, 0)
@@ -236,23 +236,23 @@ proc buildFp4KmGemv2RowProgram*(K, N: int): VmProgram =
     p.emitULoadU8(15, 8, 16)
     p.emitULoadIn(3, 7, 0)
     p.emitULoadIn(9, 7, 32)
-    # nhóm A, hàng 0
+    # group A, row 0
     p.emitUShr(10, 10, 4); p.emitUAndK(10, 10, 15)
     p.emitUToR(1, 10); p.emitTgLoadF32(1, 1, 0)
     p.emitUToR(2, 11); p.emitTgLoadF32(2, 2, 16)
     p.emitMul(1, 1, 2); p.emitFma(4, 1, 3, 4)
-    # nhóm A, hàng 1
+    # group A, row 1
     p.emitUShr(13, 13, 4); p.emitUAndK(13, 13, 15)
     p.emitUToR(7, 13); p.emitTgLoadF32(7, 7, 0)
     p.emitUToR(8, 14); p.emitTgLoadF32(8, 8, 16)
     p.emitMul(7, 7, 8); p.emitFma(12, 7, 3, 12)
-    p.emitULoadU8(10, 9, 1)                       # scale hàng 1 của nhóm B (U10 đã rảnh)
-    # nhóm B, hàng 0
+    p.emitULoadU8(10, 9, 1)                       # row 1 scale of group B (U10 is free now)
+    # group B, row 0
     p.emitUShr(3, 3, 4); p.emitUAndK(3, 3, 15)
     p.emitUToR(1, 3); p.emitTgLoadF32(1, 1, 0)
     p.emitUToR(2, 12); p.emitTgLoadF32(2, 2, 16)
     p.emitMul(1, 1, 2); p.emitFma(4, 1, 9, 4)
-    # nhóm B, hàng 1
+    # group B, row 1
     p.emitUShr(15, 15, 4); p.emitUAndK(15, 15, 15)
     p.emitUToR(7, 15); p.emitTgLoadF32(7, 7, 0)
     p.emitUToR(8, 10); p.emitTgLoadF32(8, 8, 16)
@@ -263,18 +263,18 @@ proc buildFp4KmGemv2RowProgram*(K, N: int): VmProgram =
   else:
     p.emitLoadConstF32(5, float32(nG))              # loop count (must stay unchanged in loop)
     p.emitForBegin(5)
-    # Nạp CẢ BỐN byte (code+scale của cả hai hàng) TRƯỚC khi giải mã. Đây là
-    # kernel bound-độ-trễ: 1 load/lane đang để bộ nhớ nhàn rỗi ~90%. Bốn load
-    # độc lập này cho 4 load cùng bay, và KHÔNG đổi một phép tính nào
-    # (thứ tự cộng của từng lane giữ nguyên => kết quả bit-identical).
-    # R10/R11 = code+scale hàng 0; R13/R14 = code+scale hàng 1.
-    # TUYỆT ĐỐI KHÔNG dùng R12: R12 là accumulator của hàng 1 (khởi tạo
-    # `LoadConstF32(12, 0.0)` trước vòng lặp, rồi `Fma(12, ...)`), nạp byte
-    # vào R12 sẽ phá accumulator ngay từ iteration đầu.
-    p.emitULoadU8(10, 5, 0)                         # row0 byte mã
-    p.emitULoadU8(11, 6, 0)                         # row0 byte scale nhóm
-    p.emitULoadU8(13, 8, 0)                         # row1 byte mã
-    p.emitULoadU8(14, 9, 0)                         # row1 byte scale nhóm
+    # Load ALL FOUR bytes (code+scale of both rows) BEFORE decoding. This is
+    # a latency-bound kernel: 1 load/lane leaves memory idle ~90%. These four
+    # independent loads put 4 loads in flight and change NO arithmetic
+    # (each lane's summation order is unchanged => bit-identical result).
+    # R10/R11 = code+scale of row 0; R13/R14 = code+scale of row 1.
+    # NEVER use R12: R12 is row 1's accumulator (initialised with
+    # `LoadConstF32(12, 0.0)` before the loop, then `Fma(12, ...)`); loading a byte
+    # into R12 would destroy the accumulator on the first iteration.
+    p.emitULoadU8(10, 5, 0)                         # row0 code byte
+    p.emitULoadU8(11, 6, 0)                         # row0 group scale byte
+    p.emitULoadU8(13, 8, 0)                         # row1 code byte
+    p.emitULoadU8(14, 9, 0)                         # row1 group scale byte
     # Row 0: decode one nibble and scale, then multiply by the shared x lane.
     p.emitUShr(10, 10, 4); p.emitUAndK(10, 10, 15)
     p.emitUToR(1, 10); p.emitTgLoadF32(1, 1, 0)
@@ -304,13 +304,13 @@ proc buildFp4KmGemv2RowProgram*(K, N: int): VmProgram =
   p.emitHalt()
   result = p
 
-# ── Biến thể kernel GEMV fp4-KM (chọn bằng BYBY_GEMV_VARIANT, xem gpu_layers.nim) ────────
-# Cùng layout weight/LUT/scale với buildFp4KmGemv2RowProgram -> dùng chung bộ nhớ đệm GPU
-# với kernel prefill GEMM. Layout 1 nhóm 32 giá trị = 16 byte: nibble THẤP của byte b là
-# giá trị b, nibble CAO của byte b là giá trị 16+b.
+# ── fp4-KM GEMV kernel variants (selected with BYBY_GEMV_VARIANT, see gpu_layers.nim) ────────
+# Same weight/LUT/scale layout as buildFp4KmGemv2RowProgram -> shares GPU buffers
+# with the prefill GEMM kernel. Layout of one group of 32 values = 16 bytes: the LOW nibble of byte b is
+# value b, the HIGH nibble of byte b is value 16+b.
 
 proc emitKmLutCopy(p: var VmProgram) =
-  ## Chép LUT 272 float vào tgF32[0..272) (cộng tác 32 lane). Dùng R10,R11,R12,R13,U8,U9.
+  ## Copies the 272-float LUT into tgF32[0..272) (32 lanes cooperate). Uses R10,R11,R12,R13,U8,U9.
   p.emitUAddK(8, 1, 0)
   p.emitLoadConstF32(10, float32((Fp4KmLutLen + GemvTg - 1) div GemvTg))
   p.emitLoadConstF32(12, float32(Fp4KmLutLen))
@@ -329,11 +329,11 @@ proc fp4KmGemvWideSupported*(K, N: int): bool =
   K > 0 and K mod 256 == 0 and N > 0 and N mod 2 == 0
 
 proc buildFp4KmGemvWideProgram*(K, N: int): VmProgram =
-  ## 2 hàng/threadgroup. Mỗi lane nạp MỘT WORD 32-bit (8 giá trị) cho mỗi hàng; 4 lane = 1 nhóm
-  ## 32 giá trị, 32 lane = 8 nhóm / vòng. Tra scale E4M3 MỘT lần / nhóm (kernel cũ: mỗi giá trị).
-  ## Số lệnh nạp global/SLM giảm ~3x. Tổng theo nhóm: acc += scale * sum(lut[nibble] * x).
+  ## 2 rows/threadgroup. Each lane loads ONE 32-bit WORD (8 values) per row; 4 lanes = 1 group
+  ## of 32 values, 32 lanes = 8 groups / iteration. The E4M3 scale is looked up ONCE / group (old kernel: per value).
+  ## Global/SLM load count drops ~3x. Per-group sum: acc += scale * sum(lut[nibble] * x).
   if not fp4KmGemvWideSupported(K, N):
-    raise newException(ValueError, "buildFp4KmGemvWideProgram: can K chia het 256, N chan")
+    raise newException(ValueError, "buildFp4KmGemvWideProgram: needs K divisible by 256, N even")
   let nG = K div 32
   let nIter = K div 256
   var p: VmProgram
@@ -341,41 +341,41 @@ proc buildFp4KmGemvWideProgram*(K, N: int): VmProgram =
   p.emitULid(1)
   p.emitUToR(6, 1)
   p.emitKmLutCopy()
-  p.emitUMulK(2, 0, 2)                              # U2 = hàng đầu của cặp
-  p.emitUShrK(3, 1, 2)                              # U3 = gi = lane/4 (nhóm trong vòng)
-  p.emitUAndK(4, 1, 3)                              # U4 = wi = lane%4 (word trong nhóm)
-  p.emitUMulK(5, 2, uint32(K div 2))                # code ptr hàng 0
+  p.emitUMulK(2, 0, 2)                              # U2 = first row of the pair
+  p.emitUShrK(3, 1, 2)                              # U3 = gi = lane/4 (group in the iteration)
+  p.emitUAndK(4, 1, 3)                              # U4 = wi = lane%4 (word in the group)
+  p.emitUMulK(5, 2, uint32(K div 2))                # row 0 code ptr
   p.emitUShlK(10, 3, 4); p.emitUAdd(5, 5, 10)       # + gi*16
   p.emitUShlK(10, 4, 2); p.emitUAdd(5, 5, 10)       # + wi*4
-  p.emitUMulK(6, 2, uint32(nG))                     # scale ptr hàng 0
+  p.emitUMulK(6, 2, uint32(nG))                     # row 0 scale ptr
   p.emitUAddK(6, 6, uint32(N * (K div 2)))
   p.emitUAdd(6, 6, 3)                               # + gi
   p.emitUShlK(7, 3, 5)                              # x ptr = gi*32
   p.emitUShlK(10, 4, 2); p.emitUAdd(7, 7, 10)       # + wi*4
-  p.emitLoadConstF32(4, 0.0'f32)                    # acc hàng 0
-  p.emitLoadConstF32(12, 0.0'f32)                   # acc hàng 1
+  p.emitLoadConstF32(4, 0.0'f32)                    # row 0 acc
+  p.emitLoadConstF32(12, 0.0'f32)                   # row 1 acc
   p.emitLoadConstF32(5, float32(nIter))
   p.emitForBegin(5)
-  p.emitLoadConstF32(13, 0.0'f32)                   # tổng nhóm hàng 0
-  p.emitLoadConstF32(14, 0.0'f32)                   # tổng nhóm hàng 1
-  p.emitULoadU32(8, 5, 0)                           # 8 nibble hàng 0
-  p.emitULoadU32(9, 5, uint32(K div 2))             # 8 nibble hàng 1
-  p.emitULoadU8(10, 6, 0)                           # scale hàng 0
-  p.emitULoadU8(11, 6, uint32(nG))                  # scale hàng 1
+  p.emitLoadConstF32(13, 0.0'f32)                   # row 0 group sum
+  p.emitLoadConstF32(14, 0.0'f32)                   # row 1 group sum
+  p.emitULoadU32(8, 5, 0)                           # 8 nibbles of row 0
+  p.emitULoadU32(9, 5, uint32(K div 2))             # 8 nibbles of row 1
+  p.emitULoadU8(10, 6, 0)                           # row 0 scale
+  p.emitULoadU8(11, 6, uint32(nG))                  # row 1 scale
   for t in 0 ..< 4:
     for hi in 0 ..< 2:
       let sh = uint32(8 * t + 4 * hi)
       let xoff = uint32(t + 16 * hi)
       p.emitUShrK(12, 8, sh); p.emitUAndK(12, 12, 15)
       p.emitUToR(1, 12); p.emitTgLoadF32(1, 1, 0)
-      p.emitUShrK(13, 9, sh)                        # U13 = nibble hàng 1
+      p.emitUShrK(13, 9, sh)                        # U13 = row 1 nibble
       p.emitUAndK(13, 13, 15)
       p.emitUToR(2, 13); p.emitTgLoadF32(2, 2, 0)
       p.emitULoadIn(3, 7, xoff)
       p.emitFma(13, 1, 3, 13)
       p.emitFma(14, 2, 3, 14)
-  p.emitUToR(10, 10); p.emitTgLoadF32(10, 10, 16)   # scale hàng 0
-  p.emitUToR(11, 11); p.emitTgLoadF32(11, 11, 16)   # scale hàng 1
+  p.emitUToR(10, 10); p.emitTgLoadF32(10, 10, 16)   # row 0 scale
+  p.emitUToR(11, 11); p.emitTgLoadF32(11, 11, 16)   # row 1 scale
   p.emitFma(4, 10, 13, 4)
   p.emitFma(12, 11, 14, 12)
   p.emitUAddK(5, 5, 128); p.emitUAddK(6, 6, 8); p.emitUAddK(7, 7, 256)
@@ -394,8 +394,8 @@ proc buildFp4KmGemvWideProgram*(K, N: int): VmProgram =
   result = p
 
 proc buildFp4KmGemv4RowProgram*(K, N: int): VmProgram =
-  ## 4 hàng/threadgroup, cùng ánh xạ lane như kernel 2 hàng (x nạp 1 lần dùng cho 4 hàng; LUT
-  ## và barrier amortize trên 4 hàng). Nạp 8 byte (code+scale của 4 hàng) TRƯỚC khi giải mã.
+  ## 4 rows/threadgroup, same lane mapping as the 2-row kernel (x loaded once for 4 rows; LUT
+  ## and barriers amortised over 4 rows). Loads 8 bytes (code+scale of 4 rows) BEFORE decoding.
   if K <= 0 or K mod 32 != 0 or N <= 0 or N mod 4 != 0:
     raise newException(ValueError, "buildFp4KmGemv4RowProgram: K chia het 32, N chia het 4")
   let nG = K div 32
@@ -405,7 +405,7 @@ proc buildFp4KmGemv4RowProgram*(K, N: int): VmProgram =
   p.emitULid(1)
   p.emitUToR(6, 1)
   p.emitKmLutCopy()
-  p.emitUMulK(2, 0, 4)                              # U2 = hàng đầu của bộ 4
+  p.emitUMulK(2, 0, 4)                              # U2 = first row of the group of 4
   p.emitUAndK(3, 1, 15)
   p.emitUShrK(4, 1, 4); p.emitUShlK(4, 4, 2)        # U4 = shift nibble 0|4
   p.emitUMulK(5, 2, uint32(K div 2)); p.emitUAdd(5, 5, 3)
@@ -712,15 +712,15 @@ proc buildFp4KmGemm2ColProgram*(K, N, tg, rows: int): VmProgram =
   p.emitUTgid(0); p.emitULid(1); p.emitKmLutCopyDynamic(tg)
   p.emitUShrK(3, 1, 2); p.emitUAndK(4, 1, 3)          # U3=lane>>2, U4=lane&3
   p.emitUMulK(12, 0, 2)                               # U12 = 2*tgid
-  p.emitUMulK(2, 0, uint32(K))                        # U2 = (2*tgid)*K/2 bytes (cột A)
+  p.emitUMulK(2, 0, uint32(K))                        # U2 = (2*tgid)*K/2 bytes (column A)
   p.emitUShlK(6, 3, 4); p.emitUAdd(2, 2, 6)
   p.emitUShlK(6, 4, 2); p.emitUAdd(2, 2, 6)           # + (lane>>2)*16 + (lane&3)*4
-  p.emitUAddK(7, 2, uint32(K div 2))                  # U7 = cột B weight ptr
+  p.emitUAddK(7, 2, uint32(K div 2))                  # U7 = column B weight ptr
   p.emitUShlK(5, 3, 5); p.emitUAdd(5, 5, 6)           # U5 = x offset (lane)
   p.emitUMulK(3, 0, uint32(K div 16))                 # U3 = (2*tgid)*K/32 (scale A)
   p.emitUAddK(3, 3, uint32(N * (K div 2)))
   p.emitUShrK(6, 1, 2); p.emitUAdd(3, 3, 6)           # + lane>>2
-  p.emitUAddK(11, 3, uint32(K div 32))                # U11 = scale cột B ptr
+  p.emitUAddK(11, 3, uint32(K div 32))                # U11 = column B scale ptr
   for r in 0 ..< nAcc: p.emitLoadConstF32(uint32(8 + r), 0)
   p.emitLoadConstF32(cnt, float32(K div (tg * 8)))
   sessionVmForGpu(p, cnt):
@@ -745,7 +745,7 @@ proc buildFp4KmGemm2ColProgram*(K, N, tg, rows: int): VmProgram =
     p.emitUAddK(2, 2, uint32(tg * 4)); p.emitUAddK(7, 7, uint32(tg * 4))
     p.emitUAddK(3, 3, uint32(tg div 4)); p.emitUAddK(11, 11, uint32(tg div 4))
     p.emitUAddK(5, 5, uint32(tg * 8))
-  # reduce nAcc accs qua tg lane, roi ghi 2 cột
+  # reduce nAcc accs across tg lanes, then write 2 columns
   p.emitUToR(0, 1)                                    # R0 = lane
   for r in 0 ..< nAcc: p.emitTgStoreF32(uint32(8 + r), 0, uint32(Fp4KmLutLen + r * tg))
   p.emitBarrierTg()
@@ -771,14 +771,14 @@ proc buildFp4KmGemm2ColProgram*(K, N, tg, rows: int): VmProgram =
   result = p
 
 proc buildFp4KmGemmM4Program*(K, N: int): VmProgram =
-  ## FP4-KM group-32 GEMM tile MBLOCK=4: 1 cột output / threadgroup, 4 hàng input.
-  ## Weight đọc 1 lần / phần tử cột, tái dùng cho 4 token (ý tưởng matmul_q4_batched
-  ## trong nim_inference / Metal Q4). Input layout [4, K], output [4, N] row-major.
-  ## Acc: R4/R11/R12/R13. Temps loop: R1/R2/R3. Reduce clobber R5/R7/R8/R9/R10.
+  ## FP4-KM group-32 GEMM tile MBLOCK=4: 1 output column / threadgroup, 4 input rows.
+  ## Weights read once per column element, reused for 4 tokens (the matmul_q4_batched idea
+  ## in nim_inference / Metal Q4). Input layout [4, K], output [4, N] row-major.
+  ## Acc: R4/R11/R12/R13. Loop temps: R1/R2/R3. Reduce clobbers R5/R7/R8/R9/R10.
   if K <= 0 or K mod 32 != 0:
-    raise newException(ValueError, "buildFp4KmGemmM4Program: K phai la boi so duong cua 32")
+    raise newException(ValueError, "buildFp4KmGemmM4Program: K must be a positive multiple of 32")
   if N <= 0:
-    raise newException(ValueError, "buildFp4KmGemmM4Program: N phai duong")
+    raise newException(ValueError, "buildFp4KmGemmM4Program: N must be positive")
   let nG = K div 32
   var p: VmProgram
   p.emitUTgid(0)                                  # n = output column
@@ -837,7 +837,7 @@ proc buildFp4KmGemmM4Program*(K, N: int): VmProgram =
   p.emitUAddK(5, 5, 32)
   p.emitForEnd()
 
-  # Reduce từng hàng rồi lane-0 ghi out[m*N+n] TRƯỚC khi tái dùng vùng TG.
+  # Reduce each row, then lane 0 writes out[m*N+n] BEFORE the TG area is reused.
   p.emitUToR(6, 1)
   p.emitTgReduce32(4, Fp4KmLutLen)
   p.emitLidIsZeroIf()
@@ -865,12 +865,12 @@ proc buildFp4KmGemmM4Program*(K, N: int): VmProgram =
   p.emitHalt()
   result = p
 
-# ── 2) FP32 GEMV (LoRA A/B, hoặc Linear fp32 nếu không có quant) ─
+# ── 2) FP32 GEMV (LoRA A/B, or fp32 Linear without quant) ─
 proc f32GemvTgBytes*(): int = GemvTg * 4
 
 proc buildF32GemvProgram*(K, N: int; scale: float32; accumulate: bool): VmProgram =
-  ## out[n] (+)= scale * sum_k W[n*K+k] * x[k];  W ở buffer(3), x ở buffer(4).
-  ## K bất kỳ (phần dư K mod 32 xử lý bằng mặt nạ).
+  ## out[n] (+)= scale * sum_k W[n*K+k] * x[k];  W in buffer(3), x in buffer(4).
+  ## Any K (the K mod 32 remainder is handled with a mask).
   var p: VmProgram
   let full = K div GemvTg
   let tail = K mod GemvTg
@@ -910,28 +910,28 @@ proc buildF32GemvProgram*(K, N: int; scale: float32; accumulate: bool): VmProgra
   p.emitHalt()
   result = p
 
-# ── 2b) FP32 GEMV rank nhỏ, KHÔNG tree-reduction (dùng cho LoRA B) ──
+# ── 2b) small-rank FP32 GEMV, NO tree reduction (used for LoRA B) ──
 proc f32GemvSmallKTgBytes*(): int = 16
 
 proc buildF32GemvSmallKProgram*(K, N: int; scale: float32; accumulate: bool): VmProgram =
-  ## Một thread = một hàng output, KHÔNG reduction.
-  ## LoRA B có K = rank (4..16): kernel 32-lane ở trên phải trả 5 barrier
-  ## chỉ cho một dot-product vài phần tử, nên nó chậm hơn hẳn K phép FMA
-  ## nối tiếp. Dispatch N thread (1 hàng / thread) thay vì N*GemvTg.
-  ## out[n] (+)= scale * sum_k W[n*K+k] * x[k];  W ở buffer(3), x ở buffer(4).
+  ## One thread = one output row, NO reduction.
+  ## LoRA B has K = rank (4..16): the 32-lane kernel above pays 5 barriers
+  ## for a dot product of a few elements, so it is much slower than K
+  ## serial FMAs. Dispatches N threads (1 row / thread) instead of N*GemvTg.
+  ## out[n] (+)= scale * sum_k W[n*K+k] * x[k];  W in buffer(3), x in buffer(4).
   if K <= 0 or K > 32:
     raise newException(ValueError,
-      "buildF32GemvSmallKProgram: K phai trong 1..32 (nhan " & $K & ")")
+      "buildF32GemvSmallKProgram: K must be in 1..32 (got " & $K & ")")
   if N <= 0:
-    raise newException(ValueError, "buildF32GemvSmallKProgram: N phai duong")
+    raise newException(ValueError, "buildF32GemvSmallKProgram: N must be positive")
   var p: VmProgram
-  p.emitRToU(0, 0)                                # U0 = n = tid (1 hàng / thread)
-  p.emitUMulK(1, 0, uint32(K))                    # U1 = n*K (gốc hàng W)
-  p.emitUMulK(2, 0, 0)                            # U2 = 0   (gốc vector x)
+  p.emitRToU(0, 0)                                # U0 = n = tid (1 row / thread)
+  p.emitUMulK(1, 0, uint32(K))                    # U1 = n*K (W row base)
+  p.emitUMulK(2, 0, 0)                            # U2 = 0   (x vector base)
   p.emitUAddK(3, 2, uint32(N))                    # U3 = N
   p.emitUToR(6, 0); p.emitUToR(7, 3)              # R6 = n, R7 = N
   p.emitCmpLt(8, 6, 7)                            # n < N
-  p.emitIfBegin(8)                                # chặn thread dư của grid
+  p.emitIfBegin(8)                                # masks the grid's extra threads
   p.emitLoadConstF32(4, 0.0'f32)                  # acc = 0
   for k in 0 ..< K:
     p.emitULoadConstF(1, 1, uint32(k))            # R1 = W[n*K+k]
@@ -947,22 +947,22 @@ proc buildF32GemvSmallKProgram*(K, N: int; scale: float32; accumulate: bool): Vm
   p.emitHalt()
   result = p
 
-# ── 2c) FP32 batched GEMM cho PREFILL (Linear không quant: sidecar block G) ──
+# ── 2c) FP32 batched GEMM for PREFILL (unquantized Linear: sidecar block G) ──
 proc f32GemmBatchTgBytes*(rows, tg: int): int = max(rows * tg * 4, 16)
 
 proc buildF32GemmBatchProgram*(K, N, tg, rows: int): VmProgram =
   ## out[r*N + n] = sum_k W[n*K + k] * x[r*K + k], r = 0 ..< rows.
-  ## W ở slot constF, x ở slot Input, out ở slot MemF32 (giống buildF32Gemv).
-  ## Một threadgroup giữ 1 cột output và chỉ đọc mỗi weight MỘT lần cho cả
-  ## `rows` hàng. Trước đây prefill rơi về MPS cho các Linear fp32 này và MPS
-  ## chỉ đạt ~1.7 GFLOP/s ở M=11 trên iGPU (qkvProj 4096x12288 mất 654 ms/block),
-  ## tức chậm hơn ~100 lần so với GEMV fp32 của decode.
-  doAssert tg in [32, 64, 128, 256], "buildF32GemmBatchProgram: tg khong hop le"
-  doAssert K > 0 and K mod tg == 0, "buildF32GemmBatchProgram: K phai chia het tg"
+  ## W in the constF slot, x in the Input slot, out in the MemF32 slot (like buildF32Gemv).
+  ## One threadgroup holds 1 output column and reads each weight only ONCE for all
+  ## `rows` rows. Prefill used to fall back to MPS for these fp32 Linears and MPS
+  ## reached only ~1.7 GFLOP/s at M=11 on the iGPU (qkvProj 4096x12288 took 654 ms/block),
+  ## i.e. ~100x slower than the decode fp32 GEMV.
+  doAssert tg in [32, 64, 128, 256], "buildF32GemmBatchProgram: invalid tg"
+  doAssert K > 0 and K mod tg == 0, "buildF32GemmBatchProgram: K must be divisible by tg"
   doAssert rows in 1 .. 12 and N > 0, "buildF32GemmBatchProgram: rows 1..12"
-  # 8 acc đầu dùng các reg mà kernel fp4 m8 đã dùng; 4 acc cuối (rows > 8) lấy
-  # reg 0..3. Sau khi ghi acc xuống TG memory chúng chết nên phần reduce tái
-  # dùng lại chính chúng làm temp.
+  # The first 8 accs use the regs the fp4 m8 kernel uses; the last 4 accs (rows > 8) take
+  # regs 0..3. After the accs are written to TG memory they are dead, so the reduce reuses
+  # them as temps.
   const accLo = [4'u32, 6'u32, 10'u32, 11'u32, 12'u32, 13'u32, 14'u32, 15'u32]
   const accHi = [0'u32, 1'u32, 2'u32, 3'u32]
   var acc: seq[uint32]
@@ -1003,12 +1003,12 @@ proc buildF32GemmBatchProgram*(K, N, tg, rows: int): VmProgram =
   p.emitHalt()
   result = p
 
-# ── 3) bias (+ APFLU) element-wise: thread tid = phần tử ────────
+# ── 3) bias (+ APFLU) element-wise: thread tid = element ────────
 proc buildBiasActProgram*(apflu: bool; alpha = 0.1'f32; beta = 1.0'f32): VmProgram =
-  ## mem[i] = act(mem[i] + bias[i]); bias ở buffer(3). Dispatch đúng n thread.
-  ## APFLU: x>0 ? x*(1+alpha*x) : beta*x*exp(x)  (khớp cpuApflu trong gpubackend.nim)
+  ## mem[i] = act(mem[i] + bias[i]); bias in buffer(3). Dispatch exactly n threads.
+  ## APFLU: x>0 ? x*(1+alpha*x) : beta*x*exp(x)  (matches cpuApflu in gpubackend.nim)
   var p: VmProgram
-  p.emitRToU(0, 0)                                # U0 = tid  (R0 = tid do kernel gán)
+  p.emitRToU(0, 0)                                # U0 = tid  (R0 = tid set by the kernel)
   p.emitULoadF32(1, 0, 0)
   p.emitULoadConstF(2, 0, 0)
   p.emitAdd(1, 1, 2)
@@ -1028,11 +1028,11 @@ proc buildBiasActProgram*(apflu: bool; alpha = 0.1'f32; beta = 1.0'f32): VmProgr
   p.emitHalt()
   result = p
 
-# ── 4) Linear++ (attention tuyến tính) 1 bước, state O(1) ───────
+# ── 4) Linear++ (linear attention) single step, O(1) state ───────
 type
   LpLayout* = object
     C*, H*, D*: int
-    offProj*, offY*, offZ*, offS*, total*: int   ## đơn vị float, đã căn 64
+    offProj*, offY*, offZ*, offS*, total*: int   ## in floats, aligned to 64
 
 proc lpLayout*(C, H: int): LpLayout =
   doAssert C mod H == 0
@@ -1044,7 +1044,7 @@ proc lpLayout*(C, H: int): LpLayout =
   result.total = alignUp64(result.offS + H * result.D * result.D)
 
 proc emitPhi(p: var VmProgram; dst, src: uint32) =
-  ## phi(x) = x>0 ? x+1 : exp(x) = max(x,0) + exp(min(x,0)); dùng R14=0, R15 tạm.
+  ## phi(x) = x>0 ? x+1 : exp(x) = max(x,0) + exp(min(x,0)); uses R14=0, R15 as temp.
   p.emitCmpLt(15, 14, src)
   p.emitMul(dst, src, 15)
   p.emitSub(15, src, dst)
@@ -1089,8 +1089,8 @@ proc buildEluPlus1BackwardProgram*(N: int): VmProgram =
   result = p
 
 proc buildLinearPlusStepProgram*(lay: LpLayout; eps: float32): VmProgram =
-  ## Mỗi threadgroup = 1 head (D lane, lane = chiều value vd).
-  ## Buffer memF32 = [proj(3C) | y(C) | z(H*D) | S(H*D*D)] (xem lpLayout).
+  ## Each threadgroup = 1 head (D lanes, lane = value dim vd).
+  ## memF32 buffer = [proj(3C) | y(C) | z(H*D) | S(H*D*D)] (see lpLayout).
   ## S[kd][vd] += phi(k[kd])*v[vd]; z[kd] += phi(k[kd]);
   ## y[vd] = sum_kd phi(q[kd])*S[kd][vd] / (sum_kd phi(q[kd])*z[kd] + eps)
   let C = lay.C; let D = lay.D
@@ -1109,8 +1109,8 @@ proc buildLinearPlusStepProgram*(lay: LpLayout; eps: float32): VmProgram =
   p.emitUAdd(8, 8, 1)                             # S ptr = offS + h*D*D + vd
   p.emitLoadConstF32(12, 0.0'f32)                 # num
   p.emitLoadConstF32(13, 0.0'f32)                 # den
-  p.emitLoadConstF32(10, float32(D))              # R10 = số vòng (KHÔNG ghi đè trong thân vòng:
-  p.emitForBegin(10)                              # kernel JIT đọc lại R[count] mỗi vòng)
+  p.emitLoadConstF32(10, float32(D))              # R10 = iteration count (NOT overwritten in the loop body:
+  p.emitForBegin(10)                              # the JIT kernel rereads R[count] each iteration)
   p.emitULoadF32(1, 2, 0)                         # q
   p.emitULoadF32(2, 3, 0)                         # k
   p.emitPhi(3, 1)                                 # phi(q)
@@ -1119,7 +1119,7 @@ proc buildLinearPlusStepProgram*(lay: LpLayout; eps: float32): VmProgram =
   p.emitFma(5, 4, 11, 5)                          # S += phi(k)*v
   p.emitUStoreF32(5, 8, 0)
   p.emitFma(12, 3, 5, 12)                         # num += phi(q)*S
-  p.emitULoadF32(6, 7, 0)                         # z (cũ)
+  p.emitULoadF32(6, 7, 0)                         # z (old)
   p.emitAdd(6, 6, 4)                              # z + phi(k)
   p.emitFma(13, 3, 6, 13)                         # den += phi(q)*(z+phi(k))
   p.emitUAddK(2, 2, 1)
@@ -1133,8 +1133,8 @@ proc buildLinearPlusStepProgram*(lay: LpLayout; eps: float32): VmProgram =
   p.emitUAdd(9, 9, 1)
   p.emitUAddK(9, 9, uint32(lay.offY))
   p.emitUStoreF32(12, 9, 0)                       # y[h*D+vd]
-  p.emitBarrierTg()                               # mọi lane đã đọc xong z cũ
-  # lane vd cập nhật z[h, vd] += phi(k[h, vd])
+  p.emitBarrierTg()                               # every lane has read the old z
+  # lane vd updates z[h, vd] += phi(k[h, vd])
   p.emitUMulK(10, 0, uint32(D))
   p.emitUAdd(10, 10, 1)                           # h*D + vd
   p.emitUAddK(11, 10, uint32(C))
@@ -1147,25 +1147,25 @@ proc buildLinearPlusStepProgram*(lay: LpLayout; eps: float32): VmProgram =
   p.emitHalt()
   result = p
 
-# ── 5) INT4 asymmetric GEMV (weight block A trong NIMBIN4 / QLoRA4) ─────
+# ── 5) INT4 asymmetric GEMV (block A weights in NIMBIN4 / QLoRA4) ─────
 proc int4GemvTgBytes*(): int = GemvTg * 4
 
 proc int4AsymSupported*(K, groupSize: int): bool =
-  ## groupSize=0: per-row (1 scale/zp cho ca hang); >0: per-group (luy thua 2, >=64).
+  ## groupSize=0: per-row (1 scale/zp per row); >0: per-group (power of 2, >=64).
   if K mod 64 != 0: return false
   if groupSize == 0: return true
   groupSize >= 64 and (groupSize and (groupSize - 1)) == 0 and K mod groupSize == 0
 
 proc buildInt4AsymGemvProgram*(K, N, groupSize: int): VmProgram =
   ## out[n] = sum_k x[k] * (nib(n,k) - zp[n,g]) * sc[n,g]
-  ## Layout data: hang n co K/2 byte, byte b giu phan tu 2b (nibble thap) va 2b+1 (cao)
-  ## - khop dequantizeInt4Asymmetric. buffer(3) = [scale(N*nG) | zp(N*nG)] (fp32),
-  ## nG = 1 neu per-row. Moi lane xu ly 1 byte (2 phan tu) / vong; 32 lane = 64 phan tu.
+  ## Data layout: row n has K/2 bytes, byte b holds element 2b (low nibble) and 2b+1 (high)
+  ## - matches dequantizeInt4Asymmetric. buffer(3) = [scale(N*nG) | zp(N*nG)] (fp32),
+  ## nG = 1 for per-row. Each lane handles 1 byte (2 elements) / iteration; 32 lanes = 64 elements.
   if not int4AsymSupported(K, groupSize):
     raise newException(ValueError, "buildInt4AsymGemvProgram: K=" & $K & " groupSize=" & $groupSize &
-                       " khong ho tro (can K%64==0, group luy thua 2 >= 64)")
+                       " not supported (needs K%64==0, group a power of 2 >= 64)")
   let nG = if groupSize == 0: 1 else: K div groupSize
-  ## groupSize là luỹ thừa 2 (int4AsymSupported) -> log2 = số bit 0 đuôi, không cần vòng
+  ## groupSize is a power of 2 (int4AsymSupported) -> log2 = trailing zero bits, no loop needed
   let log2G = if groupSize > 0: countTrailingZeroBits(groupSize) else: 0
   var p: VmProgram
   p.emitUTgid(0)
@@ -1174,7 +1174,7 @@ proc buildInt4AsymGemvProgram*(K, N, groupSize: int): VmProgram =
   p.emitUAdd(2, 2, 1)                             # byte ptr = n*K/2 + lane
   p.emitUShlK(5, 1, 1)                            # x ptr = 2*lane
   p.emitUMulK(10, 0, uint32(nG))                  # U10 = n*nG
-  p.emitLoadConstF32(13, float32(K div 64))       # so vong (KHONG ghi de R13 trong than)
+  p.emitLoadConstF32(13, float32(K div 64))       # iteration count (do NOT overwrite R13 in the body)
   p.emitForBegin(13)
   p.emitULoadU8(6, 2, 0)
   p.emitUAndK(7, 6, 15)
@@ -1200,7 +1200,7 @@ proc buildInt4AsymGemvProgram*(K, N, groupSize: int): VmProgram =
   p.emitUAddK(2, 2, 32)
   p.emitUAddK(5, 5, 64)
   p.emitForEnd()
-  p.emitUToR(6, 1)                                # R6 = lane cho reduce
+  p.emitUToR(6, 1)                                # R6 = lane for reduce
   p.emitTgReduce32(12, 0)
   p.emitLidIsZeroIf()
   p.emitTgLoadF32(9, 6, 0)

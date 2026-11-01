@@ -1,56 +1,56 @@
 ## pytorch_bin_loader.nim
-## Load pytorch_model.bin của ayoubkirouane/Mamba-Chat-2.8B (dựa trên
-## mamba_ssm gốc - MambaLMHeadModel, KHÔNG phải transformers.AutoModel,
-## dim=2560, 64 layer mamba thuần). Model gốc lưu ở FP16
-## (`MambaLMHeadModel.from_pretrained(..., dtype=torch.float16)`), nên xử
-## lý cẩn thận:
-##   - torch.load trả tensor fp16 -> BẮT BUỘC ép fp32 trước khi tobytes,
-##     nếu không buffer sẽ là 2 byte/phần tử (fp16) trong khi code Nim bên
-##     dưới giả định 4 byte/phần tử (fp32) -> đọc sai hoàn toàn hoặc crash.
-##     pyTensorToSeq() dưới đây ép fp32 ở PHÍA NUMPY (arr.astype("float32"))
-##     - KHÔNG dùng tensor.to(torch.float32) (xem lý do kỹ thuật + lỗi nimpy
-##     cụ thể đã gặp trong comment ngay tại pyTensorToSeq) - đừng bỏ bước ép
-##     fp32 này khi sửa code.
-##   - fp16 có dải giá trị hẹp (~[-65504, 65504], eps lớn) - vài tensor như
-##     A_log, dt_proj.bias của Mamba SSM có thể có giá trị cực nhỏ/cực lớn
-##     sau khi exp/softplus; ép fp32 xong vẫn giữ nguyên giá trị (chỉ đổi
-##     cách biểu diễn bit, không tăng precision đã mất) - không có cách nào
-##     phục hồi precision đã mất khi model gốc lưu fp16, chỉ là tránh MẤT
-##     THÊM precision trong lúc convert.
+## Loads the pytorch_model.bin of ayoubkirouane/Mamba-Chat-2.8B (based on
+## the original mamba_ssm - MambaLMHeadModel, NOT transformers.AutoModel,
+## dim=2560, 64 pure Mamba layers). The original model is stored in FP16
+## (`MambaLMHeadModel.from_pretrained(..., dtype=torch.float16)`), so it is handled
+## carefully:
+##   - torch.load returns fp16 tensors -> they MUST be cast to fp32 before tobytes,
+##     otherwise the buffer is 2 bytes/element (fp16) while the Nim code below
+##     assumes 4 bytes/element (fp32) -> completely wrong reads or a crash.
+##     pyTensorToSeq() below casts to fp32 ON THE NUMPY SIDE (arr.astype("float32"))
+##     - NOT tensor.to(torch.float32) (see the technical reason + the specific nimpy error
+##     hit, in the comment right at pyTensorToSeq) - do not drop this fp32
+##     cast when editing the code.
+##   - fp16 has a narrow range (~[-65504, 65504], a large eps) - some tensors such as
+##     A_log and dt_proj.bias of the Mamba SSM may hold tiny/huge values
+##     after exp/softplus; casting to fp32 keeps the values (only the
+##     bit representation changes, lost precision is not recovered) - precision lost
+##     when the original model was saved in fp16 cannot be recovered, this only avoids LOSING
+##     MORE precision during the conversion.
 ##
-## Sau bước này, xem thêm ghi chú "fp16" trong lora.nim (LoRA A/B init +
-## Adam eps phải đủ lớn để không underflow khi base đến từ fp16).
+## After this step, see also the "fp16" notes in lora.nim (LoRA A/B init +
+## Adam eps must be large enough not to underflow when the base comes from fp16).
 ##
-## Chạy trước:
-##   1. Tải file: huggingface-cli download ayoubkirouane/Mamba-Chat-2.8B --local-dir ./mamba-chat-2.8b
+## Run first:
+##   1. Download: huggingface-cli download ayoubkirouane/Mamba-Chat-2.8B --local-dir ./mamba-chat-2.8b
 ##   2. ./pytorch_bin_loader ./mamba-chat-2.8b/pytorch_model.bin
-##      -> chỉ ghi manifest (.manifest.json, rất nhẹ) để xem ten tensor thật
+##      -> only writes the manifest (.manifest.json, very light) to see the real tensor names
 ##         (backbone.embedding.weight, backbone.layers.N.mixer.*, ...)
-##   3. Pipeline fine-tune (graft_attention.nim --from-hf, jamba_hybrid.
-##      loadMambaOnlyFromHFBin) đọc THẲNG file .bin gốc này qua
-##      loadAllHFTensors() - KHÔNG cần xuất thêm 1 file .bin nào khác,
-##      tránh nhân đôi dung lượng đĩa (checkpoint HF gốc có thể vài GB).
-##      Cờ `--export out.bin` bên dưới CHỈ là tiện ích tùy chọn (archive/
-##      inspect offline), KHÔNG phải bước bắt buộc - xem cảnh báo trong
+##   3. The fine-tune pipeline (graft_attention.nim --from-hf, jamba_hybrid.
+##      loadMambaOnlyFromHFBin) reads this original .bin DIRECTLY through
+##      loadAllHFTensors() - NO other .bin file needs to be exported,
+##      avoiding doubling the disk usage (an original HF checkpoint can be several GB).
+##      The `--export out.bin` flag below is ONLY an optional utility (archive/
+##      offline inspection), NOT a required step - see the warning in
 ##      exportBinToRawBin().
 ##
-## YÊU CẦU: `nimble install nimpy`, và python env đã có torch (bạn xác nhận
-## đã cài). Biến môi trường NIMPY_PYTHON hoặc PYTHONHOME có thể cần set nếu
-## nimpy không tự tìm ra đúng python có torch.
+## REQUIRES: `nimble install nimpy`, and a Python env with torch (confirmed
+## installed). NIMPY_PYTHON or PYTHONHOME may need to be set if
+## nimpy does not find the Python that has torch.
 
 import std/[json, os, strformat, tables, strutils]
 import nimpy
-import rawbin   # xuat sang .bin THO (khong nen) - KHONG dung .nimq (quant.nim)
-                # o buoc nay, vi day la mot phan cua pipeline fine-tune
+import rawbin   # exports to a RAW .bin (uncompressed) - NOT .nimq (quant.nim)
+                # at this step, because this is part of the fine-tune pipeline
 
 let pyBuiltins = pyImport("builtins")
 proc pyLen(o: PyObject): int =
-  ## LUU Y: KHONG dung o.len() - "len" trong Python la HAM BUILT-IN
-  ## (len(x)), KHONG PHAI method cua object (x.len()) - torch.Size (tuple)
-  ## va nhieu object khac KHONG co attribute "len" -> o.len() se bi nimpy
-  ## co goi dong (dynamic dispatch) sang Python va bao loi runtime "No
-  ## callable attribute: len". Dung ham nay (goi qua builtins.len(x)) o MOI
-  ## noi thay vi o.len().to(int).
+  ## NOTE: do NOT use o.len() - "len" in Python is a BUILT-IN FUNCTION
+  ## (len(x)), NOT an object method (x.len()) - torch.Size (a tuple)
+  ## and many other objects have NO "len" attribute -> o.len() makes nimpy
+  ## try a dynamic call into Python and fail at run time with "No
+  ## callable attribute: len". Use this function (calling builtins.len(x)) EVERYWHERE
+  ## instead of o.len().to(int).
   pyBuiltins.len(o).to(int)
 
 type
@@ -60,8 +60,8 @@ type
     dtype*: string
 
 # ─────────────────────────────────────────────────────────────────
-# Gọi Python: torch.load(path, map_location="cpu") -> dict[str, Tensor]
-# Hỗ trợ cả .bin (pickle) lẫn .safetensors (qua thư viện safetensors nếu có).
+# Calls Python: torch.load(path, map_location="cpu") -> dict[str, Tensor]
+# Supports both .bin (pickle) and .safetensors (through the safetensors library if present).
 # ─────────────────────────────────────────────────────────────────
 proc pyLoadStateDict(path: string): PyObject =
   let torch = pyImport("torch")
@@ -73,25 +73,25 @@ proc pyLoadStateDict(path: string): PyObject =
 
 proc pyTensorToSeq(t: PyObject): tuple[data: seq[float32], shape: seq[int]] =
   ## .detach().contiguous().float().flatten() -> numpy -> tobytes() -> seq[float32].
-  ## SUA (Codestral-7B / bf16): checkpoint cua Mistral luu dtype bfloat16 -
-  ## numpy KHONG HO TRO bfloat16 (khong co kieu nay trong numpy) nen
-  ## tensor.numpy() RAISE NGAY LAP TUC ("Got unsupported ScalarType
-  ## BFloat16"), truoc ca khi kip chay .astype("float32") o buoc sau (buoc
-  ## do gia dinh sai la .numpy() luon thanh cong roi moi can doi dtype).
-  ## BAT BUOC ep ve float32 O PHIA TORCH (torch CO ho tro bfloat16 that,
-  ## chi numpy la khong) TRUOC khi goi .numpy().
-  ## LUU Y QUAN TRONG (van dung nhu ghi chu cu): KHONG dung tensor.to(torch.float32)
-  ## - nimpy TU DINH NGHIA san 1 proc rieng ten "to" (dung de convert
-  ## PyObject -> kieu Nim, vd `.to(int)`), trung ten voi method ".to(dtype)"
-  ## cua PyTorch -> bi Nim/nimpy resolve NHAM. Dung ".float()" thay the -
-  ## day la shorthand CHINH THUC cua PyTorch cho ".to(torch.float32)", TEN
-  ## KHAC hoan toan nen khong dung ham "to" cua nimpy, khong bi nham lan.
-  ## LUU Y THEM (phat hien them 1 truong hop nham lan y het ".to"): goi truc
-  ## tiep ".float()" tren PyObject cung bi Nim/nimpy resolve NHAM thanh ham
-  ## convert builtin `float()` cua chinh Nim (ep kieu ve kieu so `float` cua
-  ## Nim, khong phai goi method Python) -> "type mismatch: expected float".
-  ## Giai phap: dung callMethod("float") TUONG MINH - ep nimpy phai dispatch
-  ## dong sang Python thay vi de Nim tu resolve ten truoc.
+  ## CHANGED (Codestral-7B / bf16): Mistral's checkpoint stores dtype bfloat16 -
+  ## numpy does NOT SUPPORT bfloat16 (numpy has no such type), so
+  ## tensor.numpy() RAISES IMMEDIATELY ("Got unsupported ScalarType
+  ## BFloat16"), even before .astype("float32") in the next step (that step
+  ## wrongly assumed .numpy() always succeeds and only the dtype needs changing).
+  ## It MUST be cast to float32 ON THE TORCH SIDE (torch DOES support bfloat16,
+  ## only numpy does not) BEFORE calling .numpy().
+  ## IMPORTANT NOTE (still true as noted before): do NOT use tensor.to(torch.float32)
+  ## - nimpy DEFINES its own proc named "to" (to convert a
+  ## PyObject -> a Nim type, e.g. `.to(int)`), clashing with PyTorch's ".to(dtype)"
+  ## method -> Nim/nimpy resolves it WRONGLY. Use ".float()" instead -
+  ## PyTorch's OFFICIAL shorthand for ".to(torch.float32)", a completely DIFFERENT
+  ## NAME, so nimpy's "to" is not involved, no confusion.
+  ## ADDITIONAL NOTE (one more confusion just like ".to"): calling
+  ## ".float()" directly on a PyObject is also resolved WRONGLY by Nim/nimpy as Nim's own
+  ## builtin `float()` conversion (to Nim's numeric `float`,
+  ## not a Python method call) -> "type mismatch: expected float".
+  ## Solution: call callMethod("float") EXPLICITLY - forcing nimpy to dispatch
+  ## dynamically into Python instead of letting Nim resolve the name first.
   let flat = t.detach().contiguous().callMethod("float").flatten()
   let shapeObj = t.shape
   var shape: seq[int] = @[]
@@ -99,11 +99,11 @@ proc pyTensorToSeq(t: PyObject): tuple[data: seq[float32], shape: seq[int]] =
     shape.add(shapeObj[i].to(int))
   let n = pyLen(flat)
   var data = newSeq[float32](n)
-  # Vòng lặp Python->Nim từng phần tử chậm với model 1B (>1e9 tham số cho
-  # toàn bộ checkpoint) nếu làm 100% qua nimpy indexing, nên chuyển qua
-  # numpy rồi lấy buffer thẳng cho nhanh.
-  let arrRaw = flat.numpy()             # gio da CHAC CHAN la float32 (da .float() o tren)
-  let arr = arrRaw.astype("float32")    # giu lai (vo hai, phong truong hop dtype khac lot qua)
+  # A per-element Python->Nim loop is slow for a 1B model (>1e9 parameters for
+  # the whole checkpoint) if done 100% through nimpy indexing, so it goes through
+  # numpy and takes the buffer directly for speed.
+  let arrRaw = flat.numpy()             # now SURELY float32 (.float() above)
+  let arr = arrRaw.astype("float32")    # kept (harmless, in case another dtype slips through)
   let buf = arr.tobytes()
   let raw = buf.to(string)
   assert raw.len == n * 4
@@ -111,8 +111,8 @@ proc pyTensorToSeq(t: PyObject): tuple[data: seq[float32], shape: seq[int]] =
   result = (data, shape)
 
 proc listStateDictInfo*(path: string): seq[HFTensorInfo] =
-  ## Chỉ đọc metadata (tên + shape + dtype), KHÔNG kéo hết data vào RAM.
-  ## Dùng cái này trước để xem manifest rồi mới quyết định map tên ra sao.
+  ## Reads only metadata (name + shape + dtype), does NOT pull all the data into RAM.
+  ## Use this first to see the manifest, then decide how to map the names.
   let sd = pyLoadStateDict(path)
   result = @[]
   for key in sd.keys():
@@ -122,13 +122,13 @@ proc listStateDictInfo*(path: string): seq[HFTensorInfo] =
     let shapeObj = t.shape
     for i in 0 ..< pyLen(shapeObj):
       shape.add(shapeObj[i].to(int))
-    # LUU Y: t.dtype la 1 object Python kieu 'torch.dtype' (vd
-    # torch.float16), KHONG PHAI PyObject kieu str -> goi thang
-    # ".to(string)" tren no se bi nimpy tu choi voi loi runtime "Can't
-    # convert python obj of type 'torch.dtype' to string" (.to(string) cua
-    # nimpy chi chap nhan object THAT SU la Python str, khong tu dong goi
-    # str() ho). Phai goi ham built-in str() cua Python (qua pyBuiltins)
-    # TRUOC de bien no thanh 1 PyObject str that, roi moi .to(string) duoc.
+    # NOTE: t.dtype is a Python object of type 'torch.dtype' (e.g.
+    # torch.float16), NOT a str PyObject -> calling
+    # ".to(string)" on it directly is rejected by nimpy with the runtime error "Can't
+    # convert python obj of type 'torch.dtype' to string" (nimpy's .to(string)
+    # only accepts objects that REALLY are Python str, it does not call
+    # str() for you). Python's built-in str() (through pyBuiltins) must be called
+    # FIRST to turn it into a real str PyObject, then .to(string) works.
     let dtype = pyBuiltins.str(t.dtype).to(string)
     result.add(HFTensorInfo(name: name, shape: shape, dtype: dtype))
 
@@ -139,14 +139,14 @@ proc writeManifest*(infos: seq[HFTensorInfo], outPath: string) =
     for s in info.shape: shapeArr.add(%s)
     arr.add(%*{"name": info.name, "shape": shapeArr, "dtype": info.dtype})
   writeFile(outPath, pretty(arr))
-  echo &"[loader] Da ghi manifest {infos.len} tensor -> {outPath}"
+  echo &"[loader] Wrote the manifest of {infos.len} tensors -> {outPath}"
 
 proc loadAllHFTensors*(path: string): seq[RawBinTensor] =
-  ## Đọc TOÀN BỘ checkpoint HF (.bin/.safetensors) thẳng vào RAM (seq
-  ## RawBinTensor), KHÔNG ghi ra bất kỳ file nào trên đĩa. Dùng hàm này khi
-  ## bạn cần build model Nim trực tiếp từ .bin gốc (vd
-  ## jamba_hybrid.loadMambaOnlyFromHFBin) mà không muốn nhân đôi dung lượng
-  ## đĩa bằng 1 file .bin trung gian.
+  ## Reads the WHOLE HF checkpoint (.bin/.safetensors) straight into RAM (seq
+  ## RawBinTensor), writing NO file to disk. Use it when
+  ## you need to build the Nim model directly from the original .bin (e.g.
+  ## jamba_hybrid.loadMambaOnlyFromHFBin) without doubling the disk usage
+  ## with an intermediate .bin file.
   let sd = pyLoadStateDict(path)
   result = @[]
   var n = 0
@@ -157,16 +157,16 @@ proc loadAllHFTensors*(path: string): seq[RawBinTensor] =
     result.add(RawBinTensor(name: name, shape: shape, data: data))
     inc n
     if n mod 20 == 0:
-      echo &"[loader] ... {n} tensor da doc (RAM, khong ghi dia)"
+      echo &"[loader] ... {n} tensors read (RAM, nothing written to disk)"
 
 proc exportBinToRawBin*(binPath, outBinPath: string, arch: array[5, int] = [0, 0, 0, 0, 0]) =
-  ## TIỆN ÍCH TÙY CHỌN, KHÔNG PHẢI BƯỚC BẮT BUỘC của pipeline fine-tune.
-  ## Ghi toàn bộ checkpoint .bin/.safetensors ra 1 file .bin thô KHÁC (rawbin.nim)
-  ## - nghĩa là NHÂN ĐÔI dung lượng đĩa (vd checkpoint 5.5GB -> thêm 5.5GB nữa).
-  ## CHỈ dùng khi bạn thật sự cần 1 bản sao đọc được bằng Nim thuần không cần
-  ## Python nữa (vd để archive/inspect offline). Cho pipeline fine-tune bình
-  ## thường (graft_attention --from-hf, jamba_hybrid.loadMambaOnlyFromHFBin),
-  ## KHÔNG gọi hàm này - dùng loadAllHFTensors (chỉ ở RAM) thay vào đó.
+  ## OPTIONAL UTILITY, NOT A REQUIRED STEP of the fine-tune pipeline.
+  ## Writes the whole .bin/.safetensors checkpoint to ANOTHER raw .bin file (rawbin.nim)
+  ## - i.e. DOUBLES the disk usage (e.g. a 5.5GB checkpoint -> 5.5GB more).
+  ## ONLY use it when you really need a copy readable by pure Nim without
+  ## Python (e.g. to archive/inspect offline). For the normal fine-tune pipeline
+  ## (graft_attention --from-hf, jamba_hybrid.loadMambaOnlyFromHFBin),
+  ## do NOT call this - use loadAllHFTensors (RAM only) instead.
   let tensors = loadAllHFTensors(binPath)
   var meta = initTable[string, string]()
   meta["vocab"] = $arch[0]
@@ -175,31 +175,31 @@ proc exportBinToRawBin*(binPath, outBinPath: string, arch: array[5, int] = [0, 0
   meta["nLayers"] = $arch[3]
   meta["ffMult"] = $arch[4]
   saveRawBin(outBinPath, meta, tensors)
-  echo &"[loader] Xong: {tensors.len} tensor -> {outBinPath} (CANH BAO: file nay la BAN SAO THEM, chiem them dia)"
+  echo &"[loader] Done: {tensors.len} tensors -> {outBinPath} (WARNING: this file is an EXTRA COPY taking more disk)"
 
 proc loadTensorByName*(path, tensorName: string): tuple[data: seq[float32], shape: seq[int]] =
-  ## Đọc đúng 1 tensor theo tên (đỡ tốn RAM khi chỉ cần vài tensor, vd
-  ## embedding hoặc 1 layer cụ thể để so sánh/khởi tạo).
+  ## Reads exactly one tensor by name (saves RAM when only a few tensors are needed, e.g.
+  ## the embedding or one layer for comparison/initialisation).
   let sd = pyLoadStateDict(path)
-  # LUU Y: KHONG dung sd.contains(tensorName) - dict Python KHONG co method
-  # ".contains()" (chi co toan tu "in"/__contains__, khong phai method) ->
-  # nimpy se co gang goi dong (dynamic dispatch sang Python) va bao loi
-  # runtime "No callable attribute: contains". Duyet qua sd.keys() (method
-  # that su, an toan) roi so sanh ten thay vi dung .contains().
+  # NOTE: do NOT use sd.contains(tensorName) - a Python dict has NO
+  # ".contains()" method (only the "in"/__contains__ operator, not a method) ->
+  # nimpy would try a dynamic call into Python and fail at
+  # run time with "No callable attribute: contains". Iterate sd.keys() (a real
+  # method, safe) and compare the names instead of .contains().
   var found = false
   for k in sd.keys():
     if k.to(string) == tensorName:
       found = true
       break
   if not found:
-    raise newException(KeyError, "Khong thay tensor: " & tensorName)
+    raise newException(KeyError, "Tensor not found: " & tensorName)
   result = pyTensorToSeq(sd[tensorName])
 
 when isMainModule:
-  # cách dùng: ./pytorch_bin_loader <path/pytorch_model.bin> [--export out.bin]
-  # (--export la TUY CHON, ghi them 1 ban sao .bin - xem canh bao trong
-  #  exportBinToRawBin(). Pipeline fine-tune binh thuong KHONG can co nay,
-  #  no doc thang tu file .bin goc qua loadAllHFTensors/graft_attention --from-hf)
+  # usage: ./pytorch_bin_loader <path/pytorch_model.bin> [--export out.bin]
+  # (--export is OPTIONAL and writes an extra .bin copy - see the warning in
+  #  exportBinToRawBin(). The normal fine-tune pipeline does NOT need this flag,
+  #  it reads the original .bin directly through loadAllHFTensors/graft_attention --from-hf)
   let args = commandLineParams()
   if args.len < 1:
     echo "usage: pytorch_bin_loader <model.bin|model.safetensors> [--export out.bin]"
@@ -211,6 +211,6 @@ when isMainModule:
   for info in infos[0 ..< min(20, infos.len)]:
     echo &"  {info.name}  shape={info.shape}  dtype={info.dtype}"
   if infos.len > 20:
-    echo &"  ... con {infos.len - 20} tensor nua, xem full trong {path}.manifest.json"
+    echo &"  ... {infos.len - 20} more tensors, see the full list in {path}.manifest.json"
   if args.len >= 3 and args[1] == "--export":
     exportBinToRawBin(path, args[2], [0, 0, 0, 0, 0])

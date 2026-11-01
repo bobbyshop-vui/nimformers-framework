@@ -1,7 +1,7 @@
 ## customfloat.nim
-## Port của CustomFloat + APF (Adaptive Precision Float) từ metal_ai.py
-## Không phụ thuộc trực tiếp vào GPU driver nào - ủy quyền hoàn toàn qua BybyLang (CUDA/Metal/OpenCL/Vulkan).
-## Tự động tăng tốc GPU, hỗ trợ CPU Fallback tự động kèm theo log cảnh báo rõ ràng.
+## Port of CustomFloat + APF (Adaptive Precision Float) from metal_ai.py
+## No direct dependency on any GPU driver - fully delegated to BybyLang (CUDA/Metal/OpenCL/Vulkan).
+## GPU acceleration is automatic, with an automatic CPU fallback and a clear warning log.
 
 import std/[math, strformat, algorithm]
 
@@ -13,13 +13,13 @@ type
     usesUint64*: bool
 
 proc newCustomFloat*(exponentBits, mantissaBits: int, name = ""): CustomFloat =
-  # === SỬA: cho phép exponentBits = 0 cho trường hợp int8/int4 ===
-  assert exponentBits >= 0 and mantissaBits >= 0  # Đổi từ >= 1 thành >= 0
+  # === CHANGED: allow exponentBits = 0 for the int8/int4 case ===
+  assert exponentBits >= 0 and mantissaBits >= 0  # changed from >= 1 to >= 0
   result.exponentBits = exponentBits
   result.mantissaBits = mantissaBits
   result.totalBits = 1 + exponentBits + mantissaBits
   result.itemSize = (result.totalBits + 7) div 8
-  # === SỬA: nếu exponentBits = 0 thì bias = 0 ===
+  # === CHANGED: if exponentBits = 0 then bias = 0 ===
   if exponentBits > 0:
     result.bias = (1 shl (exponentBits - 1)) - 1
     result.maxExp = (1 shl exponentBits) - 1
@@ -30,7 +30,7 @@ proc newCustomFloat*(exponentBits, mantissaBits: int, name = ""): CustomFloat =
                 else: &"float{result.totalBits}_e{exponentBits}m{mantissaBits}"
   result.usesUint64 = result.totalBits <= 64
 
-# ── Preset thường dùng (tương đương FP8_E4M3 ... FP256 trong bản Python) ──
+# ── Common presets (equivalent to FP8_E4M3 ... FP256 in the Python version) ──
 let
   FP8_E4M3* = newCustomFloat(4, 3, "fp8_e4m3")
   FP8_E5M2* = newCustomFloat(5, 2, "fp8_e5m2")
@@ -43,7 +43,7 @@ let
   FP64C*    = newCustomFloat(11, 52, "float64_custom")
 
 # ─────────────────────────────────────────────────────────────
-# fp32 <-> packed uint64  (CPU fallback core, dùng khi không có GPU)
+# fp32 <-> packed uint64  (CPU fallback core, used when there is no GPU)
 # ─────────────────────────────────────────────────────────────
 
 proc fp32ToPackedU64*(x: float32, cf: CustomFloat): uint64 =
@@ -102,25 +102,25 @@ proc packedU64ToFp32*(packed: uint64, cf: CustomFloat): float32 =
   result = cast[float32](bits32)
 
 # ─────────────────────────────────────────────────────────────
-# API Điểm Vào Cho Framework (Hỗ Trợ GPU OpenCL & CPU Fallback)
+# Framework entry-point API (GPU OpenCL & CPU fallback support)
 # ─────────────────────────────────────────────────────────────
 
 proc buildDecodeLUT*(cf: CustomFloat): array[256, float32] =
-  ## LUT giai ma nhanh - CHI dung duoc khi cf.itemSize == 1 (1 byte/phan tu:
-  ## dung cho ca fp4 VA fp8 trong codebase nay, vi itemSize = ceil(totalBits/8)
-  ## nen fp4 (4 bit) van chiem tron 1 byte, khong nen 2 gia tri/byte). Build
-  ## 1 LAN cho moi CustomFloat spec (khong doi trong suot qua trinh train),
-  ## sau do decode chi la 1 phep tra bang O(1) thay vi tinh lai exponent/
-  ## mantissa tung phan tu (packedU64ToFp32) - nhanh hon dang ke khi decode
-  ## lap lai nhieu lan (vd on-demand dequant weight moi buoc train).
-  assert cf.itemSize == 1, &"buildDecodeLUT chi ho tro itemSize==1 (fp4/fp8), cf nay itemSize={cf.itemSize}"
+  ## Fast decode LUT - ONLY usable when cf.itemSize == 1 (1 byte/element:
+  ## used for both fp4 AND fp8 in this codebase, because itemSize = ceil(totalBits/8),
+  ## so fp4 (4 bits) still takes a whole byte, not 2 values/byte). Built
+  ## ONCE per CustomFloat spec (it does not change during training),
+  ## after which decoding is an O(1) table lookup instead of recomputing the exponent/
+  ## mantissa per element (packedU64ToFp32) - noticeably faster when decoding
+  ## repeatedly (e.g. on-demand weight dequant every training step).
+  assert cf.itemSize == 1, &"buildDecodeLUT supports only itemSize==1 (fp4/fp8), this cf has itemSize={cf.itemSize}"
   for b in 0 ..< 256:
     result[b] = packedU64ToFp32(uint64(b), cf)
 
 proc decodeArrayLUT*(buf: openArray[uint8], lut: array[256, float32]): seq[float32] =
-  ## Ban nhanh cua decodeArray, dung LUT da build san (buildDecodeLUT). Ket
-  ## qua GIONG HET decodeArray(buf, cf) (da verify - xem test_lut_correctness
-  ## trong smoke test) nhung nhanh hon vi khong tinh lai bit-arithmetic.
+  ## Fast variant of decodeArray using a prebuilt LUT (buildDecodeLUT). The
+  ## result is IDENTICAL to decodeArray(buf, cf) (verified - see test_lut_correctness
+  ## in the smoke test) but faster because the bit arithmetic is not redone.
   result = newSeq[float32](buf.len)
   for i in 0 ..< buf.len:
     result[i] = lut[int(buf[i])]
@@ -143,21 +143,21 @@ proc cpuDecodeArray*(buf: openArray[uint8], cf: CustomFloat): seq[float32] =
     result[i] = packedU64ToFp32(packed, cf)
 
 proc encodeArray*(arr: openArray[float32], cf: CustomFloat): seq[uint8] =
-  ## float32 -> bytes đóng gói theo CustomFloat (itemSize byte / phần tử, little-endian)
-  assert cf.usesUint64, "encodeArray chỉ hỗ trợ total_bits <= 64"
+  ## float32 -> bytes packed by the CustomFloat (itemSize bytes / element, little-endian)
+  assert cf.usesUint64, "encodeArray supports only total_bits <= 64"
   if arr.len == 0: return @[]
   return cpuEncodeArray(arr, cf)
 
 proc decodeArray*(buf: openArray[uint8], cf: CustomFloat): seq[float32] =
-  ## bytes đóng gói -> float32
-  assert cf.usesUint64, "decodeArray chỉ hỗ trợ total_bits <= 64"
+  ## packed bytes -> float32
+  assert cf.usesUint64, "decodeArray supports only total_bits <= 64"
   assert buf.len mod cf.itemSize == 0
   if buf.len == 0: return @[]
   return cpuDecodeArray(buf, cf)
 
 
 # ═══════════════════════════════════════════════════════════════
-# APF — tự build CustomFloat theo tensor/gradient (không theo RAM)
+# APF — builds a CustomFloat from the tensor/gradient itself (not from RAM)
 # ═══════════════════════════════════════════════════════════════
 
 const
