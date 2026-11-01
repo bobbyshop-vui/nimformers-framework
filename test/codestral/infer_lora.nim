@@ -1060,7 +1060,7 @@ proc parallelPrefillFallbackReason(m: NimformerModelJamba; lora: JambaLora;
     return "Linear++ parallel scan is unavailable for this sequence length/device"
 
 proc forwardParallelPrefill(m: var NimformerModelJamba; lora: JambaLora;
-                            tokenIds: seq[int]; ctx: Backend) =
+                            tokenIds: seq[int]; ctx: Backend; continued = false) =
   pfReset()
   gPfActive = true
   let pfWall0 = getMonoTime()
@@ -1078,10 +1078,14 @@ proc forwardParallelPrefill(m: var NimformerModelJamba; lora: JambaLora;
       if count == 1:
         discard forwardStepJambaGpuRetry(m,tokenIds[offset],tokenIds,offset,ctx,produceLogits=false)
       else:
-        forwardResidentPrefill(m,tokenIds[offset..<offset+count],ctx,continuation=offset>0)
+        forwardResidentPrefill(m,tokenIds[offset..<offset+count],ctx,
+          continuation=continued or offset>0)
         markGpuPrefillReady()
       offset += count
     return
+  # The sequence path below starts from a zero state.
+  if continued:
+    raise newException(ValueError, "continued prefill needs the resident prefill")
   pfTime("warmup+reset"):
     warmupGpuForParallelPrefill(m, ctx)
   var x = pfExpr("embed", m.embed.lookupBatch(@[tokenIds], ctx))
@@ -1105,19 +1109,27 @@ proc forwardParallelPrefill(m: var NimformerModelJamba; lora: JambaLora;
        &"R/P blocks={m.blocks.len}, P sidecars={pCount}; terminal recurrent states imported."
 
 proc forwardPrefillBatch*(m: var NimformerModelJamba; lora: JambaLora;
-                          tokenIds: seq[int]; ctx: Backend) =
+                          tokenIds: seq[int]; ctx: Backend; continued = false) =
   ## Prefill R/P prefixes with sequence-parallel scans, then import each
   ## terminal state into the recurrent decode buffers. Decode remains one-token
   ## causal. Unsupported presets/blocks use the existing fallback; resident R/P/G
   ## prefixes use compact inference scans and GPU MPS tiles in chunks up to 128.
+  ## continued: the tokens extend the current recurrent state (a later chat
+  ## turn) instead of starting a sequence. Only the resident prefill carries
+  ## a state in; without it the tokens run through decode steps.
   if tokenIds.len == 0: return
   if isGpuCtx(ctx): ensureTgCap(ctx)
-  let fallbackReason = parallelPrefillFallbackReason(m, lora, tokenIds, ctx)
+  var fallbackReason = parallelPrefillFallbackReason(m, lora, tokenIds, ctx)
+  if continued and fallbackReason.len == 0 and
+      (getEnv("BYBY_PREFILL_RESIDENT", "1") == "0" or residentPrefillReason(m, ctx).len > 0):
+    fallbackReason = "continued prefill needs the resident prefill"
   if fallbackReason.len == 0:
     try:
-      forwardParallelPrefill(m, lora, tokenIds, ctx)
+      forwardParallelPrefill(m, lora, tokenIds, ctx, continued)
       return
     except CatchableError as e:
+      # A reset would drop the state the continued tokens extend.
+      if continued: raise
       # A failure during imports can leave some earlier blocks advanced.
       # Always return the whole model to a clean recurrent state first.
       resetGpuGenState(m, ctx)

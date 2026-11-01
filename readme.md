@@ -252,7 +252,12 @@ Before the first prompt a warmup compiles the GPU pipelines and prints
 `ready: warmup ...`; `--no-warmup` skips it, and the first reply then pays the compile
 time. For Mamba-2, prompts shorter than 129 tokens run through the decode kernels already
 compiled by the warmup; longer prompts send whole 128-token chunks
-(`BYBY_PREFILL_BATCH_SIZE`) through the parallel prefill.
+(`BYBY_PREFILL_BATCH_SIZE`) through the parallel prefill. On a Vulkan dGPU with tensor
+cores (`prefill=tensor-cores-only` in the `--verbose` device line) the rest of a prompt
+also prefills in 16-token chunks, later chat turns prefill too (carrying the recurrent
+state in), and the warmup compiles the 16-token kernels; every prefill GEMM then runs on
+the tensor cores, never on a scalar kernel. `BYBY_VULKAN_TENSOR_CORES=tune` lets the
+scalar kernels compete again, `0` turns the tensor cores off.
 
 #### LoRA merge
 
