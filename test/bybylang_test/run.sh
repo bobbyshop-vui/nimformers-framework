@@ -25,4 +25,12 @@ for name in syntax_test native_gpu_test cpu_test capi_test; do
 done
 
 echo ""
+echo "=== [bybylang-test] cpu_kernel_regression ==="
+"${NIM:-nim}" c -r --hints:off --mm:arc --opt:speed \
+    --path="$ROOT/vendor/bybylang" \
+    --nimcache="$CACHE/cpu-kernel-regression" \
+    -o:"$CACHE/cpu_kernel_regression" \
+    "$HERE/cpu_kernel_regression.nim"
+
+echo ""
 echo "[bybylang-test] all tests passed"
