@@ -85,7 +85,7 @@ Các nhà phát triển model sau được ghi nhận; liên kết GitHub dùng 
 
 - **Mistral AI** ([@mistralai](https://github.com/mistralai)): Devstral, Codestral, Mistral Large
 - **RWKV** ([@RWKV](https://github.com/RWKV)): RWKV-3
-- **Anthropic** ([@anthropics](https://github.com/anthropics), [@claude](https://github.com/claude)): Claude Sonnet 4.6, Claude Sonnet 5, Claude Sonnet 5.5, Claude Opus 4.6, Claude Opus 5, Claude Opus 5.5
+- **Anthropic** ([@anthropics](https://github.com/anthropics), [@claude](https://github.com/claude)): Claude Sonnet 4.6, Claude Sonnet 5, Claude Sonnet 5.5, Claude Opus 4.6, Claude Opus 5, Claude Opus 5.5, Claude Fable 5
 - **Google DeepMind** ([@google-deepmind](https://github.com/google-deepmind)): Gemini 3.8 Flash, Gemini 3.7 Flash
 - **Moonshot AI** ([@MoonshotAI](https://github.com/MoonshotAI)): Kimi K3
 - **Allen Institute for AI (Ai2)** ([@allenai](https://github.com/allenai)): SERA-8B
