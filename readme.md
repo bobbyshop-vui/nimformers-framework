@@ -2,6 +2,10 @@
 
 [English](readme.md) | [Tiếng Việt](readme.vi.md)
 
+**Benchmarks** (prefill/decode tok/s on Tesla T4 and Intel Iris Plus 640):
+[DeepSeek Coder 6.7B](test/deepseek-inference/benchmark.md) ·
+[Codestral Mamba + QLoRA](test/codestral/benchmark.md)
+
 Nimformer is a Nim framework for transformer inference and training with Metal and Vulkan GPU backends. The API references, usage guides, file formats, and BybyLang GPU programming docs are in [`docs/`](docs/README.md).
 
 Start with the [documentation index](docs/README.md), then see [Getting Started](docs/getting-started.md) for a minimal program.
