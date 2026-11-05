@@ -2,7 +2,8 @@
 
 A llama.cpp-style inference framework written in **BybyLang** (`.bybylang`, compiled ahead
 of time to Nim) on top of nimformers. One command, `formers-cli`, detects the model in
-`--models` and runs DeepSeek/Llama or Codestral (Mamba-2, with or without LoRA/Linear++).
+`--models` and runs DeepSeek/Llama, Codestral (Mamba-2) or Mamba-3 SISO, with optional
+Mamba LoRA/Linear++ checkpoints.
 
 The Llama path runs **exactly what `nim_inference.nim` runs**:
 `newLlamaLConfig` (every size read from `config.json`) → `newLlamaModelL` →
@@ -16,6 +17,10 @@ The Mamba-2 path imports the Mamba-2/Linear++ blocks and GPU kernels (`jamba_hyb
 `lora`, `infer_lora.forwardPrefillBatch`), the `.nimq`/`.bin` loaders and the tokenizer.
 Everything else is formers.n's own, with sizes taken from `config.json`: model assembly,
 LoRA loading, sampler, generation loop.
+
+The Mamba-3 SISO path reuses `test/mamba3`'s quantized base/LoRA loader, recurrent GPU
+runtime and tokenizer/generation implementation. It supports the official 187M and
+1.5B SISO dimensions and one-shot generation; interactive chat is rejected for Mamba-3.
 
 ## Layout
 
@@ -34,6 +39,7 @@ other/formers.n/
 │       ├── runtime/console.bybylang   # "> " chat input
 │       ├── models/llama.bybylang      # Llama runner (nim_inference's own functions)
 │       ├── models/mamba2.bybylang     # Mamba-2 base / LoRA / Linear++ runner
+│       ├── models/mamba3.bybylang     # Mamba-3 SISO base / LoRA / Linear++ runner
 │       └── router.bybylang            # detection -> runner (false when unsupported)
 └── tests/
     ├── test_detect.bybylang     # fake configs/tensors + real headers, no weights loaded
@@ -48,10 +54,12 @@ other/formers.n/
 | `backbone.layers.N.mixer.{A_log,in_proj,conv1d,dt_bias,...}`, `model_type` mamba2 | `mamba2` | Mamba-2 base (the base-Mamba path of `infer_lora.nim`) |
 | Mamba-2 + LoRA `.bin` with adapters only | `mamba2+lora` | LoRA checkpoint (like `infer_lora.nim`) |
 | Mamba-2 + LoRA `.bin` with P/G/A blocks (`newBlock.blockN.attn.*`) | `mamba2+linear++` | same, keeping the checkpoint's `normPreset` |
+| Mamba-3 SISO tensors + official 187M or 1.5B config | `mamba3` | `test/mamba3` resident inference |
+| Mamba-3 SISO + LoRA `.bin` (R/P/G blocks) | `mamba3` | `test/mamba3` inference with the checkpoint |
 | anything else (gemma, qwen2, gpt2, Mamba-1, ...) | `unknown` | not run, `fmRun` returns `false`, exit 3 |
 
 Detection checks the layer count, hidden size, head and KV-head counts, head_dim, FFN size,
-vocab, the Mamba-2 `in_proj`/`conv1d` sizes and the LoRA pattern/sizes against the real
+vocab, the Mamba-2 `in_proj`/`conv1d` sizes, Mamba-3 SISO projection/MLP tensor shapes and the LoRA pattern/sizes against the real
 shape of every tensor; any mismatch is rejected with its reason. For Llama it also checks
 that `tokenizer.json` is a Hugging Face tokenizer (older `export_to_nimq.py` versions
 overwrote it).
@@ -68,6 +76,17 @@ make formers-smoke          # tiny random Llama end to end on the GPU
 other/formers.n/formers-cli --models test/deepseek-inference/models -p "Write quicksort in Python" -n 128
 other/formers.n/formers-cli --models test/codestral/models -p "Hello" -n 60 --temp 0.7
 other/formers.n/formers-cli --models test/codestral/models --no-lora -p "Hello"
+# Mamba-3 187M + gated LoRA (one-shot; Mamba-3 does not support -cnv)
+other/formers.n/formers-cli --models test/mamba3/models -m test/mamba3/models/mamba3_siso_187m.nimq --config test/mamba3/models/mamba3-siso-187m/config.json --tokenizer test/mamba3/models/mamba3-siso-187m --lora test/mamba3/models/runs/mamba3-siso-187m-gated/lora.bin -p 'Write a Python function to check if a string is a palindrome' -n 64 --temp 0.7 --backend metal
+
+# Mamba-3 1.5B + gated LoRA
+other/formers.n/formers-cli --models test/mamba3/models -m test/mamba3/models/mamba3_siso_1.5b.nimq --config test/mamba3/models/mamba3-siso-1.5b/config.json --tokenizer test/mamba3/models/mamba3-siso-1.5b --lora test/mamba3/models/runs/mamba3-siso-1.5b-gated/lora-g1.bin -p 'Write a Python function to check if a string is a palindrome' -n 64 --temp 0.7 --backend metal
+
+# Inspect detection without loading weights or generating
+other/formers.n/formers-cli --models test/mamba3/models -m test/mamba3/models/mamba3_siso_187m.nimq --config test/mamba3/models/mamba3-siso-187m/config.json --tokenizer test/mamba3/models/mamba3-siso-187m --lora test/mamba3/models/runs/mamba3-siso-187m-gated/lora.bin --detect-only
+
+# Run a base model without its LoRA
+other/formers.n/formers-cli --models test/mamba3/models -m test/mamba3/models/mamba3_siso_187m.nimq --config test/mamba3/models/mamba3-siso-187m/config.json --tokenizer test/mamba3/models/mamba3-siso-187m --no-lora -p 'Write a Python function to check if a string is a palindrome' -n 64 --temp 0.7 --backend metal
 other/formers.n/formers-cli --models <dir> --detect-only
 ```
 
@@ -102,6 +121,7 @@ quits.
   stops.
 - Mamba-2: the recurrent state lives on the GPU, there is no context limit. Each turn feeds
   `</s>` (when the previous reply was cut short) + `[INST] ...[/INST]`.
+- Mamba-3: one-shot generation only; `-cnv` is unsupported.
 
 Chat templates that do not emit `bos_token` (DeepSeek-coder, TinyLlama) get BOS prepended
 when the tokenizer adds one, like llama.cpp.
@@ -139,7 +159,8 @@ Quiet by default: the loader, LoRA, JIT, Metal and kernel-tuning logs of the lib
 (which write to fd 1/2 directly) go to `/dev/null`, and only formers.n's own lines show:
 one `loading` line, `ready`, the generated text, the statistics and errors. `-v/--verbose`
 shows everything, as before. An error in quiet mode prints its message and suggests
-`--verbose` for the full log.
+`--verbose` for the full log. Use `--verbose` to see Mamba-3 runtime statistics; set
+`BYBY_METAL_JIT_LOG=0` to suppress Metal JIT messages in verbose output.
 
 A Mamba-2 LoRA is merged into the resident FP4-KM weights at startup
 (`infer_lora.mergeResidentLoraIfEnabled`, ~35 s on Codestral 7B): the decode kernels then

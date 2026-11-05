@@ -43,14 +43,14 @@ function fmDefaultOptions(): FmOptions
 
 function fmUsage(): string
     var lines: seq[string]
-    lines.add("formers-cli - DeepSeek/Llama and Codestral (Mamba-2) inference on nimformers + BybyLang")
+    lines.add("formers-cli - Llama, Mamba-2 and Mamba-3 inference on nimformers + BybyLang")
     lines.add("")
     lines.add("Usage: formers-cli --models <dir> [options]")
     lines.add("")
     lines.add("Model:")
     lines.add("  --models DIR           directory with the .nimq, config.json, tokenizer, LoRA .bin")
     lines.add("  -m, --model FILE       .nimq file (default: found in --models)")
-    lines.add("  --lora FILE            LoRA adapter .bin (NIMBIN1/NIMBIN4) for Mamba-2")
+    lines.add("  --lora FILE            LoRA adapter .bin (NIMBIN1/NIMBIN4) for Mamba-2/3")
     lines.add("  --no-lora              ignore a LoRA found in --models")
     lines.add("  --no-merge-lora        keep the LoRA adapters separate (default: merged into the weights)")
     lines.add("  --config FILE          config.json (default: found automatically)")

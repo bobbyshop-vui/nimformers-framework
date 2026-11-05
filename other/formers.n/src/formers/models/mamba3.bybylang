@@ -1,0 +1,32 @@
+# formers.n — Mamba-3 SISO runner.
+#
+# Reuses the maintained Mamba-3 loader, GPU runtime and generation loop from
+# test/mamba3/infer_lora.nim rather than duplicating that inference stack.
+
+import nim "std/[os, strutils]"
+import nim "backend"
+import nim "m3_formers_infer as m3infer"
+import "../cli/options.bybylang"
+import "../arch/detect.bybylang"
+import "../runtime/console.bybylang"
+
+function fmRunMamba3(det: FmDetection, opts: FmOptions): bool
+    if opts.noMergeLora:
+        putEnv("BYBY_MERGE_LORA", "0")
+    putEnv("BYBY_TOP_P", $opts.topP)
+    putEnv("BYBY_MIN_P", $opts.minP)
+    putEnv("BYBY_REPEAT_PENALTY", $opts.repeatPenalty)
+    putEnv("BYBY_REPEAT_WINDOW", $opts.repeatLastN)
+    m3infer.configureInferenceDefaults()
+    m3infer.setInferenceThreadPriority()
+    let ctx = newBackend(opts.backend)
+    var prompt = opts.prompt.strip()
+    if not opts.rawPrompt and not prompt.startsWith("[INST]"):
+        prompt = "[INST] " & prompt & "[/INST]"
+    if det.route == frMamba3Lora:
+        var loaded = m3infer.loadBinaryLoraForInfer(det.lora.path)
+        discard m3infer.generate(loaded.model, loaded.lora, loaded.tok, prompt, opts.nPredict, ctx, temperature = opts.temperature, seed = opts.seed, output = fmOut())
+    else:
+        var loaded = m3infer.loadPureMambaForInfer(det.files.tokenizerDir, det.files.nimqPath)
+        discard m3infer.generate(loaded.model, loaded.lora, loaded.tok, prompt, opts.nPredict, ctx, temperature = opts.temperature, seed = opts.seed, output = fmOut())
+    result = true

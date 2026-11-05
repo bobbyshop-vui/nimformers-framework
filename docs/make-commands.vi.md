@@ -25,7 +25,7 @@ và các gói tương ứng, xem [LoRA fine-tuning](finetune-lora-api.vi.md).
 
 Backend framework hỗ trợ `auto`, `metal`, `vulkan`. `cuda` và `opencl` là tên
 tương thích được chuyển sang Vulkan; chúng không bật CUDA/OpenCL runtime riêng.
-CPU không còn là backend chạy model.
+Framework cũng hỗ trợ backend CPU.
 
 
 ## Bắt đầu với Spectron
@@ -52,6 +52,12 @@ Trên macOS, chọn Metal rõ ràng:
 make run-metal
 ```
 
+Chọn Vulkan rõ ràng trên hệ thống có Vulkan loader và driver:
+
+```sh
+make run-vulkan
+```
+
 Chi tiết cấu hình, dữ liệu, loss và resume nằm trong
 [Hướng dẫn Spectron](spectron-guide.vi.md).
 
@@ -64,11 +70,14 @@ Chi tiết cấu hình, dữ liệu, loss và resume nằm trong
 - `make run`: check, compile và chạy trainer với backend `auto`.
 - `make run-metal`: check, compile với `-d:backend=metal`, rồi train. Ngoài
   macOS target chỉ in thông báo Metal không được hỗ trợ.
+- `make run-vulkan`: check/compile `test/spectron/test_nimformer.nim` với
+  `-d:backend=vulkan`, rồi chạy `test/spectron/test_nimformer`. Target không
+  giới hạn hệ điều hành macOS; hệ thống cần có Vulkan.
 - `make run-opencl`: check, compile với tên backend `opencl`, rồi chạy bằng
   Vulkan theo mapping hiện tại.
 - `make run-cuda`: tương tự với tên `cuda`, được chuyển sang Vulkan.
-- `make run-cpu`: target cũ vẫn còn trong Makefile, nhưng binary sẽ báo lỗi
-  khi tạo backend CPU. Dùng Metal/Vulkan/auto.
+- `make run-cpu`: check/compile với `-d:backend=cpu`, rồi chạy bằng backend
+  CPU của framework.
 - `make build-spectron`: check và compile **chương trình chat**, tạo
   `./test_inferencespectron` ở thư mục gốc.
 - `make run-spectron`: build chương trình chat, rồi chạy checkpoint Spectron
@@ -76,6 +85,9 @@ Chi tiết cấu hình, dữ liệu, loss và resume nằm trong
 
 `test_nimformer` là trainer dù có chữ `test` trong tên. `test_inferencespectron`
 là chương trình inference. Hai binary có vị trí output khác nhau.
+
+`make run-vulkan` chạy trainer Spectron theo các thiết lập `CFG_*`; đây không
+phải lệnh inference Mamba3.
 
 Trainer và chat Spectron hiện không đọc tham số CLI về số step, batch, prompt
 hay đường dẫn checkpoint. `make run ARGS='--steps 100'` không đổi cấu hình

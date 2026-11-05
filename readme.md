@@ -4,7 +4,8 @@
 
 **Benchmarks** (prefill/decode tok/s on Tesla T4 and Intel Iris Plus 640):
 [DeepSeek Coder 6.7B](test/deepseek-inference/benchmark.md) ·
-[Codestral Mamba + QLoRA](test/codestral/benchmark.md)
+[Codestral Mamba + QLoRA](test/codestral/benchmark.md) ·
+[Mamba-3 SISO + LoRA](test/mamba3/benchmark.md)
 
 Nimformer is a Nim framework for transformer inference and training with Metal and Vulkan GPU backends. The API references, usage guides, file formats, and BybyLang GPU programming docs are in [`docs/`](docs/README.md).
 
@@ -21,9 +22,10 @@ Practical guides:
 - [BybyLang walkthrough](docs/bybylang-guide.md): compiler, DSL/AOT, sessions,
   micro-kernels, and the C ABI.
 - [formers.n](#run-deepseek-or-codestral-with-formersn-formers-cli): one llama.cpp-style
-  `formers-cli` for DeepSeek/Llama and Codestral (Mamba-2, LoRA), single prompt or chat.
+  `formers-cli` for DeepSeek/Llama, Codestral (Mamba-2, LoRA), and Mamba-3 SISO
+  187M/1.5B. Mamba-3 uses single-prompt generation; Llama and Mamba-2 also support chat.
 
-Model-specific programs and data live under `test/spectron/`, `test/codestral/`, and `test/deepseek-inference/`. Model assets live in each project's `models/` folder. The FP4 GEMV micro-kernel modules live under `kernelfortest/`; shared runtime modules remain at the project root.
+Model-specific programs and data live under `test/spectron/`, `test/codestral/`, `test/mamba3/`, and `test/deepseek-inference/`. Model assets live in each project's `models/` folder. The FP4 GEMV micro-kernel modules live under `kernelfortest/`; shared runtime modules remain at the project root.
 
 
 ## Python and C ABI
@@ -102,11 +104,21 @@ This is an AI model and developer acknowledgement list; it does not replace indi
 
 These repositories contain the model files used by the inference targets in this project:
 
-| Repository | Contents | Make target |
-| --- | --- | --- |
-| [DeepSeek Coder 6.7B NimQ](https://huggingface.co/bobbydeveloper2014/deepseek-coder-6.7b-nimq) | `model.nimq`, `config.json`, and tokenizer files for `test/deepseek-inference/nim_inference.nim` | `infer-deepseek`, `formers` |
-| [Codestral v0.1 7B NimQ](https://huggingface.co/bobbydeveloper2014/codestral-v0.1-7b-nimq) | Codestral base weights, model config, and Tekken/HF tokenizer files | `infer-lora` base, `formers` |
-| [Codestral v0.1 QLoRA LinearAttention](https://huggingface.co/bobbydeveloper2014/codestral-v0.1-nimq-qlora-linearattention) | `jamba_parallel_lora.bin` adapter checkpoint; it uses the Codestral NimQ base above | `infer-lora` adapter, `formers` |
+| Repository | Contents | GitHub code | Make target |
+| --- | --- | --- | --- |
+| [DeepSeek Coder 6.7B NimQ](https://huggingface.co/bobbydeveloper2014/deepseek-coder-6.7b-nimq) | `model.nimq`, `config.json`, and tokenizer files | [DeepSeek inference](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/test/deepseek-inference) | `infer-deepseek`, `formers` |
+| [Codestral v0.1 7B NimQ](https://huggingface.co/bobbydeveloper2014/codestral-v0.1-7b-nimq) | Codestral base weights, model config, and Tekken/HF tokenizer files | [Codestral inference](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/test/codestral) | `infer-lora` base, `formers` |
+| [Codestral v0.1 QLoRA LinearAttention](https://huggingface.co/bobbydeveloper2014/codestral-v0.1-nimq-qlora-linearattention) | `jamba_parallel_lora.bin` adapter; uses the Codestral NimQ base above | [Codestral LoRA](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/test/codestral) | `infer-lora` adapter, `formers` |
+| [Mamba-3 SISO 187M NimQ + LoRA](https://huggingface.co/bobbydeveloper2014/mamba-siso-175m-nimq) | NimQ weights, root-level config/tokenizer, and gated LoRA checkpoint | [Mamba-3](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/test/mamba3) | `infer-lora`, `formers` |
+| [Mamba-3 SISO 1.5B NimQ + LoRA](https://huggingface.co/bobbydeveloper2014/mamba-siso-1.5b-nimq) | NimQ weights, root-level config/tokenizer, and gated LoRA checkpoint | [Mamba-3](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/test/mamba3) | `infer-lora`, `formers` |
+
+To make Hugging Face tools pick up your token from the local ignored environment file, load it in the shell before using `hf` or `huggingface_hub`:
+
+```sh
+set -a
+source .env.huggingface
+set +a
+```
 
 
 ### Inference benchmarks
@@ -119,17 +131,112 @@ test machines and the commands used:
 | --- | --- |
 | DeepSeek Coder 6.7B (`nim_inference`) | [`test/deepseek-inference/benchmark.md`](test/deepseek-inference/benchmark.md) |
 | Codestral Mamba + QLoRA (`infer_lora`) | [`test/codestral/benchmark.md`](test/codestral/benchmark.md) |
+| Mamba-3 SISO 187M + LoRA (`test/mamba3/infer_lora_bin`) | [187M benchmark](test/mamba3/benchmark.md#mamba-3-siso-187m) |
+| Mamba-3 SISO 1.5B + gated LoRA (`test/mamba3/infer_lora_bin`) | [1.5B benchmark](test/mamba3/benchmark.md#mamba-3-siso-15b) |
 
+Latest recorded **Mamba-3 1.5B** run on Intel Iris Plus 640 / Metal: prefill
+**9.88 tok/s** (18 tokens, 1.822 s, including 0.039 s kernel setup), decode
+**4.89 tok/s** (64 tokens, 13.084 s), and 14.906 s combined. This is one
+user-provided run with the optimized shared kernels, excluding model loading
+and LoRA merge; it is not a controlled cold-start or multi-run average.
+The linked benchmark keeps this separate from the older 187M measurement.
+
+
+### Mamba-3 SISO: separate 187M and 1.5B models
+
+The Mamba-3 pipeline supports two separate bases through the same trainer and
+inference binaries. The smaller model is **187M**; there is no 125M base in the
+current local setup. Both variants use FP4-KM base weights and a learned gated
+Mamba-3 + Linear++ branch (`G`) at the last layer.
+
+- **187M:** 12 layers, hidden size 768. Config/tokenizer directory:
+  `test/mamba3/models/mamba3-siso-187m/`; base: `test/mamba3/models/mamba3_siso_187m.nimq`.
+  LoRA checkpoint: `test/mamba3/models/runs/mamba3-siso-187m-gated/lora.bin`; scratch:
+  `test/mamba3/models/runs/mamba3-siso-187m-gated/scratch/`. Pattern: 11 `R` blocks + one `G`.
+- **1.5B:** 24 layers, hidden size 2048. Config/tokenizer directory:
+  `test/mamba3/models/mamba3-siso-1.5b/`; base:
+  `test/mamba3/models/mamba3_siso_1.5b.nimq`. LoRA checkpoint:
+  `test/mamba3/models/runs/mamba3-siso-1.5b-gated/lora-g1.bin`; scratch:
+  `test/mamba3/models/runs/mamba3-siso-1.5b-gated/scratch-g1/`. Pattern: 23 `R` blocks + one `G`.
+
+Each checkpoint records its own base path and topology. Keep checkpoints and
+resume state separate between variants. Build the shared inference binary and
+choose the checkpoint explicitly:
+
+```sh
+make -f test/mamba3/Makefile infer
+
+# 187M
+BYBY_METAL_JIT_LOG=0 BYBY_ONE_DISPATCH=0 BYBY_MAX_NEW_TOKENS=64 \
+test/mamba3/infer_lora_bin test/mamba3/models/runs/mamba3-siso-187m-gated/lora.bin \
+  'Write a Python function to check if a string is a palindrome' 0.7
+
+# 1.5B
+BYBY_METAL_JIT_LOG=0 BYBY_ONE_DISPATCH=0 BYBY_MAX_NEW_TOKENS=64 \
+test/mamba3/infer_lora_bin test/mamba3/models/runs/mamba3-siso-1.5b-gated/lora-g1.bin \
+  'Write a Python function to check if a string is a palindrome' 0.7
+```
+
+The final argument is temperature; `BYBY_MAX_NEW_TOKENS` sets the output limit.
+See [the Mamba-3 guide](test/mamba3/README.md) for separate finetune/resume commands
+and setup. Root `make infer-lora` / `make finetune-mamba` select the Codestral
+pipeline; the commands above select Mamba-3.
+
+#### Run either Mamba-3 model through formers.n
+
+`formers-cli` routes both variants to the same `test/mamba3` loader, generation
+loop and optimized GPU runtime. Build it, then select the base, config,
+tokenizer and adapter explicitly because `models/` contains both variants:
+
+```sh
+make build-formers
+
+# 187M: 11 R + G
+BYBY_METAL_JIT_LOG=0 BYBY_ONE_DISPATCH=0 other/formers.n/formers-cli \
+  --models test/mamba3/models \
+  -m test/mamba3/models/mamba3_siso_187m.nimq \
+  --config test/mamba3/models/mamba3-siso-187m/config.json \
+  --tokenizer test/mamba3/models/mamba3-siso-187m \
+  --lora test/mamba3/models/runs/mamba3-siso-187m-gated/lora.bin \
+  -p 'Write a Python function to check if a string is a palindrome' \
+  -n 64 --temp 0.7 --backend metal
+
+# 1.5B: 23 R + G
+BYBY_METAL_JIT_LOG=0 BYBY_ONE_DISPATCH=0 other/formers.n/formers-cli \
+  --models test/mamba3/models \
+  -m test/mamba3/models/mamba3_siso_1.5b.nimq \
+  --config test/mamba3/models/mamba3-siso-1.5b/config.json \
+  --tokenizer test/mamba3/models/mamba3-siso-1.5b \
+  --lora test/mamba3/models/runs/mamba3-siso-1.5b-gated/lora-g1.bin \
+  -p 'Write a Python function to check if a string is a palindrome' \
+  -n 64 --temp 0.7 --backend metal
+```
+
+Add `--detect-only` to inspect the selected architecture and checkpoint without
+loading weights onto the GPU. Replace `--lora <path>` with `--no-lora` for the
+base model. Add `--verbose` for Mamba-3 prefill/decode statistics, retaining
+`BYBY_METAL_JIT_LOG=0` to hide routine Metal JIT logs. Use `--backend vulkan` on
+a Vulkan setup. Mamba-3 currently supports single prompts; omit `-cnv`/`-i`.
 
 ### Download the models
 
-The Hugging Face repositories are public. From the repository root, run this target to download all DeepSeek and Codestral assets into the paths used by the inference targets:
+All five Hugging Face repositories above are public. From the repository root, run this target to download their weights, adapters, configs, and tokenizers into the paths used by inference and formers.n:
 
 ```sh
 make download-models
 ```
 
-The target creates the model directories under `test/` as needed, downloads the base weights, tokenizer/config files and adapter, then writes the Codestral tokenizer-directory sidecar used by `infer-lora`. It uses `curl` with retries and resume support.
+The target creates the model directories under `test/` as needed and uses `curl` with retries and resume support. It also fetches each Mamba-3 config/tokenizer into its own directory so the 187M and 1.5B configs do not overwrite each other, then installs the LoRA tokenizer sidecars at the paths recorded by their checkpoints.
+
+| Hugging Face repository | Downloaded files |
+| --- | --- |
+| [DeepSeek Coder 6.7B NimQ](https://huggingface.co/bobbydeveloper2014/deepseek-coder-6.7b-nimq) | `test/deepseek-inference/models/` |
+| [Codestral v0.1 7B NimQ](https://huggingface.co/bobbydeveloper2014/codestral-v0.1-7b-nimq) | `test/codestral/models/` and `test/codestral/models/hf/` |
+| [Codestral QLoRA LinearAttention](https://huggingface.co/bobbydeveloper2014/codestral-v0.1-nimq-qlora-linearattention) | `test/codestral/models/jamba_parallel_lora.bin` and its tokenizer sidecar |
+| [Mamba-3 SISO 187M NimQ + LoRA](https://huggingface.co/bobbydeveloper2014/mamba-siso-175m-nimq) | base `test/mamba3/models/`; config/tokenizer `test/mamba3/models/mamba3-siso-187m/`; adapter `test/mamba3/models/runs/mamba3-siso-187m-gated/` |
+| [Mamba-3 SISO 1.5B NimQ + LoRA](https://huggingface.co/bobbydeveloper2014/mamba-siso-1.5b-nimq) | base `test/mamba3/models/`; config/tokenizer `test/mamba3/models/mamba3-siso-1.5b/`; adapter `test/mamba3/models/runs/mamba3-siso-1.5b-gated/` |
+
+All assets are public, so downloading them does not require `HF_TOKEN` or a Hugging Face login. The `HF_TOKEN` environment setup above is only needed for private or gated repositories and write operations.
 
 If Codestral weights are already present but `newHfTokenizer` reports missing
 files, download only its tokenizer/config assets:
@@ -316,6 +423,7 @@ one binary and one set of flags:
 | Llama family (`LlamaForCausalLM`, DeepSeek Coder) | `nim_inference` transformer blocks | `test/deepseek-inference/models` |
 | Mamba-2 (Codestral Mamba) | `infer_lora` base-Mamba path | a directory without a LoRA `.bin` |
 | Mamba-2 + LoRA / Linear++ | `infer_lora` checkpoint path | `test/codestral/models` |
+| Mamba-3 SISO 187M or 1.5B, base or LoRA / gated Linear++ | `test/mamba3` shared inference runtime | `test/mamba3/models` with explicit model/config/tokenizer flags |
 
 #### Build
 
@@ -360,7 +468,7 @@ make formers ARGS='--models test/codestral/models -p "Write quicksort in Python.
 | weights | the only `.nimq`; with several, the one named in the LoRA `nimqPath` metadata, else `model.nimq` | `-m FILE` |
 | config | `config.json` in the directory or a subdirectory (Codestral keeps it in `hf/`) | `--config FILE` |
 | tokenizer | a directory with `tokenizer.json` or `tokenizer.model` | `--tokenizer DIR` |
-| LoRA (Mamba-2) | the only `.bin` with a `NIMBIN1`/`NIMBIN4` header; several is an error | `--lora FILE`, `--no-lora` |
+| LoRA (Mamba-2/3) | the only `.bin` with a `NIMBIN1`/`NIMBIN4` header; several is an error | `--lora FILE`, `--no-lora` |
 
 `--detect-only` prints the files, the architecture, the route and the model sizes, and
 says why a model is not supported (for example Mamba-1 or an unknown `model_type`).
@@ -481,6 +589,16 @@ make run
 ```
 
 `make run` compiles and trains with the default `auto` backend, 6,000 steps, batch 32, and sequence length 128. It writes `test/spectron/models/spectron_bpe_tokenizer.json` when no tokenizer exists, saves `test/spectron/models/finetune.nimq` every five steps, and resumes from an existing checkpoint. The checkpoint keeps model weights and step count, but Adam moments restart when resuming. On macOS, `make run-metal` compiles with the Metal backend.
+
+To check, compile, and run `test_nimformer` with Vulkan explicitly:
+
+```sh
+make run-vulkan
+```
+
+This uses `-d:backend=vulkan` and starts the Spectron trainer with its configured
+datasets and training settings. It requires a Vulkan loader/driver (MoltenVK on
+macOS). To preview the commands without starting training, use `make -n run-vulkan`.
 
 
 ### Run the trained Spectron checkpoint

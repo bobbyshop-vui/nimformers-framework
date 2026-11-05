@@ -27,6 +27,11 @@ Cách gộp trên macOS:
 make run-metal
 ```
 
+Trên hệ thống có Vulkan loader và driver, dùng `make run-vulkan` để check,
+compile với `-d:backend=vulkan`, rồi chạy cùng trainer Spectron. Target không
+giới hạn macOS. Trainer dùng các thiết lập `CFG_*` bên dưới; đây không phải
+lệnh inference Mamba3.
+
 Hoặc dùng `make run` cho backend tự dò. Mỗi lần chạy trainer sẽ thực hiện
 thêm `CFG_N_STEPS` bước, sau đó sinh thử từ `CFG_GEN_PROMPT` và thoát.
 

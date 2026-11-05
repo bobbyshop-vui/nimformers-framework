@@ -71,6 +71,29 @@ function tMamba2Tensors(vocab, hidden, layers, heads, state, groups, conv, expan
 function tMamba2Config(vocab, hidden, layers, heads, state, groups, conv, expand: int): JsonNode
     result = %*{"model_type": "mamba2", "architectures": ["Mamba2ForCausalLM"], "vocab_size": vocab, "hidden_size": hidden, "num_hidden_layers": layers, "num_heads": heads, "head_dim": expand * hidden div heads, "state_size": state, "n_groups": groups, "conv_kernel": conv, "expand": expand, "rms_norm": true}
 
+function tMamba3Tensors(vocab = 128256, hidden = 768, inner = 1536, layers = 12, heads = 24, state = 128): seq[(string, seq[int])]
+    let proj = 2 * inner + 2 * state + 3 * heads + state div 4
+    result.add(("backbone.embeddings.weight", @[vocab, hidden]))
+    result.add(("backbone.norm_f.weight", @[hidden]))
+    result.add(("lm_head.weight", @[vocab, hidden]))
+    for layer in 0 ..< layers:
+        let p = "backbone.layers." & $layer & "."
+        result.add((p & "norm.weight", @[hidden]))
+        result.add((p & "norm2.weight", @[hidden]))
+        result.add((p & "mixer.in_proj.weight", @[proj, hidden]))
+        result.add((p & "mixer.out_proj.weight", @[hidden, inner]))
+        result.add((p & "mixer.B_bias", @[heads, 1, state]))
+        result.add((p & "mixer.C_bias", @[heads, 1, state]))
+        result.add((p & "mixer.B_norm.weight", @[state]))
+        result.add((p & "mixer.C_norm.weight", @[state]))
+        result.add((p & "mixer.dt_bias", @[heads]))
+        result.add((p & "mixer.D", @[heads]))
+        result.add((p & "mlp.fc1.weight", @[4 * hidden, hidden]))
+        result.add((p & "mlp.fc2.weight", @[hidden, 2 * hidden]))
+
+function tMamba3Config(vocab = 128256, hidden = 768, inner = 1536, layers = 12, expand = 2, headDim = 64): JsonNode
+    result = %*{"vocab_size": vocab, "d_model": hidden, "d_intermediate": inner, "n_layer": layers, "ssm_cfg": {"layer": "Mamba3", "d_state": 128, "expand": expand, "headdim": headDim, "ngroups": 1, "rope_fraction": 0.5, "is_mimo": false}}
+
 function tWriteLoraBin(path, pattern, nimqName: string, hidden, vocab, heads: int, withLinearPP: bool)
     var meta: seq[(string, string)]
     meta.add(("format", "nimformers-lora-v1-qlora4"))
@@ -190,7 +213,41 @@ det = fmDetect(tOpts(dir))
 if not tCheck("mamba2-2.7b", det, faMamba2, true) or det.mamba.inProjRows != 2 * 5120 + 2 * 128 + 80:
     inc failures
 
-# 11. Mamba-1 and an unknown architecture
+# 11. Mamba-3 SISO base and LoRA routes
+dir = tModelDir(root, "mamba3-siso", tMamba3Config(), tMamba3Tensors(), "hf")
+det = fmDetect(tOpts(dir))
+if not tCheck("mamba3-siso-base", det, faMamba3, true) or det.route != frMamba3Base or det.mamba3.nHeads != 24:
+    inc failures
+var mamba3ChatOpts = tOpts(dir)
+mamba3ChatOpts.conversation = true
+reason = ""
+if fmCheckRun(det, mamba3ChatOpts, reason) or reason.len == 0:
+    echo "FAIL mamba3-chat: interactive conversation should be rejected"
+    inc failures
+tWriteLoraBin(dir / "mamba3-adapters.bin", "R".repeat(12), "model.nimq", 768, 128256, 24, false)
+det = fmDetect(tOpts(dir))
+if not tCheck("mamba3-siso-lora", det, faMamba3, true) or det.route != frMamba3Lora:
+    inc failures
+
+# 11b. Official 1.5B SISO shape, including LoRA route and strict header checks.
+dir = tModelDir(root, "mamba3-1.5b", tMamba3Config(128256, 2048, 4096, 24), tMamba3Tensors(128256, 2048, 4096, 24, 64), "hf")
+det = fmDetect(tOpts(dir))
+if not tCheck("mamba3-siso-1.5b-base", det, faMamba3, true) or det.route != frMamba3Base or det.mamba3.nHeads != 64:
+    inc failures
+tWriteLoraBin(dir / "mamba3-adapters.bin", "R".repeat(24), "model.nimq", 2048, 128256, 64, false)
+det = fmDetect(tOpts(dir))
+if not tCheck("mamba3-siso-1.5b-lora", det, faMamba3, true) or det.route != frMamba3Lora:
+    inc failures
+
+# Config and tensor dimensions must agree even when the architecture is supported.
+dir = tModelDir(root, "mamba3-1.5b-bad-tensors", tMamba3Config(128256, 2048, 4096, 24), tMamba3Tensors(128256, 768, 1536, 12, 24), "")
+if not tCheck("mamba3-1.5b-tensor-mismatch", fmDetect(tOpts(dir)), faUnknown, false):
+    inc failures
+dir = tModelDir(root, "mamba3-bad-config-shape", tMamba3Config(128256, 2048, 4096, 24, 2, 32), tMamba3Tensors(128256, 2048, 4096, 24, 64), "")
+if not tCheck("mamba3-unsupported-head-shape", fmDetect(tOpts(dir)), faUnknown, false):
+    inc failures
+
+# 12. Mamba-1 and an unknown architecture
 dir = tModelDir(root, "mamba1", %*{"model_type": "mamba", "vocab_size": 10, "hidden_size": 8, "num_hidden_layers": 1}, @[("backbone.embeddings.weight", @[10, 8]), ("backbone.layers.0.mixer.x_proj.weight", @[4, 16])], "")
 if not tCheck("mamba1", fmDetect(tOpts(dir)), faUnknown, false):
     inc failures
@@ -198,7 +255,7 @@ dir = tModelDir(root, "gpt2", %*{"model_type": "gpt2", "vocab_size": 10, "n_embd
 if not tCheck("gpt2", fmDetect(tOpts(dir)), faUnknown, false):
     inc failures
 
-# 12. fmCheckRun: --ngl and unsupported architectures
+# 13. fmCheckRun: --ngl and unsupported architectures
 det = fmDetect(tOpts(root / "tinyllama"))
 reason = ""
 nglOpts = tOpts(root / "tinyllama")
@@ -213,7 +270,7 @@ else:
     print "FAIL fmCheckRun: " & $okAll & " " & $okPart & " " & $okGpt2
     inc failures
 
-# 13. Real checkpoints, headers only (skipped when not downloaded)
+# 14. Real checkpoints, headers only (skipped when not downloaded)
 if fileExists("test/deepseek-inference/models/model.nimq") and fileExists("test/deepseek-inference/models/config.json"):
     det = fmDetect(tOpts("test/deepseek-inference/models"))
     if not tCheck("real deepseek-coder-6.7b", det, faLlama, true):

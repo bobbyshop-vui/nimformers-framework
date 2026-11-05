@@ -65,24 +65,26 @@ NIM_INFER_SRC   := test/deepseek-inference/nim_inference.nim
 SPECTRON_SRC    := test/spectron/test_inferencespectron.nim
 COMPACT_LORA_SRC := test/codestral/compact_lora_checkpoint.nim
 MIGRATE_LORA_SRC := test/codestral/migrate_lora_json_to_bin.nim
+MAMBA3_FINETUNE_SRC := test/mamba3/finetune_lora.nim
 
 GRAFT_BIN       := graft_attention_bin$(EXE_EXT)
 FINETUNE_BIN    := finetune_lora_bin$(EXE_EXT)
 INFER_LORA_BIN  := infer_lora_bin$(EXE_EXT)
 COMPACT_LORA_BIN := compact_lora_checkpoint$(EXE_EXT)
 MIGRATE_LORA_BIN := migrate_lora_json_to_bin$(EXE_EXT)
+MAMBA3_HF_FINETUNE_BIN := mamba3_hf_finetune_bin$(EXE_EXT)
 NIM_INFER_BIN   := nim_inference$(EXE_EXT)
 SPECTRON_BIN    := test_inferencespectron$(EXE_EXT)
 CLEAN_BINS      := $(TEST_BIN) $(GRAFT_BIN) $(FINETUNE_BIN) $(INFER_LORA_BIN) $(C_API_LIB) \
-                   $(COMPACT_LORA_BIN) $(MIGRATE_LORA_BIN) $(NIM_INFER_BIN) $(SPECTRON_BIN) \
+                   $(COMPACT_LORA_BIN) $(MIGRATE_LORA_BIN) $(MAMBA3_HF_FINETUNE_BIN) $(NIM_INFER_BIN) $(SPECTRON_BIN) \
                    $(BYBYLANG_TEST_BINS) $(addsuffix .nim,$(BYBYLANG_TEST_BINS))
 
-.PHONY: shaders all build run run-cpu run-metal run-opencl run-cuda clean \
+.PHONY: shaders all build run run-cpu run-metal run-vulkan run-opencl run-cuda clean \
         download-models download-datasets download-codestral-tokenizer \
         build-graft build-finetune build-infer-lora build-compact-lora \
         build-migrate-lora build-nim-inference build-spectron build-for-python \
         python-test python-example c-example bybylang-test bench-gflops \
-        graft finetune-mamba infer-lora infer-mamba infer-deepseek run-spectron mamba-pipeline \
+        graft finetune-mamba hf-train build-hf-train infer-lora infer-mamba infer-deepseek run-spectron mamba-pipeline \
         build-formers formers-cli formers flash-attention-test q4-gemm-test formers-test formers-smoke formers-clean
 
 all: build run
@@ -110,6 +112,11 @@ else
 	@echo "Metal is only supported on macOS"
 endif
 
+run-vulkan:
+	$(NIM) check $(NIMFLAGS) -d:backend=vulkan $(TEST_SRC)
+	$(NIM) c $(NIMFLAGS) -d:backend=vulkan $(TEST_SRC)
+	$(RUN_PREFIX)test/spectron/$(TEST_BIN)
+
 run-opencl:
 	$(NIM) check $(NIMFLAGS) -d:backend=opencl $(TEST_SRC)
 	$(NIM) c $(NIMFLAGS) -d:backend=opencl $(TEST_SRC)
@@ -134,7 +141,9 @@ run-cuda:
 # Download public Hugging Face assets into the paths used by inference/training.
 download-models:
 	@set -eu; \
-	mkdir -p test/deepseek-inference/models test/codestral/models/hf; \
+	mkdir -p test/deepseek-inference/models test/codestral/models/hf \
+	  test/mamba3/models/mamba3-siso-187m test/mamba3/models/runs/mamba3-siso-187m-gated \
+	  test/mamba3/models/mamba3-siso-1.5b test/mamba3/models/runs/mamba3-siso-1.5b-gated; \
 	for file in model.nimq config.json tokenizer.json tokenizer_config.json; do \
 	  curl -fL --retry 3 -C - "https://huggingface.co/bobbydeveloper2014/deepseek-coder-6.7b-nimq/resolve/main/$$file" -o "test/deepseek-inference/models/$$file"; \
 	done; \
@@ -143,7 +152,25 @@ download-models:
 	done; \
 	curl -fL --retry 3 -C - https://huggingface.co/bobbydeveloper2014/codestral-v0.1-7b-nimq/resolve/main/codestral_mamba_only.nimq -o test/codestral/models/codestral_mamba_only.nimq; \
 	curl -fL --retry 3 -C - https://huggingface.co/bobbydeveloper2014/codestral-v0.1-nimq-qlora-linearattention/resolve/main/jamba_parallel_lora.bin -o test/codestral/models/jamba_parallel_lora.bin; \
-	echo 'test/codestral/models/hf' > test/codestral/models/jamba_parallel_lora.bin.hf_tokenizer_dir
+	echo 'test/codestral/models/hf' > test/codestral/models/jamba_parallel_lora.bin.hf_tokenizer_dir; \
+	for file in mamba3_siso_187m.nimq; do \
+	  curl -fL --retry 3 -C - "https://huggingface.co/bobbydeveloper2014/mamba-siso-175m-nimq/resolve/main/$$file" -o "test/mamba3/models/$$file"; \
+	done; \
+	for file in config.json tokenizer.json tokenizer_config.json special_tokens_map.json; do \
+	  curl -fL --retry 3 -C - "https://huggingface.co/bobbydeveloper2014/mamba-siso-175m-nimq/resolve/main/$$file" -o "test/mamba3/models/mamba3-siso-187m/$$file"; \
+	done; \
+	for file in lora.bin; do \
+	  curl -fL --retry 3 -C - "https://huggingface.co/bobbydeveloper2014/mamba-siso-175m-nimq/resolve/main/$$file" -o "test/mamba3/models/runs/mamba3-siso-187m-gated/$$file"; \
+	done; \
+	echo 'test/mamba3/models/mamba3-siso-187m' > test/mamba3/models/runs/mamba3-siso-187m-gated/lora.bin.hf_tokenizer_dir; \
+	curl -fL --retry 3 -C - https://huggingface.co/bobbydeveloper2014/mamba-siso-1.5b-nimq/resolve/main/mamba3_siso_1.5b.nimq -o test/mamba3/models/mamba3_siso_1.5b.nimq; \
+	for file in config.json tokenizer.json tokenizer_config.json special_tokens_map.json; do \
+	  curl -fL --retry 3 -C - "https://huggingface.co/bobbydeveloper2014/mamba-siso-1.5b-nimq/resolve/main/$$file" -o "test/mamba3/models/mamba3-siso-1.5b/$$file"; \
+	done; \
+	for file in lora-g1.bin; do \
+	  curl -fL --retry 3 -C - "https://huggingface.co/bobbydeveloper2014/mamba-siso-1.5b-nimq/resolve/main/$$file" -o "test/mamba3/models/runs/mamba3-siso-1.5b-gated/$$file"; \
+	done; \
+	echo 'test/mamba3/models/mamba3-siso-1.5b' > test/mamba3/models/runs/mamba3-siso-1.5b-gated/lora-g1.bin.hf_tokenizer_dir
 
 # Repair tokenizer assets without downloading multi-GB model weights again.
 download-codestral-tokenizer:
@@ -208,6 +235,13 @@ build-graft:
 build-finetune:
 	$(NIM) check $(NIMFLAGS) $(FINETUNE_SRC)
 	$(NIM) c $(NIMFLAGS) -o:$(FINETUNE_BIN) $(FINETUNE_SRC)
+
+# Direct Hugging Face source loading is opt-in and requires nimpy + Python torch.
+build-hf-train:
+	$(NIM) c $(NIMFLAGS) -d:mamba3HfSource -o:$(MAMBA3_HF_FINETUNE_BIN) $(MAMBA3_FINETUNE_SRC)
+
+hf-train: build-hf-train
+	$(RUN_PREFIX)$(MAMBA3_HF_FINETUNE_BIN) $(ARGS)
 
 # Infer defaults: independent decode kernels in one session + resident GPU
 # prefill (R/P/G). One-dispatch is opt-in after the Iris 640 end-to-end A/B.

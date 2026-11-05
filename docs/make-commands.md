@@ -26,7 +26,7 @@ loading paths also need Python and the corresponding packages; see
 
 Framework backends are `auto`, `metal`, and `vulkan`. `cuda` and `opencl` are
 compatibility names redirected to Vulkan; they do not enable separate
-CUDA/OpenCL runtimes. CPU model execution is no longer supported.
+CUDA/OpenCL runtimes. The framework also supports a CPU backend.
 
 
 ## Start with Spectron
@@ -53,6 +53,12 @@ Select Metal explicitly on macOS:
 make run-metal
 ```
 
+Select Vulkan explicitly on systems with a Vulkan loader and driver:
+
+```sh
+make run-vulkan
+```
+
 See the [Spectron guide](spectron-guide.md) for configuration, data, loss, and resume.
 
 
@@ -64,11 +70,14 @@ See the [Spectron guide](spectron-guide.md) for configuration, data, loss, and r
 - `make run`: checks, compiles, and runs the trainer with `auto`.
 - `make run-metal`: checks/compiles with `-d:backend=metal`, then trains.
   Outside macOS, it only prints that Metal is unsupported.
+- `make run-vulkan`: checks/compiles `test/spectron/test_nimformer.nim` with
+  `-d:backend=vulkan`, then runs `test/spectron/test_nimformer`. It has no
+  macOS-only gate; Vulkan must be available on the system.
 - `make run-opencl`: checks/compiles with backend name `opencl`, then runs
   through Vulkan under the current mapping.
 - `make run-cuda`: the corresponding legacy `cuda` name, redirected to Vulkan.
-- `make run-cpu`: the old target remains, but the executable fails when
-  creating a CPU backend. Use Metal/Vulkan/auto.
+- `make run-cpu`: checks/compiles with `-d:backend=cpu`, then runs with the
+  framework's CPU backend.
 - `make build-spectron`: checks and compiles the **chat program**, producing
   `./test_inferencespectron` at the repository root.
 - `make run-spectron`: builds chat and runs the trained Spectron checkpoint.
@@ -76,6 +85,9 @@ See the [Spectron guide](spectron-guide.md) for configuration, data, loss, and r
 
 Despite its name, `test_nimformer` is the trainer. `test_inferencespectron` is
 inference. The two binaries have different output locations.
+
+`make run-vulkan` runs the Spectron trainer with its `CFG_*` settings. It is
+not Mamba3 inference.
 
 The Spectron trainer and chat currently do not read CLI options for steps,
 batch size, prompts, or checkpoint paths. `make run ARGS='--steps 100'` does

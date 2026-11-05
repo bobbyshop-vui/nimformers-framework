@@ -27,6 +27,11 @@ Combine the steps on macOS:
 make run-metal
 ```
 
+On a system with a Vulkan loader and driver, use `make run-vulkan` to check,
+compile with `-d:backend=vulkan`, and run the same Spectron trainer. The target
+has no macOS-only gate. The trainer follows the `CFG_*` settings below; this is
+not Mamba3 inference.
+
 Or use `make run` for automatic backend detection. Each launch trains an
 additional `CFG_N_STEPS` steps, generates from `CFG_GEN_PROMPT`, then exits.
 

@@ -4,7 +4,8 @@
 
 **Benchmark** (tok/s prefill/decode trên Tesla T4 và Intel Iris Plus 640):
 [DeepSeek Coder 6.7B](test/deepseek-inference/benchmark.md) ·
-[Codestral Mamba + QLoRA](test/codestral/benchmark.md)
+[Codestral Mamba + QLoRA](test/codestral/benchmark.md) ·
+[Mamba-3 SISO + LoRA](test/mamba3/benchmark.md)
 
 Nimformer là framework Nim cho inference và training transformer trên GPU
 Metal/Vulkan. Tài liệu API, hướng dẫn sử dụng, định dạng file và lập trình
@@ -23,12 +24,12 @@ Các hướng dẫn thực hành:
   NumPy, lượng tử hóa, NIMQ, micro-VM và xử lý lỗi.
 - [BybyLang thực hành](docs/bybylang-guide.vi.md): compiler, DSL/AOT, session,
   micro-kernel và C ABI.
-- [formers.n](#chạy-deepseek-hoặc-codestral-bằng-formersn-formers-cli): một
-  `formers-cli` kiểu llama.cpp cho DeepSeek/Llama và Codestral (Mamba-2, LoRA),
-  một prompt hoặc chat.
+- [formers.n](#chạy-deepseek-codestral-hoặc-mamba-3-bằng-formersn-formers-cli): một
+  `formers-cli` kiểu llama.cpp cho DeepSeek/Llama, Codestral (Mamba-2, LoRA)
+  và Mamba-3 SISO (một prompt; không chat).
 
 Chương trình/dữ liệu theo model nằm trong `test/spectron/`,
-`test/codestral/`, `test/deepseek-inference/`; asset nằm trong `models/` của
+`test/codestral/`, `test/mamba3/`, `test/deepseek-inference/`; asset nằm trong `models/` của
 mỗi phần. Module micro-kernel FP4 GEMV nằm trong `kernelfortest/`;
 runtime chung ở thư mục gốc.
 
@@ -109,12 +110,21 @@ cá nhân hoặc hàm ý các nhà phát triển bảo chứng cho project.
 
 Các repository chứa file model dùng bởi target inference:
 
-| Repository | Nội dung | Target Make |
-| --- | --- | --- |
-| [DeepSeek Coder 6.7B NimQ](https://huggingface.co/bobbydeveloper2014/deepseek-coder-6.7b-nimq) | `model.nimq`, `config.json` và tokenizer cho `test/deepseek-inference/nim_inference.nim` | `infer-deepseek`, `formers` |
-| [Codestral v0.1 7B NimQ](https://huggingface.co/bobbydeveloper2014/codestral-v0.1-7b-nimq) | trọng số base Codestral, config và tokenizer Tekken/HF | base của `infer-lora`, `formers` |
-| [Codestral v0.1 QLoRA LinearAttention](https://huggingface.co/bobbydeveloper2014/codestral-v0.1-nimq-qlora-linearattention) | checkpoint adapter `jamba_parallel_lora.bin`, dùng base Codestral NimQ trên | adapter của `infer-lora`, `formers` |
+| Repository | Nội dung | Mã nguồn GitHub | Target Make |
+| --- | --- | --- | --- |
+| [DeepSeek Coder 6.7B NimQ](https://huggingface.co/bobbydeveloper2014/deepseek-coder-6.7b-nimq) | `model.nimq`, `config.json` và tokenizer | [DeepSeek inference](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/test/deepseek-inference) | `infer-deepseek`, `formers` |
+| [Codestral v0.1 7B NimQ](https://huggingface.co/bobbydeveloper2014/codestral-v0.1-7b-nimq) | trọng số base, config và tokenizer Tekken/HF | [Codestral inference](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/test/codestral) | base của `infer-lora`, `formers` |
+| [Codestral v0.1 QLoRA LinearAttention](https://huggingface.co/bobbydeveloper2014/codestral-v0.1-nimq-qlora-linearattention) | checkpoint adapter `jamba_parallel_lora.bin`, dùng base Codestral NimQ trên | [Codestral LoRA](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/test/codestral) | adapter của `infer-lora`, `formers` |
+| [Mamba-3 SISO 187M NimQ + LoRA](https://huggingface.co/bobbydeveloper2014/mamba-siso-175m-nimq) | trọng số NimQ, config/tokenizer ở root repo và gated LoRA | [Mamba-3](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/test/mamba3) | `infer-lora`, `formers` |
+| [Mamba-3 SISO 1.5B NimQ + LoRA](https://huggingface.co/bobbydeveloper2014/mamba-siso-1.5b-nimq) | trọng số NimQ, config/tokenizer ở root repo và gated LoRA | [Mamba-3](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/test/mamba3) | `infer-lora`, `formers` |
 
+Để các công cụ Hugging Face tự nhận token từ file môi trường cục bộ đã được Git bỏ qua, nạp file trong shell trước khi dùng `hf` hoặc `huggingface_hub`:
+
+```sh
+set -a
+source .env.huggingface
+set +a
+```
 
 ### Benchmark inference
 
@@ -126,20 +136,90 @@ lệnh đã chạy:
 | --- | --- |
 | DeepSeek Coder 6.7B (`nim_inference`) | [`test/deepseek-inference/benchmark.md`](test/deepseek-inference/benchmark.md) |
 | Codestral Mamba + QLoRA (`infer_lora`) | [`test/codestral/benchmark.md`](test/codestral/benchmark.md) |
+| Mamba-3 SISO 187M + LoRA (`test/mamba3/infer_lora_bin`) | [`187M`](test/mamba3/benchmark.md#mamba-3-siso-187m) |
+| Mamba-3 SISO 1.5B + LoRA (`test/mamba3/infer_lora_bin`) | [`1.5B`](test/mamba3/benchmark.md#mamba-3-siso-15b) |
 
+
+### Mamba-3 SISO: tách riêng 187M và 1.5B
+
+Pipeline Mamba-3 dùng chung binary train/infer cho hai base riêng. Model nhỏ là
+**187M**; bộ model local hiện tại không có bản 125M. Cả hai cấu hình dùng base
+FP4-KM và gated fusion Mamba-3 + Linear++ (`G`) ở layer cuối.
+
+- **187M:** 12 layer, hidden 768. Thư mục config/tokenizer:
+  `test/mamba3/models/mamba3-siso-187m/`; base: `test/mamba3/models/mamba3_siso_187m.nimq`.
+  Checkpoint LoRA: `test/mamba3/models/runs/mamba3-siso-187m-gated/lora.bin`; scratch:
+  `test/mamba3/models/runs/mamba3-siso-187m-gated/scratch/`. Pattern: 11 block `R` + một `G`.
+- **1.5B:** 24 layer, hidden 2048. Thư mục config/tokenizer:
+  `test/mamba3/models/mamba3-siso-1.5b/`; base:
+  `test/mamba3/models/mamba3_siso_1.5b.nimq`. Checkpoint LoRA:
+  `test/mamba3/models/runs/mamba3-siso-1.5b-gated/lora-g1.bin`; scratch:
+  `test/mamba3/models/runs/mamba3-siso-1.5b-gated/scratch-g1/`. Pattern: 23 block `R` + một `G`.
+
+Mỗi checkpoint ghi đường dẫn base và topology riêng. Giữ checkpoint và state
+resume riêng giữa hai bản. Build binary infer chung rồi chọn checkpoint:
+
+```sh
+make -f test/mamba3/Makefile infer
+
+# 187M
+BYBY_METAL_JIT_LOG=0 BYBY_MAX_NEW_TOKENS=64 test/mamba3/infer_lora_bin \
+  test/mamba3/models/runs/mamba3-siso-187m-gated/lora.bin 'Write a Python palindrome function' 0.7
+
+# 1.5B
+BYBY_METAL_JIT_LOG=0 BYBY_MAX_NEW_TOKENS=64 test/mamba3/infer_lora_bin \
+  test/mamba3/models/runs/mamba3-siso-1.5b-gated/lora-g1.bin 'Write a Python palindrome function' 0.7
+```
+
+Tham số cuối là temperature; giới hạn sinh đặt bằng `BYBY_MAX_NEW_TOKENS`.
+Xem [hướng dẫn Mamba-3](test/mamba3/README.md) để tải model và chạy lệnh
+finetune/resume riêng. `make infer-lora` / `make finetune-mamba` ở thư mục gốc
+chọn pipeline Codestral; các lệnh trên chọn Mamba-3. Benchmark một lần chạy 1.5B trên
+Iris Plus 640 (Metal): prefill 18 token trong 1.822 s (9.88 tok/s; setup 0.039 s),
+decode 64 token trong 13.084 s (4.89 tok/s; steady 4.90 tok/s), tổng 14.906 s.
+Thời gian không gồm load/merge; đây là một lần chạy, không phải trung bình cold-start.
+
+
+Chạy hai model này qua `formers-cli` (Mamba-3 chỉ hỗ trợ một prompt, không có `-cnv`):
+
+```sh
+make build-formers
+
+# 187M + gated LoRA
+other/formers.n/formers-cli --models test/mamba3/models -m test/mamba3/models/mamba3_siso_187m.nimq --config test/mamba3/models/mamba3-siso-187m/config.json --tokenizer test/mamba3/models/mamba3-siso-187m --lora test/mamba3/models/runs/mamba3-siso-187m-gated/lora.bin -p 'Write a Python function to check if a string is a palindrome' -n 64 --temp 0.7 --backend metal
+
+# 1.5B + gated LoRA
+other/formers.n/formers-cli --models test/mamba3/models -m test/mamba3/models/mamba3_siso_1.5b.nimq --config test/mamba3/models/mamba3-siso-1.5b/config.json --tokenizer test/mamba3/models/mamba3-siso-1.5b --lora test/mamba3/models/runs/mamba3-siso-1.5b-gated/lora-g1.bin -p 'Write a Python function to check if a string is a palindrome' -n 64 --temp 0.7 --backend metal
+```
+
+Dùng `--detect-only` cùng `-m`, `--config` và `--tokenizer` của từng model để xem nhánh nhận diện mà không nạp model hoặc sinh text; đổi `--lora FILE` thành `--no-lora` để chạy base không adapter. Bật `--verbose`
+để xem thống kê runtime Mamba-3; `BYBY_METAL_JIT_LOG=0` ẩn log Metal JIT.
 
 ### Tải model
 
-Các repo Hugging Face này công khai. Từ thư mục gốc, tải asset DeepSeek và
-Codestral vào đúng đường dẫn target inference sử dụng:
+Cả năm repo Hugging Face ở trên đều công khai. Từ thư mục gốc, chạy lệnh này
+để tải trọng số, adapter, config và tokenizer vào các đường dẫn inference và
+formers.n sử dụng:
 
 ```sh
 make download-models
 ```
 
-Target tạo thư mục model dưới `test/` khi cần, tải trọng số base,
-tokenizer/config và adapter, rồi ghi sidecar thư mục tokenizer Codestral
-cho `infer-lora`. Lệnh dùng `curl` với retry và resume.
+Target tự tạo thư mục dưới `test/`, dùng `curl` có retry và resume. Config và
+tokenizer của hai model Mamba-3 được đặt ở hai thư mục riêng để không ghi đè
+lẫn nhau; sidecar tokenizer LoRA được lưu đúng vị trí mà checkpoint tham chiếu.
+
+| Repository Hugging Face | File tải về |
+| --- | --- |
+| [DeepSeek Coder 6.7B NimQ](https://huggingface.co/bobbydeveloper2014/deepseek-coder-6.7b-nimq) | `test/deepseek-inference/models/` |
+| [Codestral v0.1 7B NimQ](https://huggingface.co/bobbydeveloper2014/codestral-v0.1-7b-nimq) | `test/codestral/models/` và `test/codestral/models/hf/` |
+| [Codestral QLoRA LinearAttention](https://huggingface.co/bobbydeveloper2014/codestral-v0.1-nimq-qlora-linearattention) | `test/codestral/models/jamba_parallel_lora.bin` và sidecar tokenizer |
+| [Mamba-3 SISO 187M NimQ + LoRA](https://huggingface.co/bobbydeveloper2014/mamba-siso-175m-nimq) | base ở `test/mamba3/models/`; config/tokenizer ở `test/mamba3/models/mamba3-siso-187m/`; adapter ở `test/mamba3/models/runs/mamba3-siso-187m-gated/` |
+| [Mamba-3 SISO 1.5B NimQ + LoRA](https://huggingface.co/bobbydeveloper2014/mamba-siso-1.5b-nimq) | base ở `test/mamba3/models/`; config/tokenizer ở `test/mamba3/models/mamba3-siso-1.5b/`; adapter ở `test/mamba3/models/runs/mamba3-siso-1.5b-gated/` |
+
+Các asset này công khai nên không cần `HF_TOKEN` hoặc đăng nhập Hugging Face.
+Biến môi trường `HF_TOKEN` phía trên chỉ cần cho repo riêng tư/bị giới hạn hoặc
+thao tác ghi lên Hugging Face.
 
 Nếu đã có trọng số Codestral nhưng `newHfTokenizer` báo thiếu file, chỉ tải
 config/tokenizer:
@@ -326,7 +406,7 @@ Chẩn đoán (chậm hơn, không phải nhánh nhanh):
 | `BYBY_VULKAN_SPLIT_K_VERBOSE` | `0` | log lựa chọn split-K |
 
 
-### Chạy DeepSeek hoặc Codestral bằng formers.n (`formers-cli`)
+### Chạy DeepSeek, Codestral hoặc Mamba-3 bằng formers.n (`formers-cli`)
 
 formers.n (`other/formers.n/`) là CLI kiểu llama.cpp viết bằng BybyLang trên các
 block của nimformers. Chỉ cần trỏ vào thư mục model: nó nhận diện kiến trúc từ
@@ -337,6 +417,7 @@ block của nimformers. Chỉ cần trỏ vào thư mục model: nó nhận di�
 | Họ Llama (`LlamaForCausalLM`, DeepSeek Coder) | block transformer của `nim_inference` | `test/deepseek-inference/models` |
 | Mamba-2 (Codestral Mamba) | nhánh base-Mamba của `infer_lora` | thư mục không có LoRA `.bin` |
 | Mamba-2 + LoRA / Linear++ | nhánh checkpoint của `infer_lora` | `test/codestral/models` |
+| Mamba-3 SISO 187M / 1.5B, một prompt | runner Mamba-3 dùng chung runtime GPU resident | `test/mamba3/models` |
 
 #### Build
 
@@ -389,7 +470,7 @@ model không được hỗ trợ (ví dụ Mamba-1 hoặc `model_type` lạ).
 
 - Không có `-cnv`: `-p TEXT` (hoặc `-f FILE`) được bọc trong chat template của model và
   sinh một lần; `--system TEXT` đặt system prompt, `--raw-prompt` gửi nguyên văn.
-- `-cnv` (hoặc `-i`) mở chat: ngữ cảnh (KV cache với Llama, recurrent state với Mamba-2)
+- `-cnv` (hoặc `-i`) mở chat với Llama/Mamba-2: ngữ cảnh (KV cache với Llama, recurrent state với Mamba-2)
   được giữ giữa các lượt, `-n` giới hạn mỗi câu trả lời, `-p` thành system prompt. Gõ
   `/exit` (hoặc `/quit`, `/bye`) để thoát, kết thúc dòng bằng `\` để viết tiếp dòng sau,
   Ctrl+C dừng câu trả lời, Ctrl+C ở dấu nhắc thì thoát.
@@ -442,8 +523,9 @@ lúc khởi động.
 
 formers-cli mặc định im lặng. Log của loader, LoRA, JIT, Metal và tune kernel đi vào
 `/dev/null`; chỉ hiện dòng loading, `ready`, text sinh ra, thống kê và lỗi.
-`-v`/`--verbose` hiện mọi dòng log. Lỗi ở chế độ im lặng in thông báo và gợi ý chạy lại
-với `--verbose`.
+`-v`/`--verbose` hiện mọi dòng log và cần bật để xem thống kê runtime Mamba-3. Đặt
+`BYBY_METAL_JIT_LOG=0` để ẩn log Metal JIT khi verbose. Lỗi ở chế độ im lặng in thông báo
+và gợi ý chạy lại với `--verbose`.
 
 #### Flag chính
 
@@ -513,6 +595,16 @@ make run
 `test/spectron/models/finetune.nimq` mỗi năm step và resume nếu checkpoint
 đã có. File lưu trọng số và step, nhưng moment Adam khởi tạo lại khi
 resume. Trên macOS, `make run-metal` chọn Metal lúc compile.
+
+Để check, compile và chạy `test_nimformer` với Vulkan:
+
+```sh
+make run-vulkan
+```
+
+Target dùng `-d:backend=vulkan`, rồi chạy trainer Spectron với dataset và cấu
+hình train hiện tại. Cần Vulkan loader/driver (MoltenVK trên macOS). Xem lệnh
+mà không chạy training bằng `make -n run-vulkan`.
 
 
 ### Chạy checkpoint Spectron đã train

@@ -11,6 +11,19 @@ if offsetResult != @[8'f32, 18]:
   quit("CPU sessionMatmulNT returned " & $offsetResult, 1)
 sessionFree(backend, c)
 
+let q4Weights = residentUploadQ4(backend, @[0x21'u8, 0x43], @[1'f32, 1], @[0'f32, 0],
+  2, 2, 2, 1)
+let activation = sessionUpload(backend, @[5'f32, 6])
+var q4Output: SessionHandle
+if not sessionMatmulQ4(backend, activation, q4Weights, q4Output, 1):
+  quit("CPU sessionMatmulQ4 rejected resident packed weights", 1)
+let q4Result = sessionRead(backend, q4Output, 2)
+if q4Result != @[17'f32, 39]:
+  quit("CPU resident Q4 matmul returned " & $q4Result, 1)
+sessionFree(backend, q4Output)
+var q4WeightsToFree = q4Weights
+residentFreeQ4(q4WeightsToFree)
+
 let source = @[5'f32, 7, 11]
 var uploaded = sessionUploadPrivatePtr(backend, unsafeAddr source[0],
   source.len * sizeof(float32))
