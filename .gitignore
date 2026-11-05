@@ -47,6 +47,7 @@ test_safe_merge_lora
 .DS_Store
 
 # Local tokenizer runtime and downloaded Hugging Face assets
+.env.huggingface
 .runtime/
 test/codestral/models/hf/
 */.DS_Store
@@ -82,3 +83,5 @@ models/tinyllama/special_tokens_map.json
 models/tinyllama/tokenizer_config.json
 models/tinyllama/tokenizer.json
 models/tinyllama/tokenizer.model
+skills/lethe-offload/SKILL.md
+test/mamba3/quantize_mamba3

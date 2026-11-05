@@ -63,13 +63,16 @@ type
 # Calls Python: torch.load(path, map_location="cpu") -> dict[str, Tensor]
 # Supports both .bin (pickle) and .safetensors (through the safetensors library if present).
 # ─────────────────────────────────────────────────────────────────
-proc pyLoadStateDict(path: string): PyObject =
+proc pyLoadStateDict(path: string; mmap = false): PyObject =
   let torch = pyImport("torch")
   if path.endsWith(".safetensors"):
     let st = pyImport("safetensors.torch")
     result = st.load_file(path)
   else:
-    result = torch.load(path, map_location = "cpu")
+    if mmap:
+      result = torch.load(path, map_location = "cpu", mmap = true)
+    else:
+      result = torch.load(path, map_location = "cpu")
 
 proc pyTensorToSeq(t: PyObject): tuple[data: seq[float32], shape: seq[int]] =
   ## .detach().contiguous().float().flatten() -> numpy -> tobytes() -> seq[float32].
@@ -158,6 +161,21 @@ proc loadAllHFTensors*(path: string): seq[RawBinTensor] =
     inc n
     if n mod 20 == 0:
       echo &"[loader] ... {n} tensors read (RAM, nothing written to disk)"
+
+proc forEachHFTensor*(path: string;
+                      consume: proc(t: RawBinTensor) {.closure.};
+                      mmap = false) =
+  ## Converts and releases one tensor at a time so quantizers can handle large
+  ## checkpoints without keeping a second fp32 copy of the complete state dict.
+  let sd = pyLoadStateDict(path, mmap)
+  var n = 0
+  for key in sd.keys():
+    let name = key.to(string)
+    let (data, shape) = pyTensorToSeq(sd[key])
+    consume(RawBinTensor(name: name, shape: shape, data: data))
+    inc n
+    if n mod 20 == 0:
+      echo &"[loader] ... {n} tensors converted (streaming)"
 
 proc exportBinToRawBin*(binPath, outBinPath: string, arch: array[5, int] = [0, 0, 0, 0, 0]) =
   ## OPTIONAL UTILITY, NOT A REQUIRED STEP of the fine-tune pipeline.

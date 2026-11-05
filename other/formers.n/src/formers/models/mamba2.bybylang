@@ -23,7 +23,7 @@ import nim "quantize_lora_bin_4bit"
 import nim "prefill_gpu"
 import nim "fp4_gemv_gpu"
 import nim "hf_tokenizer"
-import nim "infer_lora"
+import nim "test/codestral/infer_lora as m2infer"
 import "../cli/options.bybylang"
 import "../arch/detect.bybylang"
 import "../sampling/sampler.bybylang"
@@ -226,7 +226,7 @@ function fmMambaPrepareGpu(mm: var FmMambaModel, ctx: Backend)
     # The physical merge, as infer_lora.generate does it: the packed FP4-KM
     # weight resident on the GPU absorbs B@A, so the decode kernels drop the
     # LoRA fusion. On by default; --no-merge-lora keeps the adapters separate.
-    let merged = mergeResidentLoraIfEnabled(mm.model, mm.lora, ctx)
+    let merged = m2infer.mergeResidentLoraIfEnabled(mm.model, mm.lora, ctx)
     if merged > 0:
         stderr.writeLine("[formers.n] merged " & $merged & " LoRA adapters into the resident base")
     stderr.writeLine("[formers.n] GPU ready, released " & $(freed div (1024 * 1024)) & " MiB of duplicate host weights")
@@ -309,7 +309,7 @@ function fmMambaFeed(mm: var FmMambaModel, ctx: Backend, chat: var FmMambaChat, 
     var start = 0
     if first or tensorCores:
         for piece in fmMambaPrefillPieces(input.len - 1, tensorCores):
-            forwardPrefillBatch(mm.model, mm.lora, input[start ..< start + piece], ctx, continued = not first or start > 0)
+            m2infer.forwardPrefillBatch(mm.model, mm.lora, input[start ..< start + piece], ctx, continued = not first or start > 0)
             chat.ids.add(input[start ..< start + piece])
             start += piece
         if start > 0 and getEnv("BYBY_PREFILL_KEEP_SCRATCH", "0") != "1":
@@ -456,8 +456,8 @@ function fmRunMamba2(det: FmDetection, opts: FmOptions): bool
     # Kernel-selection defaults of the Mamba-2 GPU blocks; explicit env wins.
     if opts.noMergeLora:
         putEnv("BYBY_MERGE_LORA", "0")
-    configureInferenceDefaults()
-    setInferenceThreadPriority()
+    m2infer.configureInferenceDefaults()
+    m2infer.setInferenceThreadPriority()
     stderr.writeLine("[formers.n] tokenizer " & det.files.tokenizerDir)
     let tok = hf_tokenizer.newHfTokenizer(det.files.tokenizerDir)
     if vocabSizeHf(tok) != det.mamba.vocabSize:

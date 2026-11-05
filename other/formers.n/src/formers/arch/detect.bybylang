@@ -7,6 +7,7 @@
 #   Mamba-2 tensors + mamba2 config          -> faMamba2         -> frMamba2Base
 #   Mamba-2 + LoRA .bin (adapters only)      -> faMamba2Lora     -> frMamba2Lora
 #   Mamba-2 + LoRA .bin with Linear++ blocks -> faMamba2LinearPP -> frMamba2Lora
+#   Mamba-3 SISO tensors + config             -> faMamba3         -> frMamba3Base
 #   anything else                            -> faUnknown        -> frNone (supported = false)
 
 import nim "std/[os, json, tables, strutils, sequtils]"
@@ -20,12 +21,15 @@ type
     faLlama = "llama",
     faMamba2 = "mamba2",
     faMamba2Lora = "mamba2+lora",
-    faMamba2LinearPP = "mamba2+linear++"
+    faMamba2LinearPP = "mamba2+linear++",
+    faMamba3 = "mamba3"
   FmRoute* = enum
     frNone = "none",
     frLlama = "llama (nim_inference transformer blocks)",
     frMamba2Base = "mamba2 base (Mamba2Real blocks, base-Mamba path of infer_lora)",
-    frMamba2Lora = "mamba2 + LoRA/Linear++ (infer_lora checkpoint path)"
+    frMamba2Lora = "mamba2 + LoRA/Linear++ (infer_lora checkpoint path)",
+    frMamba3Base = "mamba3 SISO base (test/mamba3 inference)",
+    frMamba3Lora = "mamba3 SISO + LoRA/Linear++ (test/mamba3 inference)"
   FmLlamaConfig* = object
     modelType*: string
     vocabSize*, hiddenSize*, intermediateSize*: int
@@ -41,6 +45,11 @@ type
     nHeads*, headDim*, stateSize*, nGroups*, convKernel*, expand*: int
     dInner*, inProjRows*, convChannels*: int
     normEps*: float32
+  FmMamba3Config* = object
+    modelType*: string
+    vocabSize*, hiddenSize*, intermediateSize*, nLayers*: int
+    nHeads*, headDim*, stateSize*, nGroups*, expand*, projRows*: int
+    normEps*: float32
   FmLoraInfo* = object
     path*, format*, pattern*, nimqRef*, normPreset*, mambaNormImpl*: string
     hidden*, vocab*, nHeads*, ffMult*: int
@@ -53,6 +62,7 @@ type
     files*: FmModelFiles
     llama*: FmLlamaConfig
     mamba*: FmMamba2Config
+    mamba3*: FmMamba3Config
     lora*: FmLoraInfo
     nLayers*: int
     notes*, errors*: seq[string]
@@ -62,6 +72,7 @@ type
 # norm and GELU, qwen2: q/k/v bias, phi3...) would load but compute garbage.
 const FmLlamaModelTypes = ["llama", "mistral"]
 const FmMamba2ModelTypes = ["mamba2"]
+const FmMamba3ModelTypes = ["", "mamba3", "mamba3_siso"]
 
 function fmJInt(cfg: JsonNode, key: string, fallback: int): int
     if cfg.hasKey(key) and cfg[key].kind == JInt:
@@ -128,6 +139,10 @@ function fmLooksLlama(shapes: Table[string, seq[int]]): bool
 function fmLooksMamba2(shapes: Table[string, seq[int]]): bool
     let p = "backbone.layers.0.mixer."
     result = "backbone.embeddings.weight" in shapes and (p & "A_log") in shapes and (p & "in_proj.weight") in shapes and (p & "conv1d.weight") in shapes and (p & "dt_bias") in shapes
+
+function fmLooksMamba3(shapes: Table[string, seq[int]]): bool
+    let p = "backbone.layers.0.mixer."
+    result = ("backbone.embedding.weight" in shapes or "backbone.embeddings.weight" in shapes) and (p & "in_proj.weight") in shapes and (p & "B_bias") in shapes and (p & "C_bias") in shapes and (p & "dt_bias") in shapes and (p & "A_log") notin shapes and (p & "conv1d.weight") notin shapes
 
 function fmLlamaConfigFrom(cfg: JsonNode, errors: var seq[string]): FmLlamaConfig
     result.modelType = fmModelType(cfg)
@@ -250,6 +265,81 @@ function fmCheckMamba2Tensors(c: FmMamba2Config, h: FmNimqHeader, errors: var se
         if errors.len > 0:
             return
 
+function fmMamba3ConfigFrom(cfg: JsonNode, errors: var seq[string]): FmMamba3Config
+    result.modelType = fmModelType(cfg)
+    result.vocabSize = fmJRequired(cfg, "vocab_size", errors)
+    result.hiddenSize = fmJRequired(cfg, "d_model", errors)
+    result.intermediateSize = fmJRequired(cfg, "d_intermediate", errors)
+    result.nLayers = fmJRequired(cfg, "n_layer", errors)
+    if not cfg.hasKey("ssm_cfg") or cfg["ssm_cfg"].kind != JObject:
+        errors.add("config.json: missing object 'ssm_cfg'")
+        return
+    let ssm = cfg["ssm_cfg"]
+    if ssm{"layer"}.getStr("").toLowerAscii() != "mamba3":
+        errors.add("config.json ssm_cfg.layer must be 'Mamba3'")
+    result.stateSize = fmJRequired(ssm, "d_state", errors)
+    result.nGroups = fmJInt(ssm, "ngroups", 1)
+    result.expand = fmJInt(ssm, "expand", 2)
+    result.headDim = fmJRequired(ssm, "headdim", errors)
+    result.normEps = fmJFloat(cfg, "layer_norm_epsilon", 1e-5'f32)
+    if result.headDim > 0 and result.intermediateSize > 0:
+        if result.intermediateSize mod result.headDim != 0:
+            errors.add("d_intermediate is not divisible by ssm_cfg.headdim")
+        else:
+            result.nHeads = result.intermediateSize div result.headDim
+    if result.expand * result.hiddenSize != result.intermediateSize:
+        errors.add("ssm_cfg.expand*d_model differs from d_intermediate")
+    if result.nGroups != 1 or result.stateSize mod 4 != 0:
+        errors.add("Mamba-3 SISO requires ngroups=1 and d_state divisible by 4")
+    if ssm{"is_mimo"}.getBool(false):
+        errors.add("Mamba-3 MIMO is not supported")
+    let ropeFraction = fmJFloat(ssm, "rope_fraction", 0.5'f32)
+    if abs(ropeFraction - 0.5'f32) > 1e-6'f32:
+        errors.add("Mamba-3 SISO requires rope_fraction=0.5")
+    # These are the two official SISO shapes currently supported by the local
+    # Mamba-3 loader and kernels. Tensor headers are still checked below.
+    let supported187M = result.vocabSize == 128256 and result.hiddenSize == 768 and result.intermediateSize == 1536 and result.nLayers == 12 and result.nHeads == 24 and result.stateSize == 128 and result.expand == 2 and result.headDim == 64
+    let supported15B = result.vocabSize == 128256 and result.hiddenSize == 2048 and result.intermediateSize == 4096 and result.nLayers == 24 and result.nHeads == 64 and result.stateSize == 128 and result.expand == 2 and result.headDim == 64
+    if not supported187M and not supported15B:
+        errors.add("only official Mamba-3 SISO 187M and 1.5B shapes are supported")
+    if result.modelType notin FmMamba3ModelTypes:
+        errors.add("Mamba-3-like tensors but model_type='" & result.modelType & "'")
+    let c = result.intermediateSize
+    let n = result.stateSize
+    let heads = result.nHeads
+    result.projRows = 2*c + 2*n + 3*heads + n div 4
+
+function fmCheckMamba3Tensors(c: FmMamba3Config, h: FmNimqHeader, errors: var seq[string])
+    let shapes = fmShapeIndex(h)
+    let layers = fmLayerCount(h, "backbone.layers.")
+    if layers < 0:
+        errors.add("backbone.layers.N tensors are not contiguous (" & $(-layers) & " layer)")
+    elif layers != c.nLayers:
+        errors.add("config n_layer=" & $c.nLayers & " but the .nimq has " & $layers & " layers")
+    let hidden = c.hiddenSize
+    let embedding = if "backbone.embedding.weight" in shapes: "backbone.embedding.weight" else: "backbone.embeddings.weight"
+    fmExpectShape(shapes, embedding, @[c.vocabSize, hidden], errors)
+    fmExpectShape(shapes, "backbone.norm_f.weight", @[hidden], errors)
+    fmExpectShape(shapes, "lm_head.weight", @[c.vocabSize, hidden], errors)
+    if errors.len > 0:
+        return
+    for layer in 0 ..< c.nLayers:
+        let p = "backbone.layers." & $layer & "."
+        fmExpectShape(shapes, p & "norm.weight", @[hidden], errors)
+        fmExpectShape(shapes, p & "norm2.weight", @[hidden], errors)
+        fmExpectShape(shapes, p & "mixer.in_proj.weight", @[c.projRows, hidden], errors)
+        fmExpectShape(shapes, p & "mixer.out_proj.weight", @[hidden, c.intermediateSize], errors)
+        fmExpectShape(shapes, p & "mixer.B_bias", @[c.nHeads, 1, c.stateSize], errors)
+        fmExpectShape(shapes, p & "mixer.C_bias", @[c.nHeads, 1, c.stateSize], errors)
+        fmExpectShape(shapes, p & "mixer.B_norm.weight", @[c.stateSize], errors)
+        fmExpectShape(shapes, p & "mixer.C_norm.weight", @[c.stateSize], errors)
+        fmExpectShape(shapes, p & "mixer.dt_bias", @[c.nHeads], errors)
+        fmExpectShape(shapes, p & "mixer.D", @[c.nHeads], errors)
+        fmExpectShape(shapes, p & "mlp.fc1.weight", @[4*hidden, hidden], errors)
+        fmExpectShape(shapes, p & "mlp.fc2.weight", @[hidden, 2*hidden], errors)
+        if errors.len > 0:
+            return
+
 function fmLoraInfoFrom(path: string, errors: var seq[string]): FmLoraInfo
     let hdr = fmReadLoraHeader(path)
     let meta = hdr.meta
@@ -368,6 +458,27 @@ function fmDetect(opts: FmOptions): FmDetection
                     result.arch = faMamba2Lora
         if result.errors.len == 0 and (result.mamba.hiddenSize != 4096 or result.mamba.nLayers != 64):
             result.notes.add("Mamba-2 of a size other than Codestral 7B: the GPU kernels have only been run at 7B")
+    elif fmLooksMamba3(shapes):
+        result.mamba3 = fmMamba3ConfigFrom(cfg, result.errors)
+        if result.errors.len == 0:
+            fmCheckMamba3Tensors(result.mamba3, header, result.errors)
+        if result.errors.len == 0:
+            fmCheckHfTokenizer(result.files.tokenizerDir, result.errors)
+        if result.errors.len == 0:
+            result.arch = faMamba3
+            result.route = frMamba3Base
+            result.nLayers = result.mamba3.nLayers
+        if result.errors.len == 0 and result.files.loraPath.len > 0:
+            result.lora = fmLoraInfoFrom(result.files.loraPath, result.errors)
+            let lo = result.lora
+            if lo.pattern.len != result.mamba3.nLayers:
+                result.errors.add("LoRA pattern has " & $lo.pattern.len & " blocks, the base has " & $result.mamba3.nLayers & " layers")
+            if lo.hidden != result.mamba3.hiddenSize or lo.vocab != result.mamba3.vocabSize or lo.nHeads != result.mamba3.nHeads:
+                result.errors.add("LoRA meta hidden/vocab/nHeads (" & $lo.hidden & "/" & $lo.vocab & "/" & $lo.nHeads & ") differ from the base (" & $result.mamba3.hiddenSize & "/" & $result.mamba3.vocabSize & "/" & $result.mamba3.nHeads & ")")
+            if lo.nimqRef.len > 0 and extractFilename(lo.nimqRef) != extractFilename(result.files.nimqPath):
+                result.notes.add("LoRA was trained on '" & extractFilename(lo.nimqRef) & "', using '" & extractFilename(result.files.nimqPath) & "'")
+            if result.errors.len == 0:
+                result.route = frMamba3Lora
     else:
         let p = "backbone.layers.0.mixer."
         if (p & "x_proj.weight") in shapes:
@@ -389,9 +500,10 @@ function fmCheckRun(det: FmDetection, opts: FmOptions, reason: var string): bool
     if not det.supported:
         reason = "unsupported architecture: " & det.errors.join("; ")
         return false
-    # Both engines keep every layer resident on the GPU: nim_inference
-    # refuses a decode step whose FFN is not resident, and the Mamba-2 path
-    # encodes the whole token in one GPU command buffer.
+    # These inference engines require all model layers on the GPU.
+    if opts.conversation and det.route in {frMamba3Base, frMamba3Lora}:
+        reason = "interactive conversation is not supported by the Mamba-3 inference path"
+        return false
     if opts.ngl >= 0 and opts.ngl < det.nLayers:
         reason = "--ngl " & $opts.ngl & " < " & $det.nLayers & " layers: partial offload is not supported, use --ngl " & $det.nLayers & " (or omit --ngl)"
         return false
@@ -416,6 +528,12 @@ function fmDescribe(det: FmDetection, opts: FmOptions): string
     if det.arch in {faMamba2Lora, faMamba2LinearPP}:
         let lo = det.lora
         lines.add("[formers.n] lora meta : " & lo.format & " adapters=" & $lo.adapterCount & " linear++=" & $lo.linearPPBlocks & " normPreset=" & lo.normPreset & " pattern=" & lo.pattern)
+    if det.arch == faMamba3:
+        let c = det.mamba3
+        lines.add("[formers.n] mamba3    : model_type=" & c.modelType & " layers=" & $c.nLayers & " hidden=" & $c.hiddenSize & " inner=" & $c.intermediateSize & " heads=" & $c.nHeads & " head_dim=" & $c.headDim & " state=" & $c.stateSize & " groups=" & $c.nGroups & " vocab=" & $c.vocabSize)
+    if det.arch == faMamba3 and det.route == frMamba3Lora:
+        let lo = det.lora
+        lines.add("[formers.n] lora meta : " & lo.format & " adapters=" & $lo.adapterCount & " linear++=" & $lo.linearPPBlocks & " pattern=" & lo.pattern)
     if det.nLayers > 0:
         let onGpu = if opts.ngl < 0: det.nLayers else: min(opts.ngl, det.nLayers)
         lines.add("[formers.n] ngl       : " & $onGpu & "/" & $det.nLayers & " layers on the GPU")
