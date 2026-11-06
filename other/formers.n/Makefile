@@ -14,11 +14,12 @@ BYBYLANG    := vendor/bybylang/bybylang
 CLI_SRC     := $(HERE)/src/formers_cli.bybylang
 CLI_BIN     := $(HERE)/formers-cli
 TEST_SRC    := $(HERE)/tests/test_detect.bybylang
+FIR_TEST_SRC := $(HERE)/tests/test_fir.bybylang
 SOURCES     := $(shell find $(ROOT)/$(HERE)/src -name '*.bybylang')
 
 export BYBYLANG_NIMCACHE ?= $(ROOT)/nimcache/formers-n
 
-.PHONY: all build test smoke clean
+.PHONY: all build test fir-test smoke clean
 
 all: build
 
@@ -38,6 +39,13 @@ test: $(ROOT)/$(BYBYLANG)
 	cd $(ROOT) && mkdir -p $(HERE)/build && \
 	  $(BYBYLANG) $(TEST_SRC) --aot=$(HERE)/build/test_detect --quiet && \
 	  $(HERE)/build/test_detect
+
+fir-test: $(ROOT)/$(BYBYLANG)
+	cd $(ROOT) && mkdir -p $(HERE)/build && \
+	  $(BYBYLANG) $(FIR_TEST_SRC) --aot=$(HERE)/build/test_fir --quiet && \
+	  $(HERE)/build/test_fir && \
+	  $(MAKE) -C $(HERE) build && \
+	  $(CLI_BIN) --fir-check models/mamba3-1.5b/model.fir
 
 SMOKE_DIR := $(HERE)/build/tiny-llama
 

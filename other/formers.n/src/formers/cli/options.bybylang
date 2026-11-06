@@ -24,6 +24,7 @@ type
     promptSet*, nPredictSet*: bool
     noWarmup*: bool               ## skip the startup warmup run
     verbose*: bool                ## show the library logs (loader, JIT, kernels, profiles)
+    firCheck*, firFile*: string
     errors*: seq[string]
 
 const FmDefaultPrompt = "Write a Python function to return the n-th Fibonacci number."
@@ -87,6 +88,8 @@ function fmUsage(): string
     lines.add("  --no-warmup            skip the startup warmup (GPU pipeline compile) before the first prompt")
     lines.add("  -v, --verbose          show every log line (loader, JIT, kernel tuning, profiles); default: quiet")
     lines.add("  --detect-only          detect the architecture and exit")
+    lines.add("  --fir FILE             use FIR registry programs for Mamba-3 resident inference")
+    lines.add("  --fir-check FILE       resolve FIR kernel names and build programs without weights")
     lines.add("  -h, --help             show this help")
     result = lines.join("\n")
 
@@ -123,6 +126,10 @@ function fmParseOptions(args: seq[string]): FmOptions
             flag = flag[0 ..< flag.find('=')]
             hasInline = true
         case flag
+        of "--fir":
+            result.firFile = fmOptValue(args, i, flag, inlineVal, hasInline, result.errors)
+        of "--fir-check":
+            result.firCheck = fmOptValue(args, i, flag, inlineVal, hasInline, result.errors)
         of "--models", "--model-dir":
             result.modelsDir = fmOptValue(args, i, flag, inlineVal, hasInline, result.errors)
         of "-m", "--model":
@@ -192,7 +199,7 @@ function fmParseOptions(args: seq[string]): FmOptions
     # Validation
     if result.modelsDir.len == 0 and result.modelFile.len > 0:
         result.modelsDir = parentDir(result.modelFile)
-    if result.modelsDir.len == 0 and not result.showHelp:
+    if result.modelsDir.len == 0 and result.firCheck.len == 0 and not result.showHelp:
         result.errors.add("--models <dir> (or -m <file.nimq>) is required")
     # llama.cpp conversation mode: -p is the system prompt, -n limits each reply.
     if result.conversation:

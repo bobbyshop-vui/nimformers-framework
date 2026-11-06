@@ -22,6 +22,15 @@ The Mamba-3 SISO path reuses `test/mamba3`'s quantized base/LoRA loader, recurre
 runtime and tokenizer/generation implementation. It supports the official 187M and
 1.5B SISO dimensions and one-shot generation; interactive chat is rejected for Mamba-3.
 
+## FIR (model-side IR)
+
+`--fir <file.fir>` makes the Mamba-3 resident path take its micro-kernel programs from a
+FIR file (`models/mamba3-1.5b/model.fir`) through a registry, instead of the built-in
+builders; output is identical. `--fir-check <file.fir>` resolves every kernel name and
+builds every micro program without loading weights. Details: [`docs/fir.md`](../../docs/fir.md)
+and [`models/FIR.md`](../../models/FIR.md). Tests: `make fir-test` (or `make formers-fir-test` at
+the repository root).
+
 ## Layout
 
 ```
@@ -40,9 +49,11 @@ other/formers.n/
 │       ├── models/llama.bybylang      # Llama runner (nim_inference's own functions)
 │       ├── models/mamba2.bybylang     # Mamba-2 base / LoRA / Linear++ runner
 │       ├── models/mamba3.bybylang     # Mamba-3 SISO base / LoRA / Linear++ runner
+│       ├── ir/                        # FIR: parser, types, kernel registry (fir_*.bybylang)
 │       └── router.bybylang            # detection -> runner (false when unsupported)
 └── tests/
     ├── test_detect.bybylang     # fake configs/tensors + real headers, no weights loaded
+    ├── test_fir.bybylang        # FIR parse/registry + Mamba-3 kernels on the CPU interpreter
     └── make_tiny_llama.bybylang # random 2-layer Llama for a GPU smoke test
 ```
 
@@ -69,6 +80,7 @@ overwrote it).
 ```bash
 make build-formers          # -> other/formers.n/formers-cli
 make formers-test           # detection test (no GPU, no weights loaded)
+make formers-fir-test       # FIR test (no GPU, no weights loaded)
 make formers-smoke          # tiny random Llama end to end on the GPU
 ```
 
@@ -173,7 +185,7 @@ Flags: `--models`, `-m/--model`, `--lora`, `--no-lora`, `--no-merge-lora`, `--co
 `-p/--prompt`, `-f/--file`, `--system`, `--raw-prompt`, `-n/--n-predict`, `--temp`,
 `--top-p`, `--min-p`, `--repeat-penalty`, `--repeat-last-n`, `-s/--seed`, `--backend`,
 `-ngl/--ngl/--n-gpu-layers`, `-cnv/--conversation`, `-i/--interactive`, `-c/--ctx-size`,
-`--no-progress`, `--no-warmup`, `-v/--verbose`, `--detect-only`, `-h`. Exit codes: 0 ok, 1 runtime error,
+`--no-progress`, `--no-warmup`, `-v/--verbose`, `--detect-only`, `--fir`, `--fir-check`, `-h`. Exit codes: 0 ok, 1 runtime error,
 2 bad options, 3 unsupported model.
 
 ## Module API

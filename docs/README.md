@@ -37,6 +37,7 @@ This directory is the user documentation for the public Nimformer APIs. Use the 
 
 - [GPU Session API](gpu-session-api.md): encode multiple operations per GPU session, resident buffers, and lifecycle rules.
 - [Micro-VM / JIT API](microkernel-api.md): bytecode instructions, lowering, JIT cache, and persistent-kernel constraints.
+- [FIR (formers IR)](fir.md): model-side graph file naming micro-kernels, backend kernels and dimensions; `--fir` and `--fir-check` in formers.n.
 - [BybyLang integration tests](../test/bybylang_test/README.md): BybyLang scripts that import `lib_c_api` and exercise the C ABI plus the native `gpu ...` DSL.
 - [BybyLang test API reference](bybylang-tests.md): run and extend the two `.bybylang` tests, with every DSL command and C ABI call explained.
 - [BybyLang GPU API and DSL](bybylang-api.md): GPU backend functions, DSL syntax, session blocks, imports, and native micro-kernel blocks.

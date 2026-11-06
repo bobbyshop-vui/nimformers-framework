@@ -2,6 +2,13 @@
 
 [English](readme.md) | [Tiếng Việt](readme.vi.md)
 
+> **formers.n** (`other/formers.n/`) là runner dùng ngay của framework: một
+> `formers-cli` kiểu llama.cpp tự nhận diện model trong thư mục và chạy DeepSeek/Llama,
+> Codestral (Mamba-2, LoRA) hoặc Mamba-3 SISO 187M/1.5B. Build bằng `make formers-cli`;
+> cách dùng ở [mục formers.n](#chạy-deepseek-codestral-hoặc-mamba-3-bằng-formersn-formers-cli)
+> và [`other/formers.n/README.md`](other/formers.n/README.md). Mới: **FIR**, IR phía model
+> (`--fir`) cho phép model tự khai báo micro-kernel; xem [FIR](docs/fir.vi.md).
+
 **Benchmark** (tok/s prefill/decode trên Tesla T4 và Intel Iris Plus 640):
 [DeepSeek Coder 6.7B](test/deepseek-inference/benchmark.md) ·
 [Codestral Mamba + QLoRA](test/codestral/benchmark.md) ·
@@ -27,6 +34,9 @@ Các hướng dẫn thực hành:
 - [formers.n](#chạy-deepseek-codestral-hoặc-mamba-3-bằng-formersn-formers-cli): một
   `formers-cli` kiểu llama.cpp cho DeepSeek/Llama, Codestral (Mamba-2, LoRA)
   và Mamba-3 SISO (một prompt; không chat).
+
+- [FIR (formers IR)](docs/fir.vi.md): file đồ thị model mỏng, khai báo tên micro-kernel,
+  kernel backend và kích thước; `--fir` chạy inference resident Mamba-3 qua file này.
 
 Chương trình/dữ liệu theo model nằm trong `test/spectron/`,
 `test/codestral/`, `test/mamba3/`, `test/deepseek-inference/`; asset nằm trong `models/` của
