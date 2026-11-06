@@ -58,6 +58,35 @@ other/formers.n/
     └── make_tiny_llama.bybylang # random 2-layer Llama for a GPU smoke test
 ```
 
+## Python API
+
+The pure standard-library Python 3.9+ wrapper is in [`python/`](python/). It invokes
+`formers-cli` for generation and keeps one `-cnv` process alive for multi-turn chat.
+Build the CLI with `make -C other/formers.n build`, then use:
+
+```python
+from formers import Model
+
+model = Model("path/to/models", backend="auto")
+text = model.generate("Explain a hash table", max_tokens=128)
+with model.chat() as chat:
+    reply = chat.send("Hello")
+```
+
+Pass `cli_path=` or set `FORMERS_CLI` to select the executable. Python tests use a fake
+CLI and run without loading model weights: `cd other/formers.n/python && python3 -m unittest`.
+
+### OpenAI-compatible server
+
+Run the standard-library HTTP server with `python3 -m formers.server --models path/to/models`.
+It exposes `/v1/chat/completions` and `/v1/models`:
+
+```sh
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"path/to/models","messages":[{"role":"user","content":"Hello"}]}'
+```
+
 ## Detection and routing
 
 | Tensors in the `.nimq` + `config.json` | arch | Route |
