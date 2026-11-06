@@ -1,0 +1,154 @@
+import nim "std/[os, strutils, tables, json]"
+import "fir_types.bybylang"
+
+function firEvalExpr(expr: string, syms: Table[string, int]): int
+    let s = expr.strip()
+    if s.len == 0:
+        return 0
+    if syms.hasKey(s):
+        return syms[s]
+    # FIR v1 expressions are deliberately limited to integer +, -, *, and /.
+    var depth = 0
+    for i in countdown(s.high, 0):
+        if s[i] == ')':
+            inc depth
+        elif s[i] == '(':
+            dec depth
+        elif depth == 0 and s[i] in ['+', '-'] and i > 0:
+            let left = firEvalExpr(s[0 ..< i], syms)
+            let right = firEvalExpr(s[i + 1 .. ^1], syms)
+            return if s[i] == '+': left + right else: left - right
+    depth = 0
+    for i in countdown(s.high, 0):
+        if s[i] == ')':
+            inc depth
+        elif s[i] == '(':
+            dec depth
+        elif depth == 0 and s[i] in ['*', '/']:
+            let left = firEvalExpr(s[0 ..< i], syms)
+            let right = firEvalExpr(s[i + 1 .. ^1], syms)
+            if s[i] == '*':
+                return left * right
+            if right == 0:
+                raise newException(ValueError, "division by zero in FIR expression: " & s)
+            return left div right
+    if s[0] == '(' and s[^1] == ')':
+        return firEvalExpr(s[1 .. ^2], syms)
+    try:
+        return parseInt(s)
+    except ValueError:
+        raise newException(ValueError, "unknown FIR symbol or invalid expression: " & s)
+
+function firParse(path: string, configOverride: string = ""): FirProgram
+    if not fileExists(path):
+        raise newException(IOError, "FIR file not found: " & path)
+    result.sourcePath = path
+    var cfgPath = ""
+    var rawLines = readFile(path).splitLines()
+    for i, raw in rawLines:
+        let line = raw.split('#', 1)[0].strip()
+        let w = line.splitWhitespace()
+        if w.len >= 2 and w[0] == "config":
+            cfgPath = parentDir(path) / w[1]
+    if cfgPath.len == 0:
+        cfgPath = parentDir(path) / "config.json"
+    if configOverride.len > 0:
+        cfgPath = configOverride
+    result.configPath = cfgPath
+    let cfg = parseFile(cfgPath)
+    let ssm = cfg["ssm_cfg"]
+    let hidden = cfg["d_model"].getInt()
+    let inter = cfg{"d_intermediate"}.getInt(hidden * ssm{"expand"}.getInt(2))
+    let layers = cfg["n_layer"].getInt()
+    let vocab = cfg["vocab_size"].getInt()
+    let dstate = ssm["d_state"].getInt()
+    let headdim = ssm["headdim"].getInt()
+    if min(hidden, min(inter, min(layers, min(vocab, min(dstate, headdim))))) <= 0 or inter mod headdim != 0:
+        raise newException(ValueError, "FIR config dimensions must be positive; inter must be divisible by headdim")
+    if ssm{"ngroups"}.getInt(1) != 1 or ssm{"is_mimo"}.getBool(false) or ssm{"rope_fraction"}.getFloat(0.5) != 0.5 or dstate mod 4 != 0 or dstate > 256:
+        raise newException(ValueError, "FIR Mamba-3 kernels require SISO, ngroups=1, rope_fraction=0.5, dstate divisible by 4 and <=256")
+    result.epsilon = cfg{"layer_norm_epsilon"}.getFloat(1e-5).float32
+    if result.epsilon <= 0:
+        raise newException(ValueError, "FIR epsilon must be positive")
+    result.symbols = initTable[string, int]()
+    for (k, v) in [("hidden", hidden), ("inter", inter), ("layers", layers), ("vocab", vocab), ("dstate", dstate), ("headdim", headdim), ("nheads", inter div headdim), ("rope", dstate div 4)]:
+        result.symbols[k] = v
+    var inRepeat = false
+    var sawHeader = false
+    var lineNo = 0
+    for raw in rawLines:
+        inc lineNo
+        let clean = raw.split('#', 1)[0].strip()
+        if clean.len == 0:
+            continue
+        let w = clean.splitWhitespace()
+        case w[0]
+        of "fir":
+            if sawHeader or w.len != 2 or w[1] != "1":
+                raise newException(ValueError, "FIR line " & $lineNo & ": expected 'fir 1'")
+            sawHeader = true
+        of "model":
+            if w.len >= 2:
+                result.model = w[1]
+        of "config": discard
+        of "sym":
+            if w.len < 4 or w[2] != "=":
+                raise newException(ValueError, "FIR line " & $lineNo & ": malformed symbol")
+            result.symbols[w[1]] = firEvalExpr(w[3 .. ^1].join(""), result.symbols)
+        of "buf":
+            if w.len < 4:
+                raise newException(ValueError, "FIR line " & $lineNo & ": malformed buffer")
+            var b = FirBuffer(name: w[1], dtype: w[2], shape: w[3])
+            b.elements = firEvalExpr(w[3], result.symbols)
+            b.dims = @[b.elements]
+            if w.len > 4:
+                for tokenIndex in 4 ..< w.len:
+                    let token = w[tokenIndex]
+                    if token == "per_layer":
+                        b.perLayer = true
+                    elif token == "tensor":
+                        b.kind = "tensor"
+            if b.dtype != "f32" or b.elements <= 0 or result.buffers.hasKey(b.name):
+                raise newException(ValueError, "FIR line " & $lineNo & ": invalid or duplicate buffer " & b.name)
+            result.buffers[b.name] = b
+        of "weight":
+            if w.len < 6:
+                raise newException(ValueError, "FIR line " & $lineNo & ": malformed weight")
+            var b = FirBuffer(name: w[1], dtype: w[2], shape: w[^1], kind: "weight", tensorName: w[3])
+            if w[4] != "tensor" or not b.shape.startsWith("[") or not b.shape.endsWith("]"):
+                raise newException(ValueError, "FIR line " & $lineNo & ": invalid weight shape")
+            b.elements = 1
+            for dim in b.shape[1 .. ^2].split(','):
+                let size = firEvalExpr(dim, result.symbols)
+                if size <= 0:
+                    raise newException(ValueError, "FIR weight dimensions must be positive")
+                b.elements *= size
+                b.dims.add(size)
+            if result.buffers.hasKey(b.name) or b.dtype notin ["f32", "q4"]:
+                raise newException(ValueError, "FIR duplicate weight or unsupported dtype: " & b.name)
+            result.buffers[b.name] = b
+        of "repeat":
+            if inRepeat or w.len != 2 or w[1] != "layers":
+                raise newException(ValueError, "FIR supports one layer repeat scope")
+            inRepeat = true
+        of "endrepeat":
+            if not inRepeat:
+                raise newException(ValueError, "FIR unexpected endrepeat")
+            inRepeat = false
+        of "node":
+            if w.len < 4:
+                raise newException(ValueError, "FIR line " & $lineNo & ": malformed node")
+            var n = FirNode(name: w[1], kind: w[2], op: w[3], line: lineNo, perLayer: inRepeat)
+            let arrow = w.find("->")
+            if arrow < 4 or arrow == w.high:
+                raise newException(ValueError, "FIR line " & $lineNo & ": node requires inputs -> outputs")
+            n.inputs = w[4 ..< arrow].join(" ")
+            n.outputs = w[arrow + 1 .. ^1].join(" ")
+            for previous in result.nodes:
+                if previous.name == n.name:
+                    raise newException(ValueError, "FIR duplicate node: " & n.name)
+            result.nodes.add(n)
+        else:
+            raise newException(ValueError, "FIR line " & $lineNo & ": unknown declaration '" & w[0] & "'")
+    if not sawHeader or result.model.len == 0 or inRepeat:
+        raise newException(ValueError, "FIR requires a version, model, and closed repeat scopes")

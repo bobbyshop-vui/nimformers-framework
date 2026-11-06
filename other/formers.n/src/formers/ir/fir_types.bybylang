@@ -1,0 +1,47 @@
+import nim "std/tables"
+import nim "session_vm"
+import nim "m3_inference_kernels"
+import nim "backend"
+
+type
+  FirBuffer* = object
+    name*, dtype*, shape*, kind*, tensorName*: string
+    elements*: int
+    dims*: seq[int]
+    perLayer*: bool
+  FirNode* = object
+    name*, kind*, op*, inputs*, outputs*: string
+    line*: int
+    perLayer*: bool
+  FirProgram* = object
+    model*, configPath*, sourcePath*: string
+    symbols*: Table[string, int]
+    epsilon*: float32
+    buffers*: Table[string, FirBuffer]
+    nodes*: seq[FirNode]
+  FirBindings* = object
+    arena*: M3Arena
+    state*: M3DeviceState
+    params*: M3Params
+    parameterFloats*, finalNorm*: int
+    T*: int
+    dynamicOffsets*: bool
+    memory*, constants*: Table[string, int]
+  FirKernel* = object
+    program*: VmProgram
+    threads*, tgSize*, tgBytes*: int
+  FirMicroBuilder* = proc(model: FirProgram, node: FirNode, bindings: FirBindings): FirKernel {.closure.}
+  FirExtArgs* = object
+    backend*: Backend
+    values*, weights*, scales*, zeros*: seq[float32]
+    packedWeights*: seq[uint8]
+    indices*: seq[int32]
+    inDim*, outDim*, groupSize*, groupsPerRow*, vocab*: int
+  FirExtProc* = proc(args: FirExtArgs): seq[float32] {.closure.}
+  FirExtBinding* = object
+    call*: FirExtProc
+    backendSymbol*: string
+    inputs*, outputs*: int
+  FirRegistry* = object
+    micro*, builtin*: Table[string, FirMicroBuilder]
+    external*: Table[string, FirExtBinding]

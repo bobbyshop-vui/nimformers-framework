@@ -1,0 +1,298 @@
+import nim "std/[os, math, json, tables, strutils]"
+import "../src/formers/ir/fir_parse.bybylang"
+import "../src/formers/ir/fir_exec.bybylang"
+import nim "session_vm"
+import nim "vm_interp"
+
+function closeEnough(a, b: float32, name: string)
+    if classify(a) in {fcNan, fcInf, fcNegInf} or abs(a-b) > 1e-4'f32:
+        raise newException(ValueError, name & " mismatch: " & $a & " versus " & $b)
+
+function checkTiny(tiny: FirProgram, registry: FirRegistry, label: string)
+    let bindings = firMambaBindings(tiny)
+    firValidate(tiny, registry, bindings)
+    let a = bindings.arena
+    let st = bindings.state
+    let w = bindings.params
+    var arena = newSeq[float32](st.total)
+    vm_interp.gLut = newSeq[float32](bindings.parameterFloats)
+    var prepareNode, scanNode: FirNode
+    for node in tiny.nodes:
+        if node.op == "m3.prepare":
+            prepareNode = node
+        if node.op == "m3.ssm_step":
+            scanNode = node
+
+    # Tiny deterministic Mamba-3 SISO case, checked against direct reference formulas.
+    let c = tiny.symbols["inter"]
+    let n = tiny.symbols["dstate"]
+    let h = tiny.symbols["nheads"]
+    let rope = tiny.symbols["rope"]
+    let hd = tiny.symbols["headdim"]
+    let eps = 1e-5'f32
+    let p = 2*c + 2*n + 3*h + rope
+    var proj = newSeq[float32](p)
+    for i in 0 ..< p:
+        proj[i] = float32((i mod 17) - 8) * 0.011'f32
+    for head in 0 ..< h:
+        proj[2*c+2*n+h+head] = if head mod 2 == 0: -0.2'f32 else: 0.4'f32
+    var bNorm = newSeq[float32](n)
+    var cNorm = newSeq[float32](n)
+    var bBias = newSeq[float32](h*n)
+    var cBias = newSeq[float32](h*n)
+    var dtBias = newSeq[float32](h)
+    var phaseIn = newSeq[float32](h*rope)
+    for i in 0 ..< n:
+        bNorm[i] = 1'f32 + float32(i)*0.01'f32; cNorm[i] = 0.9'f32 + float32(i)*0.008'f32
+    for i in 0 ..< h*n:
+        bBias[i] = float32(i mod 5)*0.003'f32; cBias[i] = -float32(i mod 7)*0.002'f32
+    for i in 0 ..< h:
+        dtBias[i] = -0.3'f32 + float32(i)*0.1'f32
+    for i in 0 ..< h*rope:
+        phaseIn[i] = float32(i)*0.02'f32
+    var refK = newSeq[float32](h*n)
+    var refQ = newSeq[float32](h*n)
+    var refCoeff = newSeq[float32](h*3)
+    var refPhase = newSeq[float32](h*rope)
+    var bs, cs = 0'f32
+    for i in 0 ..< n:
+        bs += proj[2*c+i]*proj[2*c+i]; cs += proj[2*c+n+i]*proj[2*c+n+i]
+    let bi = 1'f32/sqrt(bs/float32(n)+eps); let ci = 1'f32/sqrt(cs/float32(n)+eps)
+    for head in 0 ..< h:
+        let dt = max(proj[2*c+2*n+head]+dtBias[head], 0'f32) + ln(1'f32+exp(-abs(proj[2*c+2*n+head]+dtBias[head])))
+        let ap = proj[2*c+2*n+h+head]
+        let av = if ap >= 0'f32: 1'f32+ap else: 1'f32/(1'f32-ap)
+        let a = -max(1e-4'f32,av)
+        let trap = 1'f32/(1'f32+exp(-proj[2*c+2*n+2*h+head]))
+        let decay = exp(a*dt)
+        refCoeff[head*3] = decay; refCoeff[head*3+1]=(1'f32-trap)*dt*decay; refCoeff[head*3+2]=trap*dt
+        for i in 0 ..< n:
+            refK[head*n+i]=proj[2*c+i]*bi*bNorm[i]+bBias[head*n+i]
+            refQ[head*n+i]=proj[2*c+n+i]*ci*cNorm[i]+cBias[head*n+i]
+        for r in 0 ..< rope:
+            let pi=head*rope+r
+            let angle=phaseIn[pi]+tanh(proj[2*c+2*n+3*h+r])*dt*PI.float32
+            refPhase[pi]=angle
+            let ix=head*n+2*r; let co=cos(angle); let si=sin(angle)
+            let k0=refK[ix]; let k1=refK[ix+1]; let q0=refQ[ix]; let q1=refQ[ix+1]
+            refK[ix]=k0*co-k1*si; refK[ix+1]=k0*si+k1*co; refQ[ix]=q0*co-q1*si; refQ[ix+1]=q0*si+q1*co
+    for i in 0 ..< p:
+        arena[a.proj+i] = proj[i]
+    for i in 0 ..< n:
+        vm_interp.gLut[w.bNorm+i] = bNorm[i]; vm_interp.gLut[w.cNorm+i] = cNorm[i]
+    for i in 0 ..< h*n:
+        vm_interp.gLut[w.bBias+i] = bBias[i]; vm_interp.gLut[w.cBias+i] = cBias[i]
+    for i in 0 ..< h:
+        vm_interp.gLut[w.dt+i] = dtBias[i]
+    for i in 0 ..< h*rope:
+        arena[st.phase+i] = phaseIn[i]
+    let prepareKernel = firMicroKernel(prepareNode, tiny, registry, bindings)
+    runGrid(prepareKernel.program, arena, prepareKernel.threads, prepareKernel.tgSize)
+    for i in 0 ..< refK.len:
+        closeEnough(arena[a.k+i], refK[i], "prepare K"); closeEnough(arena[a.q+i], refQ[i], "prepare Q")
+    for i in 0 ..< refCoeff.len:
+        closeEnough(arena[a.coeff+i], refCoeff[i], "prepare coeff")
+    for i in 0 ..< refPhase.len:
+        closeEnough(arena[st.phase+i], refPhase[i], "prepare RoPE phase")
+        closeEnough(arena[a.angles+i], refPhase[i], "prepare RoPE angles")
+
+    var oldState = newSeq[float32](c*n)
+    var oldK = newSeq[float32](h*n)
+    var oldV = newSeq[float32](c)
+    var v = newSeq[float32](c)
+    var z = newSeq[float32](c)
+    var skip = newSeq[float32](h)
+    for i in 0 ..< c*n:
+        oldState[i]=float32(i mod 11)*0.004'f32
+    for i in 0 ..< h*n:
+        oldK[i]=float32(i mod 13)*0.006'f32
+    for i in 0 ..< c:
+        oldV[i]=float32(i mod 7)*0.01'f32; v[i]=float32((i mod 9)-4)*0.02'f32; z[i]=float32((i mod 5)-2)*0.03'f32
+    for i in 0 ..< h:
+        skip[i]=0.7'f32+float32(i)*0.1'f32
+    for i in 0 ..< c*n:
+        arena[st.ssm+i] = oldState[i]
+    for i in 0 ..< h*n:
+        arena[st.prevK+i] = oldK[i]
+    for i in 0 ..< c:
+        arena[st.prevV+i] = oldV[i]
+        arena[a.proj+c+i] = v[i]; arena[a.proj+i] = z[i]
+    for i in 0 ..< h:
+        vm_interp.gLut[w.skip+i] = skip[i]
+    let scanKernel = firMicroKernel(scanNode, tiny, registry, bindings)
+    runGrid(scanKernel.program, arena, scanKernel.threads, scanKernel.tgSize)
+    for d in 0 ..< c:
+        let head=d div hd; let co=head*3
+        let sig=1'f32/(1'f32+exp(-z[d]))
+        var y=skip[head]*v[d]
+        for i in 0 ..< n:
+            let ix=head*n+i
+            let s=refCoeff[co]*oldState[d*n+i]+refCoeff[co+1]*oldK[ix]*oldV[d]+refCoeff[co+2]*refK[ix]*v[d]
+            closeEnough(arena[st.ssm+d*n+i], s, "SSM state")
+            y+=refQ[ix]*s
+        closeEnough(arena[a.inner+d], y*z[d]*sig, "SSM gated output")
+
+    let carryNode = FirNode(name: "carry", kind: "micro", op: "m3.carry", inputs: "k proj", outputs: "prev_k prev_v")
+    let carryKernel = firMicroKernel(carryNode, tiny, registry, bindings)
+    runGrid(carryKernel.program, arena, carryKernel.threads, carryKernel.tgSize)
+    for i in 0 ..< h*n:
+        closeEnough(arena[st.prevK+i], refK[i], "carry K")
+    for i in 0 ..< c:
+        closeEnough(arena[st.prevV+i], v[i], "carry V")
+    # Check the small shared kernels and distinct norm1/norm2/norm_f bindings.
+    for node in tiny.nodes:
+        if node.kind == "builtin" and node.op == "rms_norm":
+            let inputNames = node.inputs.splitWhitespace()
+            let gamma = bindings.constants[inputNames[1]]
+            var squareSum = 0'f32
+            for i in 0 ..< a.hidden:
+                let value = float32(i-7)*0.015'f32
+                arena[a.x+i] = value
+                vm_interp.gLut[gamma+i] = 0.8'f32+float32(i)*0.007'f32
+                squareSum += value*value
+            let kernel = registry.builtin[node.op](tiny, node, bindings)
+            runGrid(kernel.program, arena, kernel.threads, kernel.tgSize)
+            let scale = 1'f32/sqrt(squareSum/float32(a.hidden)+tiny.epsilon)
+            for i in 0 ..< a.hidden:
+                closeEnough(arena[a.norm+i], arena[a.x+i]*scale*vm_interp.gLut[gamma+i], "RMS " & inputNames[1])
+        elif node.kind == "builtin" and node.op == "add":
+            var expected = newSeq[float32](a.hidden)
+            for i in 0 ..< a.hidden:
+                arena[a.x+i] = float32(i)*0.02'f32
+                arena[a.mix+i] = float32(i-11)*0.03'f32
+                expected[i] = arena[a.x+i]+arena[a.mix+i]
+            let kernel = registry.builtin[node.op](tiny, node, bindings)
+            runGrid(kernel.program, arena, kernel.threads, kernel.tgSize)
+            for i in 0 ..< a.hidden:
+                closeEnough(arena[a.x+i], expected[i], "residual")
+        elif node.kind == "micro" and node.op == "m3.silu_mul":
+            for i in 0 ..< a.F:
+                arena[a.mlp+i] = float32(i-17)*0.01'f32
+                arena[a.mlp+a.F+i] = float32(i-29)*0.02'f32
+            let kernel = firMicroKernel(node, tiny, registry, bindings)
+            runGrid(kernel.program, arena, kernel.threads, kernel.tgSize)
+            for i in 0 ..< a.F:
+                let gate = arena[a.mlp+a.F+i]
+                closeEnough(arena[a.gated+i], arena[a.mlp+i]*gate/(1'f32+exp(-gate)), "MLP gate")
+    echo "PASS " & label & ": registry prepare/ssm/carry via runGrid; K/Q, coeff, phase, state/output + RMS/add/MLP (tol 1e-4)"
+
+function checkInvalid(model: FirProgram, registry: FirRegistry, bindings: FirBindings, kind, op: string)
+    var bad = model
+    bad.nodes = @[FirNode(name: "bad", kind: kind, op: op, inputs: "hidden_in norm1", outputs: "hidden_norm")]
+    var rejected = false
+    try:
+        firValidate(bad, registry, bindings)
+    except ValueError as e:
+        rejected = e.msg.contains("unknown") and e.msg.contains(op)
+    doAssert rejected, "expected clear unknown kernel error for " & kind
+
+function checkShape(model: FirProgram, registry: FirRegistry, bindings: FirBindings)
+    var bad = model
+    bad.buffers["k"].elements += 1
+    var rejected = false
+    try:
+        firValidate(bad, registry, bindings)
+    except ValueError as e:
+        rejected = e.msg.contains("shape mismatch")
+    doAssert rejected, "invalid micro buffer shape was accepted"
+
+let model = firParse("models/mamba3-1.5b/model.fir")
+let registry = firDefaultRegistry()
+let largeBindings = firMambaBindings(model)
+firValidate(model, registry, largeBindings)
+doAssert model.symbols["hidden"] == 2048 and model.symbols["inter"] == 4096 and model.symbols["layers"] == 24
+checkInvalid(model, registry, largeBindings, "micro", "missing.micro")
+checkInvalid(model, registry, largeBindings, "ext", "missing.ext")
+checkInvalid(model, registry, largeBindings, "builtin", "missing.builtin")
+checkShape(model, registry, largeBindings)
+echo "PASS unknown micro/ext/builtin names and invalid micro shapes rejected"
+for node in model.nodes:
+    if node.kind == "micro":
+        let kernel = firMicroKernel(node, model, registry, largeBindings)
+        echo "BUILD " & node.op & ": " & $kernel.program.words.len & " words, threads=" & $kernel.threads & ", tg=" & $kernel.tgSize
+echo "PASS 1.5B config: every micro/ext/builtin resolves; all micro/builtin programs build (no weights)"
+
+# The requested two heads of width eight give C=16. An explicit d_intermediate
+# overrides hidden*expand for this kernel fixture; a physical expand=2 model
+# with hidden=32 instead has C=64, tested separately below.
+let tinyPath = getTempDir() / ("fir_tiny_" & $getCurrentProcessId() & ".json")
+var cfg = %*{"d_model": 32, "d_intermediate": 16, "n_layer": 1, "vocab_size": 64, "ssm_cfg": {"expand": 2, "headdim": 8, "d_state": 16, "ngroups": 1, "rope_fraction": 0.5}}
+writeFile(tinyPath, $cfg)
+let tiny = firParse(model.sourcePath, tinyPath)
+removeFile(tinyPath)
+checkTiny(tiny, registry, "tiny hidden=32 inter=16 heads=2 headdim=8")
+cfg["d_intermediate"] = %64
+writeFile(tinyPath, $cfg)
+let expanded = firParse(model.sourcePath, tinyPath)
+removeFile(tinyPath)
+doAssert expanded.symbols["nheads"] == 8
+checkTiny(expanded, registry, "tiny hidden=32 expand=2 inter=64 heads=8 headdim=8")
+
+# Compare every resident role against the former direct-builder call, including
+# nontrivial layer addresses, dynamic descriptors and batched prefill lengths.
+function checkResident(model: FirProgram, registry: FirRegistry)
+    var selected = model
+    var custom = registry
+    firRegisterMicro(custom, "test.prepare", firPrepareBuilder)
+    for node in selected.nodes.mitems:
+        if node.op == "m3.prepare":
+            node.op = "test.prepare"
+    firInstallMambaProvider(selected, custom)
+    let a = arenaLayout(2048, 4096, 64, 128, 128256, 128, 32)
+    for T in [1, 7, 128]:
+        for layer in [0, 23]:
+            let s = stateLayout(a, a.total+layer*600000, 0)
+            let w = M3Params(norm: layer*24000, norm2: layer*24000+2048, bNorm: layer*24000+4096, cNorm: layer*24000+4224, bBias: layer*24000+4352, cBias: layer*24000+12544, dt: layer*24000+20736, skip: layer*24000+20800)
+            for role in ["norm", "prepare", "scan", "carry", "norm2", "mlp", "residual", "finalNorm"]:
+                var request = M3ProgramRequest(role: role, arena: a, state: s, params: w, T: T, finalGamma: 580000, layers: 24, epsilon: model.epsilon, dynamicOffsets: role != "finalNorm")
+                let actual = gM3ProgramProvider(request)
+                var expected: VmProgram
+                var threads, tg, bytes: int
+                case role
+                of "norm":
+                    expected = rmsRows(a.hidden, a.x, a.norm, w.norm, model.epsilon, true, moNorm)
+                    threads = T*256; tg = 256; bytes = 1024
+                of "norm2":
+                    expected = rmsRows(a.hidden, a.x, a.norm, w.norm2, model.epsilon, true, moNorm2)
+                    threads = T*256; tg = 256; bytes = 1024
+                of "prepare":
+                    expected = prepareSiso(a, s, w, T, model.epsilon, true)
+                    threads = a.H*256; tg = 256; bytes = 1024
+                of "scan":
+                    expected = scanSiso(a, s, w, T, true)
+                    threads = a.C*32; tg = 32; bytes = 128
+                of "carry":
+                    expected = carrySiso(a, s, T, true)
+                    threads = max(a.C, a.H*a.N); tg = 256; bytes = 16
+                of "mlp":
+                    expected = siluMlp(a)
+                    threads = T*a.F; tg = 256; bytes = 16
+                of "residual":
+                    expected = residual(a.x, a.mix, a.x)
+                    threads = T*a.hidden; tg = 256; bytes = 16
+                of "finalNorm":
+                    expected = rmsRows(a.hidden, a.x, a.norm, request.finalGamma, model.epsilon)
+                    threads = T*256; tg = 256; bytes = 1024
+                else: discard
+                doAssert actual.program.words == expected.words, "resident bytecode mismatch: " & role
+                doAssert actual.threads == threads and actual.tgSize == tg and actual.tgBytes == bytes, "resident dispatch mismatch: " & role
+    doAssert firProviderPrograms() == 48
+    for defect in ["role", "dimensions", "epsilon", "capacity"]:
+        var request = M3ProgramRequest(role: "prepare", arena: a, state: stateLayout(a, a.total, 0), T: 1, layers: 24, epsilon: model.epsilon, dynamicOffsets: true)
+        case defect
+        of "role": request.role = "missing"
+        of "dimensions": request.arena.hidden += 1
+        of "epsilon": request.epsilon *= 2
+        of "capacity": request.T = a.capacity+1
+        else: discard
+        var rejected = false
+        try:
+            discard gM3ProgramProvider(request)
+        except ValueError:
+            rejected = true
+        doAssert rejected, "provider accepted invalid " & defect
+    firRemoveMambaProvider()
+    doAssert gM3ProgramProvider.isNil
+    echo "PASS resident provider: 48 bytecode/dispatch comparisons; T=1/7/128, layers=0/23, graph-selected custom op; invalid requests rejected; provider removed"
+
+checkResident(model, registry)

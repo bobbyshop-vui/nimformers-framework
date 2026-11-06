@@ -1,0 +1,268 @@
+import nim "std/[tables, strutils]"
+import nim "session_vm"
+import nim "m3_inference_kernels"
+import nim "backend"
+import nim "m3_gpu_runtime"
+import "fir_types.bybylang"
+
+# Builders use the framework's existing memory ABI; FIR never interprets bytecode.
+function firBindMambaAddresses(bindings: var FirBindings)
+    let a = bindings.arena
+    let s = bindings.state
+    let w = bindings.params
+    for (name, address) in [("hidden_in", a.x), ("hidden_norm", a.norm), ("proj", a.proj), ("k", a.k), ("q", a.q), ("coeff", a.coeff), ("ssm_out", a.inner), ("mlp_gate", a.mlp), ("mlp_out", a.gated), ("residual", a.mix), ("logits", a.logits), ("state", s.ssm), ("phase", s.phase), ("prev_k", s.prevK), ("prev_v", s.prevV)]:
+        bindings.memory[name] = address
+    for (name, address) in [("norm1", w.norm), ("norm2", w.norm2), ("norm_f", bindings.finalNorm), ("b_norm", w.bNorm), ("c_norm", w.cNorm), ("b_bias", w.bBias), ("c_bias", w.cBias), ("dt_bias", w.dt), ("D", w.skip)]:
+        bindings.constants[name] = address
+
+function firMambaBindings(model: FirProgram): FirBindings
+    let d = model.symbols
+    result.arena = arenaLayout(d["hidden"], d["inter"], d["nheads"], d["dstate"], d["vocab"], 1, 1)
+    result.state = stateLayout(result.arena, result.arena.total, 0)
+    let a = result.arena
+    var offset = 0
+    result.params.norm = offset; offset += a.hidden
+    result.params.norm2 = offset; offset += a.hidden
+    result.params.bNorm = offset; offset += a.N
+    result.params.cNorm = offset; offset += a.N
+    result.params.bBias = offset; offset += a.H*a.N
+    result.params.cBias = offset; offset += a.H*a.N
+    result.params.dt = offset; offset += a.H
+    result.params.skip = offset; offset += a.H
+    result.finalNorm = offset; offset += a.hidden
+    result.parameterFloats = offset
+    result.T = 1
+    firBindMambaAddresses(result)
+
+function firRequireNode(model: FirProgram, node: FirNode, inputs, outputs: string)
+    if node.inputs != inputs or node.outputs != outputs:
+        raise newException(ValueError, "FIR kernel ABI mismatch for " & node.op & ": expected " & inputs & " -> " & outputs)
+
+function firRequireSize(model: FirProgram, name: string, count: int)
+    if not model.buffers.hasKey(name) or model.buffers[name].elements != count:
+        raise newException(ValueError, "FIR buffer shape mismatch: " & name & " expects " & $count & " elements")
+
+function firRegisterMicro(registry: var FirRegistry, name: string, builder: FirMicroBuilder)
+    registry.micro[name] = builder
+
+function firRegisterExt(registry: var FirRegistry, name, backendSymbol: string, inputs, outputs: int, callback: FirExtProc)
+    registry.external[name] = FirExtBinding(backendSymbol: backendSymbol, inputs: inputs, outputs: outputs, call: callback)
+
+function firPrepareBuilder(model: FirProgram, node: FirNode, bindings: FirBindings): FirKernel
+    firRequireNode(model, node, "proj b_norm c_norm b_bias c_bias dt_bias phase", "k q coeff phase")
+    let a = bindings.arena
+    for (name, count) in [("proj", a.P), ("b_norm", a.N), ("c_norm", a.N), ("b_bias", a.H*a.N), ("c_bias", a.H*a.N), ("dt_bias", a.H), ("phase", a.H*a.R), ("k", a.H*a.N), ("q", a.H*a.N), ("coeff", a.H*3)]:
+        firRequireSize(model, name, count)
+    FirKernel(program: prepareSiso(bindings.arena, bindings.state, bindings.params, max(1, bindings.T), model.epsilon, bindings.dynamicOffsets), threads: bindings.arena.H*256, tgSize: 256, tgBytes: 1024)
+
+function firScanBuilder(model: FirProgram, node: FirNode, bindings: FirBindings): FirKernel
+    firRequireNode(model, node, "proj k q coeff state prev_k prev_v D", "ssm_out state")
+    let a = bindings.arena
+    for (name, count) in [("proj", a.P), ("k", a.H*a.N), ("q", a.H*a.N), ("coeff", a.H*3), ("state", a.C*a.N), ("prev_k", a.H*a.N), ("prev_v", a.C), ("D", a.H), ("ssm_out", a.C)]:
+        firRequireSize(model, name, count)
+    FirKernel(program: scanSiso(bindings.arena, bindings.state, bindings.params, max(1, bindings.T), bindings.dynamicOffsets), threads: bindings.arena.C*32, tgSize: 32, tgBytes: 128)
+
+function firCarryBuilder(model: FirProgram, node: FirNode, bindings: FirBindings): FirKernel
+    let a = bindings.arena
+    firRequireNode(model, node, "k proj", "prev_k prev_v")
+    let count = max(a.C, a.H*a.N)
+    FirKernel(program: carrySiso(a, bindings.state, max(1, bindings.T), bindings.dynamicOffsets), threads: ((count+255) div 256)*256, tgSize: 256, tgBytes: 16)
+
+function firMlpBuilder(model: FirProgram, node: FirNode, bindings: FirBindings): FirKernel
+    firRequireNode(model, node, "mlp_gate", "mlp_out")
+    firRequireSize(model, "mlp_gate", 4*bindings.arena.hidden)
+    firRequireSize(model, "mlp_out", 2*bindings.arena.hidden)
+    FirKernel(program: siluMlp(bindings.arena), threads: max(1, bindings.T)*bindings.arena.F, tgSize: min(256, bindings.arena.F), tgBytes: 16)
+
+function firNormBuilder(model: FirProgram, node: FirNode, bindings: FirBindings): FirKernel
+    let inputs = node.inputs.splitWhitespace()
+    let output = node.outputs.splitWhitespace()[0]
+    for name in inputs & @[output]:
+        firRequireSize(model, name, bindings.arena.hidden)
+    if not bindings.memory.hasKey(inputs[0]) or not bindings.memory.hasKey(output) or not bindings.constants.hasKey(inputs[1]):
+        raise newException(ValueError, "FIR rms_norm requires activation and gamma bindings")
+    let dynamic = bindings.dynamicOffsets and inputs[1] != "norm_f"
+    let slot = if inputs[1] == "norm2": moNorm2 else: moNorm
+    FirKernel(program: rmsRows(bindings.arena.hidden, bindings.memory[inputs[0]], bindings.memory[output], bindings.constants[inputs[1]], model.epsilon, dynamic, slot), threads: max(1, bindings.T)*256, tgSize: 256, tgBytes: 1024)
+
+function firAddBuilder(model: FirProgram, node: FirNode, bindings: FirBindings): FirKernel
+    let inputs = node.inputs.splitWhitespace()
+    let output = node.outputs.splitWhitespace()[0]
+    let a = bindings.arena
+    for name in inputs & @[output]:
+        firRequireSize(model, name, a.hidden)
+        if not bindings.memory.hasKey(name):
+            raise newException(ValueError, "FIR add requires an activation binding: " & name)
+    FirKernel(program: residual(bindings.memory[inputs[0]], bindings.memory[inputs[1]], bindings.memory[output]), threads: max(1, bindings.T)*a.hidden, tgSize: min(256, a.hidden), tgBytes: 16)
+
+function firQ4Backend(args: FirExtArgs): seq[float32]
+    beMatmulQ4(args.backend, args.values, args.packedWeights, args.scales, args.zeros, 1, args.inDim, args.outDim, args.groupSize, args.groupsPerRow)
+
+function firEmbeddingBackend(args: FirExtArgs): seq[float32]
+    beEmbeddingLookup(args.backend, args.weights, args.indices, args.vocab, args.outDim)
+
+function firExternal(node: FirNode, registry: FirRegistry): FirExtBinding
+    if not registry.external.hasKey(node.op):
+        raise newException(ValueError, "FIR unknown external kernel '" & node.op & "' (node " & node.name & ")")
+    registry.external[node.op]
+
+function firDefaultRegistry(): FirRegistry
+    firRegisterMicro(result, "m3.prepare", firPrepareBuilder)
+    firRegisterMicro(result, "m3.ssm_step", firScanBuilder)
+    firRegisterMicro(result, "m3.carry", firCarryBuilder)
+    firRegisterMicro(result, "m3.silu_mul", firMlpBuilder)
+    result.builtin["rms_norm"] = firNormBuilder
+    result.builtin["add"] = firAddBuilder
+    # Backend symbols are contracts for a caller with loaded weights and GPU handles.
+    firRegisterExt(result, "m3.gemv_q4", "backend.beMatmulQ4", 2, 1, firQ4Backend)
+    firRegisterExt(result, "m3.embedding", "backend.beEmbeddingLookup", 2, 1, firEmbeddingBackend)
+
+function firMicroKernel(node: FirNode, model: FirProgram, registry: FirRegistry, bindings: FirBindings): FirKernel
+    if not registry.micro.hasKey(node.op) or registry.micro[node.op].isNil:
+        raise newException(ValueError, "FIR unknown micro kernel '" & node.op & "' (node " & node.name & ")")
+    result = registry.micro[node.op](model, node, bindings)
+    if result.threads <= 0 or result.tgSize <= 0 or result.threads mod result.tgSize != 0 or result.tgBytes < 0:
+        raise newException(ValueError, "FIR invalid dispatch geometry: " & node.op)
+    if result.program.words.len <= 1:
+        raise newException(ValueError, "FIR kernel '" & node.op & "' built an empty or Halt-only program")
+
+function firMicroProgram(node: FirNode, model: FirProgram, registry: FirRegistry, bindings: FirBindings): VmProgram
+    firMicroKernel(node, model, registry, bindings).program
+
+function firMicroKey(node: FirNode): string
+    node.op
+
+function firValidate(model: FirProgram, registry: FirRegistry, bindings: FirBindings)
+    for node in model.nodes:
+        let inputs = node.inputs.splitWhitespace()
+        let outputs = node.outputs.splitWhitespace()
+        for name in inputs & outputs:
+            if not model.buffers.hasKey(name):
+                raise newException(ValueError, "FIR node '" & node.name & "' references unknown buffer '" & name & "'")
+        case node.kind
+        of "micro":
+            discard firMicroKernel(node, model, registry, bindings)
+        of "ext":
+            if not registry.external.hasKey(node.op):
+                raise newException(ValueError, "FIR unknown external kernel '" & node.op & "' (node " & node.name & ")")
+            let ext = registry.external[node.op]
+            if ext.call.isNil or ext.backendSymbol.len == 0 or inputs.len != ext.inputs or outputs.len != ext.outputs:
+                raise newException(ValueError, "FIR external kernel binding/arity mismatch: " & node.op)
+            if node.op in ["m3.gemv_q4", "m3.embedding"]:
+                let weight = model.buffers[inputs[1]]
+                if weight.kind != "weight" or weight.dims.len != 2:
+                    raise newException(ValueError, "FIR external kernel requires a matrix weight: " & node.op)
+                if node.op == "m3.gemv_q4":
+                    if weight.dtype != "q4" or weight.dims[1] != model.buffers[inputs[0]].elements or weight.dims[0] != model.buffers[outputs[0]].elements:
+                        raise newException(ValueError, "FIR GEMV shape/dtype mismatch: " & node.name)
+                elif node.op == "m3.embedding":
+                    if model.buffers[inputs[0]].elements != 1 or weight.dims != @[model.symbols["vocab"], model.buffers[outputs[0]].elements]:
+                        raise newException(ValueError, "FIR embedding shape mismatch: " & node.name)
+        of "builtin":
+            if not registry.builtin.hasKey(node.op) or registry.builtin[node.op].isNil:
+                raise newException(ValueError, "FIR unknown builtin '" & node.op & "' (node " & node.name & ")")
+            if inputs.len != 2 or outputs.len != 1:
+                raise newException(ValueError, "FIR builtin expects two inputs and one output: " & node.op)
+            if registry.builtin[node.op](model, node, bindings).program.words.len <= 1:
+                raise newException(ValueError, "FIR builtin built an empty program: " & node.op)
+        else:
+            raise newException(ValueError, "FIR unknown node kind: " & node.kind)
+
+function firSummary(model: FirProgram, registry: FirRegistry, bindings: FirBindings): string
+    var microCount, builtinCount, extCount = 0
+    for node in model.nodes:
+        case node.kind
+        of "micro": inc microCount
+        of "builtin": inc builtinCount
+        of "ext": inc extCount
+        else: discard
+    "FIR " & model.model & ": " & $model.buffers.len & " buffers, " & $model.nodes.len & " nodes; registry resolved " & $microCount & " micro, " & $builtinCount & " builtin, " & $extCount & " ext; all micro/builtin programs built; config=" & model.configPath
+
+# The resident scheduler owns execution order. Resolve its fixed activation ABI
+# through graph nodes, allowing the model file to choose registered operations.
+function firResidentRole(node: FirNode): string
+    if node.kind == "builtin":
+        if node.inputs == "hidden_in norm1" and node.outputs == "hidden_norm":
+            return "norm"
+        if node.inputs == "hidden_in norm2" and node.outputs == "hidden_norm":
+            return "norm2"
+        if node.inputs == "hidden_in norm_f" and node.outputs == "hidden_norm":
+            return "finalNorm"
+        if node.inputs == "hidden_in residual" and node.outputs == "hidden_in":
+            return "residual"
+    elif node.kind == "micro":
+        case node.outputs
+        of "k q coeff phase": return "prepare"
+        of "ssm_out state": return "scan"
+        of "prev_k prev_v": return "carry"
+        of "mlp_out": return "mlp"
+        else: discard
+
+function firResidentKernel(model: FirProgram, registry: FirRegistry, request: M3ProgramRequest): FirKernel
+    let a = request.arena
+    for (name, actual) in [("hidden", a.hidden), ("inter", a.C), ("nheads", a.H), ("dstate", a.N), ("rope", a.R), ("vocab", a.total-a.logits), ("layers", request.layers)]:
+        if model.symbols[name] != actual:
+            raise newException(ValueError, "FIR runtime dimension mismatch: " & name)
+    if request.T < 1 or request.T > a.capacity:
+        raise newException(ValueError, "FIR runtime batch exceeds arena capacity")
+    if model.epsilon != request.epsilon:
+        raise newException(ValueError, "FIR runtime epsilon mismatch: " & request.role)
+    var bindings: FirBindings
+    bindings.arena = a
+    bindings.state = request.state
+    bindings.params = request.params
+    bindings.finalNorm = request.finalGamma
+    bindings.T = request.T
+    bindings.dynamicOffsets = request.dynamicOffsets
+    firBindMambaAddresses(bindings)
+    var found = false
+    for node in model.nodes:
+        if firResidentRole(node) == request.role:
+            # Both residual nodes share one program; require identical operations.
+            let kernel = if node.kind == "micro": firMicroKernel(node, model, registry, bindings) else: registry.builtin[node.op](model, node, bindings)
+            if found and (kernel.program.words != result.program.words or kernel.threads != result.threads or kernel.tgSize != result.tgSize or kernel.tgBytes != result.tgBytes):
+                raise newException(ValueError, "FIR conflicting resident role: " & request.role)
+            result = kernel
+            found = true
+    if not found:
+        raise newException(ValueError, "FIR missing resident role: " & request.role)
+
+type
+  FirProviderState* = ref object
+    model*: FirProgram
+    registry*: FirRegistry
+    programs*: int
+
+function firProviderSlot(): ptr FirProviderState
+    var state {.global.}: FirProviderState
+    result = addr state
+
+function firResidentProvider(request: M3ProgramRequest): M3ProvidedProgram
+    let state = firProviderSlot()[]
+    let kernel = firResidentKernel(state.model, state.registry, request)
+    inc state.programs
+    M3ProvidedProgram(program: kernel.program, threads: kernel.threads, tgSize: kernel.tgSize, tgBytes: kernel.tgBytes)
+
+function firInstallMambaProvider(model: FirProgram, registry: FirRegistry)
+    firValidate(model, registry, firMambaBindings(model))
+    for node in model.nodes:
+        if node.kind in ["micro", "builtin"] and firResidentRole(node).len == 0:
+            raise newException(ValueError, "FIR node has no resident scheduling role: " & node.name)
+    for role in ["norm", "prepare", "scan", "carry", "norm2", "mlp", "residual", "finalNorm"]:
+        var found = false
+        for node in model.nodes:
+            if firResidentRole(node) == role:
+                found = true
+        if not found:
+            raise newException(ValueError, "FIR missing resident role: " & role)
+    firProviderSlot()[] = FirProviderState(model: model, registry: registry)
+    setM3ProgramProvider(firResidentProvider)
+
+function firProviderPrograms(): int
+    if firProviderSlot()[].isNil:
+        return 0
+    firProviderSlot()[].programs
+
+function firRemoveMambaProvider()
+    setM3ProgramProvider(nil)
+    firProviderSlot()[] = nil

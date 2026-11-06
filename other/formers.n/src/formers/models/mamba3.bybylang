@@ -7,10 +7,18 @@ import nim "std/[os, strutils]"
 import nim "backend"
 import nim "m3_formers_infer as m3infer"
 import "../cli/options.bybylang"
+import "../ir/fir_parse.bybylang"
+import "../ir/fir_exec.bybylang"
 import "../arch/detect.bybylang"
 import "../runtime/console.bybylang"
 
 function fmRunMamba3(det: FmDetection, opts: FmOptions): bool
+    if opts.firFile.len > 0:
+        firInstallMambaProvider(firParse(opts.firFile), firDefaultRegistry())
+    defer:
+        if opts.firFile.len > 0:
+            fmSay("FIR: provider used for " & $firProviderPrograms() & " programs")
+            firRemoveMambaProvider()
     if opts.noMergeLora:
         putEnv("BYBY_MERGE_LORA", "0")
     putEnv("BYBY_TOP_P", $opts.topP)

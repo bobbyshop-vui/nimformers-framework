@@ -2,6 +2,13 @@
 
 [English](readme.md) | [Tiếng Việt](readme.vi.md)
 
+> **formers.n** (`other/formers.n/`) is the ready-to-use runner of this framework: one
+> llama.cpp-style `formers-cli` that detects the model in a folder and runs DeepSeek/Llama,
+> Codestral (Mamba-2, LoRA) or Mamba-3 SISO 187M/1.5B. Build it with `make formers-cli`;
+> usage is in [Run with formers.n](#run-deepseek-or-codestral-with-formersn-formers-cli) and
+> [`other/formers.n/README.md`](other/formers.n/README.md). New: **FIR**, a model-side IR
+> (`--fir`) that lets a model name its own micro-kernels; see [FIR](docs/fir.md).
+
 **Benchmarks** (prefill/decode tok/s on Tesla T4 and Intel Iris Plus 640):
 [DeepSeek Coder 6.7B](test/deepseek-inference/benchmark.md) ·
 [Codestral Mamba + QLoRA](test/codestral/benchmark.md) ·
@@ -24,6 +31,9 @@ Practical guides:
 - [formers.n](#run-deepseek-or-codestral-with-formersn-formers-cli): one llama.cpp-style
   `formers-cli` for DeepSeek/Llama, Codestral (Mamba-2, LoRA), and Mamba-3 SISO
   187M/1.5B. Mamba-3 uses single-prompt generation; Llama and Mamba-2 also support chat.
+
+- [FIR (formers IR)](docs/fir.md): a thin model graph file that names micro-kernels,
+  backend kernels and dimensions; `--fir` runs Mamba-3 resident inference through it.
 
 Model-specific programs and data live under `test/spectron/`, `test/codestral/`, `test/mamba3/`, and `test/deepseek-inference/`. Model assets live in each project's `models/` folder. The FP4 GEMV micro-kernel modules live under `kernelfortest/`; shared runtime modules remain at the project root.
 

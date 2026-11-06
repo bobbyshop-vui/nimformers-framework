@@ -85,7 +85,7 @@ CLEAN_BINS      := $(TEST_BIN) $(GRAFT_BIN) $(FINETUNE_BIN) $(INFER_LORA_BIN) $(
         build-migrate-lora build-nim-inference build-spectron build-for-python \
         python-test python-example c-example bybylang-test bench-gflops \
         graft finetune-mamba hf-train build-hf-train infer-lora infer-mamba infer-deepseek run-spectron mamba-pipeline \
-        build-formers formers-cli formers flash-attention-test q4-gemm-test formers-test formers-smoke formers-clean
+        build-formers formers-cli formers flash-attention-test q4-gemm-test formers-test formers-fir-test formers-smoke formers-clean
 
 all: build run
 
@@ -461,6 +461,9 @@ q4-gemm-test:
 
 formers-test:
 	$(MAKE) -C other/formers.n test
+
+formers-fir-test:
+	$(MAKE) -C other/formers.n fir-test
 
 formers-smoke:
 	$(MAKE) -C other/formers.n smoke

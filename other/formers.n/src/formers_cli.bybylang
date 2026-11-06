@@ -12,6 +12,8 @@ import "formers/arch/detect.bybylang"
 import "formers/runtime/signals.bybylang"
 import "formers/runtime/console.bybylang"
 import "formers/router.bybylang"
+import "formers/ir/fir_parse.bybylang"
+import "formers/ir/fir_exec.bybylang"
 
 opts = fmParseOptions(commandLineParams())
 if opts.showHelp:
@@ -22,7 +24,21 @@ if opts.errors.len > 0:
         stderr.writeLine("[formers.n] " & e)
     stderr.writeLine("[formers.n] see: formers-cli --help")
     quit(2)
+if opts.firCheck.len > 0:
+    try:
+        firProgram = firParse(opts.firCheck)
+        firRegistry = firDefaultRegistry()
+        firBindings = firMambaBindings(firProgram)
+        firValidate(firProgram, firRegistry, firBindings)
+        print firSummary(firProgram, firRegistry, firBindings)
+        quit(0)
+    except Exception as e:
+        stderr.writeLine("[formers.n] FIR check failed: " & e.msg)
+        quit(1)
 det = fmDetect(opts)
+if opts.firFile.len > 0 and det.arch != faMamba3:
+    stderr.writeLine("[formers.n] --fir requires the Mamba-3 resident runtime")
+    quit(3)
 if opts.verbose or opts.detectOnly:
     stderr.writeLine(fmDescribe(det, opts))
 reason = ""

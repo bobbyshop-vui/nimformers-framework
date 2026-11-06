@@ -9,6 +9,18 @@ import prefill_inference_kernels
 import vendor/bybylang/gpubackend as byby
 
 type
+  M3ProgramRequest* = object
+    role*: string
+    arena*: M3Arena
+    state*: M3DeviceState
+    params*: M3Params
+    T*, finalGamma*, layers*: int
+    epsilon*: float32
+    dynamicOffsets*: bool
+  M3ProvidedProgram* = object
+    program*: VmProgram
+    threads*, tgSize*, tgBytes*: int
+  M3ProgramProvider* = proc(request: M3ProgramRequest): M3ProvidedProgram {.closure.}
   M3BlockStat* = object
     idx*:int
     kind*:char
@@ -45,6 +57,12 @@ type
     lastTrace*:seq[M3BlockStat]
 
 var gM3Runtime*:M3Runtime
+var gM3ProgramProvider*:M3ProgramProvider
+
+proc setM3ProgramProvider*(provider:M3ProgramProvider) =
+  # Cached programs must be rebuilt when the source of their bytecode changes.
+  gM3Runtime.programs.clear()
+  gM3ProgramProvider=provider
 
 proc require(ok:bool;message:string)=
   if not ok:raise newException(CatchableError,"Mamba-3 GPU: " & message)
@@ -141,6 +159,19 @@ proc preparePrograms(m:NimformerModelJamba;T:int)=
   if T in gM3Runtime.programs:return
   let a=gM3Runtime.a;let be=gM3Runtime.be
   var pr:RuntimePrograms
+  template provided(roleName:string; stateValue:M3DeviceState; paramsValue:M3Params;
+      epsValue:float32; dynamicValue:bool; gammaValue:int; tagValue:string;
+      fallback:untyped):Kernel =
+    block:
+      if gM3ProgramProvider.isNil:
+        fallback
+      else:
+        let built=gM3ProgramProvider(M3ProgramRequest(role:roleName,arena:a,
+          state:stateValue,params:paramsValue,T:T,epsilon:epsValue,
+          dynamicOffsets:dynamicValue,finalGamma:gammaValue,layers:m.blocks.len))
+        require(built.program.words.len>1 and built.threads>0 and built.tgSize>0 and
+          built.threads mod built.tgSize==0 and built.tgBytes>=0,"invalid provider program: " & roleName)
+        compile(built.program,tagValue,built.threads,built.tgSize,built.tgBytes,be)
   for i,blk in m.blocks:
     let s=gM3Runtime.states[i];let w=gM3Runtime.params[i]
     # The cache also hashes every bytecode word (including embedded state and
@@ -148,13 +179,20 @@ proc preparePrograms(m:NimformerModelJamba;T:int)=
     # across layers and chunk lengths; dispatch sizes remain in each Kernel.
     let tag="m3resident_" & $a.hidden & "_" & $a.C & "_" & $a.H & "_" & $a.N
     var lp:LayerPrograms
-    lp.norm=compile(rmsRows(a.hidden,a.x,a.norm,w.norm,blk.rms1.eps,true,moNorm),tag & "_norm",T*256,256,1024,be)
-    lp.prepare=compile(prepareSiso(a,s,w,T,blk.mambaReal.normEps,true),tag & "_prepare",a.H*256,256,1024,be)
-    lp.scan=compile(scanSiso(a,s,w,T,true),tag & "_scan",a.C*32,32,128,be)
-    lp.carry=compile(carrySiso(a,s,T,true),tag & "_carry",max(a.C,a.H*a.N),256,16,be)
-    lp.norm2=compile(rmsRows(a.hidden,a.x,a.norm,w.norm2,blk.mambaReal.normEps,true,moNorm2),tag & "_norm2",T*256,256,1024,be)
-    lp.mlp=compile(siluMlp(a),tag & "_mlp",T*a.F,256,16,be)
-    lp.residual=compile(residual(a.x,a.mix,a.x),tag & "_residual",T*a.hidden,256,16,be)
+    lp.norm=provided("norm",s,w,blk.rms1.eps,true,0,tag & "_norm"):
+      compile(rmsRows(a.hidden,a.x,a.norm,w.norm,blk.rms1.eps,true,moNorm),tag & "_norm",T*256,256,1024,be)
+    lp.prepare=provided("prepare",s,w,blk.mambaReal.normEps,true,0,tag & "_prepare"):
+      compile(prepareSiso(a,s,w,T,blk.mambaReal.normEps,true),tag & "_prepare",a.H*256,256,1024,be)
+    lp.scan=provided("scan",s,w,blk.mambaReal.normEps,true,0,tag & "_scan"):
+      compile(scanSiso(a,s,w,T,true),tag & "_scan",a.C*32,32,128,be)
+    lp.carry=provided("carry",s,w,blk.mambaReal.normEps,true,0,tag & "_carry"):
+      compile(carrySiso(a,s,T,true),tag & "_carry",max(a.C,a.H*a.N),256,16,be)
+    lp.norm2=provided("norm2",s,w,blk.mambaReal.normEps,true,0,tag & "_norm2"):
+      compile(rmsRows(a.hidden,a.x,a.norm,w.norm2,blk.mambaReal.normEps,true,moNorm2),tag & "_norm2",T*256,256,1024,be)
+    lp.mlp=provided("mlp",s,w,blk.mambaReal.normEps,true,0,tag & "_mlp"):
+      compile(siluMlp(a),tag & "_mlp",T*a.F,256,16,be)
+    lp.residual=provided("residual",s,w,blk.mambaReal.normEps,true,0,tag & "_residual"):
+      compile(residual(a.x,a.mix,a.x),tag & "_residual",T*a.hidden,256,16,be)
     if blk.kind!=bkMambaReal:
       lp.lp=compile(linearPlusScan(a,s,blk.attn.nHeads,T,true),tag & "_lp",a.hidden*32,32,128,be)
       lp.lpCarry=compile(carryLinearPlus(a,s,true),tag & "_lpCarry",a.hidden,256,16,be)
@@ -164,7 +202,8 @@ proc preparePrograms(m:NimformerModelJamba;T:int)=
         lp.gate=compile(mixGate(a),tag & "_gate",T*a.hidden,256,16,be)
     pr.layers.add(lp)
   let finalGamma=gM3Runtime.paramData.len-a.hidden
-  pr.finalNorm=compile(rmsRows(a.hidden,a.x,a.norm,finalGamma,m.rmsF.eps),"m3final_" & $a.hidden,T*256,256,1024,be)
+  pr.finalNorm=provided("finalNorm",default(M3DeviceState),default(M3Params),m.rmsF.eps,false,finalGamma,"m3final_" & $a.hidden):
+    compile(rmsRows(a.hidden,a.x,a.norm,finalGamma,m.rmsF.eps),"m3final_" & $a.hidden,T*256,256,1024,be)
   for name,lin in gLinCache:
     if not name.startsWith("block") and name!="outProj.weight":continue
     pr.bias[name]=compile(biasRows(lin.N,0),"m3_bias_" & $lin.N,T*lin.N,256,16,be)
@@ -245,6 +284,7 @@ proc runM3Resident*(m:var NimformerModelJamba;ids:seq[int];ctx:Backend;produceLo
   let odMode=getEnv("BYBY_ONE_DISPATCH","0")
   require(odMode in ["0","1","auto"],"BYBY_ONE_DISPATCH must be 0, 1 or auto")
   var useOd=T==1 and produceLogits and odMode!="0" and not gDisableLora and not gM3Runtime.skipAttn and not trace
+  require(not useOd or gM3ProgramProvider.isNil,"program provider requires the resident micro-kernel path (BYBY_ONE_DISPATCH=0)")
   if useOd and not gM3Runtime.od.ready:
     let reason=eligible(m,ctx)
     if reason.len>0:
