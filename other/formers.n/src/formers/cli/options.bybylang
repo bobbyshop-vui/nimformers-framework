@@ -24,6 +24,7 @@ type
     promptSet*, nPredictSet*: bool
     noWarmup*: bool               ## skip the startup warmup run
     verbose*: bool                ## show the library logs (loader, JIT, kernels, profiles)
+    firF32*: bool
     firCheck*, firFile*: string
     errors*: seq[string]
 
@@ -44,13 +45,13 @@ function fmDefaultOptions(): FmOptions
 
 function fmUsage(): string
     var lines: seq[string]
-    lines.add("formers-cli - Llama, Mamba-2 and Mamba-3 inference on nimformers + BybyLang")
+    lines.add("formers-cli - Llama, Mamba-2, Mamba-3 and FIR graph model inference on nimformers + BybyLang")
     lines.add("")
     lines.add("Usage: formers-cli --models <dir> [options]")
     lines.add("")
     lines.add("Model:")
-    lines.add("  --models DIR           directory with the .nimq, config.json, tokenizer, LoRA .bin")
-    lines.add("  -m, --model FILE       .nimq file (default: found in --models)")
+    lines.add("  --models DIR           directory with .nimq or model.safetensors + model.fir, config.json, tokenizer, LoRA .bin")
+    lines.add("  -m, --model FILE       .nimq or .safetensors file (default: found in --models)")
     lines.add("  --lora FILE            LoRA adapter .bin (NIMBIN1/NIMBIN4) for Mamba-2/3")
     lines.add("  --no-lora              ignore a LoRA found in --models")
     lines.add("  --no-merge-lora        keep the LoRA adapters separate (default: merged into the weights)")
@@ -61,7 +62,7 @@ function fmUsage(): string
     lines.add("  -p, --prompt TEXT      prompt")
     lines.add("  -f, --file FILE        read the prompt from a file")
     lines.add("  --system TEXT          system prompt (chat template)")
-    lines.add("  --raw-prompt           do not apply the chat template")
+    lines.add("  --raw, --raw-prompt     do not apply the chat template")
     lines.add("  -n, --n-predict N      maximum tokens to generate (default 128)")
     lines.add("  --temp T               temperature (default 0.7; 0 = greedy)")
     lines.add("  --top-p P              nucleus sampling (default 0.9; 1 = off)")
@@ -72,14 +73,14 @@ function fmUsage(): string
     lines.add("")
     lines.add("Chat (like llama-cli):")
     lines.add("  -cnv, --conversation   multi-turn chat, context (KV/state) kept between turns")
-    lines.add("  -i, --interactive      same as -cnv")
+    lines.add("  -i, --interactive      same as -cnv (Llama, Mamba-2, Mamba-3 and FIR graph models; the chat template comes from the model folder)")
     lines.add("                         in chat -p is the system prompt; -n limits each reply")
-    lines.add("  -c, --ctx-size N       context (KV) size in tokens (Llama chat default 1024)")
+    lines.add("  -c, --ctx-size N       context size in tokens (Llama chat default 1024; FIR graph models: up to their positions)")
     lines.add("                         type /exit to quit; Ctrl+C stops a reply, Ctrl+C at the prompt quits;")
     lines.add("                         end a line with \\ to continue on the next line")
     lines.add("")
     lines.add("Device:")
-    lines.add("  --backend NAME         auto | metal | vulkan | cuda (= vulkan)")
+    lines.add("  --backend NAME         auto | cpu | metal | vulkan | cuda (= vulkan)")
     lines.add("  -ngl, --ngl, --n-gpu-layers N")
     lines.add("                         layers on the GPU (default: all)")
     lines.add("")
@@ -88,7 +89,8 @@ function fmUsage(): string
     lines.add("  --no-warmup            skip the startup warmup (GPU pipeline compile) before the first prompt")
     lines.add("  -v, --verbose          show every log line (loader, JIT, kernel tuning, profiles); default: quiet")
     lines.add("  --detect-only          detect the architecture and exit")
-    lines.add("  --fir FILE             use FIR registry programs for Mamba-3 resident inference")
+    lines.add("  --fir FILE             use a FIR model file (Mamba-3 resident provider or a self-contained graph)")
+    lines.add("  --fir-f32             keep q4 matrices of a FIR graph model in fp32 (correctness reference)")
     lines.add("  --fir-check FILE       resolve FIR kernel names and build programs without weights")
     lines.add("  -h, --help             show this help")
     result = lines.join("\n")
@@ -126,6 +128,8 @@ function fmParseOptions(args: seq[string]): FmOptions
             flag = flag[0 ..< flag.find('=')]
             hasInline = true
         case flag
+        of "--fir-f32":
+            result.firF32 = true
         of "--fir":
             result.firFile = fmOptValue(args, i, flag, inlineVal, hasInline, result.errors)
         of "--fir-check":
@@ -156,7 +160,7 @@ function fmParseOptions(args: seq[string]): FmOptions
                 result.errors.add(flag & ": file not found: " & path)
         of "--system", "-sys":
             result.systemText = fmOptValue(args, i, flag, inlineVal, hasInline, result.errors)
-        of "--raw-prompt":
+        of "--raw", "--raw-prompt":
             result.rawPrompt = true
         of "-n", "--n-predict", "--predict":
             result.nPredict = fmToInt(fmOptValue(args, i, flag, inlineVal, hasInline, result.errors), flag, result.errors)
@@ -223,5 +227,5 @@ function fmParseOptions(args: seq[string]): FmOptions
         result.errors.add("--repeat-last-n must be >= 0")
     if result.ngl < -1:
         result.errors.add("--ngl must be >= 0 (or -1 = all)")
-    if result.backend notin ["auto", "metal", "vulkan", "cuda"]:
+    if result.backend notin ["auto", "cpu", "metal", "vulkan", "cuda"]:
         result.errors.add("invalid --backend: " & result.backend)

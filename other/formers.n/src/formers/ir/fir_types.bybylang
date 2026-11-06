@@ -5,7 +5,7 @@ import nim "backend"
 
 type
   FirBuffer* = object
-    name*, dtype*, shape*, kind*, tensorName*: string
+    name*, dtype*, shape*, kind*, tensorName*, role*: string
     elements*: int
     dims*: seq[int]
     perLayer*: bool
@@ -13,8 +13,21 @@ type
     name*, kind*, op*, inputs*, outputs*: string
     line*: int
     perLayer*: bool
+  FirKernelLine* = object
+    mnemonic*: string
+    args*: seq[string]
+    line*: int
+  FirKernelDef* = object
+    name*: string
+    ins*, outs*: int
+    threads*, tg*, tgBytes*: string
+    sizeEq*, expects*: seq[string]
+    body*: seq[FirKernelLine]
+    line*: int
   FirProgram* = object
-    model*, configPath*, sourcePath*: string
+    kernels*: Table[string, FirKernelDef]
+    model*, configPath*, sourcePath*, runtime*: string
+    prefixes*: seq[string]
     symbols*: Table[string, int]
     epsilon*: float32
     buffers*: Table[string, FirBuffer]
@@ -23,7 +36,7 @@ type
     arena*: M3Arena
     state*: M3DeviceState
     params*: M3Params
-    parameterFloats*, finalNorm*: int
+    parameterFloats*, finalNorm*, memoryFloats*: int
     T*: int
     dynamicOffsets*: bool
     memory*, constants*: Table[string, int]
@@ -34,6 +47,7 @@ type
   FirExtArgs* = object
     backend*: Backend
     values*, weights*, scales*, zeros*: seq[float32]
+    residentQ4*: ResidentWeightHandle
     packedWeights*: seq[uint8]
     indices*: seq[int32]
     inDim*, outDim*, groupSize*, groupsPerRow*, vocab*: int

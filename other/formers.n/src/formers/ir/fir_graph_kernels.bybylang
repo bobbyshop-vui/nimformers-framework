@@ -1,0 +1,71 @@
+# Graph-model helpers. All arithmetic is emitted through session_vm.
+# One lane owns a norm row or attention head; no cross-group synchronization.
+import nim "std/[tables, strutils, math]"
+import nim "session_vm"
+import nim "backend"
+import "fir_types.bybylang"
+
+function firGraphBindings(model: FirProgram): FirBindings
+    var offset = 0
+    # Allocate small weight vectors in memF32 alongside graph activations.
+    var names: seq[string]
+    for name, buffer in model.buffers:
+        if buffer.kind != "weight" or buffer.dims.len == 1:
+            names.add(name)
+    # Sorting is unnecessary for correctness: every program uses this same map.
+    for name in names:
+        let buffer = model.buffers[name]
+        result.memory[name] = offset
+        offset += buffer.elements * (if buffer.perLayer or buffer.tensorName.contains("{i}"): model.symbols["layers"] else: 1)
+    result.memoryFloats = offset
+    result.T = 1
+
+function fgLinearF32(args: FirExtArgs): seq[float32]
+    beMatmul(args.backend, args.values, 1, args.inDim, args.weights, args.inDim, args.outDim)
+
+function fgResidentQ4(args: FirExtArgs): seq[float32]
+    beResidentLinearQ4(args.backend, args.values, args.residentQ4, 1)
+
+function fgEmbedding(args: FirExtArgs): seq[float32]
+    beEmbeddingLookup(args.backend, args.weights, args.indices, args.vocab, args.outDim)
+
+function fgLmHead(args: FirExtArgs): seq[float32]
+    # Weight [out,in] shared with the embedding; backend NT avoids transposing or duplicating it.
+    let be = args.backend.kind.toByby()
+    if not sessionBegin(be):
+        raise newException(ValueError, "FIR graph lm_head sessionBegin failed")
+    var x = sessionUpload(be, args.values)
+    var w = sessionUpload(be, args.weights)
+    var y = sessionAllocScratch(be, args.outDim)
+    try:
+        let ok = sessionMatmulNT(be, x, w, y, 1, args.inDim, args.outDim)
+        let ended = sessionEnd(be)
+        if not ok or not ended:
+            raise newException(ValueError, "FIR graph lm_head backend matmul failed")
+        result = sessionRead(be, y, args.outDim)
+    finally:
+        sessionFree(be, x)
+        sessionFree(be, w)
+        sessionFree(be, y)
+
+function firRegisterGraph(registry: var FirRegistry)
+    # fir.linear: y = x * W with W [in,out] ([in,out] layout). The weight dtype
+    # selects the backend kernel: q4 -> resident Q4 GEMV, f32 -> F32 matmul.
+    registry.external["fir.linear"] = FirExtBinding(call: fgLinearF32, backendSymbol: "backend.sessionMatmulQ4|backend.sessionMatmul", inputs: 2, outputs: 1)
+    registry.external["fir.embedding"] = FirExtBinding(call: fgEmbedding, backendSymbol: "backend.beEmbeddingLookup", inputs: 2, outputs: 1)
+    registry.external["fir.linear_t"] = FirExtBinding(call: fgLmHead, backendSymbol: "backend.sessionMatmulNT", inputs: 2, outputs: 1)
+
+function fgValidateExternal(model: FirProgram, node: FirNode)
+    let ins = node.inputs.splitWhitespace()
+    let outs = node.outputs.splitWhitespace()
+    let w = model.buffers[ins[1]]
+    let x = model.buffers[ins[0]]
+    let y = model.buffers[outs[0]]
+    if w.kind != "weight" or (w.dtype notin ["q4", "f32"] or (node.op != "fir.linear" and w.dtype != "f32")) or w.dims.len != 2 or x.kind == "weight" or y.kind == "weight":
+        raise newException(ValueError, "FIR graph external requires matching weight dtype and f32 activations: " & node.name)
+    let expected = if node.op == "fir.linear": @[x.elements, y.elements] else: @[y.elements, x.elements]
+    if node.op == "fir.embedding":
+        if x.elements != 1 or w.dims[1] != y.elements:
+            raise newException(ValueError, "FIR graph embedding shape mismatch: " & node.name)
+    elif w.dims != expected:
+        raise newException(ValueError, "FIR graph matrix shape mismatch: " & node.name)

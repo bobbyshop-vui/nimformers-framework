@@ -2,7 +2,7 @@
 
 A llama.cpp-style inference framework written in **BybyLang** (`.bybylang`, compiled ahead
 of time to Nim) on top of nimformers. One command, `formers-cli`, detects the model in
-`--models` and runs DeepSeek/Llama, Codestral (Mamba-2) or Mamba-3 SISO, with optional
+`--models` and runs DeepSeek/Llama, Codestral (Mamba-2), Mamba-3 SISO, or any self-contained FIR graph model (`model.fir` with `runtime graph`), with optional
 Mamba LoRA/Linear++ checkpoints.
 
 The Llama path runs **exactly what `nim_inference.nim` runs**:
@@ -20,7 +20,8 @@ LoRA loading, sampler, generation loop.
 
 The Mamba-3 SISO path reuses `test/mamba3`'s quantized base/LoRA loader, recurrent GPU
 runtime and tokenizer/generation implementation. It supports the official 187M and
-1.5B SISO dimensions and one-shot generation; interactive chat is rejected for Mamba-3.
+1.5B SISO dimensions, one-shot generation and `-cnv` chat (chat template from the model
+directory, same loop as the FIR graph models).
 
 ## FIR (model-side IR)
 
@@ -67,13 +68,20 @@ other/formers.n/
 | Mamba-2 + LoRA `.bin` with P/G/A blocks (`newBlock.blockN.attn.*`) | `mamba2+linear++` | same, keeping the checkpoint's `normPreset` |
 | Mamba-3 SISO tensors + official 187M or 1.5B config | `mamba3` | `test/mamba3` resident inference |
 | Mamba-3 SISO + LoRA `.bin` (R/P/G blocks) | `mamba3` | `test/mamba3` inference with the checkpoint |
-| anything else (gemma, qwen2, gpt2, Mamba-1, ...) | `unknown` | not run, `fmRun` returns `false`, exit 3 |
+| F32 safetensors + `model.fir` declaring `runtime graph` | `fir` | generic FIR graph executor |
+| anything else (gemma, qwen2, Mamba-1, ...) | `unknown` | not run, `fmRun` returns `false`, exit 3 |
 
 Detection checks the layer count, hidden size, head and KV-head counts, head_dim, FFN size,
 vocab, the Mamba-2 `in_proj`/`conv1d` sizes, Mamba-3 SISO projection/MLP tensor shapes and the LoRA pattern/sizes against the real
 shape of every tensor; any mismatch is rejected with its reason. For Llama it also checks
 that `tokenizer.json` is a Hugging Face tokenizer (older `export_to_nimq.py` versions
 overwrote it).
+
+## Benchmarks
+
+Intel Iris Plus 640 and Tesla T4 results per model: [DeepSeek Coder](../../test/deepseek-inference/benchmark.md) ·
+[Codestral Mamba](../../test/codestral/benchmark.md) · [Mamba-3](../../test/mamba3/benchmark.md) ·
+[GPT-2 125M via FIR](../../models/gpt2-125m/benchmark.md) · [TinyLlama](../../models/tinyllama/benchmark.md)
 
 ## Usage
 
@@ -88,7 +96,7 @@ make formers-smoke          # tiny random Llama end to end on the GPU
 other/formers.n/formers-cli --models test/deepseek-inference/models -p "Write quicksort in Python" -n 128
 other/formers.n/formers-cli --models test/codestral/models -p "Hello" -n 60 --temp 0.7
 other/formers.n/formers-cli --models test/codestral/models --no-lora -p "Hello"
-# Mamba-3 187M + gated LoRA (one-shot; Mamba-3 does not support -cnv)
+# Mamba-3 187M + gated LoRA (one-shot; add -cnv for chat)
 other/formers.n/formers-cli --models test/mamba3/models -m test/mamba3/models/mamba3_siso_187m.nimq --config test/mamba3/models/mamba3-siso-187m/config.json --tokenizer test/mamba3/models/mamba3-siso-187m --lora test/mamba3/models/runs/mamba3-siso-187m-gated/lora.bin -p 'Write a Python function to check if a string is a palindrome' -n 64 --temp 0.7 --backend metal
 
 # Mamba-3 1.5B + gated LoRA
@@ -133,7 +141,12 @@ quits.
   stops.
 - Mamba-2: the recurrent state lives on the GPU, there is no context limit. Each turn feeds
   `</s>` (when the previous reply was cut short) + `[INST] ...[/INST]`.
-- Mamba-3: one-shot generation only; `-cnv` is unsupported.
+- Mamba-3 and FIR graph models (`runtime graph` in `model.fir`): a template-driven loop in
+  `models/mamba2` (`fmTemplateChatLoop`). The prompt is the model's chat template (`chat_template`
+  in `tokenizer_config.json` or a `chat_template.jinja` next to it); a missing template is an
+  error before the weights load. Mamba-3 keeps its recurrent state on the GPU; a graph model
+  keeps its KV cache, so the context is `positions` (limited by `-c`). Templates ship in the
+  GPT-2 and Mistral-style model folders (`chat_template.jinja`).
 
 Chat templates that do not emit `bos_token` (DeepSeek-coder, TinyLlama) get BOS prepended
 when the tokenizer adds one, like llama.cpp.
@@ -185,7 +198,7 @@ Flags: `--models`, `-m/--model`, `--lora`, `--no-lora`, `--no-merge-lora`, `--co
 `-p/--prompt`, `-f/--file`, `--system`, `--raw-prompt`, `-n/--n-predict`, `--temp`,
 `--top-p`, `--min-p`, `--repeat-penalty`, `--repeat-last-n`, `-s/--seed`, `--backend`,
 `-ngl/--ngl/--n-gpu-layers`, `-cnv/--conversation`, `-i/--interactive`, `-c/--ctx-size`,
-`--no-progress`, `--no-warmup`, `-v/--verbose`, `--detect-only`, `--fir`, `--fir-check`, `-h`. Exit codes: 0 ok, 1 runtime error,
+`--no-progress`, `--no-warmup`, `-v/--verbose`, `--detect-only`, `--fir`, `--fir-f32`, `--fir-check`, `-h`. Exit codes: 0 ok, 1 runtime error,
 2 bad options, 3 unsupported model.
 
 ## Module API
@@ -228,3 +241,38 @@ on Apple Silicon.
   No norm-preset bisect yet.
 - The Codestral path (base, LoRA, Linear++) builds but has not been run end to end, since it
   needs the 7B model.
+
+## Graph models through FIR
+
+A directory whose `model.fir` declares `runtime graph` runs directly from its
+`model.safetensors` with `tokenizer.json` (native HF BPE); no `.nimq` conversion and
+no model-specific code in formers.n. `models/gpt2-125m` is a complete example.
+
+```sh
+make formers-cli
+other/formers.n/formers-cli --fir-check models/gpt2-125m/model.fir
+other/formers.n/formers-cli --models models/gpt2-125m \
+  --fir models/gpt2-125m/model.fir --raw -p "Hello, my name is" -n 32 --temp 0 --backend cpu
+# GPU check outside the sandbox (or use --backend vulkan)
+other/formers.n/formers-cli --models models/gpt2-125m \
+  --fir models/gpt2-125m/model.fir --raw -p "Hello, my name is" -n 32 --temp 0 --backend metal
+make formers-fir-test
+python3 models/gpt2-125m/check_hf.py --backend cpu
+```
+
+`src/formers/ir/fir_graph.bybylang` schedules the whole FIR decode graph in one GPU
+session per token; `fir_kernel.bybylang` turns the `kernel ... endkernel` blocks of
+`model.fir` into `VmProgram`s (one `session_vm.emit*` call per line), so the model's own
+operations (layernorm, `gelu_new`, bias add, cached attention) live in the model
+file, not in Nim. `models/fir_model.bybylang` handles tokenization, the shared sampler, EOS
+and generation (chat lives in `models/mamba2.bybylang`); `io/safetensors.bybylang` loads only graph weights.
+Linear layers are Q4 resident by default (`--fir-f32` keeps them fp32 as the
+correctness reference). Tests run the file's kernels via `runGrid` and full tiny graphs
+through the production CPU backend (tolerance `1e-4`), and reject malformed kernel blocks.
+
+Without `--fir`, the model directory's `model.fir` is used. This is one-shot
+completion (`-cnv` chat uses the model's chat template); partial offload, unsupported config variants and context overflow
+are rejected. On Intel Iris Plus 640, chat decode runs at 8.57 tok/s (Metal) and 11.40 tok/s (Vulkan) with Q4,
+10.78 / 8.54 tok/s with `--fir-f32`; see
+[`models/gpt2-125m/benchmark.md`](../../models/gpt2-125m/benchmark.md). The fp32 path matches offline Hugging Face on all 32 greedy
+tokens.

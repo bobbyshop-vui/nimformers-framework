@@ -1,0 +1,287 @@
+# Thin FIR scheduler: framework resident linears and session_vm programs share
+# one session per token. No host activation/KV staging and no FIR interpreter.
+import nim "std/[tables, strutils]"
+import nim "backend"
+import nim "quant"
+import nim "session_vm"
+import nim "session_vm_dispatch"
+import nim "jit_vm"
+import nim "vendor/bybylang/gpubackend"
+import nim "vendor/bybylang/backends/cpu/cpu_backend"
+import "fir_types.bybylang"
+import "fir_parse.bybylang"
+import "fir_exec.bybylang"
+import "fir_graph_kernels.bybylang"
+import "../io/safetensors.bybylang"
+
+type
+  FgResidentProgram* = object
+    kernel*: FirKernel
+    name*, source*: string
+  FirGraph* = object
+    graph*: FirProgram
+    registry*: FirRegistry
+    bindings*: FirBindings
+    arena*, linearInput*, linearOutput*, logitsReadback*: SessionHandle
+    fp32*: Table[string, SessionHandle]
+    q4*: Table[string, ResidentWeightHandle]
+    programs*: Table[string, FgResidentProgram]
+    backend*: Backend
+    position*, dispatched*, sessions*, logitsReads*: int
+    failed*: bool
+
+function fgTensorName(buffer: FirBuffer, layer: int): string
+    buffer.tensorName.replace("{i}", $layer)
+
+function fgNodeKey(node: FirNode, layer: int): string
+    node.name & ":" & $(if node.perLayer: layer else: -1)
+
+function firF32Weights(graph: FirProgram): FirProgram
+    # Copy value types so the caller's Q4 graph remains usable.
+    result = graph
+    for name, buffer in result.buffers.mpairs:
+        if buffer.dtype == "q4":
+            buffer.dtype = "f32"
+
+function fgLayerBindings(model: FirGraph, layer: int): FirBindings
+    result = model.bindings
+    for name, buffer in model.graph.buffers:
+        if buffer.perLayer or buffer.tensorName.contains("{i}"):
+            if result.memory.hasKey(name):
+                result.memory[name] += layer*buffer.elements
+
+function firFreeGraph(model: var FirGraph)
+    let be = model.backend.kind.toByby()
+    for weight in model.q4.mvalues:
+        beResidentFreeQ4(weight)
+    for weight in model.fp32.mvalues:
+        sessionFree(be, weight)
+    sessionFree(be, model.arena)
+    sessionFree(be, model.linearInput)
+    sessionFree(be, model.linearOutput)
+    sessionFree(be, model.logitsReadback)
+    model.q4.clear()
+    model.fp32.clear()
+    model.failed = true
+
+function fgUploadWeight(model: var FirGraph, name: string, buffer: FirBuffer, layer: int, values: seq[float32], memory: var seq[float32])
+    let tensor = fgTensorName(buffer, layer)
+    if values.len != buffer.elements:
+        raise newException(ValueError, "FIR graph invalid weight element count: " & tensor)
+    if buffer.dims.len == 1:
+        let offset = fgLayerBindings(model, layer).memory[name]
+        for i, value in values:
+            memory[offset+i] = value
+    elif buffer.dtype == "q4":
+        # Weight [in,out] -> resident Q4 [out,in], grouped along input.
+        let k = buffer.dims[0]
+        let n = buffer.dims[1]
+        var transposed = newSeq[float32](values.len)
+        for j in 0 ..< n:
+            for i in 0 ..< k:
+                transposed[j*k+i] = values[i*n+j]
+        let packed = quantizeInt4AsymmetricGrouped(transposed, @[n, k], 32)
+        model.q4[tensor] = beResidentUploadQ4(model.backend, packed.data, packed.scale, packed.zero_point, k, n, packed.groupSize, (k+31) div 32)
+    else:
+        # F32 linears stay [in,out] for sessionMatmul. Embeddings and tied
+        # lm_head share a single [vocab,hidden] allocation, consumed with NT.
+        model.fp32[tensor] = beResidentUploadFp32(model.backend, values)
+
+function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): FirGraph
+    if graph.runtime != "graph":
+        raise newException(ValueError, "FIR graph executor requires 'runtime graph' in the model file")
+    for name in ["layers", "positions", "vocab"]:
+        if not graph.symbols.hasKey(name):
+            raise newException(ValueError, "FIR graph needs symbol '" & name & "' (define it with sym)")
+    discard firRoleBuffer(graph, "token")
+    discard firRoleBuffer(graph, "position")
+    discard firRoleBuffer(graph, "logits")
+    result.graph = graph
+    result.registry = registry
+    result.bindings = firGraphBindings(graph)
+    result.backend = backend
+    firValidate(graph, registry, result.bindings)
+    let be = backend.kind.toByby()
+    if not ensureGpuInit(be):
+        raise newException(ValueError, "FIR graph backend initialization failed")
+    var cfg = defaultJitConfig()
+    cfg.enableMetalJit = be == gbMetal
+    cfg.hotThreshold = 1
+    cfg.maxCacheEntries = 1024
+    var jit = initJitCache(cfg)
+    var jobs: seq[tuple[name, source: string]]
+    for node in graph.nodes:
+        if node.kind == "micro":
+            for layer in 0 ..< (if node.perLayer: graph.symbols["layers"] else: 1):
+                let kernel = firMicroKernel(node, graph, registry, fgLayerBindings(result, layer))
+                var prepared = FgResidentProgram(kernel: kernel)
+                if be == gbMetal:
+                    prepared.name = dispatchProgramNoSession(jit, kernel.program, node.op)
+                    if prepared.name == "micro_vm_kernel":
+                        raise newException(ValueError, "FIR graph Metal JIT compilation failed: " & node.op)
+                elif be == gbVulkan:
+                    prepared.name = kernelNameFor(jit, kernel.program, node.op)
+                    prepared.source = glslSourceFor(jit, kernel.program, node.op)
+                    jobs.add((prepared.name, prepared.source))
+                result.programs[fgNodeKey(node, layer)] = prepared
+        elif node.kind != "ext":
+            raise newException(ValueError, "FIR graph executor supports micro and ext nodes: " & node.name)
+    sessionJitPrewarm(be, jobs)
+
+function fgAllocate(model: var FirGraph, memory: seq[float32])
+    let be = model.backend.kind.toByby()
+    model.arena = sessionUpload(be, memory)
+    var largest = model.graph.symbols["vocab"]
+    for name, buffer in model.graph.buffers:
+        if buffer.kind != "weight" and not buffer.perLayer:
+            largest = max(largest, buffer.elements)
+    model.linearInput = sessionAllocScratch(be, largest)
+    model.linearOutput = sessionAllocScratch(be, largest)
+    model.logitsReadback = sessionAllocScratch(be, model.graph.symbols["vocab"])
+
+function firNewGraph(graph: FirProgram, weights: Table[string, seq[float32]], backend: Backend, registry: FirRegistry): FirGraph
+    result = fgPrepare(graph, backend, registry)
+    try:
+        var memory = newSeq[float32](result.bindings.memoryFloats)
+        for name, buffer in graph.buffers:
+            if buffer.kind != "weight":
+                continue
+            for layer in 0 ..< (if buffer.tensorName.contains("{i}"): graph.symbols["layers"] else: 1):
+                let tensor = fgTensorName(buffer, layer)
+                if not weights.hasKey(tensor):
+                    raise newException(ValueError, "FIR graph missing weight: " & tensor)
+                fgUploadWeight(result, name, buffer, layer, weights[tensor], memory)
+        fgAllocate(result, memory)
+    except:
+        firFreeGraph(result)
+        raise
+
+function firLoadGraph(graph: FirProgram, path: string, backend: Backend): FirGraph
+    let header = fmReadSafeHeader(path)
+    result = fgPrepare(graph, backend, firDefaultRegistry())
+    try:
+        var memory = newSeq[float32](result.bindings.memoryFloats)
+        for name, buffer in graph.buffers:
+            if buffer.kind != "weight":
+                continue
+            for layer in 0 ..< (if buffer.tensorName.contains("{i}"): graph.symbols["layers"] else: 1):
+                let tensor = fgTensorName(buffer, layer)
+                # Load, transpose/quantize and upload each tensor once; release
+                # its host F32 payload before loading the next matrix.
+                let source = fmResolveTensor(header, graph.prefixes, tensor)
+                if source.len == 0:
+                    raise newException(ValueError, "FIR graph checkpoint lacks tensor: " & tensor)
+                let values = fmLoadSafeF32(path, header, source, buffer.dims)
+                fgUploadWeight(result, name, buffer, layer, values, memory)
+        fgAllocate(result, memory)
+    except:
+        firFreeGraph(result)
+        raise
+
+function fgEncodeMicro(model: var FirGraph, prepared: FgResidentProgram): bool
+    let be = model.backend.kind.toByby()
+    let k = prepared.kernel
+    inc model.dispatched
+    if be == gbCpu:
+        # Production framework VM, in place; vm_interp is used only in tests.
+        return cpu_backend.vmRun(k.program.words, model.arena.cpuData, newSeq[float32](), k.threads, max(4, k.tgBytes div 4), k.tgSize)
+    if be == gbVulkan:
+        return sessionJitMicroVmEnc(be, prepared.name, prepared.source, model.arena, k.threads, k.tgSize, max(4, k.tgBytes div 4))
+    # Compiled MSL ignores the bytecode binding. All arithmetic is already in
+    # the prepared pipeline, and all addresses refer to the resident arena.
+    sessionPipeline(prepared.name) and sessionBindBuffer(0, model.arena.metalHandle) and sessionBindBuffer(1, model.arena.metalHandle) and sessionBindBuffer(2, model.arena.metalHandle) and sessionBindBuffer(3, model.arena.metalHandle) and sessionSetThreadgroupBytes(0, max(16, k.tgBytes)) and sessionDispatch(k.threads, k.tgSize)
+
+function fgEncodeNode(model: var FirGraph, node: FirNode, layer, token: int): bool
+    if node.kind == "micro":
+        return fgEncodeMicro(model, model.programs[fgNodeKey(node, layer)])
+    let be = model.backend.kind.toByby()
+    let ins = node.inputs.splitWhitespace()
+    let output = node.outputs.splitWhitespace()[0]
+    let weight = model.graph.buffers[ins[1]]
+    let tensor = fgTensorName(weight, layer)
+    let bindings = fgLayerBindings(model, layer)
+    let n = model.graph.buffers[output].elements
+    if node.op == "fir.embedding":
+        let role = model.graph.buffers[ins[0]].role
+        if role != "token" and role != "position":
+            raise newException(ValueError, "FIR graph embedding input needs role token or position: " & ins[0])
+        let index = if role == "token": token else: model.position
+        if index < 0 or index >= weight.dims[0]:
+            raise newException(ValueError, "FIR graph embedding index outside weight")
+        return sessionCopyInto(be, model.fp32[tensor], model.arena, index*n, bindings.memory[output], n)
+    let k = model.graph.buffers[ins[0]].elements
+    if not sessionCopyInto(be, model.arena, model.linearInput, bindings.memory[ins[0]], 0, k):
+        return false
+    var ok = false
+    case node.op
+    of "fir.linear":
+        if weight.dtype == "q4":
+            ok = sessionMatmulQ4(be, model.linearInput, model.q4[tensor], model.linearOutput, 1)
+        else:
+            ok = sessionMatmul(be, model.linearInput, model.fp32[tensor], model.linearOutput, 1, k, n)
+    of "fir.linear_t":
+        ok = sessionMatmulNT(be, model.linearInput, model.fp32[tensor], model.linearOutput, 1, k, n)
+    else:
+        raise newException(ValueError, "FIR graph unsupported resident external: " & node.op)
+    ok and sessionCopyInto(be, model.linearOutput, model.arena, 0, bindings.memory[output], n)
+
+function firGraphReset(model: var FirGraph)
+    if model.failed:
+        raise newException(ValueError, "FIR graph model is closed or a prior session failed")
+    # Attention overwrites every used KV slot before reading; future slots
+    # are unreachable. No cache clear or host transfer is needed.
+    model.position = 0
+
+function firGraphStep(model: var FirGraph, token: int): seq[float32]
+    if model.failed:
+        raise newException(ValueError, "FIR graph model is closed or a prior session failed")
+    if token < 0 or token >= model.graph.symbols["vocab"]:
+        raise newException(ValueError, "FIR graph token outside vocabulary")
+    if model.position >= model.graph.symbols["positions"]:
+        raise newException(ValueError, "FIR graph context exceeds n_positions")
+    let be = model.backend.kind.toByby()
+    # Two scalar inputs are the only per-token host upload. All weights,
+    # scratch, activations and KV remain allocated across sessions.
+    var scalars = sessionUpload(be, @[float32(token), float32(model.position)])
+    if not sessionBegin(be):
+        sessionFree(be, scalars)
+        raise newException(ValueError, "FIR graph sessionBegin failed")
+    inc model.sessions
+    var ended = false
+    try:
+        if not sessionCopyInto(be, scalars, model.arena, 0, model.bindings.memory[firRoleBuffer(model.graph, "token")], 1) or not sessionCopyInto(be, scalars, model.arena, 1, model.bindings.memory[firRoleBuffer(model.graph, "position")], 1):
+            raise newException(ValueError, "FIR graph scalar input encode failed")
+        var index = 0
+        while index < model.graph.nodes.len:
+            if model.graph.nodes[index].perLayer:
+                var stop = index
+                while stop < model.graph.nodes.len and model.graph.nodes[stop].perLayer:
+                    inc stop
+                for layer in 0 ..< model.graph.symbols["layers"]:
+                    for i in index ..< stop:
+                        let node = model.graph.nodes[i]
+                        if not fgEncodeNode(model, node, layer, token):
+                            raise newException(ValueError, "FIR graph resident encode failed: " & node.name)
+                index = stop
+            else:
+                let node = model.graph.nodes[index]
+                if not fgEncodeNode(model, node, 0, token):
+                    raise newException(ValueError, "FIR graph resident encode failed: " & node.name)
+                inc index
+        if not sessionCopyInto(be, model.arena, model.logitsReadback, model.bindings.memory[firRoleBuffer(model.graph, "logits")], 0, model.graph.symbols["vocab"]):
+            raise newException(ValueError, "FIR graph logits encode failed")
+        ended = true
+        if not sessionEnd(be):
+            raise newException(ValueError, "FIR graph sessionEnd failed")
+        result = sessionRead(be, model.logitsReadback, model.graph.symbols["vocab"])
+        if result.len != model.graph.symbols["vocab"]:
+            raise newException(ValueError, "FIR graph logits read length mismatch")
+        inc model.logitsReads
+        inc model.position
+    except:
+        model.failed = true
+        raise
+    finally:
+        if not ended:
+            discard sessionEnd(be)
+        sessionFree(be, scalars)

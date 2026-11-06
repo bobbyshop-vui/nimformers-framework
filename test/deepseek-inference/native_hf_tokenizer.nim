@@ -387,7 +387,11 @@ proc newHFTokenizer*(modelPath: string): HFTokenizer =
   if fileExists(path):
     let root = parseFile(path)
     let spec = field(root, "model")
-    if text(spec, "type") != "BPE": bad("tokenizer.json model type must be BPE; use tokenizer.model for SentencePiece")
+    # Early HF GPT-2 tokenizers predate the explicit model.type discriminator.
+    let legacyBpe = text(spec, "type").len == 0 and
+      field(spec, "vocab").kind == JObject and field(spec, "merges").kind == JArray
+    if text(spec, "type") != "BPE" and not legacyBpe:
+      bad("tokenizer.json model type must be BPE; use tokenizer.model for SentencePiece")
     if field(spec, "dropout").kind notin {JNull} and field(spec, "dropout").getFloat() != 0:
       bad("inference tokenizer must have BPE dropout disabled")
     let m = NativeBpe(modelIds: initTable[string, int](), ids: initTable[string, int](),

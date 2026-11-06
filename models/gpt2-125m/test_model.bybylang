@@ -1,0 +1,342 @@
+# Independent float references; runGrid tests never use the production CPU VM.
+import nim "std/[os, tables, json, math, random, strutils]"
+import nim "vm_interp"
+import nim "backend"
+import nim "quant"
+import "../../other/formers.n/src/formers/ir/fir_parse.bybylang"
+import "../../other/formers.n/src/formers/ir/fir_exec.bybylang"
+import "../../other/formers.n/src/formers/ir/fir_graph.bybylang"
+import "../../other/formers.n/src/formers/ir/fir_graph_kernels.bybylang"
+import "../../other/formers.n/src/formers/io/safetensors.bybylang"
+import "../../other/formers.n/src/formers/arch/detect.bybylang"
+
+function fgClose(actual, expected: openArray[float32], label: string)
+    doAssert actual.len == expected.len, label & " length"
+    for i in 0 ..< actual.len:
+        if classify(actual[i]) in {fcNan, fcInf, fcNegInf} or abs(actual[i]-expected[i]) > 1e-4'f32:
+            raise newException(ValueError, label & " index=" & $i & ": " & $actual[i] & " != " & $expected[i])
+
+function fgRandom(rng: var Rand, count: int, scale: float32 = 0.3'f32): seq[float32]
+    result = newSeq[float32](count)
+    for value in result.mitems:
+        value = (rng.rand(2.0'f32)-1)*scale
+
+function refNorm(x, gamma, beta: seq[float32], eps: float32): seq[float32]
+    var mean = 0'f32
+    for value in x:
+        mean += value
+    mean /= float32(x.len)
+    var variance = 0'f32
+    for value in x:
+        variance += (value-mean)*(value-mean)
+    let inverse = 1'f32/sqrt(variance/float32(x.len)+eps)
+    for i, value in x:
+        result.add((value-mean)*inverse*gamma[i]+beta[i])
+
+function refAdd(a, b: seq[float32]): seq[float32]
+    for i in 0 ..< a.len:
+        result.add(a[i]+b[i])
+
+function refGelu(x: seq[float32]): seq[float32]
+    # Independent tanh form of gelu_new (equivalent to the sigmoid builder).
+    for value in x:
+        result.add(0.5'f32*value*(1'f32+tanh(sqrt(2'f32/PI.float32)*(value+0.044715'f32*value*value*value))))
+
+function refLinear(x, w, bias: seq[float32]): seq[float32]
+    result = bias
+    for j in 0 ..< bias.len:
+        for i in 0 ..< x.len:
+            result[j] += x[i]*w[i*bias.len+j]
+
+function refAttention(qkv: seq[float32], keys, values: var seq[float32], position, hidden, heads: int): seq[float32]
+    for i in 0 ..< hidden:
+        keys[position*hidden+i] = qkv[hidden+i]
+        values[position*hidden+i] = qkv[2*hidden+i]
+    let width = hidden div heads
+    result = newSeq[float32](hidden)
+    for head in 0 ..< heads:
+        var scores = newSeq[float32](position+1)
+        for t in 0 .. position:
+            for d in 0 ..< width:
+                scores[t] += qkv[head*width+d]*keys[t*hidden+head*width+d]
+            scores[t] /= sqrt(float32(width))
+        var peak = scores[0]
+        for score in scores:
+            peak = max(peak, score)
+        var total = 0'f32
+        for score in scores.mitems:
+            score = exp(score-peak)
+            total += score
+        for t in 0 .. position:
+            for d in 0 ..< width:
+                result[head*width+d] += scores[t]/total*values[t*hidden+head*width+d]
+
+function checkMicro(graph: FirProgram)
+    let registry = firDefaultRegistry()
+    let bindings = firGraphBindings(graph)
+    firValidate(graph, registry, bindings)
+    var rng = initRand(7293)
+    for node in graph.nodes:
+        if node.kind != "micro":
+            continue
+        let ins = node.inputs.splitWhitespace()
+        let output = node.outputs.splitWhitespace()[0]
+        var memory = fgRandom(rng, bindings.memoryFloats, 4'f32)
+        var expected: seq[float32]
+        if node.op == "g2.attn_decode":
+            var keys = fgRandom(rng, graph.buffers["key_cache"].elements)
+            var values = fgRandom(rng, keys.len)
+            for position in 0 ..< graph.symbols["positions"]:
+                let qkv = fgRandom(rng, graph.buffers["qkv"].elements, 3'f32)
+                for i, value in qkv:
+                    memory[bindings.memory["qkv"]+i] = value
+                memory[bindings.memory["position"]] = float32(position)
+                # Future cache entries are poison; causal decode must not read them.
+                for i in position*graph.symbols["hidden"] ..< keys.len:
+                    memory[bindings.memory["key_cache"]+i] = 999'f32
+                    memory[bindings.memory["value_cache"]+i] = -999'f32
+                expected = refAttention(qkv, keys, values, position, graph.symbols["hidden"], graph.symbols["nheads"])
+                let kernel = firMicroKernel(node, graph, registry, bindings)
+                runGrid(kernel.program, memory, kernel.threads, kernel.tgSize)
+                let offset = bindings.memory["attn"]
+                fgClose(memory[offset ..< offset+expected.len], expected, "attention")
+                let count = (position+1)*graph.symbols["hidden"]
+                for cache in ["key_cache", "value_cache"]:
+                    let base = bindings.memory[cache]
+                    let reference = if cache == "key_cache": keys else: values
+                    fgClose(memory[base ..< base+count], reference[0 ..< count], cache)
+                for head in 0 ..< graph.symbols["nheads"]:
+                    var total = 0'f32
+                    for t in 0 .. position:
+                        total += memory[bindings.memory["scores"]+head*graph.symbols["positions"]+t]
+                    fgClose(@[total], @[1'f32], "softmax sum")
+            continue
+        let xoff = bindings.memory[ins[0]]
+        let count = graph.buffers[ins[0]].elements
+        let x = memory[xoff ..< xoff+count]
+        if node.op == "g2.layernorm":
+            let goff = bindings.memory[ins[1]]
+            let boff = bindings.memory[ins[2]]
+            expected = refNorm(x, memory[goff ..< goff+count], memory[boff ..< boff+count], graph.epsilon)
+        elif node.op == "g2.gelu_new":
+            expected = refGelu(x)
+        else:
+            let boff = bindings.memory[ins[1]]
+            expected = refAdd(x, memory[boff ..< boff+count])
+        let kernel = firMicroKernel(node, graph, registry, bindings)
+        runGrid(kernel.program, memory, kernel.threads, kernel.tgSize)
+        let offset = bindings.memory[output]
+        fgClose(memory[offset ..< offset+expected.len], expected, node.name)
+    echo "PASS GPT-2 all micro nodes through runGrid: layernorm, gelu_new, bias/residual, causal attention/softmax and KV (tol 1e-4)"
+
+function refForward(graph: FirProgram, weights: Table[string, seq[float32]], tokens: seq[int]): seq[float32]
+    let hidden = graph.symbols["hidden"]
+    let capacity = graph.symbols["positions"]
+    let heads = graph.symbols["nheads"]
+    var keys = newSeq[seq[float32]](graph.symbols["layers"])
+    var values = newSeq[seq[float32]](keys.len)
+    for i in 0 ..< keys.len:
+        keys[i] = newSeq[float32](capacity*hidden)
+        values[i] = newSeq[float32](capacity*hidden)
+    for position, token in tokens:
+        let wte = weights["wte.weight"]
+        let wpe = weights["wpe.weight"]
+        var x = refAdd(wte[token*hidden ..< (token+1)*hidden], wpe[position*hidden ..< (position+1)*hidden])
+        for layer in 0 ..< keys.len:
+            let p = "h." & $layer & "."
+            let norm1 = refNorm(x, weights[p & "ln_1.weight"], weights[p & "ln_1.bias"], graph.epsilon)
+            let qkv = refLinear(norm1, weights[p & "attn.c_attn.weight"], weights[p & "attn.c_attn.bias"])
+            let attn = refAttention(qkv, keys[layer], values[layer], position, hidden, heads)
+            x = refAdd(x, refLinear(attn, weights[p & "attn.c_proj.weight"], weights[p & "attn.c_proj.bias"]))
+            let norm2 = refNorm(x, weights[p & "ln_2.weight"], weights[p & "ln_2.bias"], graph.epsilon)
+            let fc = refLinear(norm2, weights[p & "mlp.c_fc.weight"], weights[p & "mlp.c_fc.bias"])
+            x = refAdd(x, refLinear(refGelu(fc), weights[p & "mlp.c_proj.weight"], weights[p & "mlp.c_proj.bias"]))
+        x = refNorm(x, weights["ln_f.weight"], weights["ln_f.bias"], graph.epsilon)
+        result = newSeq[float32](graph.symbols["vocab"])
+        for token in 0 ..< result.len:
+            for i in 0 ..< hidden:
+                result[token] += x[i]*wte[token*hidden+i]
+
+function writeSafe(path: string, weights: Table[string, seq[float32]], shapes: Table[string, seq[int]])
+    var header = newJObject()
+    var offset = 0
+    var names: seq[string]
+    for name, data in weights:
+        names.add(name)
+        header[name] = %*{"dtype": "F32", "shape": shapes[name], "data_offsets": [offset, offset+data.len*4]}
+        offset += data.len*4
+    var text = $header
+    while text.len mod 8 != 0:
+        text.add(' ')
+    var f = open(path, fmWrite)
+    defer: f.close()
+    var length = uint64(text.len)
+    discard f.writeBuffer(addr length, 8)
+    f.write(text)
+    for name in names:
+        let data = weights[name]
+        discard f.writeBuffer(unsafeAddr data[0], data.len*4)
+
+function checkFull(graph: FirProgram, root: string)
+    var weights = initTable[string, seq[float32]]()
+    var shapes = initTable[string, seq[int]]()
+    var rng = initRand(8343)
+    for name, buffer in graph.buffers:
+        if buffer.kind != "weight":
+            continue
+        for layer in 0 ..< (if buffer.tensorName.contains("{i}"): graph.symbols["layers"] else: 1):
+            let tensor = buffer.tensorName.replace("{i}", $layer)
+            weights[tensor] = fgRandom(rng, buffer.elements)
+            shapes[tensor] = buffer.dims
+    let safePath = root / "model.safetensors"
+    writeSafe(safePath, weights, shapes)
+    var model = firLoadGraph(firF32Weights(graph), safePath, newBackend("cpu"))
+    defer: firFreeGraph(model)
+    var tokens: seq[int]
+    for i in 0 ..< graph.symbols["positions"]:
+        let token = rng.rand(graph.symbols["vocab"]-1)
+        tokens.add(token)
+        let actual = firGraphStep(model, token)
+        let expected = refForward(graph, weights, tokens)
+        fgClose(actual, expected, "full graph at position " & $i)
+    doAssert model.dispatched > 0
+    doAssert model.sessions == tokens.len and model.logitsReads == tokens.len
+    firGraphReset(model)
+    fgClose(firGraphStep(model, tokens[0]), refForward(graph, weights, @[tokens[0]]), "fp32 reset")
+    # Independently dequantize the framework's packed Q4, transpose back to HF
+    # layout and compare the whole resident graph with scalar float formulas.
+    var rounded = weights
+    for name, buffer in graph.buffers:
+        if buffer.dtype != "q4":
+            continue
+        let k = buffer.dims[0]
+        let n = buffer.dims[1]
+        for layer in 0 ..< graph.symbols["layers"]:
+            let tensor = buffer.tensorName.replace("{i}", $layer)
+            var transposed = newSeq[float32](buffer.elements)
+            for j in 0 ..< n:
+                for i in 0 ..< k:
+                    transposed[j*k+i] = weights[tensor][i*n+j]
+            let packed = quantizeInt4AsymmetricGrouped(transposed, @[n, k])
+            doAssert packed.kind == qkInt4Asymmetric and packed.groupSize == 32
+            let restored = dequantizeTensor(packed)
+            var hf = newSeq[float32](buffer.elements)
+            for j in 0 ..< n:
+                for i in 0 ..< k:
+                    hf[i*n+j] = restored[j*k+i]
+            rounded[tensor] = hf
+    var resident = firNewGraph(graph, weights, newBackend("cpu"), firDefaultRegistry())
+    defer: firFreeGraph(resident)
+    doAssert resident.q4.len == 4*graph.symbols["layers"]
+    doAssert resident.fp32.len == 2, "tied head must reuse wte"
+    var prefix: seq[int]
+    for token in tokens:
+        prefix.add(token)
+        fgClose(firGraphStep(resident, token), refForward(graph, rounded, prefix), "Q4 resident graph")
+    doAssert resident.sessions == tokens.len and resident.logitsReads == tokens.len
+    firGraphReset(resident)
+    fgClose(firGraphStep(resident, tokens[0]), refForward(graph, rounded, @[tokens[0]]), "Q4 reset")
+    echo "PASS resident Q4 full graph vs independently dequantized scalar reference; transpose, tied head, one session/read per token, reset (tol 1e-4)"
+    for i in 1 ..< tokens.len:
+        discard firGraphStep(model, tokens[i])
+    var rejected = false
+    try:
+        discard firGraphStep(model, 0)
+    except ValueError:
+        rejected = true
+    doAssert rejected, "context overflow accepted"
+    # Header-only routing, then malformed shape and truncated payload rejection.
+    writeFile(root / "model.fir", readFile(graph.sourcePath))
+    writeFile(root / "tokenizer.json", "{}")
+    var opts = fmDefaultOptions()
+    opts.modelsDir = root
+    opts.backend = "cpu"
+    let detected = fmDetect(opts)
+    doAssert detected.supported and detected.route == frFir, detected.errors.join("; ")
+    let header = fmReadSafeHeader(safePath)
+    rejected = false
+    try:
+        discard fmLoadSafeF32(safePath, header, "wte.weight", @[1, 1])
+    except ValueError:
+        rejected = true
+    doAssert rejected, "wrong safetensors shape accepted"
+    let valid = readFile(safePath)
+    writeFile(safePath, valid[0 ..< valid.len-4])
+    rejected = false
+    try:
+        discard fmReadSafeHeader(safePath)
+    except ValueError:
+        rejected = true
+    doAssert rejected, "truncated safetensors accepted"
+    echo "PASS GPT-2 tiny full graph through production CPU VM/backend vs independent reference, all positions (tol 1e-4); safetensors, detection, context guards"
+
+function checkQuant()
+    var rng = initRand(425)
+    let rows = 3
+    let cols = 35 # Odd row width and a partial second group.
+    var input = fgRandom(rng, rows*cols, 5'f32)
+    for c in 0 ..< cols:
+        input[c] = 2.5'f32 # Constant groups must retain their nonzero value.
+    let packed = quantizeInt4AsymmetricGrouped(input, @[rows, cols])
+    doAssert packed.data.len == rows*((cols+1) div 2)
+    doAssert packed.scale.len == rows*2 and packed.zero_point.len == rows*2
+    let restored = dequantizeTensor(packed)
+    for r in 0 ..< rows:
+        for c in 0 ..< cols:
+            let sc = packed.scale[r*2+c div 32]
+            doAssert abs(restored[r*cols+c]-input[r*cols+c]) <= sc*0.501'f32+1e-6'f32
+    fgClose(restored[0 ..< cols], input[0 ..< cols], "constant Q4 groups")
+    let ctx = newBackend("cpu")
+    var w = beResidentUploadQ4(ctx, packed.data, packed.scale, packed.zero_point, cols, rows, 32, 2)
+    defer: beResidentFreeQ4(w)
+    let x = fgRandom(rng, cols)
+    var expected = newSeq[float32](rows)
+    for r in 0 ..< rows:
+        for c in 0 ..< cols:
+            expected[r] += x[c]*restored[r*cols+c]
+    fgClose(beResidentLinearQ4(ctx, x, w, 1), expected, "odd grouped resident GEMV")
+    echo "PASS grouped asymmetric Q4: odd row padding, partial groups, nonzero constants and resident GEMV (tol 1e-4)"
+
+function checkBadKernels(root: string)
+    # Kernel blocks in a model file must fail loudly: no silent wrong programs.
+    let source = readFile("models/gpt2-125m/model.fir")
+    var cases: seq[(string, string, string)]
+    cases.add(("unknown mnemonic", "  mulconst 1 1 1/in0.size", "  bogus 1 1"))
+    cases.add(("register out of range", "  add 1 1 2\n  ustoref32 1 0 @out0", "  add 1 1 40\n  ustoref32 1 0 @out0"))
+    cases.add(("unclosed loop", "  forend\n  mulconst 1 1 1/in0.size", "  mulconst 1 1 1/in0.size"))
+    cases.add(("unknown name", "mulconst 2 2 0.044715", "mulconst 2 2 not_a_symbol"))
+    cases.add(("wrong buffer size", "in1:1,", "in1:2,"))
+    cases.add(("wrong arity", "kernel g2.add in=2 out=1", "kernel g2.add in=3 out=1"))
+    cases.add(("wrong argument count", "  mul 2 1 1\n  mul 2 2 1", "  mul 2 1\n  mul 2 2 1"))
+    for (label, find, replacement) in cases:
+        if not source.contains(find):
+            raise newException(ValueError, "bad-kernel fixture does not match model.fir: " & label)
+        let bad = root / "bad.fir"
+        writeFile(bad, source.replace(find, replacement))
+        var rejected = false
+        try:
+            let graph = firParse(bad)
+            firValidate(graph, firDefaultRegistry(), firGraphBindings(graph))
+        except ValueError:
+            rejected = true
+        if not rejected:
+            raise newException(ValueError, "bad kernel accepted: " & label)
+    echo "PASS FIR kernel blocks reject unknown mnemonics, bad registers, unbalanced loops, unknown names, wrong sizes and arities"
+
+checkQuant()
+let root = getTempDir() / ("fir_graph_" & $getCurrentProcessId())
+createDir(root)
+try:
+    let path = root / "config.json"
+    for (hidden, heads) in [(8, 2), (15, 3)]:
+        let cfg = %*{"model_type": "gpt2", "n_embd": hidden, "n_head": heads, "n_layer": 2, "n_positions": 5, "vocab_size": 19, "layer_norm_epsilon": 0.0003, "activation_function": "gelu_new"}
+        writeFile(path, $cfg)
+        let graph = firParse("models/gpt2-125m/model.fir", path)
+        checkMicro(graph)
+        checkFull(graph, root)
+    let large = firParse("models/gpt2-125m/model.fir")
+    firValidate(large, firDefaultRegistry(), firGraphBindings(large))
+    echo "PASS GPT-2 real config FIR validation, every micro program built without weights"
+    checkBadKernels(root)
+finally:
+    removeDir(root)

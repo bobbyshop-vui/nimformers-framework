@@ -80,7 +80,10 @@ function fmFindModelFiles(opts: FmOptions): FmModelFiles
             result.errors.add("-m not found: " & opts.modelFile)
     else:
         result.nimqCandidates = fmFilesWithExt(opts.modelsDir, ".nimq")
-        result.nimqPath = fmPickNimq(result.nimqCandidates, result.loraPath, result.notes, result.errors)
+        if result.nimqCandidates.len == 0 and fileExists(opts.modelsDir / "model.safetensors"):
+            result.nimqPath = opts.modelsDir / "model.safetensors"
+        else:
+            result.nimqPath = fmPickNimq(result.nimqCandidates, result.loraPath, result.notes, result.errors)
     # config.json
     if opts.configFile.len > 0:
         if fileExists(opts.configFile):

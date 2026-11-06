@@ -12,7 +12,9 @@
 **Benchmark** (tok/s prefill/decode trên Tesla T4 và Intel Iris Plus 640):
 [DeepSeek Coder 6.7B](test/deepseek-inference/benchmark.md) ·
 [Codestral Mamba + QLoRA](test/codestral/benchmark.md) ·
-[Mamba-3 SISO + LoRA](test/mamba3/benchmark.md)
+[Mamba-3 SISO + LoRA](test/mamba3/benchmark.md) ·
+[GPT-2 125M via FIR](models/gpt2-125m/benchmark.md) ·
+[TinyLlama](models/tinyllama/benchmark.md)
 
 Nimformer là framework Nim cho inference và training transformer trên GPU
 Metal/Vulkan. Tài liệu API, hướng dẫn sử dụng, định dạng file và lập trình
@@ -148,6 +150,8 @@ lệnh đã chạy:
 | Codestral Mamba + QLoRA (`infer_lora`) | [`test/codestral/benchmark.md`](test/codestral/benchmark.md) |
 | Mamba-3 SISO 187M + LoRA (`test/mamba3/infer_lora_bin`) | [`187M`](test/mamba3/benchmark.md#mamba-3-siso-187m) |
 | Mamba-3 SISO 1.5B + LoRA (`test/mamba3/infer_lora_bin`) | [`1.5B`](test/mamba3/benchmark.md#mamba-3-siso-15b) |
+| GPT-2 125M qua FIR (`formers-cli`) | [`models/gpt2-125m/benchmark.md`](models/gpt2-125m/benchmark.md) |
+| TinyLlama (`formers-cli`) | [`models/tinyllama/benchmark.md`](models/tinyllama/benchmark.md) |
 
 
 ### Mamba-3 SISO: tách riêng 187M và 1.5B
@@ -187,7 +191,7 @@ finetune/resume riêng. `make infer-lora` / `make finetune-mamba` ở thư mục
 chọn pipeline Codestral; các lệnh trên chọn Mamba-3. Benchmark một lần chạy 1.5B trên
 Iris Plus 640 (Metal): prefill 18 token trong 1.822 s (9.88 tok/s; setup 0.039 s),
 decode 64 token trong 13.084 s (4.89 tok/s; steady 4.90 tok/s), tổng 14.906 s.
-Thời gian không gồm load/merge; đây là một lần chạy, không phải trung bình cold-start.
+
 
 
 Chạy hai model này qua `formers-cli` (Mamba-3 chỉ hỗ trợ một prompt, không có `-cnv`):

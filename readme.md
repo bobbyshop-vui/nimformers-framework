@@ -12,7 +12,9 @@
 **Benchmarks** (prefill/decode tok/s on Tesla T4 and Intel Iris Plus 640):
 [DeepSeek Coder 6.7B](test/deepseek-inference/benchmark.md) ·
 [Codestral Mamba + QLoRA](test/codestral/benchmark.md) ·
-[Mamba-3 SISO + LoRA](test/mamba3/benchmark.md)
+[Mamba-3 SISO + LoRA](test/mamba3/benchmark.md) ·
+[GPT-2 125M via FIR](models/gpt2-125m/benchmark.md) ·
+[TinyLlama](models/tinyllama/benchmark.md)
 
 Nimformer is a Nim framework for transformer inference and training with Metal and Vulkan GPU backends. The API references, usage guides, file formats, and BybyLang GPU programming docs are in [`docs/`](docs/README.md).
 
@@ -143,14 +145,12 @@ test machines and the commands used:
 | Codestral Mamba + QLoRA (`infer_lora`) | [`test/codestral/benchmark.md`](test/codestral/benchmark.md) |
 | Mamba-3 SISO 187M + LoRA (`test/mamba3/infer_lora_bin`) | [187M benchmark](test/mamba3/benchmark.md#mamba-3-siso-187m) |
 | Mamba-3 SISO 1.5B + gated LoRA (`test/mamba3/infer_lora_bin`) | [1.5B benchmark](test/mamba3/benchmark.md#mamba-3-siso-15b) |
+| GPT-2 125M through FIR (`formers-cli`) | [`models/gpt2-125m/benchmark.md`](models/gpt2-125m/benchmark.md) |
+| TinyLlama (`formers-cli`) | [`models/tinyllama/benchmark.md`](models/tinyllama/benchmark.md) |
 
 Latest recorded **Mamba-3 1.5B** run on Intel Iris Plus 640 / Metal: prefill
 **9.88 tok/s** (18 tokens, 1.822 s, including 0.039 s kernel setup), decode
-**4.89 tok/s** (64 tokens, 13.084 s), and 14.906 s combined. This is one
-user-provided run with the optimized shared kernels, excluding model loading
-and LoRA merge; it is not a controlled cold-start or multi-run average.
-The linked benchmark keeps this separate from the older 187M measurement.
-
+**4.89 tok/s** (64 tokens, 13.084 s), and 14.906 s combined.
 
 ### Mamba-3 SISO: separate 187M and 1.5B models
 
@@ -226,7 +226,7 @@ Add `--detect-only` to inspect the selected architecture and checkpoint without
 loading weights onto the GPU. Replace `--lora <path>` with `--no-lora` for the
 base model. Add `--verbose` for Mamba-3 prefill/decode statistics, retaining
 `BYBY_METAL_JIT_LOG=0` to hide routine Metal JIT logs. Use `--backend vulkan` on
-a Vulkan setup. Mamba-3 currently supports single prompts; omit `-cnv`/`-i`.
+a Vulkan setup. Add `-cnv` for chat; the prompt comes from the model folder's chat template.
 
 ### Download the models
 

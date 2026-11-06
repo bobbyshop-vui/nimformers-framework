@@ -1,4 +1,4 @@
-import nim "std/[os, strutils, tables, json]"
+import nim "std/[os, strutils, tables, json, math]"
 import "fir_types.bybylang"
 
 function firEvalExpr(expr: string, syms: Table[string, int]): int
@@ -39,6 +39,20 @@ function firEvalExpr(expr: string, syms: Table[string, int]): int
     except ValueError:
         raise newException(ValueError, "unknown FIR symbol or invalid expression: " & s)
 
+function firDeclaredRuntime(path: string): string
+    ## The `runtime` declaration of a FIR file ("" when absent), without parsing the rest.
+    for raw in readFile(path).splitLines():
+        let w = raw.split('#', 1)[0].strip().splitWhitespace()
+        if w.len == 2 and w[0] == "runtime":
+            return w[1]
+
+function firRoleBuffer(graph: FirProgram, role: string): string
+    ## Name of the buffer the model file declared with input:ROLE or output:ROLE.
+    for name, buffer in graph.buffers:
+        if buffer.role == role:
+            return name
+    raise newException(ValueError, "FIR graph declares no buffer with role '" & role & "' (use input:token, input:position, output:logits)")
+
 function firParse(path: string, configOverride: string = ""): FirProgram
     if not fileExists(path):
         raise newException(IOError, "FIR file not found: " & path)
@@ -56,32 +70,45 @@ function firParse(path: string, configOverride: string = ""): FirProgram
         cfgPath = configOverride
     result.configPath = cfgPath
     let cfg = parseFile(cfgPath)
-    let ssm = cfg["ssm_cfg"]
-    let hidden = cfg["d_model"].getInt()
-    let inter = cfg{"d_intermediate"}.getInt(hidden * ssm{"expand"}.getInt(2))
-    let layers = cfg["n_layer"].getInt()
-    let vocab = cfg["vocab_size"].getInt()
-    let dstate = ssm["d_state"].getInt()
-    let headdim = ssm["headdim"].getInt()
-    if min(hidden, min(inter, min(layers, min(vocab, min(dstate, headdim))))) <= 0 or inter mod headdim != 0:
-        raise newException(ValueError, "FIR config dimensions must be positive; inter must be divisible by headdim")
-    if ssm{"ngroups"}.getInt(1) != 1 or ssm{"is_mimo"}.getBool(false) or ssm{"rope_fraction"}.getFloat(0.5) != 0.5 or dstate mod 4 != 0 or dstate > 256:
-        raise newException(ValueError, "FIR Mamba-3 kernels require SISO, ngroups=1, rope_fraction=0.5, dstate divisible by 4 and <=256")
-    result.epsilon = cfg{"layer_norm_epsilon"}.getFloat(1e-5).float32
-    if result.epsilon <= 0:
-        raise newException(ValueError, "FIR epsilon must be positive")
     result.symbols = initTable[string, int]()
-    for (k, v) in [("hidden", hidden), ("inter", inter), ("layers", layers), ("vocab", vocab), ("dstate", dstate), ("headdim", headdim), ("nheads", inter div headdim), ("rope", dstate div 4)]:
-        result.symbols[k] = v
+    if not cfg.hasKey("ssm_cfg"):
+        # Generic graph models: every positive integer config key is a symbol;
+        # the model file adds aliases with `sym` and checks with `require`.
+        for key, value in cfg:
+            if value.kind == JInt and value.getInt() > 0:
+                result.symbols[key] = value.getInt()
+    else:
+        let ssm = cfg["ssm_cfg"]
+        let hidden = cfg["d_model"].getInt()
+        let inter = cfg{"d_intermediate"}.getInt(hidden * ssm{"expand"}.getInt(2))
+        let layers = cfg["n_layer"].getInt()
+        let vocab = cfg["vocab_size"].getInt()
+        let dstate = ssm["d_state"].getInt()
+        let headdim = ssm["headdim"].getInt()
+        if min(hidden, min(inter, min(layers, min(vocab, min(dstate, headdim))))) <= 0 or inter mod headdim != 0:
+            raise newException(ValueError, "FIR config dimensions must be positive; inter must be divisible by headdim")
+        if ssm{"ngroups"}.getInt(1) != 1 or ssm{"is_mimo"}.getBool(false) or ssm{"rope_fraction"}.getFloat(0.5) != 0.5 or dstate mod 4 != 0 or dstate > 256:
+            raise newException(ValueError, "FIR Mamba-3 kernels require SISO, ngroups=1, rope_fraction=0.5, dstate divisible by 4 and <=256")
+        for (k, v) in [("hidden", hidden), ("inter", inter), ("layers", layers), ("vocab", vocab), ("dstate", dstate), ("headdim", headdim), ("nheads", inter div headdim), ("rope", dstate div 4)]:
+            result.symbols[k] = v
+    result.epsilon = cfg{"layer_norm_epsilon"}.getFloat(1e-5).float32
+    if result.epsilon <= 0 or classify(result.epsilon) in {fcNan, fcInf, fcNegInf}:
+        raise newException(ValueError, "FIR epsilon must be positive and finite")
     var inRepeat = false
     var sawHeader = false
     var lineNo = 0
+    var openKernel = ""
+    result.kernels = initTable[string, FirKernelDef]()
     for raw in rawLines:
         inc lineNo
         let clean = raw.split('#', 1)[0].strip()
         if clean.len == 0:
             continue
         let w = clean.splitWhitespace()
+        if openKernel.len > 0 and w[0] != "endkernel":
+            # Kernel body: one session_vm emit* call per line, mnemonic first.
+            result.kernels[openKernel].body.add(FirKernelLine(mnemonic: w[0].toLowerAscii(), args: w[1 .. ^1], line: lineNo))
+            continue
         case w[0]
         of "fir":
             if sawHeader or w.len != 2 or w[1] != "1":
@@ -91,6 +118,33 @@ function firParse(path: string, configOverride: string = ""): FirProgram
             if w.len >= 2:
                 result.model = w[1]
         of "config": discard
+        of "runtime":
+            if w.len != 2 or w[1] != "graph":
+                raise newException(ValueError, "FIR line " & $lineNo & ": runtime must be 'graph'")
+            result.runtime = w[1]
+        of "prefix":
+            # Optional tensor-name prefixes tried after the plain name (e.g. "transformer.").
+            result.prefixes.add(w[1 .. ^1])
+        of "epsilon":
+            if w.len != 2:
+                raise newException(ValueError, "FIR line " & $lineNo & ": epsilon takes one config key")
+            result.epsilon = cfg{w[1]}.getFloat(0.0).float32
+            if result.epsilon <= 0 or classify(result.epsilon) in {fcNan, fcInf, fcNegInf}:
+                raise newException(ValueError, "FIR epsilon must be positive and finite")
+        of "require":
+            # require config KEY VALUE : a config value that is present must equal VALUE (absent passes).
+            # require sym EXPR = EXPR  : integer expressions over the symbols must be equal.
+            if w.len >= 4 and w[1] == "config":
+                let node = cfg{w[2]}
+                let actual = if node.isNil or node.kind == JNull: "" elif node.kind == JString: node.getStr() else: $node
+                if actual.len > 0 and actual != w[3]:
+                    raise newException(ValueError, "FIR line " & $lineNo & ": config " & w[2] & " is " & actual & ", model requires " & w[3])
+            elif w.len >= 5 and w[1] == "sym" and w.find("=") > 2:
+                let eq = w.find("=")
+                if firEvalExpr(w[2 ..< eq].join(""), result.symbols) != firEvalExpr(w[eq + 1 .. ^1].join(""), result.symbols):
+                    raise newException(ValueError, "FIR line " & $lineNo & ": requirement failed: " & w[2 .. ^1].join(" "))
+            else:
+                raise newException(ValueError, "FIR line " & $lineNo & ": malformed require")
         of "sym":
             if w.len < 4 or w[2] != "=":
                 raise newException(ValueError, "FIR line " & $lineNo & ": malformed symbol")
@@ -108,6 +162,9 @@ function firParse(path: string, configOverride: string = ""): FirProgram
                         b.perLayer = true
                     elif token == "tensor":
                         b.kind = "tensor"
+                    elif token.startsWith("input:") or token.startsWith("output:"):
+                        # Runtime I/O contract: input:token, input:position, output:logits.
+                        b.role = token.split(':', 1)[1]
             if b.dtype != "f32" or b.elements <= 0 or result.buffers.hasKey(b.name):
                 raise newException(ValueError, "FIR line " & $lineNo & ": invalid or duplicate buffer " & b.name)
             result.buffers[b.name] = b
@@ -135,6 +192,31 @@ function firParse(path: string, configOverride: string = ""): FirProgram
             if not inRepeat:
                 raise newException(ValueError, "FIR unexpected endrepeat")
             inRepeat = false
+        of "kernel":
+            # kernel NAME in=N out=M threads=EXPR tg=EXPR tgbytes=EXPR [size=a,b,c]
+            if inRepeat or w.len < 2 or result.kernels.hasKey(w[1]):
+                raise newException(ValueError, "FIR line " & $lineNo & ": invalid or duplicate kernel")
+            var def = FirKernelDef(name: w[1], threads: "1", tg: "1", tgBytes: "16", line: lineNo)
+            for field in w[2 .. ^1]:
+                let kv = field.split('=', 1)
+                if kv.len != 2:
+                    raise newException(ValueError, "FIR line " & $lineNo & ": kernel option must be key=value")
+                case kv[0]
+                of "in": def.ins = parseInt(kv[1])
+                of "out": def.outs = parseInt(kv[1])
+                of "threads": def.threads = kv[1]
+                of "tg": def.tg = kv[1]
+                of "tgbytes": def.tgBytes = kv[1]
+                of "size": def.sizeEq = kv[1].split(',')
+                of "expect": def.expects = kv[1].split(',')
+                else:
+                    raise newException(ValueError, "FIR line " & $lineNo & ": unknown kernel option " & kv[0])
+            result.kernels[w[1]] = def
+            openKernel = w[1]
+        of "endkernel":
+            if openKernel.len == 0:
+                raise newException(ValueError, "FIR line " & $lineNo & ": unexpected endkernel")
+            openKernel = ""
         of "node":
             if w.len < 4:
                 raise newException(ValueError, "FIR line " & $lineNo & ": malformed node")
@@ -150,5 +232,5 @@ function firParse(path: string, configOverride: string = ""): FirProgram
             result.nodes.add(n)
         else:
             raise newException(ValueError, "FIR line " & $lineNo & ": unknown declaration '" & w[0] & "'")
-    if not sawHeader or result.model.len == 0 or inRepeat:
+    if not sawHeader or result.model.len == 0 or inRepeat or openKernel.len > 0:
         raise newException(ValueError, "FIR requires a version, model, and closed repeat scopes")

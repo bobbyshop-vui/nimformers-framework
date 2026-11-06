@@ -3,14 +3,41 @@
 # Reuses the maintained Mamba-3 loader, GPU runtime and generation loop from
 # test/mamba3/infer_lora.nim rather than duplicating that inference stack.
 
-import nim "std/[os, strutils]"
+import nim "std/[os, strutils, json]"
 import nim "backend"
 import nim "m3_formers_infer as m3infer"
+import nim "native_hf_tokenizer"
+import "mamba2.bybylang"
 import "../cli/options.bybylang"
 import "../ir/fir_parse.bybylang"
 import "../ir/fir_exec.bybylang"
 import "../arch/detect.bybylang"
 import "../runtime/console.bybylang"
+
+function fmMamba3Chat(det: FmDetection, opts: FmOptions, ctx: Backend)
+    ## Conversation mode: the same template-driven loop as the FIR graph models
+    ## (fmTemplateChatLoop in mamba2.bybylang); the recurrent state stays on the GPU.
+    let tok = native_hf_tokenizer.newHFTokenizer(det.files.tokenizerDir)
+    # Fail on a missing or unsupported chat template before loading the weights.
+    discard tok.formatChatTemplate(%*[{"role": "user", "content": "hi"}], true)
+    var loaded = if det.route == frMamba3Lora: m3infer.loadBinaryLoraForInfer(det.lora.path) else: m3infer.loadPureMambaForInfer(det.files.tokenizerDir, det.files.nimqPath)
+    m3infer.formersPrepareChat(loaded.model, loaded.lora, ctx)
+    var hist: seq[int]
+    function feedIds(ids: seq[int]): seq[float32]
+        for id in ids:
+            hist.add(id)
+            result = m3infer.formersStepChat(loaded.model, id, hist, ctx)
+    function encodeText(text: string): seq[int]
+        result = tok.encode(text, false)
+    function decodeIds(ids: seq[int]): string
+        result = tok.decode(ids)
+    function templateText(messages: JsonNode): string
+        result = tok.formatChatTemplate(messages, true)
+    var hooks = FmChatHooks(feed: feedIds, encode: encodeText, decode: decodeIds, chatTemplate: templateText)
+    hooks.stopId = tok.eosId
+    hooks.vocab = loaded.model.vocab
+    hooks.capacity = if opts.ctxSize > 0: opts.ctxSize else: 8192
+    fmTemplateChatLoop(hooks, opts)
 
 function fmRunMamba3(det: FmDetection, opts: FmOptions): bool
     if opts.firFile.len > 0:
@@ -28,6 +55,9 @@ function fmRunMamba3(det: FmDetection, opts: FmOptions): bool
     m3infer.configureInferenceDefaults()
     m3infer.setInferenceThreadPriority()
     let ctx = newBackend(opts.backend)
+    if opts.conversation:
+        fmMamba3Chat(det, opts, ctx)
+        return true
     var prompt = opts.prompt.strip()
     if not opts.rawPrompt and not prompt.startsWith("[INST]"):
         prompt = "[INST] " & prompt & "[/INST]"
