@@ -10,6 +10,7 @@ import "arch/detect.bybylang"
 import "models/llama.bybylang"
 import "models/mamba2.bybylang"
 import "models/mamba3.bybylang"
+import "models/fir_model.bybylang"
 import "runtime/console.bybylang"
 
 function fmRun(det: FmDetection, opts: FmOptions): bool
@@ -24,6 +25,8 @@ function fmRun(det: FmDetection, opts: FmOptions): bool
         result = fmRunMamba2(det, opts)
     of frMamba3Base, frMamba3Lora:
         result = fmRunMamba3(det, opts)
+    of frFir:
+        result = if opts.conversation: fmRunFirChat(det, opts) else: fmRunFir(det, opts)
     of frNone:
         fmSay("[formers.n] unsupported architecture")
         result = false

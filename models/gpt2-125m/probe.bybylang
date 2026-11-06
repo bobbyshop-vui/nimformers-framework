@@ -1,0 +1,72 @@
+# Offline diagnostic protocol for check_hf.py. Requests/responses stay on
+# stdin/stdout; no checkpoint conversion, downloads or log files are created.
+import nim "std/[os, json, times, tables]"
+import nim "backend"
+import "../../other/formers.n/src/formers/ir/fir_parse.bybylang"
+import "../../other/formers.n/src/formers/ir/fir_graph.bybylang"
+import "../../other/formers.n/src/formers/runtime/console.bybylang"
+
+function probeTop(logits: seq[float32]): int
+    for i in 1 ..< logits.len:
+        if logits[i] > logits[result]:
+            result = i
+
+function probe(model: var FirGraph, request: JsonNode): JsonNode
+    var prompt: seq[int]
+    var teacher: seq[int]
+    for id in request["prompt"]:
+        prompt.add(id.getInt())
+    for id in request["teacher"]:
+        teacher.add(id.getInt())
+    let count = request["count"].getInt()
+    if prompt.len == 0 or count < 1 or teacher.len < 1:
+        raise newException(ValueError, "probe needs prompt, teacher continuation and positive count")
+    firGraphReset(model)
+    let sessionStart = model.sessions
+    let readStart = model.logitsReads
+    var logits: seq[float32]
+    let prefillStart = epochTime()
+    for id in prompt:
+        logits = firGraphStep(model, id)
+    let prefillSeconds = epochTime()-prefillStart
+    var generated: seq[int]
+    var decodeSeconds = 0.0
+    var samples = newJArray()
+    # Greedy timing uses count-1 actual forward steps after the prompt.
+    for i in 0 ..< count:
+        let id = probeTop(logits)
+        generated.add(id)
+        if i+1 < count:
+            let start = epochTime()
+            logits = firGraphStep(model, id)
+            decodeSeconds += epochTime()-start
+    let greedySessions = model.sessions-sessionStart
+    let greedyReads = model.logitsReads-readStart
+    firGraphReset(model)
+    for id in prompt:
+        logits = firGraphStep(model, id)
+    # Every precision/backend sees identical HF prefixes when comparing logits.
+    for i, id in teacher:
+        samples.add(%logits)
+        if i+1 < teacher.len:
+            logits = firGraphStep(model, id)
+    result = %*{"generated": generated, "logits": samples, "prefill_tokens": prompt.len, "prefill_seconds": prefillSeconds, "decode_steps": count-1, "decode_seconds": decodeSeconds, "sessions": greedySessions, "logits_reads": greedyReads}
+
+fmConsoleInit(false)
+try:
+    let args = commandLineParams()
+    if args.len != 3 or args[2] notin ["q4", "fp32"]:
+        raise newException(ValueError, "usage: fir_probe MODEL_DIR cpu|metal|vulkan q4|fp32")
+    var graph = firParse(args[0] / "model.fir")
+    if args[2] == "fp32":
+        graph = firF32Weights(graph)
+    backend.setForbidCpuFallback(true)
+    var model = firLoadGraph(graph, args[0] / "model.safetensors", newBackend(args[1]))
+    defer: firFreeGraph(model)
+    var line: string
+    while stdin.readLine(line):
+        fmOut().writeLine($probe(model, parseJson(line)))
+        fmOut().flushFile()
+except Exception as e:
+    fmSay("GPT-2 probe failed: " & e.msg)
+    quit(1)

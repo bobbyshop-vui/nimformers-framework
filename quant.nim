@@ -134,7 +134,7 @@ proc quantizeInt4Asymmetric*(arr: openArray[float32], shape: seq[int]): QuantTen
   
   let range = maxVal - minVal
   let scale = if range < 1e-12'f32: 1'f32 else: range / 15'f32
-  let zeroPoint = if range < 1e-12'f32: 0'f32 else: -minVal / scale
+  let zeroPoint = -minVal / scale
   
   result.kind = qkInt4Asymmetric
   result.shape = shape
@@ -151,6 +151,33 @@ proc quantizeInt4Asymmetric*(arr: openArray[float32], shape: seq[int]): QuantTen
       result.data[byteIdx] = (result.data[byteIdx] and 0xF0'u8) or nibble
     else:
       result.data[byteIdx] = (result.data[byteIdx] and 0x0F'u8) or (nibble shl 4)
+
+proc quantizeInt4AsymmetricGrouped*(arr: openArray[float32], shape: seq[int],
+                                    groupSize = 32): QuantTensor =
+  ## Resident Q4 ABI: [out,in], low nibble first, rows padded to whole bytes,
+  ## and one floating scale/zero point per contiguous input group.
+  if shape.len != 2 or shape[0] <= 0 or shape[1] <= 0 or
+      arr.len != shape[0] * shape[1] or groupSize <= 0 or groupSize mod 2 != 0:
+    raise newException(ValueError, "grouped Q4 requires a matrix and an even positive group size")
+  let rows = shape[0]
+  let cols = shape[1]
+  let groups = (cols + groupSize - 1) div groupSize
+  let rowBytes = (cols + 1) div 2
+  result = QuantTensor(kind: qkInt4Asymmetric, shape: shape, groupSize: groupSize,
+    data: newSeq[uint8](rows * rowBytes),
+    scale: newSeq[float32](rows * groups),
+    zero_point: newSeq[float32](rows * groups))
+  for row in 0 ..< rows:
+    for group in 0 ..< groups:
+      let first = group * groupSize
+      let count = min(groupSize, cols - first)
+      let base = row * cols + first
+      let blockQ = quantizeInt4Asymmetric(arr.toOpenArray(base, base + count - 1), @[count])
+      let gi = row * groups + group
+      result.scale[gi] = blockQ.scale[0]
+      result.zero_point[gi] = blockQ.zero_point[0]
+      for i, value in blockQ.data:
+        result.data[row * rowBytes + first div 2 + i] = value
 
 proc dequantizeInt4Asymmetric*(qt: QuantTensor): seq[float32] =
   ## Per-row support: if qt.scale.len > 1 (== shape[0]), each row uses its own

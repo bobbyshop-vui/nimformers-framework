@@ -11,7 +11,7 @@
 # formers.n's own. LoRA checkpoints keep the norm preset recorded at training
 # (meta normPreset), as infer_lora.nim does.
 
-import nim "std/[os, tables, times, strutils]"
+import nim "std/[os, tables, times, strutils, json]"
 import nim "nimformer"
 import nim "backend"
 import nim "quant"
@@ -24,6 +24,9 @@ import nim "prefill_gpu"
 import nim "fp4_gemv_gpu"
 import nim "hf_tokenizer"
 import nim "test/codestral/infer_lora as m2infer"
+import nim "native_hf_tokenizer"
+import "../ir/fir_parse.bybylang"
+import "../ir/fir_graph.bybylang"
 import "../cli/options.bybylang"
 import "../arch/detect.bybylang"
 import "../sampling/sampler.bybylang"
@@ -474,4 +477,123 @@ function fmRunMamba2(det: FmDetection, opts: FmOptions): bool
         fmMambaChatLoop(mm, tok, ctx, opts)
     else:
         discard fmMambaGenerate(mm, tok, ctx, opts)
+    result = true
+
+# ── Shared conversation loop driven by the chat template of the model config ──
+# A model and its tokenizer plug in through FmChatHooks (FIR graph models in
+# fmRunFirChat below, Mamba-3 in mamba3.bybylang). The state of the model
+# (KV cache or recurrent state) keeps earlier turns.
+
+type
+  FmChatHooks* = object
+    feed*: proc(ids: seq[int]): seq[float32]          ## consumes ids, returns the logits after the last one
+    encode*: proc(text: string): seq[int]
+    decode*: proc(ids: seq[int]): string
+    chatTemplate*: proc(messages: JsonNode): string
+    stopId*, capacity*, vocab*: int
+
+function fmTemplateChatLoop(hooks: FmChatHooks, opts: FmOptions)
+    ## Same turn structure as fmMambaChatLoop (state kept across turns, only the new
+    ## template text is fed, "/exit" quits, Ctrl+C stops a reply), but the text of
+    ## each turn comes from the chat template in the model config.
+    let capacity = hooks.capacity
+    var sampler = fmNewSampler(opts, hooks.vocab)
+    var ids: seq[int]
+    var pending: seq[int]
+    var text = ""
+    var messages = newJArray()
+    if opts.systemText.len > 0:
+        messages.add(%*{"role": "system", "content": opts.systemText})
+    fmSay("[formers.n] chat: context " & $capacity & " tok, at most " & $opts.nPredict & " tok per reply; /exit quits, Ctrl+C stops a reply")
+    while true:
+        fmClearStop()
+        let turn = fmReadTurn()
+        if not turn.ok:
+            break
+        if turn.text.len == 0:
+            continue
+        messages.add(%*{"role": "user", "content": turn.text})
+        let full = hooks.chatTemplate(messages)
+        var keep = 0
+        while keep < min(text.len, full.len) and text[keep] == full[keep]:
+            inc keep
+        if keep < text.len:
+            fmSay("[formers.n] warning: the chat template rewrote " & $(text.len - keep) & " earlier characters, the context may diverge")
+        let newIds = pending & hooks.encode(full[keep .. ^1])
+        pending.setLen(0)
+        if newIds.len == 0 or ids.len + newIds.len + 1 > capacity:
+            fmSay("[formers.n] context full (" & $ids.len & "/" & $capacity & " tok): restart with a larger -c")
+            break
+        let t0 = epochTime()
+        var logits = hooks.feed(newIds)
+        ids.add(newIds)
+        let feedTime = epochTime() - t0
+        var gen: seq[int]
+        var printed = ""
+        var full2 = false
+        fmSetGenerating(true)
+        let t1 = epochTime()
+        while gen.len < opts.nPredict and not fmStopRequested():
+            let id = fmSample(sampler, logits, ids)
+            if id == hooks.stopId:
+                break
+            gen.add(id)
+            let shown = hooks.decode(gen)
+            if shown.len > printed.len and shown.startsWith(printed) and not shown.endsWith("\uFFFD"):
+                fmOut().write(shown[printed.len .. ^1])
+                fmOut().flushFile()
+                printed = shown
+            if ids.len + 1 >= capacity:
+                full2 = true
+            if gen.len >= opts.nPredict or full2:
+                pending = @[id]
+                break
+            logits = hooks.feed(@[id])
+            ids.add(id)
+        fmSetGenerating(false)
+        let reply = hooks.decode(gen)
+        if reply.len > printed.len and reply.startsWith(printed):
+            fmOut().write(reply[printed.len .. ^1])
+        fmOut().write("\n")
+        fmOut().flushFile()
+        fmMambaStats("prompt eval", newIds.len, feedTime)
+        fmMambaStats("eval       ", gen.len, epochTime() - t1)
+        text = full & reply
+        messages.add(%*{"role": "assistant", "content": reply})
+        if full2:
+            fmSay("[formers.n] context full (" & $capacity & " tok): restart with a larger -c")
+            break
+
+function fmRunFirChat(det: FmDetection, opts: FmOptions): bool
+    ## FIR graph model in conversation mode (the model.fir graph, native HF tokenizer).
+    let path = if opts.firFile.len > 0: opts.firFile else: opts.modelsDir / "model.fir"
+    var graph = firParse(path, det.files.configPath)
+    if opts.firF32:
+        graph = firF32Weights(graph)
+    let cfg = parseFile(det.files.configPath)
+    let tok = native_hf_tokenizer.newHFTokenizer(det.files.tokenizerDir)
+    if tok.totalVocabSize > graph.symbols["vocab"]:
+        raise newException(ValueError, "FIR graph: tokenizer exceeds model vocabulary")
+    # Fail on a missing or unsupported chat template before loading the weights.
+    discard tok.formatChatTemplate(%*[{"role": "user", "content": "hi"}], true)
+    backend.setForbidCpuFallback(true)
+    let ctx = newBackend(opts.backend)
+    var model = firLoadGraph(graph, det.files.nimqPath, ctx)
+    defer: firFreeGraph(model)
+    function feedIds(ids: seq[int]): seq[float32]
+        for id in ids:
+            result = firGraphStep(model, id)
+    function encodeText(text: string): seq[int]
+        result = tok.encode(text, false)
+    function decodeIds(ids: seq[int]): string
+        result = tok.decode(ids)
+    function templateText(messages: JsonNode): string
+        result = tok.formatChatTemplate(messages, true)
+    var hooks = FmChatHooks(feed: feedIds, encode: encodeText, decode: decodeIds, chatTemplate: templateText)
+    hooks.stopId = cfg{"eos_token_id"}.getInt(-1)
+    hooks.vocab = graph.symbols["vocab"]
+    hooks.capacity = graph.symbols["positions"]
+    if opts.ctxSize > 0:
+        hooks.capacity = min(hooks.capacity, opts.ctxSize)
+    fmTemplateChatLoop(hooks, opts)
     result = true

@@ -14,6 +14,10 @@ import nim "std/[os, json, tables, strutils, sequtils]"
 import "../cli/options.bybylang"
 import "../io/headers.bybylang"
 import "../io/model_files.bybylang"
+import "../io/safetensors.bybylang"
+import "../ir/fir_parse.bybylang"
+import "../ir/fir_exec.bybylang"
+import "../ir/fir_graph_kernels.bybylang"
 
 type
   FmArch* = enum
@@ -22,14 +26,16 @@ type
     faMamba2 = "mamba2",
     faMamba2Lora = "mamba2+lora",
     faMamba2LinearPP = "mamba2+linear++",
-    faMamba3 = "mamba3"
+    faMamba3 = "mamba3",
+    faFir = "fir"
   FmRoute* = enum
     frNone = "none",
     frLlama = "llama (nim_inference transformer blocks)",
     frMamba2Base = "mamba2 base (Mamba2Real blocks, base-Mamba path of infer_lora)",
     frMamba2Lora = "mamba2 + LoRA/Linear++ (infer_lora checkpoint path)",
     frMamba3Base = "mamba3 SISO base (test/mamba3 inference)",
-    frMamba3Lora = "mamba3 SISO + LoRA/Linear++ (test/mamba3 inference)"
+    frMamba3Lora = "mamba3 SISO + LoRA/Linear++ (test/mamba3 inference)",
+    frFir = "fir graph (model.fir decode graph)"
   FmLlamaConfig* = object
     modelType*: string
     vocabSize*, hiddenSize*, intermediateSize*: int
@@ -403,6 +409,32 @@ function fmDetect(opts: FmOptions): FmDetection
     if cfg.kind != JObject:
         result.errors.add("config.json is not a JSON object")
         return
+    let firPath = if opts.firFile.len > 0: opts.firFile else: opts.modelsDir / "model.fir"
+    if fileExists(firPath) and firDeclaredRuntime(firPath) == "graph":
+        # A self-contained model: the model file declares weights, kernels and graph.
+        result.arch = faFir
+        try:
+            let graph = firParse(firPath, result.files.configPath)
+            firValidate(graph, firDefaultRegistry(), firGraphBindings(graph))
+            let header = fmReadSafeHeader(result.files.nimqPath)
+            for name, buffer in graph.buffers:
+                if buffer.kind != "weight":
+                    continue
+                for layer in 0 ..< (if buffer.tensorName.contains("{i}"): graph.symbols["layers"] else: 1):
+                    let tensor = buffer.tensorName.replace("{i}", $layer)
+                    let source = fmResolveTensor(header, graph.prefixes, tensor)
+                    if source.len == 0 or header.tensors[source].dtype != "F32" or header.tensors[source].shape != buffer.dims:
+                        raise newException(ValueError, "FIR graph safetensors shape/dtype mismatch: " & tensor)
+            if not fileExists(result.files.tokenizerDir / "tokenizer.json"):
+                raise newException(ValueError, "FIR graph text runner requires tokenizer.json")
+            if result.files.loraPath.len > 0:
+                raise newException(ValueError, "FIR graph models do not support LoRA")
+            result.nLayers = graph.symbols["layers"]
+            result.route = frFir
+            result.supported = true
+        except CatchableError as e:
+            result.errors.add(e.msg)
+        return
     var header: FmNimqHeader
     try:
         header = fmReadNimqHeader(result.files.nimqPath)
@@ -500,10 +532,12 @@ function fmCheckRun(det: FmDetection, opts: FmOptions, reason: var string): bool
     if not det.supported:
         reason = "unsupported architecture: " & det.errors.join("; ")
         return false
+    if det.route == frFir:
+        if opts.ngl >= 0 and opts.backend != "cpu" and opts.ngl < det.nLayers:
+            reason = "FIR graph models do not support partial offload; use --backend cpu or all GPU layers"
+            return false
+        return true
     # These inference engines require all model layers on the GPU.
-    if opts.conversation and det.route in {frMamba3Base, frMamba3Lora}:
-        reason = "interactive conversation is not supported by the Mamba-3 inference path"
-        return false
     if opts.ngl >= 0 and opts.ngl < det.nLayers:
         reason = "--ngl " & $opts.ngl & " < " & $det.nLayers & " layers: partial offload is not supported, use --ngl " & $det.nLayers & " (or omit --ngl)"
         return false
@@ -534,7 +568,9 @@ function fmDescribe(det: FmDetection, opts: FmOptions): string
     if det.arch == faMamba3 and det.route == frMamba3Lora:
         let lo = det.lora
         lines.add("[formers.n] lora meta : " & lo.format & " adapters=" & $lo.adapterCount & " linear++=" & $lo.linearPPBlocks & " pattern=" & lo.pattern)
-    if det.nLayers > 0:
+    if det.arch == faFir and opts.backend == "cpu":
+        lines.add("[formers.n] device    : CPU (all layers)")
+    elif det.nLayers > 0:
         let onGpu = if opts.ngl < 0: det.nLayers else: min(opts.ngl, det.nLayers)
         lines.add("[formers.n] ngl       : " & $onGpu & "/" & $det.nLayers & " layers on the GPU")
     for n in det.notes:

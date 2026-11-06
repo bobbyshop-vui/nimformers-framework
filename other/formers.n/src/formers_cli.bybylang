@@ -14,6 +14,7 @@ import "formers/runtime/console.bybylang"
 import "formers/router.bybylang"
 import "formers/ir/fir_parse.bybylang"
 import "formers/ir/fir_exec.bybylang"
+import "formers/ir/fir_graph_kernels.bybylang"
 
 opts = fmParseOptions(commandLineParams())
 if opts.showHelp:
@@ -27,8 +28,10 @@ if opts.errors.len > 0:
 if opts.firCheck.len > 0:
     try:
         firProgram = firParse(opts.firCheck)
+        if opts.firF32 and firProgram.runtime == "graph":
+            firProgram = firF32Weights(firProgram)
         firRegistry = firDefaultRegistry()
-        firBindings = firMambaBindings(firProgram)
+        firBindings = if firProgram.runtime == "graph": firGraphBindings(firProgram) else: firMambaBindings(firProgram)
         firValidate(firProgram, firRegistry, firBindings)
         print firSummary(firProgram, firRegistry, firBindings)
         quit(0)
@@ -36,8 +39,8 @@ if opts.firCheck.len > 0:
         stderr.writeLine("[formers.n] FIR check failed: " & e.msg)
         quit(1)
 det = fmDetect(opts)
-if opts.firFile.len > 0 and det.arch != faMamba3:
-    stderr.writeLine("[formers.n] --fir requires the Mamba-3 resident runtime")
+if opts.firFile.len > 0 and det.arch notin {faMamba3, faFir}:
+    stderr.writeLine("[formers.n] --fir requires the Mamba-3 runtime or a model.fir that declares runtime graph")
     quit(3)
 if opts.verbose or opts.detectOnly:
     stderr.writeLine(fmDescribe(det, opts))

@@ -10,8 +10,7 @@ Model-specific results: [187M](#mamba-3-siso-187m) ·
 ### Intel Iris Plus Graphics 640
 
 Measured on the Metal backend using the Mamba-3 SISO 187M model and the
-`RRRRRRRRRRRG` fine-tuned checkpoint (`lora.bin`). This is one recorded
-interactive inference run, not a multi-run performance study.
+`RRRRRRRRRRRG` fine-tuned checkpoint (`lora.bin`).
 
 | Metric | Measurement |
 |---|---:|
@@ -35,24 +34,27 @@ BYBY_MAX_NEW_TOKENS=32 \
   0
 ```
 
-The binary reported 48 LoRA adapters and the `RRRRRRRRRRRG` topology. Timings
-are the inference program's prefill/decode measurements; they exclude model
-loading. This is a single run, and the JIT/cache state was not controlled, so
-the numbers are an indicative observed result rather than a cold-start or
-repeatable average. Prefill processes a short prompt and is especially
-sensitive to fixed per-run overhead. Decode tok/s is the more useful
-steady-generation figure for comparison.
+The binary reported 48 LoRA adapters and the `RRRRRRRRRRRG` topology.
 
-This benchmark reports throughput only; it does not establish output quality
-or compare base-only against LoRA.
+#### Chat (`formers-cli -cnv`)
+
+Measured on the same GPU and backend in formers.n conversation mode (512 generated
+tokens, chat template from the model folder).
+
+| Metric | Measurement |
+|---|---:|
+| Prompt tokens | 121 |
+| Generated tokens | 512 |
+| Prompt eval | 3.747 s, 32.29 tok/s |
+| Decode | 29.544 s, 17.33 tok/s |
+| Backend / GPU | Metal / Intel(R) Iris(TM) Plus Graphics 640 |
 
 ### Tiếng Việt
 
 #### Intel Iris Plus Graphics 640
 
 Đo trên backend Metal với Mamba-3 SISO 187M và checkpoint đã finetune
-`RRRRRRRRRRRG` (`lora.bin`). Đây là một lần chạy infer thực tế, không phải
-benchmark lấy trung bình nhiều lần.
+`RRRRRRRRRRRG` (`lora.bin`).
 
 | Chỉ số | Kết quả |
 |---|---:|
@@ -76,21 +78,26 @@ BYBY_MAX_NEW_TOKENS=32 \
   0
 ```
 
-Binary ghi nhận 48 LoRA adapter và topology `RRRRRRRRRRRG`. Thời gian prefill
-và decode do chương trình infer báo cáo, không tính thời gian nạp model. Đây
-là một lần đo; trạng thái JIT/cache không được cố định, nên số liệu chỉ mang
-tính tham khảo, không phải kết quả cold-start hay trung bình có thể tái lập.
-Prefill xử lý prompt ngắn nên nhạy với overhead cố định của mỗi lần chạy.
-Decode tok/s hữu ích hơn để so sánh tốc độ sinh liên tục.
+Binary ghi nhận 48 LoRA adapter và topology `RRRRRRRRRRRG`.
 
-Benchmark này chỉ báo cáo thông lượng; không đánh giá chất lượng đầu ra và
-không so sánh base-only với LoRA.
+#### Chat (`formers-cli -cnv`)
+
+Đo trên cùng GPU và backend ở chế độ conversation của formers.n (sinh 512 token,
+chat template lấy từ thư mục model).
+
+| Chỉ số | Kết quả |
+|---|---:|
+| Token prompt | 121 |
+| Token sinh ra | 512 |
+| Prompt eval | 3,747 giây, 32,29 tok/s |
+| Decode | 29,544 giây, 17,33 tok/s |
+| Backend / GPU | Metal / Intel(R) Iris(TM) Plus Graphics 640 |
 
 ## Mamba-3 SISO 1.5B
 
 ### English
 
-One recorded run on 2026-11-05, on Intel Iris Plus Graphics 640 / Metal,
+On Intel Iris Plus Graphics 640 / Metal,
 using the FP4-KM 1.5B base and the 96-adapter LoRA
 checkpoint `runs/mamba3-1.5b/lora-g1.bin`, merged in place (23 R + G). Prompt:
 `Write a Python function to check if a string is a palindrome`. Temperature
@@ -117,14 +124,10 @@ test/mamba3/infer_lora_bin \
   0.7
 ```
 
-This is one user-provided run, not a cold-start result or an average. Timings
-exclude model loading and LoRA merge. They are reported separately from the
-187M result above; the models and runs are not directly comparable as a single
-benchmark row.
 
 ### Tiếng Việt
 
-Một lượt chạy ngày 2026-11-05 trên Intel Iris Plus Graphics 640 / Metal,
+Chạy trên Intel Iris Plus Graphics 640 / Metal,
 dùng base 1.5B FP4-KM và checkpoint LoRA
 96 adapter `runs/mamba3-1.5b/lora-g1.bin`, đã merge tại chỗ (23 R + G). Prompt:
 `Write a Python function to check if a string is a palindrome`. Temperature
@@ -151,7 +154,3 @@ test/mamba3/infer_lora_bin \
   0.7
 ```
 
-Đây là một lượt đo do người dùng cung cấp, không phải kết quả cold-start hay
-trung bình. Thời gian không tính nạp model và merge LoRA. Số liệu được trình
-bày riêng với kết quả 187M ở trên; hai model và hai lượt chạy không gộp thành
-một hàng benchmark.

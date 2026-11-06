@@ -147,7 +147,7 @@ download-models:
 	for file in model.nimq config.json tokenizer.json tokenizer_config.json; do \
 	  curl -fL --retry 3 -C - "https://huggingface.co/bobbydeveloper2014/deepseek-coder-6.7b-nimq/resolve/main/$$file" -o "test/deepseek-inference/models/$$file"; \
 	done; \
-	for file in config.json params.json generation_config.json special_tokens_map.json tokenizer.json tokenizer_config.json tokenizer.model tokenizer.model.v3; do \
+	for file in config.json params.json generation_config.json special_tokens_map.json tokenizer.json tokenizer_config.json tokenizer.model tokenizer.model.v3 chat_template.jinja; do \
 	  curl -fL --retry 3 -C - "https://huggingface.co/bobbydeveloper2014/codestral-v0.1-7b-nimq/resolve/main/$$file" -o "test/codestral/models/hf/$$file"; \
 	done; \
 	curl -fL --retry 3 -C - https://huggingface.co/bobbydeveloper2014/codestral-v0.1-7b-nimq/resolve/main/codestral_mamba_only.nimq -o test/codestral/models/codestral_mamba_only.nimq; \
@@ -156,7 +156,7 @@ download-models:
 	for file in mamba3_siso_187m.nimq; do \
 	  curl -fL --retry 3 -C - "https://huggingface.co/bobbydeveloper2014/mamba-siso-175m-nimq/resolve/main/$$file" -o "test/mamba3/models/$$file"; \
 	done; \
-	for file in config.json tokenizer.json tokenizer_config.json special_tokens_map.json; do \
+	for file in config.json tokenizer.json tokenizer_config.json special_tokens_map.json chat_template.jinja; do \
 	  curl -fL --retry 3 -C - "https://huggingface.co/bobbydeveloper2014/mamba-siso-175m-nimq/resolve/main/$$file" -o "test/mamba3/models/mamba3-siso-187m/$$file"; \
 	done; \
 	for file in lora.bin; do \
@@ -164,7 +164,7 @@ download-models:
 	done; \
 	echo 'test/mamba3/models/mamba3-siso-187m' > test/mamba3/models/runs/mamba3-siso-187m-gated/lora.bin.hf_tokenizer_dir; \
 	curl -fL --retry 3 -C - https://huggingface.co/bobbydeveloper2014/mamba-siso-1.5b-nimq/resolve/main/mamba3_siso_1.5b.nimq -o test/mamba3/models/mamba3_siso_1.5b.nimq; \
-	for file in config.json tokenizer.json tokenizer_config.json special_tokens_map.json; do \
+	for file in config.json tokenizer.json tokenizer_config.json special_tokens_map.json chat_template.jinja; do \
 	  curl -fL --retry 3 -C - "https://huggingface.co/bobbydeveloper2014/mamba-siso-1.5b-nimq/resolve/main/$$file" -o "test/mamba3/models/mamba3-siso-1.5b/$$file"; \
 	done; \
 	for file in lora-g1.bin; do \

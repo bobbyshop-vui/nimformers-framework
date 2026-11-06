@@ -221,9 +221,11 @@ if not tCheck("mamba3-siso-base", det, faMamba3, true) or det.route != frMamba3B
 var mamba3ChatOpts = tOpts(dir)
 mamba3ChatOpts.conversation = true
 reason = ""
-if fmCheckRun(det, mamba3ChatOpts, reason) or reason.len == 0:
-    echo "FAIL mamba3-chat: interactive conversation should be rejected"
+if not fmCheckRun(det, mamba3ChatOpts, reason):
+    echo "FAIL mamba3-chat: interactive conversation should be allowed: " & reason
     inc failures
+else:
+    echo "PASS mamba3-chat: interactive conversation allowed"
 tWriteLoraBin(dir / "mamba3-adapters.bin", "R".repeat(12), "model.nimq", 768, 128256, 24, false)
 det = fmDetect(tOpts(dir))
 if not tCheck("mamba3-siso-lora", det, faMamba3, true) or det.route != frMamba3Lora:
@@ -247,12 +249,13 @@ dir = tModelDir(root, "mamba3-bad-config-shape", tMamba3Config(128256, 2048, 409
 if not tCheck("mamba3-unsupported-head-shape", fmDetect(tOpts(dir)), faUnknown, false):
     inc failures
 
-# 12. Mamba-1 and an unknown architecture
+# 12. Mamba-1 and an incomplete graph model (model.fir without a checkpoint).
 dir = tModelDir(root, "mamba1", %*{"model_type": "mamba", "vocab_size": 10, "hidden_size": 8, "num_hidden_layers": 1}, @[("backbone.embeddings.weight", @[10, 8]), ("backbone.layers.0.mixer.x_proj.weight", @[4, 16])], "")
 if not tCheck("mamba1", fmDetect(tOpts(dir)), faUnknown, false):
     inc failures
-dir = tModelDir(root, "gpt2", %*{"model_type": "gpt2", "vocab_size": 10, "n_embd": 8}, @[("transformer.wte.weight", @[10, 8]), ("transformer.h.0.attn.c_attn.weight", @[8, 24])], "")
-if not tCheck("gpt2", fmDetect(tOpts(dir)), faUnknown, false):
+dir = tModelDir(root, "graphmodel", %*{"model_type": "toy", "vocab_size": 10}, @[("wte.weight", @[10, 8])], "")
+writeFile(dir / "model.fir", "fir 1\nmodel toy\nruntime graph\n")
+if not tCheck("graph-model-incomplete", fmDetect(tOpts(dir)), faFir, false):
     inc failures
 
 # 13. fmCheckRun: --ngl and unsupported architectures
@@ -263,11 +266,11 @@ nglOpts.ngl = 99
 okAll = fmCheckRun(det, nglOpts, reason)
 nglOpts.ngl = 10
 okPart = fmCheckRun(det, nglOpts, reason)
-okGpt2 = fmCheckRun(fmDetect(tOpts(root / "gpt2")), tOpts(root / "gpt2"), reason)
-if okAll and not okPart and not okGpt2:
-    print "PASS fmCheckRun: ngl 99 ok, ngl 10/22 rejected, unknown arch -> false"
+okGraph = fmCheckRun(fmDetect(tOpts(root / "graphmodel")), tOpts(root / "graphmodel"), reason)
+if okAll and not okPart and not okGraph:
+    print "PASS fmCheckRun: ngl 99 ok, ngl 10/22 rejected, incomplete graph model -> false"
 else:
-    print "FAIL fmCheckRun: " & $okAll & " " & $okPart & " " & $okGpt2
+    print "FAIL fmCheckRun: " & $okAll & " " & $okPart & " " & $okGraph
     inc failures
 
 # 14. Real checkpoints, headers only (skipped when not downloaded)

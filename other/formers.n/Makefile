@@ -19,7 +19,7 @@ SOURCES     := $(shell find $(ROOT)/$(HERE)/src -name '*.bybylang')
 
 export BYBYLANG_NIMCACHE ?= $(ROOT)/nimcache/formers-n
 
-.PHONY: all build test fir-test smoke clean
+.PHONY: all build test fir-test fir-graph-test fir-probe smoke clean
 
 all: build
 
@@ -40,12 +40,13 @@ test: $(ROOT)/$(BYBYLANG)
 	  $(BYBYLANG) $(TEST_SRC) --aot=$(HERE)/build/test_detect --quiet && \
 	  $(HERE)/build/test_detect
 
-fir-test: $(ROOT)/$(BYBYLANG)
+fir-test: fir-graph-test $(ROOT)/$(BYBYLANG)
 	cd $(ROOT) && mkdir -p $(HERE)/build && \
 	  $(BYBYLANG) $(FIR_TEST_SRC) --aot=$(HERE)/build/test_fir --quiet && \
 	  $(HERE)/build/test_fir && \
 	  $(MAKE) -C $(HERE) build && \
-	  $(CLI_BIN) --fir-check models/mamba3-1.5b/model.fir
+	  $(CLI_BIN) --fir-check models/mamba3-1.5b/model.fir && \
+	  for f in models/*/model.fir; do $(CLI_BIN) --fir-check $$f || exit 1; done
 
 SMOKE_DIR := $(HERE)/build/tiny-llama
 
@@ -57,3 +58,13 @@ smoke: build
 
 clean:
 	rm -rf $(ROOT)/$(HERE)/build $(ROOT)/$(CLI_BIN) $(BYBYLANG_NIMCACHE)
+
+fir-graph-test: $(ROOT)/$(BYBYLANG)
+	cd $(ROOT) && mkdir -p $(HERE)/build && \
+	  $(BYBYLANG) models/gpt2-125m/test_model.bybylang --aot=$(HERE)/build/test_fir_graph --quiet && \
+	  $(HERE)/build/test_fir_graph
+
+# JSON-lines diagnostic runner; the Python quality check keeps all output in memory.
+fir-probe: $(ROOT)/$(BYBYLANG)
+	cd $(ROOT) && mkdir -p $(HERE)/build && \
+	  $(BYBYLANG) models/gpt2-125m/probe.bybylang --aot=$(HERE)/build/fir_probe --quiet

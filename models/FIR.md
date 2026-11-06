@@ -136,3 +136,43 @@ New architectures that need a different schedule also need a runtime adapter.
 `make -C other/formers.n fir-test` additionally compares all eight provider roles
 with direct builders (48 bytecode/dispatch comparisons at T=1,7,128 and two layer
 offsets), including a custom registry operation selected by the graph.
+
+## Graph models (`runtime graph`): config, registry and executor
+
+A model file with `runtime graph` is run by the generic graph executor. Config
+integers become symbols automatically; `sym`, `epsilon`, `require`, `prefix` and the
+`input:`/`output:` buffer roles (see `docs/fir.md`) let the file declare everything
+that is model-specific, including its own config checks. `models/gpt2-125m/model.fir`
+is the worked example. Linear weights are `[input,output]`; biases are explicit
+nodes; the head can reference the embedding table with `fir.linear_t`.
+
+`fir_graph_kernels.bybylang` registers only the ext entries `fir.embedding`, `fir.linear` and `fir.linear_t`. The micro-kernels (`g2.layernorm`, `g2.gelu_new`,
+`g2.add`, `g2.attn_decode`) are defined in `model.fir` itself with `kernel ... endkernel`
+blocks (see `docs/fir.md`): one `session_vm` `emit*` call per line, parsed by
+`fir_kernel.bybylang` into a `VmProgram`. `firMicroKernel` resolves a model-defined
+kernel before a registry kernel. Small weight vectors live in the F32 activation arena
+for VM access. `firGraphBindings` assigns offsets, multiplying `per_layer` cache
+allocation by `layers`; each layer gets separate K/V offsets. `position` is the
+current decode index; attention writes the new K/V, computes stable softmax over
+`[0,position]` and emits the concatenated heads. Scratch `scores` is reused between
+layers. FIR has no VM or interpreter of its own.
+
+`fir_graph.bybylang` loads graph-selected F32 safetensors tensors through the
+Nim-side header reader and executes graph order, repeating the layer scope.
+Micro programs use `jit_vm.dispatchProgramNoSession` and existing Metal/Vulkan
+JIT or production CPU VM. `vm_interp.runGrid` is used only by tests. Ext entries
+invoke backend embedding/matmul APIs. The CLI routes any directory whose `model.fir` declares `runtime graph` to this
+executor, native HF BPE and the shared sampler; `--fir-check` builds all programs
+without loading weights. No token/position dimensions are hardcoded.
+
+```sh
+make formers-cli
+make formers-fir-test
+other/formers.n/formers-cli --models models/gpt2-125m \
+  --fir models/gpt2-125m/model.fir --raw -p "Hello, my name is" -n 32 --temp 0 --backend cpu
+other/formers.n/formers-cli --models models/gpt2-125m -cnv --temp 0.8 --backend metal   # chat
+```
+
+Linear layers are Q4 resident by default (`--fir-f32` selects the fp32 reference) and
+one decode step is one GPU session. See [`docs/fir.md`](../docs/fir.md) for measured
+speed, Q4 quality and the offline HF comparison commands.

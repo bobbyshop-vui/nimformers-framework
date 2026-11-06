@@ -1,0 +1,90 @@
+# Safetensors header parsing and selective F32 loading; no Python dependency.
+import nim "std/[os, json, tables, algorithm]"
+
+type
+  FmSafeTensor* = object
+    dtype*: string
+    shape*: seq[int]
+    start*, finish*: int64
+  FmSafeHeader* = object
+    dataStart*: int64
+    tensors*: Table[string, FmSafeTensor]
+
+function fmReadSafeHeader(path: string): FmSafeHeader
+    var f = open(path, fmRead)
+    defer: f.close()
+    var bytes: array[8, uint8]
+    if f.readBuffer(addr bytes[0], 8) != 8:
+        raise newException(ValueError, "truncated safetensors length")
+    var length = 0'u64
+    for i in 0 ..< 8:
+        length = length or (uint64(bytes[i]) shl (8*i))
+    let size = getFileSize(path)
+    if length < 2 or length > 100*1024*1024 or length > uint64(max(0'i64, size-8)):
+        raise newException(ValueError, "invalid safetensors header length")
+    var text = newString(int(length))
+    if f.readBuffer(addr text[0], text.len) != text.len:
+        raise newException(ValueError, "truncated safetensors header")
+    let root = parseJson(text)
+    if root.kind != JObject:
+        raise newException(ValueError, "safetensors header must be an object")
+    result.dataStart = int64(length)+8
+    var ranges: seq[(int64, int64)]
+    for name, entry in root:
+        if name == "__metadata__":
+            continue
+        var tensor = FmSafeTensor(dtype: entry["dtype"].getStr())
+        var count = 1'i64
+        for dim in entry["shape"]:
+            let value = dim.getInt()
+            if value <= 0 or count > high(int64) div value:
+                raise newException(ValueError, "invalid safetensors shape: " & name)
+            tensor.shape.add(value)
+            count *= value
+        let offsets = entry["data_offsets"]
+        if offsets.len != 2:
+            raise newException(ValueError, "invalid safetensors offsets: " & name)
+        tensor.start = offsets[0].getBiggestInt()
+        tensor.finish = offsets[1].getBiggestInt()
+        if tensor.start < 0 or tensor.finish < tensor.start or tensor.finish > size-result.dataStart:
+            raise newException(ValueError, "safetensors range outside payload: " & name)
+        if tensor.dtype == "F32" and (count > high(int64) div 4 or tensor.finish-tensor.start != count*4):
+            raise newException(ValueError, "safetensors F32 byte count mismatch: " & name)
+        result.tensors[name] = tensor
+        ranges.add((tensor.start, tensor.finish))
+    ranges.sort()
+    var previous = 0'i64
+    for interval in ranges:
+        if interval[0] != previous:
+            raise newException(ValueError, "safetensors payload has overlapping ranges or gaps")
+        previous = interval[1]
+    if previous != size-result.dataStart:
+        raise newException(ValueError, "safetensors payload size mismatch")
+
+function fmLoadSafeF32(path: string, header: FmSafeHeader, name: string, shape: seq[int]): seq[float32]
+    if not header.tensors.hasKey(name):
+        raise newException(ValueError, "missing safetensors tensor: " & name)
+    let tensor = header.tensors[name]
+    if tensor.dtype != "F32" or tensor.shape != shape:
+        raise newException(ValueError, "safetensors shape/dtype mismatch: " & name)
+    result = newSeq[float32](int((tensor.finish-tensor.start) div 4))
+    var f = open(path, fmRead)
+    defer: f.close()
+    f.setFilePos(header.dataStart+tensor.start)
+    let count = result.len*4
+    if count > 0 and f.readBuffer(addr result[0], count) != count:
+        raise newException(ValueError, "truncated safetensors tensor: " & name)
+    # Safetensors specifies little-endian IEEE floats.
+    when cpuEndian == bigEndian:
+        for value in result.mitems:
+            let bits = cast[uint32](value)
+            value = cast[float32]((bits shr 24) or ((bits shr 8) and 0xff00'u32) or ((bits shl 8) and 0xff0000'u32) or (bits shl 24))
+
+function fmResolveTensor(header: FmSafeHeader, prefixes: seq[string], name: string): string
+    ## The checkpoint name for a FIR weight: the plain name, else the first prefix that exists.
+    if header.tensors.hasKey(name):
+        return name
+    for prefix in prefixes:
+        if header.tensors.hasKey(prefix & name):
+            return prefix & name
+    result = ""

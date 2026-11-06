@@ -1,0 +1,71 @@
+# Text completion for any self-contained FIR graph model (`runtime graph`) with a native HF tokenizer.
+import nim "std/[os, json, times, tables]"
+import nim "backend"
+import nim "native_hf_tokenizer"
+import "../cli/options.bybylang"
+import "../arch/detect.bybylang"
+import "../ir/fir_parse.bybylang"
+import "../ir/fir_graph.bybylang"
+import "../sampling/sampler.bybylang"
+import "../runtime/console.bybylang"
+import "../runtime/signals.bybylang"
+
+function fmRunFir(det: FmDetection, opts: FmOptions): bool
+    let path = if opts.firFile.len > 0: opts.firFile else: opts.modelsDir / "model.fir"
+    var graph = firParse(path, det.files.configPath)
+    if opts.firF32:
+        graph = firF32Weights(graph)
+    let cfg = parseFile(det.files.configPath)
+    let tok = native_hf_tokenizer.newHFTokenizer(det.files.tokenizerDir)
+    let eos = cfg{"eos_token_id"}.getInt(-1)
+    var ids = tok.encode(opts.prompt, false)
+    if ids.len == 0:
+        let bos = cfg{"bos_token_id"}.getInt(eos)
+        if bos < 0:
+            raise newException(ValueError, "FIR graph: an empty prompt requires bos_token_id in config.json")
+        ids = @[bos]
+    if ids.len+opts.nPredict-1 > graph.symbols["positions"] or (opts.ctxSize > 0 and ids.len+opts.nPredict-1 > opts.ctxSize):
+        raise newException(ValueError, "FIR graph: prompt and generation exceed context capacity")
+    if tok.totalVocabSize > graph.symbols["vocab"]:
+        raise newException(ValueError, "FIR graph: tokenizer exceeds model vocabulary")
+    backend.setForbidCpuFallback(true)
+    let ctx = newBackend(opts.backend)
+    var model = firLoadGraph(graph, det.files.nimqPath, ctx)
+    defer: firFreeGraph(model)
+    var sampler = fmNewSampler(opts, graph.symbols["vocab"])
+    var logits: seq[float32]
+    let start = epochTime()
+    for id in ids:
+        if fmStopRequested():
+            return true
+        logits = firGraphStep(model, id)
+    let prefillSeconds = epochTime()-start
+    var decodeSeconds = 0.0
+    var decodeSteps = 0
+    var stream = initTokenStream(tok)
+    var generated = 0
+    fmSetGenerating(true)
+    try:
+        for i in 0 ..< opts.nPredict:
+            if fmStopRequested():
+                break
+            let id = fmSample(sampler, logits, ids)
+            if id == eos:
+                break
+            ids.add(id)
+            inc generated
+            fmOut().write(stream.pushTokens([id]))
+            fmOut().flushFile()
+            if i+1 < opts.nPredict:
+                let stepStart = epochTime()
+                logits = firGraphStep(model, id)
+                decodeSeconds += epochTime()-stepStart
+                inc decodeSteps
+        fmOut().write(stream.pushTokens(newSeq[int](), true) & "\n")
+        fmOut().flushFile()
+    finally:
+        fmSetGenerating(false)
+    fmSay("[formers.n] FIR graph prefill (sequential): " & $(ids.len-generated) & " tokens, " & $prefillSeconds & " s, " & $(float64(ids.len-generated)/prefillSeconds) & " tok/s; decode: " & $decodeSteps & " steps, " & $decodeSeconds & " s, " & $(if decodeSteps > 0: float64(decodeSteps)/decodeSeconds else: 0.0) & " tok/s")
+    fmSay("[formers.n] FIR graph sessions=" & $model.sessions & ", logits reads=" & $model.logitsReads & ", weights=" & (if opts.firF32: "fp32" else: "FIR dtype") & "")
+    fmSay("[formers.n] FIR graph: " & $generated & " generated tokens in " & $(epochTime()-start) & " s; FIR: " & $model.dispatched & " VM programs, backend=" & $ctx.kind)
+    result = true

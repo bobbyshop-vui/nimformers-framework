@@ -1,0 +1,272 @@
+# FIR kernel blocks: a model file can define its own micro-kernels as text.
+# A body line is exactly one session_vm emit* call: the mnemonic is the emit
+# procedure name without "emit", lower case (emitULoadF32 -> uloadf32), and the
+# arguments are numeric expressions. This module only turns those lines into a
+# VmProgram; it has no interpreter and no bytecode of its own. Execution is the
+# framework JIT (or vm_interp in tests).
+#
+# Expression names: model symbols (hidden, nheads, ...), eps, pi, inN.size,
+# outN.size, and buffer addresses written @inN, @outN or @buffer_name.
+# Functions: sqrt(x). Numbers are evaluated in double precision, so large
+# element offsets stay exact.
+import nim "std/[tables, strutils, math]"
+import nim "session_vm"
+import "fir_types.bybylang"
+
+type
+  FkScan = object
+    text: string
+    pos: int
+    syms: Table[string, float]
+    ins, outs: seq[string]
+    memory: Table[string, int]
+    where: string
+
+function fkFail(s: FkScan, message: string)
+    raise newException(ValueError, "FIR kernel " & s.where & ": " & message & " in '" & s.text & "'")
+
+function fkIdentChar(c: char): bool
+    c.isAlphaNumeric() or c == '_' or c == '.'
+
+function fkAddress(s: var FkScan, name: string): float
+    # @in0, @out0 or any buffer name that has a memory binding.
+    var buffer = name
+    if name.len == 3 and name.startsWith("in") and name[2].isDigit() and int(name[2]) - int('0') < s.ins.len:
+        buffer = s.ins[int(name[2]) - int('0')]
+    elif name.len == 4 and name.startsWith("out") and name[3].isDigit() and int(name[3]) - int('0') < s.outs.len:
+        buffer = s.outs[int(name[3]) - int('0')]
+    if not s.memory.hasKey(buffer):
+        s.fkFail("no memory binding for @" & name)
+    float(s.memory[buffer])
+
+function fkParse(s: var FkScan, level: int): float
+    # level 0 = sum, 1 = product, 2 = factor (one recursive function: no forward declarations).
+    if level == 0:
+        result = fkParse(s, 1)
+        while s.pos < s.text.len and s.text[s.pos] in {'+', '-'}:
+            let op = s.text[s.pos]
+            inc s.pos
+            let right = fkParse(s, 1)
+            result = if op == '+': result + right else: result - right
+        return
+    if level == 1:
+        result = fkParse(s, 2)
+        while s.pos < s.text.len and s.text[s.pos] in {'*', '/'}:
+            let op = s.text[s.pos]
+            inc s.pos
+            let right = fkParse(s, 2)
+            if op == '*':
+                result = result * right
+            else:
+                if right == 0:
+                    s.fkFail("division by zero")
+                result = result / right
+        return
+    if s.pos >= s.text.len:
+        s.fkFail("unexpected end of expression")
+    let c = s.text[s.pos]
+    if c == '(':
+        inc s.pos
+        result = fkParse(s, 0)
+        if s.pos >= s.text.len or s.text[s.pos] != ')':
+            s.fkFail("missing ')'")
+        inc s.pos
+    elif c == '-':
+        inc s.pos
+        result = -fkParse(s, 2)
+    elif c.isDigit() or c == '.':
+        let start = s.pos
+        while s.pos < s.text.len and (s.text[s.pos].isDigit() or s.text[s.pos] == '.'):
+            inc s.pos
+        if s.pos < s.text.len and s.text[s.pos] in {'e', 'E'}:
+            var look = s.pos + 1
+            if look < s.text.len and s.text[look] in {'+', '-'}:
+                inc look
+            if look < s.text.len and s.text[look].isDigit():
+                s.pos = look
+                while s.pos < s.text.len and s.text[s.pos].isDigit():
+                    inc s.pos
+        try:
+            result = parseFloat(s.text[start ..< s.pos])
+        except ValueError:
+            s.fkFail("invalid number")
+    elif c == '@':
+        inc s.pos
+        let start = s.pos
+        while s.pos < s.text.len and fkIdentChar(s.text[s.pos]):
+            inc s.pos
+        result = s.fkAddress(s.text[start ..< s.pos])
+    elif c.isAlphaAscii() or c == '_':
+        let start = s.pos
+        while s.pos < s.text.len and fkIdentChar(s.text[s.pos]):
+            inc s.pos
+        let name = s.text[start ..< s.pos]
+        if s.pos < s.text.len and s.text[s.pos] == '(':
+            if name != "sqrt":
+                s.fkFail("unknown function " & name)
+            inc s.pos
+            let inner = fkParse(s, 0)
+            if s.pos >= s.text.len or s.text[s.pos] != ')' or inner < 0:
+                s.fkFail("invalid sqrt argument")
+            inc s.pos
+            result = sqrt(inner)
+        elif s.syms.hasKey(name):
+            result = s.syms[name]
+        else:
+            s.fkFail("unknown name '" & name & "'")
+    else:
+        s.fkFail("unexpected character '" & $c & "'")
+
+function fkEval(s: var FkScan, text: string): float
+    s.text = text
+    s.pos = 0
+    result = fkParse(s, 0)
+    if s.pos != s.text.len:
+        s.fkFail("trailing characters")
+
+function fkU32(s: var FkScan, text: string): uint32
+    let v = fkEval(s, text)
+    if v < 0 or v > 4294967295.0 or v != floor(v):
+        s.fkFail("expected a non-negative integer")
+    uint32(v)
+
+function fkF32(s: var FkScan, text: string): float32
+    float32(fkEval(s, text))
+
+function fkSignature(mnemonic: string): string
+    # r = register (0..31), k = integer immediate or address offset, f = float constant.
+    case mnemonic
+    of "nop", "forend", "ifend", "barriertg": ""
+    of "forbegin", "ifbegin", "loadlid", "loadtgid", "utgid", "ulid": "r"
+    of "add", "sub", "mul", "div", "cmplt", "uadd", "umul": "rrr"
+    of "fma": "rrrr"
+    of "exp", "neg", "sigmoid", "softplus", "rsqrt", "rtou", "utor": "rr"
+    of "uconst": "rk"
+    of "uaddk", "umulk", "uandk", "ushrk", "ushlk": "rrk"
+    of "uloadf32", "ustoref32", "uatomicadd", "loadf32", "storef32", "tgloadf32", "tgstoref32": "rrk"
+    of "addconst", "mulconst": "rrf"
+    of "loadconstf32": "rf"
+    else: "?"
+
+function fkEmit(p: var VmProgram, mnemonic: string, a: seq[uint32], f: float32)
+    case mnemonic
+    of "nop": p.emitNop()
+    of "forbegin": p.emitForBegin(a[0])
+    of "forend": p.emitForEnd()
+    of "ifbegin": p.emitIfBegin(a[0])
+    of "ifend": p.emitIfEnd()
+    of "barriertg": p.emitBarrierTg()
+    of "loadlid": p.emitLoadLid(a[0])
+    of "loadtgid": p.emitLoadTgid(a[0])
+    of "utgid": p.emitUTgid(a[0])
+    of "ulid": p.emitULid(a[0])
+    of "add": p.emitAdd(a[0], a[1], a[2])
+    of "sub": p.emitSub(a[0], a[1], a[2])
+    of "mul": p.emitMul(a[0], a[1], a[2])
+    of "div": p.emitDiv(a[0], a[1], a[2])
+    of "cmplt": p.emitCmpLt(a[0], a[1], a[2])
+    of "uadd": p.emitUAdd(a[0], a[1], a[2])
+    of "umul": p.emitUMul(a[0], a[1], a[2])
+    of "fma": p.emitFma(a[0], a[1], a[2], a[3])
+    of "exp": p.emitExp(a[0], a[1])
+    of "neg": p.emitNeg(a[0], a[1])
+    of "sigmoid": p.emitSigmoid(a[0], a[1])
+    of "softplus": p.emitSoftplus(a[0], a[1])
+    of "rsqrt": p.emitRsqrt(a[0], a[1])
+    of "rtou": p.emitRToU(a[0], a[1])
+    of "utor": p.emitUToR(a[0], a[1])
+    of "uconst": p.emitUConst(a[0], a[1])
+    of "uaddk": p.emitUAddK(a[0], a[1], a[2])
+    of "umulk": p.emitUMulK(a[0], a[1], a[2])
+    of "uandk": p.emitUAndK(a[0], a[1], a[2])
+    of "ushrk": p.emitUShrK(a[0], a[1], a[2])
+    of "ushlk": p.emitUShlK(a[0], a[1], a[2])
+    of "uloadf32": p.emitULoadF32(a[0], a[1], a[2])
+    of "ustoref32": p.emitUStoreF32(a[0], a[1], a[2])
+    of "uatomicadd": p.emitUAtomicAdd(a[0], a[1], a[2])
+    of "loadf32": p.emitLoadF32(a[0], a[1], a[2])
+    of "storef32": p.emitStoreF32(a[0], a[1], a[2])
+    of "tgloadf32": p.emitTgLoadF32(a[0], a[1], a[2])
+    of "tgstoref32": p.emitTgStoreF32(a[0], a[1], a[2])
+    of "addconst": p.emitAddConst(a[0], a[1], f)
+    of "mulconst": p.emitMulConst(a[0], a[1], f)
+    of "loadconstf32": p.emitLoadConstF32(a[0], f)
+    else: discard
+
+const FkMaxRegister = 31'u32
+
+function firAssembleKernel(def: FirKernelDef, model: FirProgram, node: FirNode, memory: Table[string, int]): FirKernel
+    let ins = node.inputs.splitWhitespace()
+    let outs = node.outputs.splitWhitespace()
+    var s = FkScan(ins: ins, outs: outs, memory: memory, where: def.name & " (node " & node.name & ")")
+    if ins.len != def.ins or outs.len != def.outs:
+        raise newException(ValueError, "FIR kernel " & s.where & ": expects " & $def.ins & " inputs and " & $def.outs & " outputs")
+    s.syms = initTable[string, float]()
+    for name, value in model.symbols:
+        s.syms[name] = float(value)
+    s.syms["eps"] = float(model.epsilon)
+    s.syms["pi"] = PI
+    for name in ins & outs:
+        if not model.buffers.hasKey(name):
+            raise newException(ValueError, "FIR kernel " & s.where & ": unknown buffer " & name)
+    for i, name in ins:
+        s.syms["in" & $i & ".size"] = float(model.buffers[name].elements)
+    for i, name in outs:
+        s.syms["out" & $i & ".size"] = float(model.buffers[name].elements)
+        if model.buffers[name].kind == "weight":
+            raise newException(ValueError, "FIR kernel " & s.where & ": output must be an activation: " & name)
+    for name in ins & outs:
+        if not memory.hasKey(name):
+            raise newException(ValueError, "FIR kernel " & s.where & ": missing memory binding: " & name)
+    var firstSize = -1.0
+    for port in def.sizeEq:
+        let key = port & ".size"
+        if not s.syms.hasKey(key):
+            raise newException(ValueError, "FIR kernel " & s.where & ": unknown size port " & port)
+        if firstSize < 0:
+            firstSize = s.syms[key]
+        elif s.syms[key] != firstSize:
+            raise newException(ValueError, "FIR kernel " & s.where & ": buffer sizes differ for " & port)
+    for item in def.expects:
+        # expect=PORT:EXPR checks a buffer's element count against an expression.
+        let parts = item.split(':', 1)
+        let key = if parts.len == 2: parts[0] & ".size" else: ""
+        if parts.len != 2 or not s.syms.hasKey(key):
+            raise newException(ValueError, "FIR kernel " & s.where & ": invalid expect '" & item & "'")
+        if s.syms[key] != fkEval(s, parts[1]):
+            raise newException(ValueError, "FIR kernel " & s.where & ": " & parts[0] & " has " & $int(s.syms[key]) & " elements, expected " & parts[1])
+    var p: VmProgram
+    var scopes: seq[string]
+    for line in def.body:
+        s.where = def.name & " line " & $line.line
+        let sig = fkSignature(line.mnemonic)
+        if sig == "?":
+            raise newException(ValueError, "FIR kernel " & def.name & " line " & $line.line & ": unknown mnemonic '" & line.mnemonic & "'")
+        if line.args.len != sig.len:
+            raise newException(ValueError, "FIR kernel " & def.name & " line " & $line.line & ": '" & line.mnemonic & "' takes " & $sig.len & " arguments")
+        var a: seq[uint32]
+        var f = 0'f32
+        for i, kind in sig:
+            if kind == 'f':
+                f = fkF32(s, line.args[i])
+            else:
+                a.add(fkU32(s, line.args[i]))
+                if kind == 'r' and a[^1] > FkMaxRegister:
+                    raise newException(ValueError, "FIR kernel " & def.name & " line " & $line.line & ": register out of range (0..31)")
+        case line.mnemonic
+        of "forbegin": scopes.add("for")
+        of "ifbegin": scopes.add("if")
+        of "forend", "ifend":
+            let want = if line.mnemonic == "forend": "for" else: "if"
+            if scopes.len == 0 or scopes[^1] != want:
+                raise newException(ValueError, "FIR kernel " & def.name & " line " & $line.line & ": unbalanced " & line.mnemonic)
+            scopes.setLen(scopes.len - 1)
+        else: discard
+        fkEmit(p, line.mnemonic, a, f)
+    if scopes.len > 0:
+        raise newException(ValueError, "FIR kernel " & def.name & ": unclosed " & scopes[^1] & " scope")
+    p.emitHalt()
+    result.program = p
+    result.threads = int(fkEval(s, def.threads))
+    result.tgSize = int(fkEval(s, def.tg))
+    result.tgBytes = int(fkEval(s, def.tgBytes))
