@@ -11,6 +11,100 @@ Files start with `fir 1`, `model name`, and `config config.json`. `#` starts a
 comment. `sym P = 2*inter+2*dstate+3*nheads+rope` defines a dimension; integer
 expressions support `+`, `-`, `*`, `/`, and parentheses.
 
+The optional header directive `layout classic|script` is stored on `FirProgram`.
+When absent, the parser selects `classic`; unknown values are rejected. In the
+graph runner, `classic` binds only rank-1 weights in the F32 arena (`memF32`).
+`layout script` additionally binds non-matrix (rank != 2) F32 weights there,
+including higher-rank tensors under their original checkpoint names and logical
+shapes. Their payloads are copied in row-major order after the loader checks the
+complete declared shape. Rank-2 weights retain resident matrix storage for
+external linear and embedding calls. `q4t` weights use the same resident path
+without the `[in,out]` transpose. The Python exporter emits `layout script`.
+
+### Script ABI and capabilities
+
+```text
+layout script
+script_abi 1
+require feature weights_bf16
+require feature weights_f16
+```
+
+`script_abi 1` selects the versioned runner contract. `FirProgram.scriptAbi` is
+1 when declared and 0 when omitted. Existing script files without this directive
+keep their legacy instruction validation. The runner supports the required
+features `weights_bf16` and `weights_f16`; each `require feature NAME` asserts
+runner support and is retained in `FirProgram.requiredFeatures`. Features do not
+select a storage dtype or change a weight declaration. Repeated feature
+requirements are idempotent. The ABI directive occurs at most once.
+
+Both directives require `layout script`. The parser resolves the final layout
+outside kernel bodies before checking gated declarations, including when layout
+appears later in the file. Unknown ABI versions, malformed directives and unknown
+required features fail before checkpoint loading. The graph loader also checks
+the contract for programs constructed directly by a caller.
+
+### Script checkpoint loading
+
+With `layout script`, selected safetensors tensors accept F32, BF16 and F16 source
+storage independently of the FIR `f32` or `q4` destination declaration. BF16
+conversion shifts the 16 source bits into the upper half of the F32 word. F16
+conversion constructs IEEE F32 bits exactly, including signed zero, subnormals,
+infinities and NaN sign/payload bits. No finite value needs rounding. All payloads
+are little-endian. Activations, state and converted weights use F32 storage;
+`q4` still requests the existing transpose and load-time Q4 quantization of the
+converted F32 input.
+
+The script loader checks every selected tensor's full declared shape, supported
+source dtype and exact byte count before backend preparation or weight upload.
+It resolves plain names before declared prefixes and expands each `{i}` layer
+name. Conversion covers rank-1 arena weights, higher-rank script arena weights,
+resident matrices, embeddings, tied heads, flattened checkpoint copies and Q4
+inputs. After preflight, it reads, converts and uploads one tensor at a time.
+Unsupported dtypes report the source dtype and tensor name. Required feature
+declarations assert capabilities; conversion is available to all `layout script`
+files, including those that omit the ABI directive.
+
+Default and explicit `layout classic` keep the F32-only checkpoint reader,
+placement, bytecode and error handling. A selected non-F32 tensor retains the
+error `safetensors shape/dtype mismatch: NAME`.
+
+### Instruction whitelist and conformance
+
+The FIR text whitelist is `nop`, `loadconstf32`, `add`, `sub`, `mul`, `div`, `fma`,
+`neg`, `exp`, `rsqrt`, `sigmoid`, `softplus`, `addconst`, `mulconst`, `cmplt`,
+`ifbegin`, `ifend`, `forbegin`, `forend`, `loadlid`, `loadtgid`, `ulid`, `utgid`,
+`uconst`, `uadd`, `umul`, `uaddk`, `umulk`, `uandk`, `ushrk`, `ushlk`, `ushr` and
+`uloadu8`/`uloadu32` (the last three only with `layout script`), `rtou`,
+`utor`, `loadf32`, `storef32`, `uloadf32`, `ustoref32`, `tgloadf32`, `tgstoref32`,
+`barriertg` and `uatomicadd`. Assembly appends HALT; `halt`, grid barriers and
+other framework emit helpers are outside this text whitelist.
+
+ABI 1 validation rejects writes to any active float loop-count register, including
+writes inside nested conditionals/loops, and restricts immediate shift counts to
+0..31. Classic and unversioned script assembly retain their existing validation.
+All three use the same bytecode instructions and backend implementations.
+
+- Loop counts: production CPU snapshots the integer trip count on entry;
+  JIT, Python and the test interpreter re-read the register. A fixture that sets
+  its count from 3 to 0 inside the loop executes three times on CPU and once in
+  the test interpreter. ABI 1 rejects that kernel.
+- Effective U addresses: CPU widens U+immediate before adding and bounds-checks
+  the arena; JIT and Python use uint32 wrap. CPU rejects `0xffffffff + 1` as an
+  arena address. Valid portable addresses fit without wrapping the final sum;
+  uint32 register arithmetic still wraps.
+- Shifts: CPU masks immediate counts with 31; Python uses the supplied count.
+  The CPU fixture checks both shifts by 32; ABI 1 rejects those operands.
+- FMA: production CPU uses `fmaf`, and JIT uses fused multiply-add. Python
+  evaluates in double precision then rounds; the test interpreter evaluates a
+  float expression. The CPU cancellation fixture gives exactly `-2^-46` for
+  `(1+2^-23)*(1-2^-23)-1`.
+- Softplus: CPU/JIT evaluate `log(1+exp(x))`; Python uses a stable branch for
+  large positive inputs. The CPU fixture returns infinity at 100.
+
+`make -C other/formers.n fir-test` runs the production CPU conformance fixtures,
+whitelist checks, bytecode comparisons and synthetic mixed-dtype loading tests.
+
 The initial config adapter reads Mamba dimensions: `hidden`, `inter`, `layers`,
 `vocab`, `dstate`, `headdim`, `nheads`, and `rope`. `inter` uses an explicit
 `d_intermediate` or defaults to `hidden*ssm_cfg.expand`. `nheads=inter/headdim`;
@@ -19,8 +113,23 @@ and is a float field rather than an integer dimension.
 
 `buf name f32 count` describes an activation or state. `per_layer` marks
 persistent state belonging to each layer. `weight name dtype tensor.name tensor
-[rows,cols]` describes a checkpoint tensor; it allocates no memory. Weight shapes
-and activation element counts are resolved and validated without loading weights.
+[dims]` describes a checkpoint tensor; parsing allocates no tensor memory.
+`dtype` is `f32` or `q4`; `layout script` also accepts `q4t` for a `[out,in]`
+matrix consumed by `fir.linear_t`. `q4t` is quantized in place (no transpose) at
+load and runs the resident Q4 GEMV.
+
+`layout script` also has dtypes for 2-D `[out,in]` matrices that micro-kernels read
+directly from the arena (a kernel port is the whole blob):
+
+| dtype | Arena contents (float words) |
+| --- | --- |
+| `f32a` | the matrix, row-major |
+| `q4b`, `q4b<G>` | nibble bytes `[out, ceil(in/2)]` padded to words, then `out*ceil(in/G)` scales, then as many zero points; low nibble = even k; value `(nib - zero) * scale`; `q4b` is group 32, `q4b128` group 128 |
+| `fp4km` | nibble+scale bytes (`out*in/2` + `out*in/32`) padded to words, then 272 floats: 16 FP4 values and 256 E4M3 scale values times the tensor scale; byte j of a 32-group holds element j (low) and j+16 (high) |
+
+Kernels read the byte region with `uloadu8`/`uloadu32` (script layout only), the same
+bytes the float arena holds.
+Weight shapes and activation element counts are resolved and validated without loading weights.
 The example uses a tied embedding/language-head tensor.
 
 Nodes use `node id micro|ext|builtin kernel.name inputs -> outputs`, for example:
@@ -150,15 +259,18 @@ nodes; the head can reference the embedding table with `fir.linear_t`.
 `g2.add`, `g2.attn_decode`) are defined in `model.fir` itself with `kernel ... endkernel`
 blocks (see `docs/fir.md`): one `session_vm` `emit*` call per line, parsed by
 `fir_kernel.bybylang` into a `VmProgram`. `firMicroKernel` resolves a model-defined
-kernel before a registry kernel. Small weight vectors live in the F32 activation arena
-for VM access. `firGraphBindings` assigns offsets, multiplying `per_layer` cache
-allocation by `layers`; each layer gets separate K/V offsets. `position` is the
-current decode index; attention writes the new K/V, computes stable softmax over
+kernel before a registry kernel. Rank-1 weights live in the F32 activation arena
+for VM access; `layout script` also places higher-rank non-matrix F32 weights
+there. `firGraphBindings` assigns offsets, multiplying `per_layer` buffers and
+weights whose tensor names contain `{i}` by `layers`; each layer gets separate
+weight and K/V slices. `position` is the current decode index; attention writes
+the new K/V, computes stable softmax over
 `[0,position]` and emits the concatenated heads. Scratch `scores` is reused between
 layers. FIR has no VM or interpreter of its own.
 
-`fir_graph.bybylang` loads graph-selected F32 safetensors tensors through the
-Nim-side header reader and executes graph order, repeating the layer scope.
+`fir_graph.bybylang` loads graph-selected safetensors tensors through the
+Nim-side header reader, converts script BF16/F16 sources to F32, and executes
+graph order, repeating the layer scope.
 Micro programs use `jit_vm.dispatchProgramNoSession` and existing Metal/Vulkan
 JIT or production CPU VM. `vm_interp.runGrid` is used only by tests. Ext entries
 invoke backend embedding/matmul APIs. The CLI routes any directory whose `model.fir` declares `runtime graph` to this
@@ -174,5 +286,14 @@ other/formers.n/formers-cli --models models/gpt2-125m -cnv --temp 0.8 --backend 
 ```
 
 Linear layers are Q4 resident by default (`--fir-f32` selects the fp32 reference) and
-one decode step is one GPU session. See [`docs/fir.md`](../docs/fir.md) for measured
+one decode step is one GPU session. `q4t` keeps Llama-style `[out,in]` weights in
+the same resident Q4 form. See [`docs/fir.md`](../docs/fir.md) for measured
 speed, Q4 quality and the offline HF comparison commands.
+
+## Trace lifter
+
+`docs/fir-script-lift.md` describes `fprobe 2` and the compiler that rebuilds
+`model.fir` from a recorded decode step (`other/formers.n/firlift/`). The graph
+runner can run the result directly: the GPT-2 125M round trip reproduces the
+hand-written file's structure and 24 greedy tokens, and the TinyLlama core trace
+lifts to a 16-node graph whose 24 tokens equal the Python reference export.

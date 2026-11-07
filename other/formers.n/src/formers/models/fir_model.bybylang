@@ -38,7 +38,7 @@ function fmRunFir(det: FmDetection, opts: FmOptions): bool
     for id in ids:
         if fmStopRequested():
             return true
-        logits = firGraphStep(model, id)
+        logits = firGraphStep(model, id, "prefill")
     let prefillSeconds = epochTime()-start
     var decodeSeconds = 0.0
     var decodeSteps = 0

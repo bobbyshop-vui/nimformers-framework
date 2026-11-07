@@ -1302,6 +1302,9 @@ when not defined(noOneDispatch):
 proc prepareGpuModel*(m: var NimformerModelJamba, lora: var JambaLora, ctx: Backend) =
   let be = ctx.kind.toByby()
   let hidden = m.embedDim
+  if unlikely(firProbeOn):
+    if getEnv("BYBY_ONE_DISPATCH", "0") != "0":
+      probeEvent("note kind=one_dispatch detail=\"Codestral opaque fast path requested; disable for lifting\"")
   when not defined(noOneDispatch):
     # Iris 640 end-to-end A/B: independent kernels in one session are faster.
     # Keep the persistent mega-kernel available as an explicit experiment.

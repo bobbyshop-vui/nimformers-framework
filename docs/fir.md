@@ -11,6 +11,30 @@ therefore choose or add kernels without the framework hard-coding that architect
 
 The first model is Mamba-3 SISO 1.5B: [`models/mamba3-1.5b/model.fir`](../models/mamba3-1.5b/model.fir).
 The full format and the kernel ABI are in [`models/FIR.md`](../models/FIR.md).
+For Python forward-pass tracing and the small exporter prototype, see
+[`FIR script`](fir-script.md).
+
+The optional header directive `layout classic|script` controls graph weight
+placement. A `layout script` file may declare `q4t` weights for `[out,in]`
+`fir.linear_t` matrices, and arena-resident matrices for micro-kernels: `f32a` (f32),
+`q4b` / `q4b<G>` (packed asymmetric Q4, group 32 or G) and `fp4km` (FP4-KM, group 32);
+`classic` rejects all of these dtypes. The trace lifter is in
+[`FIR from a core trace`](fir-script-lift.md). Omitting it selects `classic`: only rank-1 weights receive `memF32`
+arena bindings. With `layout script`, all non-matrix (rank != 2) F32 weights use
+the arena, retaining their original checkpoint name and declared logical shape.
+The loader checks the complete shape and copies values in row-major order.
+Rank-2 matrices keep their resident storage for external linear and embedding
+calls. Unknown layout values are rejected. The Python exporter writes `layout script`.
+
+`script_abi 1` opts a `layout script` file into the versioned script contract.
+`require feature weights_bf16` and `require feature weights_f16` declare required
+checkpoint conversion capabilities. Layout is resolved before these directives,
+so it may appear later in the file. Unknown ABI versions and required features
+fail during parsing, before weight upload. Both directives require `layout script`;
+script files without `script_abi` retain the legacy instruction contract.
+ABI 1 requires immutable float loop-count registers inside their loops and shift
+counts in 0..31. See [the script contract](../models/FIR.md) for loading rules and
+the instruction whitelist.
 
 ## Node kinds
 
@@ -85,6 +109,7 @@ graph runner, whatever the architecture. Everything model-specific comes from th
 
 | Declaration | Meaning |
 |---|---|
+| `layout classic` / `layout script` | graph weight placement; default `classic` (rank-1 arena weights), `script` adds non-matrix F32 weights |
 | `runtime graph` | the file carries its own graph, weights and kernels |
 | `sym NAME = EXPR` | symbols; every positive integer key of `config.json` is already one. The runner needs `layers`, `positions` and `vocab` |
 | `epsilon KEY` | float constant taken from a config key (`eps` in kernels) |
@@ -92,7 +117,7 @@ graph runner, whatever the architecture. Everything model-specific comes from th
 | `require sym A = B` | integer expressions over symbols must match |
 | `prefix P` | extra checkpoint tensor-name prefix tried after the plain name |
 | `buf NAME f32 N input:token` / `input:position` / `output:logits` | the runtime I/O contract |
-| `weight NAME dtype TENSOR tensor [dims]` | checkpoint tensor (`{i}` = layer), `f32` or `q4`, shape `[in,out]` for linears |
+| `weight NAME dtype TENSOR tensor [dims]` | checkpoint tensor (`{i}` = layer), `f32`, `q4`, or script-only `q4t` (shape `[out,in]` for `fir.linear_t`), `f32a`, `q4b`/`q4b<G>`, `fp4km` (shape `[out,in]`, stored in the arena for micro-kernels, see below); shape `[in,out]` for `fir.linear` |
 | `node N ext fir.embedding IDX TABLE -> OUT` | row lookup (index from the `input:` role) |
 | `node N ext fir.linear X W -> Y` | `Y = X*W`; `q4` weights run resident Q4, `f32` weights an F32 matmul |
 | `node N ext fir.linear_t X W -> Y` | `Y = X*W^T` for a `[out,in]` weight (tied heads share the embedding table) |
@@ -125,7 +150,11 @@ endkernel
 ```
 
 Options: `in=`/`out=` arity, `threads=`/`tg=`/`tgbytes=` geometry, `size=` buffers that
-must have equal element counts, `expect=PORT:EXPR,...` exact element counts. The
+must have equal element counts, `expect=PORT:EXPR,...` exact element counts, and
+`tag=NAME` (`layout script` only) an op identity such as `aten::linear` or
+`aten::add+aten::gelu` for fused kernels. A tag is metadata: it does not change execution,
+it is carried to the kernel record and written into probe logs so a recorder can map a
+micro-kernel back to the op it implements; `layout classic` files reject it. The
 parser and `--fir-check` reject unknown mnemonics, wrong argument counts, registers
 above 31, unbalanced `forbegin`/`ifbegin`, unknown names and shape mismatches. A kernel
 defined in the file wins over a framework registry kernel of the same name (Mamba-3

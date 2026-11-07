@@ -61,7 +61,64 @@ function fmReadSafeHeader(path: string): FmSafeHeader
     if previous != size-result.dataStart:
         raise newException(ValueError, "safetensors payload size mismatch")
 
-function fmLoadSafeF32(path: string, header: FmSafeHeader, name: string, shape: seq[int]): seq[float32]
+function fmBF16ToF32(bits: uint16): float32
+    cast[float32](uint32(bits) shl 16)
+
+function fmF16ToF32(bits: uint16): float32
+    # Construct IEEE bits without arithmetic rounding or NaN canonicalization.
+    let sign = (uint32(bits) and 0x8000'u32) shl 16
+    let exponent = (uint32(bits) shr 10) and 31'u32
+    var fraction = uint32(bits) and 0x3ff'u32
+    var word = sign
+    if exponent == 0:
+        if fraction != 0:
+            var exp32 = 113'u32
+            while (fraction and 0x400'u32) == 0:
+                fraction = fraction shl 1
+                dec exp32
+            word = word or (exp32 shl 23) or ((fraction and 0x3ff'u32) shl 13)
+    elif exponent == 31:
+        word = word or 0x7f800000'u32 or (fraction shl 13)
+    else:
+        word = word or ((exponent + 112'u32) shl 23) or (fraction shl 13)
+    cast[float32](word)
+
+function fmValidateScriptTensor(header: FmSafeHeader, name: string, shape: seq[int]): int
+    # Metadata-only preflight, shared by the graph loader and selective reader.
+    if not header.tensors.hasKey(name):
+        raise newException(ValueError, "missing safetensors tensor: " & name)
+    let tensor = header.tensors[name]
+    if tensor.dtype notin ["F32", "BF16", "F16"]:
+        raise newException(ValueError, "safetensors unsupported script weight dtype " & tensor.dtype & ": " & name & "; expected F32, BF16 or F16")
+    if tensor.shape != shape:
+        raise newException(ValueError, "safetensors script shape mismatch: " & name & "; declared " & $shape & ", checkpoint " & $tensor.shape)
+    let width = if tensor.dtype == "F32": 4 else: 2
+    var count = 1
+    for dim in shape:
+        if dim <= 0 or count > high(int) div dim:
+            raise newException(ValueError, "invalid safetensors shape: " & name)
+        count *= dim
+    if count > high(int) div width or tensor.start < 0 or tensor.finish < tensor.start or tensor.finish-tensor.start != int64(count)*int64(width):
+        raise newException(ValueError, "safetensors " & tensor.dtype & " byte count mismatch: " & name)
+    count
+
+function fmLoadSafeF32(path: string, header: FmSafeHeader, name: string, shape: seq[int], script: bool = false): seq[float32]
+    if script:
+        let elements = fmValidateScriptTensor(header, name, shape)
+        let tensor = header.tensors[name]
+        if tensor.dtype != "F32":
+            var bytes = newString(elements*2)
+            var f = open(path, fmRead)
+            defer: f.close()
+            f.setFilePos(header.dataStart+tensor.start)
+            if f.readBuffer(addr bytes[0], bytes.len) != bytes.len:
+                raise newException(ValueError, "truncated safetensors tensor: " & name)
+            result = newSeq[float32](elements)
+            for i in 0 ..< elements:
+                let bits = uint16(ord(bytes[2*i])) or (uint16(ord(bytes[2*i+1])) shl 8)
+                result[i] = if tensor.dtype == "BF16": fmBF16ToF32(bits) else: fmF16ToF32(bits)
+            return
+    # Keep the classic F32 reader and its shape/dtype error unchanged.
     if not header.tensors.hasKey(name):
         raise newException(ValueError, "missing safetensors tensor: " & name)
     let tensor = header.tensors[name]

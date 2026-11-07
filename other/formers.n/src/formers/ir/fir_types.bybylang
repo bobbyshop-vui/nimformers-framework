@@ -2,6 +2,7 @@ import nim "std/tables"
 import nim "session_vm"
 import nim "m3_inference_kernels"
 import nim "backend"
+import nim "std/strutils"
 
 type
   FirBuffer* = object
@@ -21,12 +22,16 @@ type
     name*: string
     ins*, outs*: int
     threads*, tg*, tgBytes*: string
+    tag*: string                    ## optional op tag (script layout only), e.g. aten::linear
     sizeEq*, expects*: seq[string]
     body*: seq[FirKernelLine]
     line*: int
   FirProgram* = object
     kernels*: Table[string, FirKernelDef]
     model*, configPath*, sourcePath*, runtime*: string
+    layout*: string
+    scriptAbi*: int
+    requiredFeatures*: seq[string]
     prefixes*: seq[string]
     symbols*: Table[string, int]
     epsilon*: float32
@@ -43,6 +48,7 @@ type
   FirKernel* = object
     program*: VmProgram
     threads*, tgSize*, tgBytes*: int
+    tag*: string                    ## op tag copied from the kernel definition (metadata only)
   FirMicroBuilder* = proc(model: FirProgram, node: FirNode, bindings: FirBindings): FirKernel {.closure.}
   FirExtArgs* = object
     backend*: Backend
@@ -59,3 +65,36 @@ type
   FirRegistry* = object
     micro*, builtin*: Table[string, FirMicroBuilder]
     external*: Table[string, FirExtBinding]
+
+const FirScriptAbi* = 1
+const FirScriptFeatures* = ["weights_bf16", "weights_f16"]
+
+function firQ4bGroup(dtype: string): int
+    # q4b is group 32; q4b<N> selects group N (script layout, packed Q4 in the arena). 0: not q4b.
+    if dtype == "q4b":
+        return 32
+    if dtype.startsWith("q4b") and dtype.len > 3:
+        let tail = dtype[3 .. ^1]
+        if tail.allCharsInSet({'0'..'9'}):
+            return parseInt(tail)
+    return 0
+
+function firFp4kmWords(n: int, k: int): int
+    # fp4km weight blob in the arena: nibble bytes [n*k/2], scale bytes [n*k/32] (padded to words),
+    # then the 272-float decode table (16 FP4 values, 256 E4M3 scale values times the tensor scale).
+    return (n*(k div 2) + n*(k div 32) + 3) div 4 + 272
+
+function firCheckScriptContract(model: FirProgram)
+    # Also validate callers that construct FirProgram without the text parser.
+    if model.layout != "script":
+        if model.scriptAbi != 0 or model.requiredFeatures.len > 0:
+            raise newException(ValueError, "FIR script_abi and required features need 'layout script'")
+        for name, def in model.kernels:
+            if def.tag.len > 0:
+                raise newException(ValueError, "FIR kernel " & name & ": tag needs 'layout script'")
+        return
+    if model.scriptAbi notin [0, FirScriptAbi]:
+        raise newException(ValueError, "FIR unsupported script_abi " & $model.scriptAbi & "; runner supports 1")
+    for feature in model.requiredFeatures:
+        if feature notin FirScriptFeatures:
+            raise newException(ValueError, "FIR unsupported required feature: " & feature)

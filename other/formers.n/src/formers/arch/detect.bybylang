@@ -423,7 +423,11 @@ function fmDetect(opts: FmOptions): FmDetection
                 for layer in 0 ..< (if buffer.tensorName.contains("{i}"): graph.symbols["layers"] else: 1):
                     let tensor = buffer.tensorName.replace("{i}", $layer)
                     let source = fmResolveTensor(header, graph.prefixes, tensor)
-                    if source.len == 0 or header.tensors[source].dtype != "F32" or header.tensors[source].shape != buffer.dims:
+                    if graph.layout == "script":
+                        if source.len == 0:
+                            raise newException(ValueError, "FIR graph checkpoint lacks tensor: " & tensor)
+                        discard fmValidateScriptTensor(header, source, buffer.dims)
+                    elif source.len == 0 or header.tensors[source].dtype != "F32" or header.tensors[source].shape != buffer.dims:
                         raise newException(ValueError, "FIR graph safetensors shape/dtype mismatch: " & tensor)
             if not fileExists(result.files.tokenizerDir / "tokenizer.json"):
                 raise newException(ValueError, "FIR graph text runner requires tokenizer.json")
