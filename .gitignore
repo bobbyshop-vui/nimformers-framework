@@ -86,3 +86,4 @@ models/tinyllama/tokenizer.model
 skills/lethe-offload/SKILL.md
 test/mamba3/quantize_mamba3
 models/gpt2-125m/model.safetensors
+.venv-torch/

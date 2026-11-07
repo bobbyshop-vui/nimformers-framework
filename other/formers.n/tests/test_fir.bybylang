@@ -1,6 +1,7 @@
 import nim "std/[os, math, json, tables, strutils]"
 import "../src/formers/ir/fir_parse.bybylang"
 import "../src/formers/ir/fir_exec.bybylang"
+import "../src/formers/ir/fir_graph.bybylang"
 import nim "session_vm"
 import nim "vm_interp"
 
@@ -296,3 +297,84 @@ function checkResident(model: FirProgram, registry: FirRegistry)
     echo "PASS resident provider: 48 bytecode/dispatch comparisons; T=1/7/128, layers=0/23, graph-selected custom op; invalid requests rejected; provider removed"
 
 checkResident(model, registry)
+
+
+function checkLayouts()
+    let root = getTempDir() / ("fir_layout_" & $getCurrentProcessId())
+    createDir(root)
+    defer: removeDir(root)
+    writeFile(root / "config.json", "{}")
+    let path = root / "model.fir"
+    var source = "fir 1\nmodel layout_test\nruntime graph\nsym layers = 2\n"
+    source &= "buf activation f32 5\nbuf cache f32 3 per_layer\n"
+    source &= "weight vector f32 bias tensor [3]\nweight matrix f32 projection tensor [2,3]\n"
+    source &= "weight cube f32 conv.weight tensor [2,1,3]\n"
+    source &= "weight repeated f32 blocks.{i}.weight tensor [2,1,3]\n"
+    source &= "weight rank4 f32 volume tensor [1,2,1,3]\n"
+    source &= "weight packed q4 packed.weight tensor [2,1,3]\n"
+    writeFile(path, source)
+    let classic = firParse(path)
+    doAssert classic.layout == "classic"
+    let original = firGraphBindings(classic)
+    # Reproduce the original allocator to check every classic name and offset.
+    var expected = initTable[string, int]()
+    var offset = 0
+    for name, buffer in classic.buffers:
+        if buffer.kind != "weight" or buffer.dims.len == 1:
+            expected[name] = offset
+            offset += buffer.elements * (if buffer.perLayer or buffer.tensorName.contains("{i}"): classic.symbols["layers"] else: 1)
+    doAssert original.memory == expected and original.memoryFloats == offset
+    doAssert not original.memory.hasKey("cube") and not original.memory.hasKey("repeated")
+    doAssert not original.memory.hasKey("matrix") and not original.memory.hasKey("rank4")
+    writeFile(path, source & "layout classic\n")
+    let explicitClassic = firGraphBindings(firParse(path))
+    doAssert explicitClassic.memory == original.memory and explicitClassic.memoryFloats == original.memoryFloats
+
+    writeFile(path, source & "layout script\n")
+    let script = firParse(path)
+    doAssert script.layout == "script"
+    doAssert script.buffers["cube"].tensorName == "conv.weight" and script.buffers["cube"].dims == @[2, 1, 3]
+    let bindings = firGraphBindings(script)
+    offset = 0
+    for name, buffer in script.buffers:
+        let inArena = buffer.kind != "weight" or buffer.dims.len == 1 or (buffer.dtype == "f32" and buffer.dims.len != 2)
+        doAssert bindings.memory.hasKey(name) == inArena
+        if inArena:
+            doAssert bindings.memory[name] == offset
+            offset += buffer.elements * (if buffer.perLayer or buffer.tensorName.contains("{i}"): script.symbols["layers"] else: 1)
+    doAssert bindings.memoryFloats == offset and offset == original.memoryFloats + 24
+    # Exercise only the host arena copy with synthetic values: no backend or checkpoint.
+    var graph = FirGraph(graph: script, bindings: bindings)
+    var memory = newSeq[float32](bindings.memoryFloats)
+    for name in ["vector", "cube", "repeated", "rank4"]:
+        let buffer = script.buffers[name]
+        for layer in 0 ..< (if name == "repeated": 2 else: 1):
+            var values = newSeq[float32](buffer.elements)
+            for i in 0 ..< values.len:
+                values[i] = float32(100*layer+i+1)
+            fgUploadWeight(graph, name, buffer, layer, values, memory)
+            let base = bindings.memory[name] + layer*buffer.elements
+            for i, value in values:
+                doAssert memory[base+i] == value
+    doAssert graph.fp32.len == 0 and graph.q4.len == 0
+    for name, buffer in script.buffers:
+        if buffer.kind != "weight":
+            for i in 0 ..< buffer.elements * (if buffer.perLayer: 2 else: 1):
+                doAssert memory[bindings.memory[name]+i] == 0
+    var badCount = false
+    try:
+        fgUploadWeight(graph, "cube", script.buffers["cube"], 0, @[1'f32], memory)
+    except ValueError as e:
+        badCount = e.msg.contains("invalid weight element count: conv.weight")
+    doAssert badCount
+    for value in ["unknown", "", "script extra"]:
+        writeFile(path, source & "layout " & value & "\n")
+        var rejected = false
+        try:
+            discard firParse(path)
+        except ValueError as e:
+            rejected = e.msg.contains("layout must be 'classic' or 'script'")
+        doAssert rejected, "invalid layout accepted: " & value
+    echo "PASS FIR layouts: default/explicit classic offsets unchanged; script F32 rank-3/rank-4 and per-layer row-major copies; matrices/Q4 excluded; invalid layouts rejected"
+
+checkLayouts()

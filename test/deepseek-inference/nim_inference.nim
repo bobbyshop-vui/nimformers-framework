@@ -6,6 +6,8 @@ import std/[math, random, sequtils, tables, algorithm, os, strformat, strutils, 
 when defined(posix): import std/posix
 import nimformers  # Tensor, Linear, newLinear, flatten2D, transpose, Embedding, addT...
 import native_hf_tokenizer
+import probe  # structure-only dispatch recorder (off unless BYBY_FIR_PROBE is set)
+from vendor/bybylang/gpubackend import probeName
 export native_hf_tokenizer
 
 # ─────────────────────────────────────────────────────────────
@@ -171,7 +173,7 @@ proc newRMSNormL*(dim: int, eps: float32 = 1e-6'f32): RMSNormL =
   result.eps = eps
   result.weight = newTensor(@[dim], 1'f32)
 
-proc uploadResidentNorm*(rn: var RMSNormL, ctx: Backend) =
+proc uploadResidentNorm*(rn: var RMSNormL, ctx: Backend, name = "") =
   ## Uploads gamma (rn.weight) to the GPU ONCE - called in the model's
   ## uploadResident() at load (like the QKV/FFN resident weights), NOT
   ## in the decode loop. Reuses beResidentUploadFp32 (the missing
@@ -179,6 +181,7 @@ proc uploadResidentNorm*(rn: var RMSNormL, ctx: Backend) =
   ## risk of introducing a new bug.
   rn.residentGamma = beResidentUploadFp32(ctx, rn.weight.data)
   rn.residentGammaReady = true
+  if unlikely(firProbeOn): probeName(rn.residentGamma, name, "f32", [rn.weight.data.len])
 
 proc rmsNormPrep*(rn: RMSNormL, x: Tensor, ctx: Backend): tuple[invBroadcast, wBroadcast: seq[float32], n: int] =
   ## Splits the "reduce" part of RMSNorm (squares + per-row sum via
@@ -2584,7 +2587,7 @@ proc forwardPrefillFlash(m: LlamaModelL, xData: seq[float32], T: int, ctx: Backe
     result = prefillFlashChunk(m, xData[start * C ..< (start + rows) * C], rows, pos + start, ctx, cache)
     start += rows
 
-proc forwardStep*(m: LlamaModelL, ids: seq[int], ctx: Backend, cache: var KVCacheL,
+proc forwardStepImpl(m: LlamaModelL, ids: seq[int], ctx: Backend, cache: var KVCacheL,
                    isPrefill: bool): Tensor =
   ## isPrefill=true: ids = the whole prompt (T tokens). isPrefill=false: ids = exactly 1 new token.
   ## Returns logits [1, 1, vocab] for the last token only; nothing samples
@@ -2700,6 +2703,19 @@ proc forwardStep*(m: LlamaModelL, ids: seq[int], ctx: Backend, cache: var KVCach
 # ===================================================================
 # Read local config.json directly; quant.nim loads the compressed weights.
 # ===================================================================
+proc forwardStep*(m: LlamaModelL, ids: seq[int], ctx: Backend, cache: var KVCacheL,
+                   isPrefill: bool): Tensor =
+  ## Probe-aware entry point: one recorded step per call when BYBY_FIR_PROBE is set.
+  if unlikely(firProbeOn):
+    probeStepBegin(if isPrefill: "prefill" else: "decode", cache.seqLen, cache.seqLen,
+                   (if ids.len > 0: ids[ids.len - 1] else: 0), max(ids.len, 1))
+    try:
+      result = forwardStepImpl(m, ids, ctx, cache, isPrefill)
+    finally:
+      probeStepEnd()
+  else:
+    result = forwardStepImpl(m, ids, ctx, cache, isPrefill)
+
 proc newLlamaLConfig*(modelPath: string): LlamaLConfig =
   let path = if fileExists(modelPath) and modelPath.endsWith(".json"): modelPath
              else: modelPath / "config.json"
@@ -2769,6 +2785,7 @@ proc loadLlamaWeightsL*(m: var LlamaModelL, path: string) =
     let wName = prefix & ".weight"
     if byName.hasKey(wName):
       setQuantWeight(lin, byName[wName])
+      lin.name = wName
     # Zero biases (exporters write them for bias-free Llama/DeepSeek layers)
     # would only cost an upload + add per layer per token; drop them.
     let b = get(prefix & ".bias")
@@ -2817,6 +2834,7 @@ proc loadLlamaWeightsL*(m: var LlamaModelL, path: string) =
   # (acceptable since lm_head runs forward ONCE per token, not 224 times).
   if byName.hasKey("lm_head.weight"):
     setQuantWeight(m.lmHead, byName["lm_head.weight"])
+    m.lmHead.name = "lm_head.weight"
   elif embW.len > 0 or m.embed.weight.mappedData.owner != nil:
     # Tied embeddings: lm_head reads the same rows as the embedding.
     m.lmHead.weight.data = embW
@@ -2862,8 +2880,8 @@ proc uploadAllResidentWeights*(m: var LlamaModelL, ctx: Backend) =
     tune(m.blocks[l].attn.vProj); tune(m.blocks[l].attn.oProj)
     tune(m.blocks[l].ff.gateProj); tune(m.blocks[l].ff.upProj)
     tune(m.blocks[l].ff.downProj)
-    uploadResidentNorm(m.blocks[l].inputNorm, ctx)
-    uploadResidentNorm(m.blocks[l].postAttnNorm, ctx)
+    uploadResidentNorm(m.blocks[l].inputNorm, ctx, "model.layers." & $l & ".input_layernorm.weight")
+    uploadResidentNorm(m.blocks[l].postAttnNorm, ctx, "model.layers." & $l & ".post_attention_layernorm.weight")
   uploadResident(m.lmHead, ctx)  # no-op for tied embeddings (useQuant=false)
   tune(m.lmHead)
   var zeroCopy, residentQ4 = 0
@@ -2879,7 +2897,7 @@ proc uploadAllResidentWeights*(m: var LlamaModelL, ctx: Backend) =
   count(m.lmHead)
   echo &"  weight (Q4 + lm_head): {zeroCopy}/{residentQ4} read by the GPU directly from the mmap (zero-copy), " &
     &"{residentQ4 - zeroCopy} copied from the mmap into GPU buffers."
-  uploadResidentNorm(m.finalNorm, ctx)
+  uploadResidentNorm(m.finalNorm, ctx, "model.norm.weight")
   # OPTIMISATION: the gamma of ALL 32*2+1 RMSNorms (input+postAttn per layer + final)
   # is now uploaded ONCE here, instead of sessionUpload() FROM
   # SCRATCH in EVERY layer EVERY token in forwardPrefill/forwardDecode - saving

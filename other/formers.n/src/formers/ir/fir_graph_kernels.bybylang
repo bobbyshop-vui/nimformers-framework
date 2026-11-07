@@ -12,6 +12,10 @@ function firGraphBindings(model: FirProgram): FirBindings
     for name, buffer in model.buffers:
         if buffer.kind != "weight" or buffer.dims.len == 1:
             names.add(name)
+        elif model.layout == "script" and buffer.dtype == "f32" and buffer.dims.len != 2:
+            names.add(name)
+        elif model.layout == "script" and (buffer.dtype in ["f32a", "fp4km"] or firQ4bGroup(buffer.dtype) > 0):
+            names.add(name)
     # Sorting is unnecessary for correctness: every program uses this same map.
     for name in names:
         let buffer = model.buffers[name]
@@ -61,7 +65,8 @@ function fgValidateExternal(model: FirProgram, node: FirNode)
     let w = model.buffers[ins[1]]
     let x = model.buffers[ins[0]]
     let y = model.buffers[outs[0]]
-    if w.kind != "weight" or (w.dtype notin ["q4", "f32"] or (node.op != "fir.linear" and w.dtype != "f32")) or w.dims.len != 2 or x.kind == "weight" or y.kind == "weight":
+    let dtypeOk = (node.op == "fir.linear" and w.dtype in ["q4", "f32"]) or (node.op == "fir.linear_t" and w.dtype in ["q4t", "f32"]) or (node.op == "fir.embedding" and w.dtype == "f32")
+    if w.kind != "weight" or not dtypeOk or w.dims.len != 2 or x.kind == "weight" or y.kind == "weight":
         raise newException(ValueError, "FIR graph external requires matching weight dtype and f32 activations: " & node.name)
     let expected = if node.op == "fir.linear": @[x.elements, y.elements] else: @[y.elements, x.elements]
     if node.op == "fir.embedding":

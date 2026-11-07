@@ -1,0 +1,317 @@
+# Synthetic checkpoint and instruction-contract fixtures; no model weights.
+import nim "std/[os, tables, json, math, strutils]"
+import nim "backend"
+import nim "session_vm"
+import nim "vm_interp"
+import nim "vendor/bybylang/backends/cpu/cpu_backend"
+import "../src/formers/ir/fir_parse.bybylang"
+import "../src/formers/ir/fir_exec.bybylang"
+import "../src/formers/ir/fir_kernel.bybylang"
+import "../src/formers/ir/fir_graph.bybylang"
+import "../src/formers/io/safetensors.bybylang"
+import "../src/formers/arch/detect.bybylang"
+
+function checkConversions()
+    let half = @[(0x0000'u16, 0x00000000'u32), (0x8000'u16, 0x80000000'u32), (0x0001'u16, 0x33800000'u32), (0x8001'u16, 0xb3800000'u32), (0x03ff'u16, 0x387fc000'u32), (0x0400'u16, 0x38800000'u32), (0x3c01'u16, 0x3f802000'u32), (0x7bff'u16, 0x477fe000'u32), (0xfbff'u16, 0xc77fe000'u32), (0x7c00'u16, 0x7f800000'u32), (0xfc00'u16, 0xff800000'u32), (0x7e01'u16, 0x7fc02000'u32), (0x7c01'u16, 0x7f802000'u32), (0xfe01'u16, 0xffc02000'u32)]
+    let brain = @[(0x0000'u16, 0x00000000'u32), (0x8000'u16, 0x80000000'u32), (0x0001'u16, 0x00010000'u32), (0x8001'u16, 0x80010000'u32), (0x007f'u16, 0x007f0000'u32), (0x0080'u16, 0x00800000'u32), (0x3f81'u16, 0x3f810000'u32), (0x7f7f'u16, 0x7f7f0000'u32), (0xff7f'u16, 0xff7f0000'u32), (0x7f80'u16, 0x7f800000'u32), (0xff80'u16, 0xff800000'u32), (0x7fc1'u16, 0x7fc10000'u32), (0x7f81'u16, 0x7f810000'u32), (0xffc1'u16, 0xffc10000'u32)]
+    for pair in half:
+        doAssert cast[uint32](fmF16ToF32(pair[0])) == pair[1]
+    for pair in brain:
+        doAssert cast[uint32](fmBF16ToF32(pair[0])) == pair[1]
+    # Independent numeric oracle: every finite 16-bit value is exact in F32.
+    for word in 0 .. 65535:
+        for bf in [false, true]:
+            let fractionBits = if bf: 7 else: 10
+            let maxExponent = if bf: 255 else: 31
+            let bias = if bf: 127 else: 15
+            let fraction = word and ((1 shl fractionBits)-1)
+            let exponent = (word shr fractionBits) and maxExponent
+            let negative = (word and 32768) != 0
+            let actual = if bf: fmBF16ToF32(uint16(word)) else: fmF16ToF32(uint16(word))
+            if exponent == maxExponent:
+                let expected = (if negative: 0x80000000'u32 else: 0'u32) or 0x7f800000'u32 or (uint32(fraction) shl (23-fractionBits))
+                doAssert cast[uint32](actual) == expected
+            else:
+                let magnitude = if exponent == 0: float(fraction)*pow(2.0, float(1-bias-fractionBits)) else: (1.0+float(fraction)/float(1 shl fractionBits))*pow(2.0, float(exponent-bias))
+                let expected = float32(if negative: -magnitude else: magnitude)
+                doAssert cast[uint32](actual) == cast[uint32](expected), "conversion word " & $word
+    echo "PASS script conversions: 28 golden vectors and 131072 exhaustive bit comparisons (BF16/F16, signed zero, subnormals, max, inf, NaN payloads)"
+
+function parseSource(root, source: string): FirProgram
+    writeFile(root / "model.fir", "fir 1\nmodel fixture\n" & source)
+    firParse(root / "model.fir")
+
+function parseError(root, source, message: string)
+    var actual = ""
+    try:
+        discard parseSource(root, source)
+    except ValueError as e:
+        actual = e.msg
+    doAssert actual.contains(message), "expected " & message & ", got " & actual
+
+function checkGates(root: string)
+    let graph = parseSource(root, "script_abi 1\nrequire feature weights_bf16\nrequire feature weights_f16\nlayout script\n")
+    doAssert graph.scriptAbi == 1 and graph.requiredFeatures == @["weights_bf16", "weights_f16"]
+    doAssert parseSource(root, "layout script\n").scriptAbi == 0
+    for value in ["0", "2", "-1", "bogus"]:
+        parseError(root, "script_abi " & value & "\nlayout script\n", "unsupported script_abi " & value)
+    parseError(root, "layout script\nscript_abi\n", "expected one 'script_abi 1'")
+    parseError(root, "layout script\nscript_abi 1 extra\n", "expected one 'script_abi 1'")
+    parseError(root, "layout script\nscript_abi 1\nscript_abi 1\n", "expected one 'script_abi 1'")
+    parseError(root, "require feature future\nlayout script\n", "unsupported required feature: future")
+    parseError(root, "layout script\nrequire feature\n", "expected 'require feature NAME'")
+    parseError(root, "layout script\nrequire feature weights_f16 extra\n", "expected 'require feature NAME'")
+    for layout in ["", "layout classic\n"]:
+        parseError(root, layout & "script_abi 1\n", "unknown declaration 'script_abi'")
+        parseError(root, layout & "require feature weights_bf16\n", "malformed require")
+    # The final layout controls gates even when declarations precede it.
+    parseError(root, "layout script\nscript_abi 1\nlayout classic\n", "unknown declaration 'script_abi'")
+    for defect in ["abi", "feature"]:
+        var bad = graph
+        if defect == "abi":
+            bad.scriptAbi = 99
+        else:
+            bad.requiredFeatures.add("future")
+        var actual = ""
+        try:
+            # An absent file and uninitialized backend prove negotiation runs first.
+            discard firLoadGraph(bad, root / "absent.safetensors", Backend())
+        except ValueError as e:
+            actual = e.msg
+        doAssert actual.contains(if defect == "abi": "unsupported script_abi" else: "unsupported required feature")
+    echo "PASS script gates: late layout, legacy script, ABI/feature errors, classic errors and negotiation before checkpoint/backend access"
+
+function appendWord(data: var string, word: uint32, width: int)
+    for i in 0 ..< width:
+        data.add(char((word shr (8*i)) and 255'u32))
+
+function writeSafe(path: string, header: JsonNode, payload: string)
+    let text = $header
+    var data = ""
+    let length = uint64(text.len)
+    for i in 0 ..< 8:
+        data.add(char((length shr (8*i)) and 255'u64))
+    writeFile(path, data & text & payload)
+
+function checkWireConversions(root: string)
+    var header = newJObject()
+    var payload = ""
+    let half = @[0x0000'u32, 0x8000'u32, 0x0001'u32, 0x03ff'u32, 0x0400'u32, 0x3c01'u32, 0x7bff'u32, 0x7c00'u32, 0xfc00'u32, 0x7c01'u32, 0xfe01'u32]
+    let brain = @[0x0000'u32, 0x8000'u32, 0x0001'u32, 0x007f'u32, 0x0080'u32, 0x3f81'u32, 0x7f7f'u32, 0x7f80'u32, 0xff80'u32, 0x7f81'u32, 0xffc1'u32]
+    let halfExpected = @[0x00000000'u32, 0x80000000'u32, 0x33800000'u32, 0x387fc000'u32, 0x38800000'u32, 0x3f802000'u32, 0x477fe000'u32, 0x7f800000'u32, 0xff800000'u32, 0x7f802000'u32, 0xffc02000'u32]
+    let brainExpected = @[0x00000000'u32, 0x80000000'u32, 0x00010000'u32, 0x007f0000'u32, 0x00800000'u32, 0x3f810000'u32, 0x7f7f0000'u32, 0x7f800000'u32, 0xff800000'u32, 0x7f810000'u32, 0xffc10000'u32]
+    for dtype in ["F16", "BF16", "F32"]:
+        let start = payload.len
+        let words = if dtype == "F16": half elif dtype == "BF16": brain else: halfExpected
+        for word in words:
+            appendWord(payload, word, (if dtype == "F32": 4 else: 2))
+        header[dtype] = %*{"dtype": dtype, "shape": [words.len], "data_offsets": [start, payload.len]}
+    let path = root / "vectors.safetensors"
+    writeSafe(path, header, payload)
+    let safe = fmReadSafeHeader(path)
+    for dtype in ["F16", "BF16", "F32"]:
+        let expected = if dtype == "BF16": brainExpected else: halfExpected
+        let values = fmLoadSafeF32(path, safe, dtype, @[expected.len], true)
+        for i, value in values:
+            doAssert cast[uint32](value) == expected[i]
+    echo "PASS safetensors wire vectors: 33 exact BF16/F16/F32 bit patterns, little-endian decoding and NaN payload preservation"
+
+function addTensor(header: JsonNode, payload: var string, name, dtype: string, shape: seq[int], count: int): seq[float32]
+    let start = payload.len
+    for i in 0 ..< count:
+        # Exactly representable, nonuniform inputs for transpose and partial Q4 groups.
+        let value = float32((i mod 17)-8)*0.25'f32
+        let word = cast[uint32](value)
+        if dtype == "F32":
+            appendWord(payload, word, 4)
+        elif dtype == "BF16":
+            appendWord(payload, word shr 16, 2)
+        else:
+            var bits = 0'u32
+            if value != 0:
+                bits = ((word shr 16) and 0x8000'u32) or ((((word shr 23) and 255'u32)-112'u32) shl 10) or ((word shr 13) and 1023'u32)
+            appendWord(payload, bits, 2)
+        result.add(value)
+    header[name] = %*{"dtype": dtype, "shape": shape, "data_offsets": [start, payload.len]}
+
+function loadError(graph: FirProgram, path, message: string)
+    var actual = ""
+    try:
+        # Preflight errors must win over the missing runtime symbols/roles.
+        discard firLoadGraph(graph, path, Backend())
+    except ValueError as e:
+        actual = e.msg
+    doAssert actual.contains(message), "expected " & message & ", got " & actual
+
+function checkCheckpoint(root: string)
+    var source = "runtime graph\nlayout script\nscript_abi 1\nrequire feature weights_bf16\nrequire feature weights_f16\nprefix checkpoint.\nsym layers = 2\nsym positions = 1\nsym vocab = 2\n"
+    source &= "buf token f32 1 input:token\nbuf position f32 1 input:position\nbuf logits f32 2 output:logits\n"
+    source &= "weight vector f32 vector tensor [4]\nweight cube f32 cube tensor [1,2,2]\nweight rank4 f32 rank4 tensor [1,1,2,2]\nweight repeated f32 blocks.{i}.weight tensor [1,2,2]\n"
+    source &= "weight matrix f32 matrix tensor [2,2]\nweight matrix_b f32 matrix_b tensor [2,2]\nweight matrix32 f32 matrix32 tensor [2,2]\nweight vector32 f32 vector32 tensor [4]\nweight quant q4 blocks.{i}.quant tensor [35,2]\n"
+    let graph = parseSource(root, source)
+    var header = newJObject()
+    var payload = ""
+    var expected = initTable[string, seq[float32]]()
+    for name, buffer in graph.buffers:
+        if buffer.kind != "weight":
+            continue
+        for layer in 0 ..< (if buffer.tensorName.contains("{i}"): 2 else: 1):
+            let tensor = fgTensorName(buffer, layer)
+            let dtype = if name in ["matrix32", "vector32"]: "F32" elif name in ["cube", "matrix"] or (name in ["repeated", "quant"] and layer == 1): "F16" else: "BF16"
+            expected[tensor] = addTensor(header, payload, "checkpoint." & tensor, dtype, buffer.dims, buffer.elements)
+    let path = root / "mixed.safetensors"
+    writeSafe(path, header, payload)
+    writeFile(root / "tokenizer.json", "{}")
+    var opts = fmDefaultOptions()
+    opts.modelsDir = root
+    opts.modelFile = path
+    opts.backend = "cpu"
+    let detected = fmDetect(opts)
+    doAssert detected.supported and detected.route == frFir, detected.errors.join("; ")
+    let safe = fmReadSafeHeader(path)
+    for name, buffer in graph.buffers:
+        if buffer.kind == "weight":
+            for layer in 0 ..< (if buffer.tensorName.contains("{i}"): 2 else: 1):
+                let tensor = fgTensorName(buffer, layer)
+                doAssert fmLoadSafeF32(path, safe, "checkpoint." & tensor, buffer.dims, true) == expected[tensor]
+    var loaded = firLoadGraph(graph, path, newBackend("cpu"))
+    defer: firFreeGraph(loaded)
+    var reference = firNewGraph(graph, expected, newBackend("cpu"), firDefaultRegistry())
+    defer: firFreeGraph(reference)
+    doAssert loaded.arena.cpuData == reference.arena.cpuData
+    doAssert loaded.fp32.len == 3 and loaded.q4.len == 2
+    for name, handle in loaded.fp32:
+        doAssert handle.cpuData == expected[name]
+    for name, handle in loaded.q4:
+        doAssert handle.cpuWq == reference.q4[name].cpuWq
+        doAssert handle.cpuScales == reference.q4[name].cpuScales
+        doAssert handle.cpuZeros == reference.q4[name].cpuZeros
+    for layout in ["", "layout classic\n"]:
+        let classic = parseSource(root, layout & "runtime graph\nsym layers = 1\nsym positions = 1\nsym vocab = 2\nbuf token f32 1 input:token\nbuf position f32 1 input:position\nbuf logits f32 2 output:logits\nprefix checkpoint.\nweight vector f32 vector tensor [4]\n")
+        var actual = ""
+        try:
+            discard firLoadGraph(classic, path, newBackend("cpu"))
+        except ValueError as e:
+            actual = e.msg
+        doAssert actual == "safetensors shape/dtype mismatch: checkpoint.vector"
+    echo "PASS mixed script checkpoint: 11 tensors, BF16/F16/F32, ranks 1/2/3/4, prefix and per-layer arena/Q4, exact resident F32 and Q4 input parity; classic BF16 error unchanged"
+
+    # Invalid selected tensors are found before fgPrepare can check graph roles.
+    for dtype in ["BF16", "F16", "I8", "F8_E4M3"]:
+        var badHeader = newJObject()
+        var badPayload = ""
+        discard addTensor(badHeader, badPayload, "bad", "F16", @[2], 2)
+        badHeader["bad"]["dtype"] = %dtype
+        let badPath = root / "bad.safetensors"
+        let badGraph = parseSource(root, "layout script\nweight w f32 bad tensor [2]\n")
+        if dtype in ["I8", "F8_E4M3"]:
+            writeSafe(badPath, badHeader, badPayload)
+            loadError(badGraph, badPath, "unsupported script weight dtype " & dtype & ": bad")
+        else:
+            for extra in [-2, 2]:
+                let bytes = badPayload & "xx"
+                let size = badPayload.len+extra
+                badHeader["bad"]["data_offsets"] = %*[0, size]
+                writeSafe(badPath, badHeader, bytes[0 ..< size])
+                loadError(badGraph, badPath, "safetensors " & dtype & " byte count mismatch: bad")
+            badHeader["bad"]["data_offsets"] = %*[0, badPayload.len]
+            badHeader["bad"]["shape"] = %*[1, 2]
+            writeSafe(badPath, badHeader, badPayload)
+            loadError(badGraph, badPath, "script shape mismatch: bad")
+            badHeader["bad"]["shape"] = %*[2]
+            writeSafe(badPath, badHeader, badPayload)
+            let stale = fmReadSafeHeader(badPath)
+            let valid = readFile(badPath)
+            writeFile(badPath, valid[0 ..< valid.len-1])
+            var rejected = false
+            try:
+                discard fmLoadSafeF32(badPath, stale, "bad", @[2], true)
+            except ValueError as e:
+                rejected = e.msg == "truncated safetensors tensor: bad"
+            doAssert rejected
+    echo "PASS script checkpoint preflight: unsupported I8/F8, BF16/F16 short/long bytes, complete shapes and truncated reads rejected before upload"
+
+function program(root, directives, body: string): VmProgram
+    let graph = parseSource(root, directives & "buf out f32 8\nkernel probe in=0 out=1 threads=1 tg=1 tgbytes=16\n" & body & "endkernel\nnode probe micro probe -> out\n")
+    firMicroProgram(graph.nodes[0], graph, firDefaultRegistry(), firGraphBindings(graph))
+
+function checkInstructions(root: string)
+    for mnemonic in ["nop", "forend", "ifend", "barriertg", "forbegin", "ifbegin", "loadlid", "loadtgid", "utgid", "ulid", "add", "sub", "mul", "div", "cmplt", "uadd", "umul", "fma", "exp", "neg", "sigmoid", "softplus", "rsqrt", "rtou", "utor", "uconst", "uaddk", "umulk", "uandk", "ushrk", "ushlk", "uloadf32", "ustoref32", "uatomicadd", "loadf32", "storef32", "tgloadf32", "tgstoref32", "addconst", "mulconst", "loadconstf32"]:
+        let signature = fkSignature(mnemonic)
+        doAssert signature != "?"
+        var args: seq[string]
+        for kind in signature:
+            args.add(if kind == 'k': "0" else: "1")
+        var body = mnemonic & " " & args.join(" ") & "\n"
+        if mnemonic == "forbegin":
+            body &= "forend\n"
+        if mnemonic == "forend":
+            body = "forbegin 1\n" & body
+        if mnemonic == "ifbegin":
+            body &= "ifend\n"
+        if mnemonic == "ifend":
+            body = "ifbegin 1\n" & body
+        let classic = program(root, "", body)
+        doAssert program(root, "layout script\nscript_abi 1\n", body).words == classic.words
+    # Script-only integer helpers: a register shift and byte/word loads of the float arena.
+    for mnemonic in ["ushr", "uloadu8", "uloadu32"]:
+        let body = "uconst 0 1\nuconst 1 2\nuconst 2 1\n" & (if mnemonic == "ushr": "ushr 3 0 2\n" else: mnemonic & " 3 0 0\n")
+        discard program(root, "layout script\nscript_abi 1\n", body)
+        var gated = false
+        try:
+            discard program(root, "", body)
+        except ValueError as e:
+            gated = e.msg.contains("needs 'layout script'")
+        doAssert gated
+    for mnemonic in ["halt", "gridbarrier", "loadu8", "tloadf16"]:
+        var rejected = false
+        try:
+            discard program(root, "layout script\nscript_abi 1\n", mnemonic & "\n")
+        except ValueError as e:
+            rejected = e.msg.contains("unknown mnemonic '" & mnemonic & "'")
+        doAssert rejected
+    let common = "loadconstf32 1 3\nloadconstf32 2 0\nforbegin 1\naddconst 2 2 1\nforend\nuconst 0 0\nustoref32 2 0 0\n"
+    let original = program(root, "", common)
+    for directives in ["layout classic\n", "layout script\n", "layout script\nscript_abi 1\n"]:
+        doAssert program(root, directives, common).words == original.words
+    for body in ["loadconstf32 1 3\nforbegin 1\nifbegin 1\nloadconstf32 1 0\nifend\nforend\n", "uconst 0 1\nushrk 1 0 32\n", "uconst 0 1\nushlk 1 0 32\n"]:
+        discard program(root, "layout classic\n", body)
+        discard program(root, "layout script\n", body)
+        var rejected = false
+        try:
+            discard program(root, "layout script\nscript_abi 1\n", body)
+        except ValueError as e:
+            rejected = e.msg.contains("immutable") or e.msg.contains("shift count must be in 0..31")
+        doAssert rejected
+    echo "PASS FIR instruction whitelist: 41 accepted/5 rejected mnemonics; classic/legacy/ABI 1 bytecode parity; ABI 1 immutable loop counts and shift domains"
+
+    var mem = newSeq[float32](8)
+    let loop = program(root, "", "loadconstf32 1 3\nloadconstf32 2 0\nforbegin 1\nloadconstf32 1 0\naddconst 2 2 1\nforend\nuconst 0 0\nustoref32 2 0 0\n")
+    doAssert cpu_backend.vmRun(loop.words, mem, newSeq[float32](), 1, 4, 1)
+    doAssert mem[0] == 3
+    runGrid(loop, mem, 1, 1)
+    doAssert mem[0] == 1
+    let shifts = program(root, "", "uconst 0 1\nushlk 1 0 32\nushrk 2 0 32\nutor 1 1\nutor 2 2\nuconst 0 0\nustoref32 1 0 0\nustoref32 2 0 1\n")
+    doAssert cpu_backend.vmRun(shifts.words, mem, newSeq[float32](), 1, 4, 1)
+    doAssert mem[0] == 1 and mem[1] == 1
+    let wrap = program(root, "", "uconst 0 4294967295\nuloadf32 1 0 1\n")
+    doAssert not cpu_backend.vmRun(wrap.words, mem, newSeq[float32](), 1, 4, 1)
+    doAssert cpuLastErrorMessage().contains("u_load_f32"), cpuLastErrorMessage()
+    let numeric = program(root, "layout script\nscript_abi 1\n", "loadconstf32 1 1.00000011920928955078125\nloadconstf32 2 0.99999988079071044921875\nloadconstf32 3 -1\nfma 4 1 2 3\nuconst 0 0\nustoref32 4 0 0\nloadconstf32 5 100\nsoftplus 6 5\nustoref32 6 0 1\n")
+    doAssert cpu_backend.vmRun(numeric.words, mem, newSeq[float32](), 1, 4, 1)
+    doAssert cast[uint32](mem[0]) == 0xa8800000'u32
+    doAssert classify(mem[1]) == fcInf
+    echo "PASS production CPU conformance: snapshotted loop=3 vs interpreter=1, masked shifts=32, nonwrapping address rejection, fused FMA=-2^-46, softplus(100)=inf"
+
+function main()
+    let root = getTempDir() / ("fir_script_" & $getCurrentProcessId())
+    createDir(root)
+    defer: removeDir(root)
+    writeFile(root / "config.json", "{}")
+    checkConversions()
+    checkGates(root)
+    checkWireConversions(root)
+    checkCheckpoint(root)
+    checkInstructions(root)
+
+main()

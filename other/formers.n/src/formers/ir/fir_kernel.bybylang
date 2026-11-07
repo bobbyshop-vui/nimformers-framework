@@ -138,12 +138,12 @@ function fkSignature(mnemonic: string): string
     case mnemonic
     of "nop", "forend", "ifend", "barriertg": ""
     of "forbegin", "ifbegin", "loadlid", "loadtgid", "utgid", "ulid": "r"
-    of "add", "sub", "mul", "div", "cmplt", "uadd", "umul": "rrr"
+    of "add", "sub", "mul", "div", "cmplt", "uadd", "umul", "ushr": "rrr"
     of "fma": "rrrr"
     of "exp", "neg", "sigmoid", "softplus", "rsqrt", "rtou", "utor": "rr"
     of "uconst": "rk"
     of "uaddk", "umulk", "uandk", "ushrk", "ushlk": "rrk"
-    of "uloadf32", "ustoref32", "uatomicadd", "loadf32", "storef32", "tgloadf32", "tgstoref32": "rrk"
+    of "uloadf32", "ustoref32", "uatomicadd", "loadf32", "storef32", "tgloadf32", "tgstoref32", "uloadu8", "uloadu32": "rrk"
     of "addconst", "mulconst": "rrf"
     of "loadconstf32": "rf"
     else: "?"
@@ -167,6 +167,9 @@ function fkEmit(p: var VmProgram, mnemonic: string, a: seq[uint32], f: float32)
     of "cmplt": p.emitCmpLt(a[0], a[1], a[2])
     of "uadd": p.emitUAdd(a[0], a[1], a[2])
     of "umul": p.emitUMul(a[0], a[1], a[2])
+    of "ushr": p.emitUShr(a[0], a[1], a[2])
+    of "uloadu8": p.emitULoadU8(a[0], a[1], a[2])
+    of "uloadu32": p.emitULoadU32(a[0], a[1], a[2])
     of "fma": p.emitFma(a[0], a[1], a[2], a[3])
     of "exp": p.emitExp(a[0], a[1])
     of "neg": p.emitNeg(a[0], a[1])
@@ -237,11 +240,14 @@ function firAssembleKernel(def: FirKernelDef, model: FirProgram, node: FirNode, 
             raise newException(ValueError, "FIR kernel " & s.where & ": " & parts[0] & " has " & $int(s.syms[key]) & " elements, expected " & parts[1])
     var p: VmProgram
     var scopes: seq[string]
+    var loopCounts: seq[uint32]
     for line in def.body:
         s.where = def.name & " line " & $line.line
         let sig = fkSignature(line.mnemonic)
         if sig == "?":
             raise newException(ValueError, "FIR kernel " & def.name & " line " & $line.line & ": unknown mnemonic '" & line.mnemonic & "'")
+        if line.mnemonic in ["ushr", "uloadu8", "uloadu32"] and model.layout != "script":
+            raise newException(ValueError, "FIR kernel " & def.name & " line " & $line.line & ": '" & line.mnemonic & "' needs 'layout script'")
         if line.args.len != sig.len:
             raise newException(ValueError, "FIR kernel " & def.name & " line " & $line.line & ": '" & line.mnemonic & "' takes " & $sig.len & " arguments")
         var a: seq[uint32]
@@ -253,14 +259,25 @@ function firAssembleKernel(def: FirKernelDef, model: FirProgram, node: FirNode, 
                 a.add(fkU32(s, line.args[i]))
                 if kind == 'r' and a[^1] > FkMaxRegister:
                     raise newException(ValueError, "FIR kernel " & def.name & " line " & $line.line & ": register out of range (0..31)")
+        if model.layout == "script" and model.scriptAbi == FirScriptAbi:
+            # ABI 1 uses the common domain of the existing CPU/JIT instructions.
+            if line.mnemonic in ["ushrk", "ushlk"] and a[2] > 31:
+                raise newException(ValueError, "FIR kernel " & s.where & ": script shift count must be in 0..31")
+            let writesFloat = line.mnemonic in ["loadconstf32", "add", "sub", "mul", "div", "fma", "neg", "exp", "rsqrt", "sigmoid", "softplus", "addconst", "mulconst", "cmplt", "loadlid", "loadtgid", "utor", "loadf32", "uloadf32", "tgloadf32"]
+            if writesFloat and a[0] in loopCounts:
+                raise newException(ValueError, "FIR kernel " & s.where & ": script loop count register is immutable inside its loop")
         case line.mnemonic
-        of "forbegin": scopes.add("for")
+        of "forbegin":
+            scopes.add("for")
+            loopCounts.add(a[0])
         of "ifbegin": scopes.add("if")
         of "forend", "ifend":
             let want = if line.mnemonic == "forend": "for" else: "if"
             if scopes.len == 0 or scopes[^1] != want:
                 raise newException(ValueError, "FIR kernel " & def.name & " line " & $line.line & ": unbalanced " & line.mnemonic)
             scopes.setLen(scopes.len - 1)
+            if want == "for":
+                loopCounts.setLen(loopCounts.len - 1)
         else: discard
         fkEmit(p, line.mnemonic, a, f)
     if scopes.len > 0:
@@ -270,3 +287,4 @@ function firAssembleKernel(def: FirKernelDef, model: FirProgram, node: FirNode, 
     result.threads = int(fkEval(s, def.threads))
     result.tgSize = int(fkEval(s, def.tg))
     result.tgBytes = int(fkEval(s, def.tgBytes))
+    result.tag = def.tag

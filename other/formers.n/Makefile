@@ -19,7 +19,7 @@ SOURCES     := $(shell find $(ROOT)/$(HERE)/src -name '*.bybylang')
 
 export BYBYLANG_NIMCACHE ?= $(ROOT)/nimcache/formers-n
 
-.PHONY: all build test fir-test fir-graph-test fir-probe smoke clean
+.PHONY: all build test fir-test fir-graph-test fir-probe fir-lift-test smoke clean
 
 all: build
 
@@ -44,6 +44,8 @@ fir-test: fir-graph-test $(ROOT)/$(BYBYLANG)
 	cd $(ROOT) && mkdir -p $(HERE)/build && \
 	  $(BYBYLANG) $(FIR_TEST_SRC) --aot=$(HERE)/build/test_fir --quiet && \
 	  $(HERE)/build/test_fir && \
+	  $(BYBYLANG) $(HERE)/tests/test_fir_script.bybylang --aot=$(HERE)/build/test_fir_script --quiet && \
+	  $(HERE)/build/test_fir_script && \
 	  $(MAKE) -C $(HERE) build && \
 	  $(CLI_BIN) --fir-check models/mamba3-1.5b/model.fir && \
 	  for f in models/*/model.fir; do $(CLI_BIN) --fir-check $$f || exit 1; done
@@ -63,6 +65,28 @@ fir-graph-test: $(ROOT)/$(BYBYLANG)
 	cd $(ROOT) && mkdir -p $(HERE)/build && \
 	  $(BYBYLANG) models/gpt2-125m/test_model.bybylang --aot=$(HERE)/build/test_fir_graph --quiet && \
 	  $(HERE)/build/test_fir_graph
+
+# Trace recorder, lifter, library numeric test and builder round trip.
+fir-lift-test: build
+	cd $(ROOT) && nim c -d:release --hints:off --path:vendor/bybylang \
+	  --nimcache:nimcache/firlift -o:$(HERE)/firlift/firlift $(HERE)/firlift/firlift_main.nim
+	cd $(ROOT) && nim c -d:release --hints:off --path:vendor/bybylang \
+	  --nimcache:nimcache/fir-library-test -o:$(HERE)/firlift/test_library $(HERE)/firlift/test_library.nim
+	cd $(ROOT) && $(HERE)/firlift/test_library
+	cd $(ROOT) && nim c -d:release --hints:off --mm:arc --path:vendor/bybylang --path:. --path:kernelfortest \
+	  --nimcache:nimcache/session-gpu-test -o:$(HERE)/firlift/test_session_gpu $(HERE)/firlift/test_session_gpu.nim
+	# Every backend present (Metal, Vulkan/MoltenVK) records an op trace; each must lower completely.
+	for b in metal vulkan; do \
+	  cd $(ROOT) && rm -f /tmp/fir-session-ops-$$b.fprobe && \
+	  BACKEND=$$b BYBY_FIR_PROBE=/tmp/fir-session-ops-$$b.fprobe BYBY_FIR_PROBE_STEPS=decode:1 $(HERE)/firlift/test_session_gpu || exit 1; \
+	  if grep -q '^op ' /tmp/fir-session-ops-$$b.fprobe 2>/dev/null; then \
+	    $(HERE)/firlift/firlift --trace /tmp/fir-session-ops-$$b.fprobe --config $(HERE)/firlift/coverage_config.json \
+	      --out /tmp/fir-session-ops-$$b --coverage || exit 1; fi; \
+	done
+	cd $(ROOT) && nim c -d:release --hints:off --path:vendor/bybylang \
+	  --nimcache:nimcache/builder-test -o:$(HERE)/firlift/builder_test $(HERE)/firlift/builder_test.nim
+	cd $(ROOT) && $(HERE)/firlift/builder_test
+	cd $(ROOT) && $(CLI_BIN) --fir-check /tmp/fir-builder/model.fir
 
 # JSON-lines diagnostic runner; the Python quality check keeps all output in memory.
 fir-probe: $(ROOT)/$(BYBYLANG)

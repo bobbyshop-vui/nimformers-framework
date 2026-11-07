@@ -57,11 +57,23 @@ function firParse(path: string, configOverride: string = ""): FirProgram
     if not fileExists(path):
         raise newException(IOError, "FIR file not found: " & path)
     result.sourcePath = path
+    result.layout = "classic"
     var cfgPath = ""
     var rawLines = readFile(path).splitLines()
+    # Resolve the final layout outside kernel bodies before gated declarations.
+    # Leave validation in the original pass to preserve classic error ordering.
+    var headerLayout = "classic"
+    var headerKernel = false
     for i, raw in rawLines:
         let line = raw.split('#', 1)[0].strip()
         let w = line.splitWhitespace()
+        if w.len > 0:
+            if w[0] == "kernel":
+                headerKernel = true
+            elif w[0] == "endkernel":
+                headerKernel = false
+            elif not headerKernel and w.len == 2 and w[0] == "layout" and w[1] in ["classic", "script"]:
+                headerLayout = w[1]
         if w.len >= 2 and w[0] == "config":
             cfgPath = parentDir(path) / w[1]
     if cfgPath.len == 0:
@@ -98,6 +110,7 @@ function firParse(path: string, configOverride: string = ""): FirProgram
     var sawHeader = false
     var lineNo = 0
     var openKernel = ""
+    var sawScriptAbi = false
     result.kernels = initTable[string, FirKernelDef]()
     for raw in rawLines:
         inc lineNo
@@ -122,6 +135,19 @@ function firParse(path: string, configOverride: string = ""): FirProgram
             if w.len != 2 or w[1] != "graph":
                 raise newException(ValueError, "FIR line " & $lineNo & ": runtime must be 'graph'")
             result.runtime = w[1]
+        of "layout":
+            if w.len != 2 or w[1] notin ["classic", "script"]:
+                raise newException(ValueError, "FIR line " & $lineNo & ": layout must be 'classic' or 'script'")
+            result.layout = w[1]
+        of "script_abi":
+            if headerLayout != "script":
+                raise newException(ValueError, "FIR line " & $lineNo & ": unknown declaration 'script_abi'")
+            if sawScriptAbi or w.len != 2:
+                raise newException(ValueError, "FIR line " & $lineNo & ": expected one 'script_abi 1' directive")
+            if w[1] != $FirScriptAbi:
+                raise newException(ValueError, "FIR line " & $lineNo & ": unsupported script_abi " & w[1] & "; runner supports 1")
+            result.scriptAbi = FirScriptAbi
+            sawScriptAbi = true
         of "prefix":
             # Optional tensor-name prefixes tried after the plain name (e.g. "transformer.").
             result.prefixes.add(w[1 .. ^1])
@@ -134,7 +160,13 @@ function firParse(path: string, configOverride: string = ""): FirProgram
         of "require":
             # require config KEY VALUE : a config value that is present must equal VALUE (absent passes).
             # require sym EXPR = EXPR  : integer expressions over the symbols must be equal.
-            if w.len >= 4 and w[1] == "config":
+            if headerLayout == "script" and w.len >= 2 and w[1] == "feature":
+                if w.len != 3:
+                    raise newException(ValueError, "FIR line " & $lineNo & ": expected 'require feature NAME'")
+                if w[2] notin FirScriptFeatures:
+                    raise newException(ValueError, "FIR line " & $lineNo & ": unsupported required feature: " & w[2])
+                result.requiredFeatures.add(w[2])
+            elif w.len >= 4 and w[1] == "config":
                 let node = cfg{w[2]}
                 let actual = if node.isNil or node.kind == JNull: "" elif node.kind == JString: node.getStr() else: $node
                 if actual.len > 0 and actual != w[3]:
@@ -181,7 +213,21 @@ function firParse(path: string, configOverride: string = ""): FirProgram
                     raise newException(ValueError, "FIR weight dimensions must be positive")
                 b.elements *= size
                 b.dims.add(size)
-            if result.buffers.hasKey(b.name) or b.dtype notin ["f32", "q4"]:
+            # Script-only dtypes: q4t (resident Q4, [out,in]), f32a (arena resident matrix) and
+            # q4b (packed Q4 [out,in] stored in the arena: nibble bytes, then scales, then zeros).
+            let q4bGroup = firQ4bGroup(b.dtype)
+            let scriptDtype = b.dtype in ["q4t", "f32a", "fp4km"] or q4bGroup > 0
+            if b.dtype == "fp4km":
+                if b.dims.len != 2 or b.dims[1] mod 32 != 0:
+                    raise newException(ValueError, "FIR fp4km weight needs a 2-D [out,in] shape with in divisible by 32: " & b.name)
+                b.elements = firFp4kmWords(b.dims[0], b.dims[1])
+            if q4bGroup > 0:
+                if b.dims.len != 2:
+                    raise newException(ValueError, "FIR q4b weight needs a 2-D [out,in] shape: " & b.name)
+                let bytesPerRow = (b.dims[1] + 1) div 2
+                let groups = (b.dims[1] + q4bGroup - 1) div q4bGroup
+                b.elements = (b.dims[0]*bytesPerRow + 3) div 4 + 2*b.dims[0]*groups
+            if result.buffers.hasKey(b.name) or (b.dtype notin ["f32", "q4", "q4t", "f32a", "fp4km"] and q4bGroup == 0) or (scriptDtype and headerLayout != "script"):
                 raise newException(ValueError, "FIR duplicate weight or unsupported dtype: " & b.name)
             result.buffers[b.name] = b
         of "repeat":
@@ -207,6 +253,15 @@ function firParse(path: string, configOverride: string = ""): FirProgram
                 of "threads": def.threads = kv[1]
                 of "tg": def.tg = kv[1]
                 of "tgbytes": def.tgBytes = kv[1]
+                of "tag":
+                    # Metadata only: op identity such as aten::linear or aten::add+aten::gelu.
+                    var tagOk = kv[1].len > 0 and kv[1].len <= 120
+                    for ch in kv[1]:
+                        if not (ch.isAlphaNumeric or ch == '_' or ch == ':' or ch == '+' or ch == '.'):
+                            tagOk = false
+                    if not tagOk:
+                        raise newException(ValueError, "FIR line " & $lineNo & ": invalid kernel tag")
+                    def.tag = kv[1]
                 of "size": def.sizeEq = kv[1].split(',')
                 of "expect": def.expects = kv[1].split(',')
                 else:
@@ -234,3 +289,4 @@ function firParse(path: string, configOverride: string = ""): FirProgram
             raise newException(ValueError, "FIR line " & $lineNo & ": unknown declaration '" & w[0] & "'")
     if not sawHeader or result.model.len == 0 or inRepeat or openKernel.len > 0:
         raise newException(ValueError, "FIR requires a version, model, and closed repeat scopes")
+    firCheckScriptContract(result)

@@ -140,6 +140,7 @@ function firMicroKey(node: FirNode): string
     node.op
 
 function firValidate(model: FirProgram, registry: FirRegistry, bindings: FirBindings)
+    firCheckScriptContract(model)
     for node in model.nodes:
         let inputs = node.inputs.splitWhitespace()
         let outputs = node.outputs.splitWhitespace()
