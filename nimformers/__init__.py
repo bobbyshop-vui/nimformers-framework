@@ -25,8 +25,10 @@ from ._lib import (
 from .core import Context, Nimformers, ResidentF32Weights, ResidentQ4Weights, cpu_info
 from .model import LlamaConfig, LlamaModel
 from .quant import KIND_IDS, QuantKind, QuantTensor
+from .session import Buffer, Session
 from .state import StateDict
 from .tensor import Tensor
+from .tracing import Trace, trace, trace_active, trace_file, trace_stop
 from .tokenizer import SentencePieceTokenizer, Tokenizer
 from .vm import Op, VMProgram
 
@@ -44,7 +46,14 @@ __all__ = [
     "LlamaConfig",
     "LlamaModel",
     "VMProgram",
+    "Buffer",
+    "Session",
     "Op",
+    "Trace",
+    "trace",
+    "trace_active",
+    "trace_file",
+    "trace_stop",
     "NimformersError",
     "ResidentF32Weights",
     "ResidentQ4Weights",

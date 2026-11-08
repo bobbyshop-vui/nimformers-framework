@@ -128,7 +128,7 @@ function firMicroKernel(node: FirNode, model: FirProgram, registry: FirRegistry,
         raise newException(ValueError, "FIR unknown micro kernel '" & node.op & "' (node " & node.name & ")")
     else:
         result = registry.micro[node.op](model, node, bindings)
-    if result.threads <= 0 or result.tgSize <= 0 or result.threads mod result.tgSize != 0 or result.tgBytes < 0:
+    if result.threads <= 0 or result.tgSize <= 0 or (not result.slotLayout and result.threads mod result.tgSize != 0) or result.tgBytes < 0:
         raise newException(ValueError, "FIR invalid dispatch geometry: " & node.op)
     if result.program.words.len <= 1:
         raise newException(ValueError, "FIR kernel '" & node.op & "' built an empty or Halt-only program")
@@ -168,6 +168,8 @@ function firValidate(model: FirProgram, registry: FirRegistry, bindings: FirBind
                 elif node.op == "m3.embedding":
                     if model.buffers[inputs[0]].elements != 1 or weight.dims != @[model.symbols["vocab"], model.buffers[outputs[0]].elements]:
                         raise newException(ValueError, "FIR embedding shape mismatch: " & node.name)
+        of "session":
+            discard
         of "builtin":
             if not registry.builtin.hasKey(node.op) or registry.builtin[node.op].isNil:
                 raise newException(ValueError, "FIR unknown builtin '" & node.op & "' (node " & node.name & ")")

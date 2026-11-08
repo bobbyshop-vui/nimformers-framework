@@ -226,8 +226,6 @@ proc initLayerV2*(ctx: Backend; H, D, N, G, C, cDim, K, hidden: int;
   result.eps = eps
   result.hWork  = byby.sessionUploadPrivate(be, buf)
   result.hGamma = byby.sessionUploadPrivate(be, ln1Gamma)
-  probeName(result.hGamma, "mamba2.norm.weight", "f32", [ln1Gamma.len])
-  probeRole(result.hWork, "state")
   block:
     var ones = newSeq[float32](ln1Gamma.len)
     for i in 0 ..< ones.len: ones[i] = 1'f32

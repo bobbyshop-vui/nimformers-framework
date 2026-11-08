@@ -130,16 +130,12 @@ proc prepareM3Runtime*(m:var NimformerModelJamba;ctx:Backend)=
     setOffset(moDt,w.dt);setOffset(moSkip,w.skip)
     setOffset(moLpS,s.lpS);setOffset(moLpZ,s.lpZ);setOffset(moLpZNext,s.lpZNext)
     st.layerOffsets.add(sessionUpload(st.be,offsets))
-    probeName(st.layerOffsets[^1], "layerOffsets." & $i, "f32", [offsets.len])
-    probeRole(st.layerOffsets[^1], "layerOffsets")
   st.stateEnd=endState
   discard param(m.rmsF.gamma.data)
   st.constants=sessionUpload(st.be,st.paramData)
   st.arena=sessionUpload(st.be,newSeq[float32](endState))
-  probeRole(st.arena, "state", st.stateStart*4, (st.stateEnd-st.stateStart)*4)
   st.zeros=sessionUpload(st.be,newSeq[float32](endState-st.stateStart))
   st.readback=sessionAllocScratch(st.be,m.vocab+4)
-  probeRole(st.readback, "logits", 0, m.vocab*4)
   st.ready=true;st.modelKey=m.pattern & ":" & $m.embedDim & ":" & $m.vocab
   gM3Runtime=st
 
@@ -285,8 +281,6 @@ proc runM3Resident*(m:var NimformerModelJamba;ids:seq[int];ctx:Backend;produceLo
   let setupStart=getMonoTime().ticks
   preparePrograms(m,T) # compile before opening the command buffer
   let pr=gM3Runtime.programs[T]
-  if unlikely(firProbeOn):
-    probeEvent("note kind=mamba3 detail=\"resident roles and layerOffsets registered; host embedding omitted\"")
   let odMode=getEnv("BYBY_ONE_DISPATCH","0")
   require(odMode in ["0","1","auto"],"BYBY_ONE_DISPATCH must be 0, 1 or auto")
   var useOd=T==1 and produceLogits and odMode!="0" and not gDisableLora and not gM3Runtime.skipAttn and not trace

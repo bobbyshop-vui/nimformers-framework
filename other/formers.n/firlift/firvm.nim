@@ -113,7 +113,7 @@ proc uConstExpr*(value: uint32; ports: seq[LiftPort]): string =
 proc floatOf(w: uint32): float32 =
   copyMem(addr result, unsafeAddr w, 4)
 
-proc needsWord(op: uint32): bool =
+proc needsWord*(op: uint32): bool =
   case op
   of OpLoadF32, OpStoreF32, OpLoadU8, OpLoadConst, OpFma, OpAddConst, OpMulConst,
      OpTgLoadF32, OpTgStoreF32, OpUConst, OpUAddK, OpUMulK, OpUAndK, OpUShrK,
@@ -124,7 +124,7 @@ proc needsWord(op: uint32): bool =
   else:
     false
 
-proc arityWord(op: uint32): int =
+proc arityWord*(op: uint32): int =
   case op
   of OpVtgBegin: 2
   else: 1

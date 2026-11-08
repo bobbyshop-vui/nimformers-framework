@@ -287,6 +287,63 @@ thô. `tg_floats` tính bộ nhớ threadgroup theo số ô float; `tg_size` c�
 số thread/group, 0 để backend chọn.
 
 
+## Buffer resident và Session
+
+Model cần trọng số và trạng thái nằm lại trên GPU giữa các dispatch. `Buffer` giữ dữ liệu float32 trên
+thiết bị còn `Session` ghi nhiều dispatch rồi mới submit một lần. Dispatch cần backend Metal
+(`ctx.backend == "metal"`); buffer và chương trình được tạo qua context.
+
+```python
+import numpy as np
+from nimformers import Buffer, Context, Op, Session
+
+with Context() as ctx:
+    x = Buffer(ctx, np.arange(64, dtype=np.float32))     # trọng số / đầu vào
+    y = Buffer(ctx, size=64)                              # trạng thái, khởi tạo 0
+    p = ctx.vm_program()
+    p.emit(Op.U_LID, 0)
+    p.emit(Op.U_LOAD_IN, 1, 0, value=0)                   # r1 = input[lane]
+    p.mul_const(1, 1, 2.0)
+    p.emit(Op.U_STORE_F32, 1, 0, value=0)                 # mem[lane] = r1
+    p.halt()
+    sess = Session(ctx)
+    kernel = sess.compile(p, "double")                    # JIT một lần, ngoài session
+    with sess:                                            # một command buffer
+        sess.dispatch(kernel, threads=64, tg_size=64, mem=y, input=x)
+    print(y.read(0, 64))                                  # chỉ đọc được sau khi session đóng
+```
+
+| API | Ý nghĩa |
+| --- | --- |
+| `Buffer(ctx, data=None, size=None)` | Buffer float32 resident từ `data`, hoặc `size` số 0. Có `.size`, `.handle`. |
+| `Buffer.read(offset=0, n=None)` | Chép `n` float về NumPy. Chỉ khi không có session đang mở. |
+| `Buffer.close()` | Giải phóng bộ nhớ thiết bị (cũng khi bị dọn rác). |
+| `Session(ctx)` | Một session; `with sess:` mở và submit. |
+| `Session.compile(program, tag="py")` | JIT một `VMProgram` và trả về tên kernel; cache theo chương trình và tag. Gọi ngoài session đang mở. |
+| `Session.dispatch(kernel, *, threads, tg_size, tg_bytes=16, mem=None, u8=None, lut=None, input=None)` | Ghi một dispatch. Mỗi binding là `Buffer` hoặc `(Buffer, float_offset)`; `mem` đọc/ghi float32, `u8` byte, `lut` và `input` chỉ đọc float32. Địa chỉ trong chương trình tính từ buffer được bind cộng offset. |
+| `Session.set(buffer, offset, values)` | Trong session đang mở: ghi float từ host vào buffer. |
+| `Session.step(token, position, kind="decode")` | Context manager đánh dấu một bước host cho [trace](trace-api.vi.md). `kind` là `"decode"` hoặc `"prefill"`. |
+| `Session.set_step_inputs(buffer, token_offset, position_offset, token, position)` | Trong session: ghi token và vị trí của bước, có gán vai trò để trace lift được. |
+
+Một bước model thường là `with sess.step(token, pos): with sess: set_step_inputs(...); dispatch(...)...`;
+xem `examples/python/qwen3_moe_vm.py` và `examples/python/forge_vm.py` cho model đầy đủ.
+
+## Trace
+
+`nimformers.trace(path, steps="", data=True, data_max=0)` ghi lại một lần chạy để lift thành
+`model.fir`. Nó là context manager; `trace_active()`, `trace_file()` và `trace_stop()` truy vấn và
+dừng recorder của tiến trình. Xem [Trace API](trace-api.vi.md) cho tham số, bản Nim, BybyLang, C và
+quy trình trace → lift → chạy.
+
+```python
+import nimformers as nf
+
+with nf.trace("run.fprobe", steps="decode:2"):
+    for pos, tok in enumerate(tokens):
+        model.step(tok)
+```
+
+
 ## Tokenizer
 
 ```python
@@ -350,6 +407,8 @@ text decode, source lower và khóa chương trình phải được giải phón
 | `quant.nim` | `nimf_quantize` / `nimf_quant_dequantize`, truy cập payload và state dict NIMQ |
 | `customfloat.nim` | encode/decode, chọn dtype APF và cast training |
 | `vendor/bybylang/micro_kernel` | tạo chương trình, I/O `.bvm`, lower và dispatch |
+| `session_low.nim` / `session_vm_dispatch.nim` | buffer resident, session, dispatch có trạng thái (`nimf_buf_*`, `nimf_sess_*`, `nimf_prog_compile`) |
+| `trace.nim` | recorder trace FIR (`nimf_trace_*`, `nimf_probe_step`) |
 | `test/deepseek-inference/native_hf_tokenizer.nim` | tokenizer HF |
 | `test/codestral/sentencepiece_native.nim` | tokenizer SentencePiece |
 | `test/deepseek-inference/nim_inference.nim` | cấu hình Llama, load trọng số và sinh token |

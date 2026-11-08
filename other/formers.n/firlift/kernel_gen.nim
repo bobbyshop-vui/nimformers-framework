@@ -770,6 +770,50 @@ proc genRopePos*(Hn, D: int; ratio: float; posScale = 1.0; outScale = 1.0): Gen 
     k.e("uaddk", xb, xb, 1))
   k.done(Hn, 2, 1)
 
+proc genRopePosRows*(T, Hn, D: int; ratio: float; posScale = 1.0; outScale = 1.0): Gen =
+  ## Rotate-half RoPE over T consecutive tokens, x laid out [T, Hn, D]; row t sits at position
+  ## `position + t` (scalar port in1 holds the first position). ports in0=x in1=position out0=y
+  ## (may alias x); lane = head.
+  let half = D div 2
+  let k = newKB()
+  let zero = k.cu(0)
+  let pos0 = k.r()
+  let pos = k.r()
+  let freq = k.r()
+  let ang = k.r()
+  let sn = k.r()
+  let cs = k.r()
+  let x1 = k.r()
+  let x2 = k.r()
+  let o = k.r()
+  let xb = k.u()
+  k.e("uloadf32", pos0, zero, "@in1")
+  if posScale != 1.0: k.e("mulconst", pos0, pos0, fnum(posScale))
+  k.e("umulk", xb, 0, D)
+  k.forN(T, proc() =
+    k.e("loadconstf32", freq, 1)
+    k.e("mulconst", pos, pos0, 1)
+    k.forN(half, proc() =
+      k.e("mul", ang, pos, freq)
+      k.sincosOf(ang, sn, cs)
+      k.e("uloadf32", x1, xb, "@in0")
+      k.e("uloadf32", x2, xb, "@in0+" & $half)
+      k.e("mul", o, x1, cs)
+      k.e("mul", ang, x2, sn)
+      k.e("sub", o, o, ang)
+      if outScale != 1.0: k.e("mulconst", o, o, fnum(outScale))
+      k.e("ustoref32", o, xb, "@out0")
+      k.e("mul", o, x2, cs)
+      k.e("mul", ang, x1, sn)
+      k.e("add", o, o, ang)
+      if outScale != 1.0: k.e("mulconst", o, o, fnum(outScale))
+      k.e("ustoref32", o, xb, "@out0+" & $half)
+      k.e("mulconst", freq, freq, fnum(ratio))
+      k.e("uaddk", xb, xb, 1))
+    k.e("addconst", pos0, pos0, fnum(posScale))
+    k.e("uaddk", xb, xb, Hn*D - half))
+  k.done(Hn, 2, 1)
+
 proc genMatmulQ4*(M, K, N, groupSize, nGroups: int; wqByteOffset = 0; packed = false): Gen =
   ## sessionMatmulQ4(a, w, c, M): C[m,n] = sum_k A[m,k] * (nib(n,k) - zero[n,g]) * scale[n,g],
   ## nibble low = even k, high = odd k, g = k / groupSize.

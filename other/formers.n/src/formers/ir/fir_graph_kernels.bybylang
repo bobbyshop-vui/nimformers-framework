@@ -5,22 +5,40 @@ import nim "session_vm"
 import nim "backend"
 import "fir_types.bybylang"
 
-function firGraphBindings(model: FirProgram): FirBindings
+function firGraphBindings(model: FirProgram, separateRawWeights: bool = false): FirBindings
     var offset = 0
+    result.separateRawWeights = separateRawWeights
+    var slots = false
+    for name, kernel in model.kernels:
+        if kernel.layout == "slots":
+            slots = true
     # Allocate small weight vectors in memF32 alongside graph activations.
     var names: seq[string]
     for name, buffer in model.buffers:
+        if buffer.viewOf.len > 0:
+            continue
+        if separateRawWeights and firResidentRaw(model, name):
+            result.memory[name] = 0
+            continue
         if buffer.kind != "weight" or buffer.dims.len == 1:
             names.add(name)
         elif model.layout == "script" and buffer.dtype == "f32" and buffer.dims.len != 2:
             names.add(name)
-        elif model.layout == "script" and (buffer.dtype in ["f32a", "fp4km"] or firQ4bGroup(buffer.dtype) > 0):
+        elif model.layout == "script" and (buffer.dtype in ["f32a", "fp4km", "raw"] or firQ4bGroup(buffer.dtype) > 0):
             names.add(name)
     # Sorting is unnecessary for correctness: every program uses this same map.
     for name in names:
         let buffer = model.buffers[name]
+        if slots:
+            # Preserve vector alignment when relocating whole recorded buffers.
+            offset = ((offset+63) div 64)*64
         result.memory[name] = offset
         offset += buffer.elements * (if buffer.perLayer or buffer.tensorName.contains("{i}"): model.symbols["layers"] else: 1)
+    for name, buffer in model.buffers:
+        if buffer.viewOf.len > 0:
+            if not result.memory.hasKey(buffer.viewOf):
+                raise newException(ValueError, "FIR view needs arena base: " & name)
+            result.memory[name] = result.memory[buffer.viewOf] + buffer.viewOffset
     result.memoryFloats = offset
     result.T = 1
 
@@ -70,7 +88,8 @@ function fgValidateExternal(model: FirProgram, node: FirNode)
         raise newException(ValueError, "FIR graph external requires matching weight dtype and f32 activations: " & node.name)
     let expected = if node.op == "fir.linear": @[x.elements, y.elements] else: @[y.elements, x.elements]
     if node.op == "fir.embedding":
-        if x.elements != 1 or w.dims[1] != y.elements:
+        let rows = if node.phase.len > 0: model.phases[node.phase] else: 1
+        if x.elements != 1 or w.dims[1]*rows != y.elements:
             raise newException(ValueError, "FIR graph embedding shape mismatch: " & node.name)
     elif w.dims != expected:
         raise newException(ValueError, "FIR graph matrix shape mismatch: " & node.name)

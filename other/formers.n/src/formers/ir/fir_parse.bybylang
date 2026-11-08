@@ -110,6 +110,7 @@ function firParse(path: string, configOverride: string = ""): FirProgram
     var sawHeader = false
     var lineNo = 0
     var openKernel = ""
+    var currentPhase = ""
     var sawScriptAbi = false
     result.kernels = initTable[string, FirKernelDef]()
     for raw in rawLines:
@@ -216,7 +217,7 @@ function firParse(path: string, configOverride: string = ""): FirProgram
             # Script-only dtypes: q4t (resident Q4, [out,in]), f32a (arena resident matrix) and
             # q4b (packed Q4 [out,in] stored in the arena: nibble bytes, then scales, then zeros).
             let q4bGroup = firQ4bGroup(b.dtype)
-            let scriptDtype = b.dtype in ["q4t", "f32a", "fp4km"] or q4bGroup > 0
+            let scriptDtype = b.dtype in ["q4t", "f32a", "fp4km", "raw"] or q4bGroup > 0
             if b.dtype == "fp4km":
                 if b.dims.len != 2 or b.dims[1] mod 32 != 0:
                     raise newException(ValueError, "FIR fp4km weight needs a 2-D [out,in] shape with in divisible by 32: " & b.name)
@@ -227,9 +228,45 @@ function firParse(path: string, configOverride: string = ""): FirProgram
                 let bytesPerRow = (b.dims[1] + 1) div 2
                 let groups = (b.dims[1] + q4bGroup - 1) div q4bGroup
                 b.elements = (b.dims[0]*bytesPerRow + 3) div 4 + 2*b.dims[0]*groups
-            if result.buffers.hasKey(b.name) or (b.dtype notin ["f32", "q4", "q4t", "f32a", "fp4km"] and q4bGroup == 0) or (scriptDtype and headerLayout != "script"):
+            if result.buffers.hasKey(b.name) or (b.dtype notin ["f32", "q4", "q4t", "f32a", "fp4km", "raw"] and q4bGroup == 0) or (scriptDtype and headerLayout != "script"):
                 raise newException(ValueError, "FIR duplicate weight or unsupported dtype: " & b.name)
             result.buffers[b.name] = b
+        of "view":
+            # view NAME BASE OFFSET COUNT; offsets/counts are float words.
+            if w.len < 5 or w.len > 6 or result.buffers.hasKey(w[1]) or not result.buffers.hasKey(w[2]):
+                raise newException(ValueError, "FIR invalid view declaration")
+            let base = result.buffers[w[2]]
+            let offset = firEvalExpr(w[3], result.symbols)
+            let count = firEvalExpr(w[4], result.symbols)
+            if base.viewOf.len > 0 or offset < 0 or count <= 0 or offset > base.elements-count:
+                raise newException(ValueError, "FIR view outside base buffer: " & w[1])
+            result.buffers[w[1]] = FirBuffer(name: w[1], dtype: "f32", elements: count, dims: @[count], viewOf: w[2], viewOffset: offset)
+            if w.len == 6:
+                if not w[5].startsWith("output:") and not w[5].startsWith("input:"):
+                    raise newException(ValueError, "FIR invalid view role")
+                result.buffers[w[1]].role = w[5].split(':', 1)[1]
+        of "init":
+            # init NAME FILE BYTE_OFFSET BYTE_COUNT; 'checkpoint' means the selected weights file.
+            if w.len notin [5, 6] or not result.buffers.hasKey(w[1]):
+                raise newException(ValueError, "FIR invalid init declaration")
+            var b = result.buffers[w[1]]
+            b.initFile = w[2]
+            b.initOffset = parseInt(w[3])
+            b.initBytes = parseInt(w[4])
+            if w.len == 6:
+                b.initFingerprint = w[5]
+            if b.viewOf.len > 0 or b.initOffset < 0 or b.initBytes <= 0 or b.initBytes > b.elements*4:
+                raise newException(ValueError, "FIR invalid init range: " & b.name)
+            result.buffers[w[1]] = b
+        of "initwords":
+            if w.len < 3 or not result.buffers.hasKey(w[1]):
+                raise newException(ValueError, "FIR invalid initwords declaration")
+            if w.len-2 != result.buffers[w[1]].elements:
+                raise newException(ValueError, "FIR initwords size mismatch")
+            for word in w[2 .. ^1]:
+                if word.len != 8 or not word.allCharsInSet(HexDigits):
+                    raise newException(ValueError, "FIR invalid initializer word")
+                result.buffers[w[1]].initialWords.add(uint32(parseHexInt(word)))
         of "repeat":
             if inRepeat or w.len != 2 or w[1] != "layers":
                 raise newException(ValueError, "FIR supports one layer repeat scope")
@@ -253,6 +290,11 @@ function firParse(path: string, configOverride: string = ""): FirProgram
                 of "threads": def.threads = kv[1]
                 of "tg": def.tg = kv[1]
                 of "tgbytes": def.tgBytes = kv[1]
+                of "layout":
+                    if kv[1] != "slots":
+                        raise newException(ValueError, "FIR unsupported kernel layout: " & kv[1])
+                    def.layout = kv[1]
+                of "slots": def.slots = kv[1].split(',')
                 of "tag":
                     # Metadata only: op identity such as aten::linear or aten::add+aten::gelu.
                     var tagOk = kv[1].len > 0 and kv[1].len <= 120
@@ -272,15 +314,35 @@ function firParse(path: string, configOverride: string = ""): FirProgram
             if openKernel.len == 0:
                 raise newException(ValueError, "FIR line " & $lineNo & ": unexpected endkernel")
             openKernel = ""
+        of "phase":
+            if w.len < 2:
+                raise newException(ValueError, "FIR line " & $lineNo & ": phase needs a name ('phase NAME rows=N' or 'phase decode')")
+            if w[1] != "decode":
+                if w.len < 3 or w.len > 4 or not w[2].startsWith("rows=") or (w.len == 4 and not w[3].startsWith("logits=")):
+                    raise newException(ValueError, "FIR line " & $lineNo & ": expected 'phase NAME rows=N [logits=BUFFER]'")
+                let rows = parseInt(w[2][5 .. ^1])
+                if rows < 2:
+                    raise newException(ValueError, "FIR line " & $lineNo & ": phase rows must be at least 2")
+                if result.phases.hasKey(w[1]):
+                    raise newException(ValueError, "FIR line " & $lineNo & ": duplicate phase " & w[1])
+                result.phases[w[1]] = rows
+                if w.len == 4:
+                    result.phaseLogits[w[1]] = w[3][7 .. ^1]
+                result.phaseOrder.add(w[1])
+                currentPhase = w[1]
+            else:
+                if w.len != 2:
+                    raise newException(ValueError, "FIR line " & $lineNo & ": phase decode takes no arguments")
+                currentPhase = ""
         of "node":
             if w.len < 4:
                 raise newException(ValueError, "FIR line " & $lineNo & ": malformed node")
-            var n = FirNode(name: w[1], kind: w[2], op: w[3], line: lineNo, perLayer: inRepeat)
+            var n = FirNode(name: w[1], kind: w[2], op: w[3], line: lineNo, perLayer: inRepeat, phase: currentPhase)
             let arrow = w.find("->")
-            if arrow < 4 or arrow == w.high:
+            if arrow < 4:
                 raise newException(ValueError, "FIR line " & $lineNo & ": node requires inputs -> outputs")
             n.inputs = w[4 ..< arrow].join(" ")
-            n.outputs = w[arrow + 1 .. ^1].join(" ")
+            n.outputs = if arrow < w.high: w[arrow + 1 .. ^1].join(" ") else: ""
             for previous in result.nodes:
                 if previous.name == n.name:
                     raise newException(ValueError, "FIR duplicate node: " & n.name)

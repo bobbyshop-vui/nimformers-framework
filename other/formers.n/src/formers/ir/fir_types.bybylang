@@ -10,10 +10,14 @@ type
     elements*: int
     dims*: seq[int]
     perLayer*: bool
+    viewOf*, initFile*, initFingerprint*: string
+    viewOffset*, initOffset*, initBytes*: int
+    initialWords*: seq[uint32]
   FirNode* = object
     name*, kind*, op*, inputs*, outputs*: string
     line*: int
     perLayer*: bool
+    phase*: string                  ## "" = decode step, otherwise the name of a declared `phase`
   FirKernelLine* = object
     mnemonic*: string
     args*: seq[string]
@@ -26,6 +30,8 @@ type
     sizeEq*, expects*: seq[string]
     body*: seq[FirKernelLine]
     line*: int
+    layout*: string
+    slots*: seq[string]
   FirProgram* = object
     kernels*: Table[string, FirKernelDef]
     model*, configPath*, sourcePath*, runtime*: string
@@ -37,6 +43,11 @@ type
     epsilon*: float32
     buffers*: Table[string, FirBuffer]
     nodes*: seq[FirNode]
+    phases*: Table[string, int]     ## named multi-row phase -> tokens it consumes per run
+    phaseOrder*: seq[string]
+    phaseLogits*: Table[string, string]  ## phase -> buffer holding rows*vocab output floats
+    rebaseOff*: Table[string, int]       ## buffer -> float offset inside its allocation (filled by the graph runner)
+    rebaseUnit*: Table[string, string]   ## buffer -> allocation that holds it (arena root or weight pool)
   FirBindings* = object
     arena*: M3Arena
     state*: M3DeviceState
@@ -44,11 +55,16 @@ type
     parameterFloats*, finalNorm*, memoryFloats*: int
     T*: int
     dynamicOffsets*: bool
+    separateRawWeights*: bool
     memory*, constants*: Table[string, int]
   FirKernel* = object
     program*: VmProgram
     threads*, tgSize*, tgBytes*: int
     tag*: string                    ## op tag copied from the kernel definition (metadata only)
+    slotLayout*: bool
+    slotOffsets*, slotSizes*: array[5, int]
+    slotBuffers*: array[5, string]
+    slotAnchor*: array[5, int]      ## float offset the domain is bound at; -1 = the buffer's own offset
   FirMicroBuilder* = proc(model: FirProgram, node: FirNode, bindings: FirBindings): FirKernel {.closure.}
   FirExtArgs* = object
     backend*: Backend
@@ -68,6 +84,20 @@ type
 
 const FirScriptAbi* = 1
 const FirScriptFeatures* = ["weights_bf16", "weights_f16"]
+
+function firResidentRaw(model: FirProgram, name: string): bool
+    # Raw weights consumed exclusively through slot kernels need no arena copy.
+    if not model.buffers.hasKey(name) or model.buffers[name].kind != "weight" or model.buffers[name].dtype != "raw":
+        return false
+    for node in model.nodes:
+        for port in (node.inputs & " " & node.outputs).splitWhitespace():
+            if not model.buffers.hasKey(port):
+                continue
+            let base = if model.buffers[port].viewOf.len > 0: model.buffers[port].viewOf else: port
+            if base == name:
+                if node.kind != "micro" or not model.kernels.hasKey(node.op) or model.kernels[node.op].layout != "slots":
+                    return false
+    return true
 
 function firQ4bGroup(dtype: string): int
     # q4b is group 32; q4b<N> selects group N (script layout, packed Q4 in the arena). 0: not q4b.

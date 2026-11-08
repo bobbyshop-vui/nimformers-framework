@@ -55,6 +55,7 @@ lượng tử hóa, backend, session và micro-VM.
   buffer resident và vòng đời.
 - [API micro-VM/JIT](microkernel-api.vi.md): instruction bytecode, lower,
   cache JIT và giới hạn kernel persistent.
+- [Trace API](trace-api.vi.md): `nf.trace` cho Python, Nim, BybyLang và C: ghi một lần chạy thành trace FIR rồi lift thành `model.fir`.
 - [FIR (formers IR)](fir.vi.md): file đồ thị phía model khai báo micro-kernel, kernel backend và kích thước; cờ `--fir` / `--fir-check` của formers.n.
 - [Test tích hợp BybyLang](../test/bybylang_test/README.vi.md): import
   `lib_c_api`, kiểm tra C ABI và native DSL `gpu ...`.
@@ -77,6 +78,7 @@ lượng tử hóa, backend, session và micro-VM.
 - `backend.nim`: [backend](backend-api.vi.md), [session GPU](gpu-session-api.vi.md),
   [backend CPU](cpu-backend.vi.md).
 - `tensor_ops.nim`: [API tensor](tensor-ops-api.vi.md).
+- `trace.nim`: [Trace API](trace-api.vi.md).
 - `nimformer.nim`: [API model cơ bản](base-model-api.vi.md).
 - `test/deepseek-inference/nim_inference.nim`:
   [inference LLaMA](llama-inference-api.vi.md), [tokenizer](tokenizer-api.vi.md).

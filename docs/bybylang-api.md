@@ -122,3 +122,20 @@ directory supplies them in `test/bybylang_test/nim.cfg`. An `import nim` of
 dynamically load the Python shared library.
 
 On macOS where the build/run session needs to remain awake, prefix the relevant commands with `caffeinate -i`. For the GPU process, ensure the backend can access the device; a sandboxed/headless launch may not expose Metal.
+
+## Tracing
+
+`trace.nim` records a run for the FIR lifter. A BybyLang script imports it like any Nim module and calls
+the same functions as Nim code:
+
+```bybylang
+import nim "../../trace"
+
+traceStart("run.fprobe", "decode:2", true, 0)   # path, steps, data, dataMax
+# ... build and run the model ...
+traceStop()
+```
+
+Start the trace **before** compiling kernels: the recorder only sees programs compiled while it is on.
+`traceActive()`, `traceFile()`, `traceBegin`/`traceEnd` (step markers) and the `withTrace`/`traceStep`
+templates are also available. Full reference: [Trace API](trace-api.md).

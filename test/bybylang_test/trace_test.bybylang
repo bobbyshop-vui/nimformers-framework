@@ -1,0 +1,34 @@
+# BybyLang integration test: the FIR trace API (trace.nim) imported into a BybyLang script.
+
+import nim "std/os"
+import nim "std/strutils"
+import nim "../../trace"
+
+print "=== BybyLang -> trace API ==="
+
+dir = getTempDir() / "nf_trace_test_bybylang"
+createDir(dir)
+path = dir / "run.fprobe"
+
+if traceActive():
+    print "FAIL a trace is already active"
+    quit(1)
+
+traceStart(path, "decode:2", false, 0)
+if not traceActive():
+    print "FAIL traceStart did not activate the trace"
+    quit(1)
+if traceFile() != path:
+    print "FAIL traceFile: " & traceFile()
+    quit(1)
+traceStop()
+if traceActive():
+    print "FAIL traceStop left the trace active"
+    quit(1)
+if not readFile(path).startsWith("fprobe"):
+    print "FAIL trace file header"
+    quit(1)
+print "PASS start/stop -> " & path
+
+removeDir(dir)
+print "PASS trace"

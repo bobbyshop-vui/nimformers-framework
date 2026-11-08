@@ -20,18 +20,22 @@ type
 
   Op* = ref object
     id*: int
+    order*: int
     step*: int
+    phase*: int   ## 0 = the selected unit, 1 = earlier ops that produced the state it reads
     tag*, impl*, prog*, rawAttrs*: string
     parent*: int
     ins*, outs*: seq[PortRef]
     attrs*: Table[string, string]
     words*: seq[uint32]
+    bindings*: seq[PortRef]  ## normalized VM domains: mem, u8, lut, input, u32
 
   BufferRec* = object
     bytes*: int
     origin*, name*, dtype*, shape*: string
 
   RoleRec* = object
+    buffer*: int           ## -1 when the record carries no buffer id
     offset*, bytes*: int
     role*: string
 
@@ -46,8 +50,13 @@ type
     dst*, src*: PortRef
     srcOffsetByte*, dstOffsetByte*, n*: int
     data*: seq[uint32]   ## a short host table (permute strides), when the recorder kept it
+    order*: int
+    fingerprint*: string
+    captureOffset*, captureBytes*: int
 
   Trace* = object
+    sourcePath*: string
+    selectionSession*: int
     backend*: string
     bufs*: seq[BufferRec]
     programs*: Table[string, seq[uint32]]
@@ -57,7 +66,9 @@ type
     transfers*: seq[TransferRec]
     hasStep*: bool
     steps*: int
+    decodeFirst*: int
     stepPosition*, stepToken*: int   ## of the last recorded step (-1 when absent)
+    stepPositions*, stepTokens*: seq[int]
 
   BufferDef* = object
     name*: string
@@ -207,7 +218,9 @@ proc parseTrace*(text: string): Trace =
   var words: seq[uint32]
   var seenStep = false
   var inside = false
+  var order = -1
   for raw in text.splitLines():
+    inc order
     if inWords.len > 0:
       let t = raw.strip()
       var hexLine = t.len > 0
@@ -238,8 +251,10 @@ proc parseTrace*(text: string): Trace =
         else: discard
       result.bufs.add b
     elif raw.startsWith("role "):
-      var r = RoleRec()
+      var r = RoleRec(buffer: -1)
       let at = raw.find('@')
+      let idText = raw[5 ..< at]
+      if idText.len > 1 and idText[0] == 'b': r.buffer = parseInt(idText[1 .. ^1])
       let colon = raw.find(':', at)
       let rolePos = raw.find("role=")
       r.offset = parseInt(raw[at+1 ..< colon])
@@ -261,7 +276,7 @@ proc parseTrace*(text: string): Trace =
       n.shape = raw[shapePos+6 .. ^1]
       result.names.add n
     elif raw.startsWith("upload ") or raw.startsWith("copy ") or raw.startsWith("read "):
-      var t = TransferRec()
+      var t = TransferRec(order: order, op: -1, captureOffset: -1)
       let toks = raw.splitWhitespace()
       t.kind = toks[0]
       for tok in toks[1 .. ^1]:
@@ -279,6 +294,11 @@ proc parseTrace*(text: string): Trace =
         of "bytes": t.n = parseInt(v) div 4
         of "data":
           for w in v.split(','): t.data.add uint32(parseHexInt(w))
+        of "fingerprint": t.fingerprint = v
+        of "capture":
+          let parts = v.split(':')
+          t.captureOffset = parseInt(parts[0])
+          t.captureBytes = parseInt(parts[1])
         else: discard
       if t.kind == "upload" and t.n == 0: t.n = t.dst.bytes div 4
       result.transfers.add t
@@ -291,12 +311,50 @@ proc parseTrace*(text: string): Trace =
       for tok in raw.splitWhitespace():
         if tok.startsWith("position="): result.stepPosition = parseInt(tok[9 .. ^1])
         elif tok.startsWith("token="): result.stepToken = parseInt(tok[6 .. ^1])
+      result.stepPositions.add result.stepPosition
+      result.stepTokens.add result.stepToken
     elif raw == "end step":
       inside = false
     elif raw.startsWith("op "):
       if seenStep and not inside: continue
       var op = parseOp(raw)
+      op.order = order
       op.step = result.steps
+      result.ops.add op
+    elif raw.startsWith("disp "):
+      if seenStep and not inside: continue
+      let toks = raw.splitWhitespace()
+      let op = Op(id: -1-parseInt(toks[1][1 .. ^1]), order: order,
+        step: result.steps, parent: -1, impl: "raw:dispatch", tag: "fir::dispatch",
+        attrs: initTable[string, string]())
+      for tok in toks[2 .. ^1]:
+        let parts = tok.split('=', 1)
+        if parts.len != 2: continue
+        case parts[0]
+        of "prog": op.prog = parts[1]
+        of "op":
+          if parts[1] != "none": op.parent = parseInt(parts[1][1 .. ^1])
+        of "nThreads": op.attrs["threads"] = parts[1]
+        of "tgSize": op.attrs["tg"] = parts[1]
+        of "tgbytes": op.attrs["tgbytes"] = parts[1]
+        of "input": op.attrs["input"] = parts[1]
+        of "pipe": op.attrs["pipe"] = unquote(parts[1])
+        else: discard
+      let start = raw.find("bind=(")
+      if start >= 0:
+        let stop = matchingParen(raw, start+5)
+        for binding in raw[start+6 ..< stop].split(','):
+          let colon = binding.find(':')
+          if colon < 0: continue
+          let slot = binding[0 ..< colon]
+          var p = parseRef(binding[colon+1 .. ^1])
+          if slot == "mem": p.name = "mem"
+          elif slot.startsWith("b"):
+            let index = parseInt(slot[1 .. ^1]) - (if result.backend == "metal": 1 else: 0)
+            if index < 0 or index > 4: continue # Metal bytecode occupies slot zero.
+            p.name = ["mem", "u8", "lut", "input", "u32"][index]
+          else: p.name = slot
+          op.bindings.add p
       result.ops.add op
     elif raw.startsWith("words "):
       inWords = raw.splitWhitespace()[1]

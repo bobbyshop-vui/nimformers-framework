@@ -17,6 +17,13 @@ type
 
 const FmNegInf = -3.0e38'f32
 
+function fmExemptFromPenalty(s: var FmSampler, ids: seq[int])
+    # Pure formatting tokens (newline, spaces, tabs) are not "repeated content": penalising them
+    # would force line breaks to be replaced (the same rule as llama.cpp's penalize_nl=false).
+    for id in ids:
+        if id >= 0 and id < s.noPenalty.len:
+            s.noPenalty[id] = true
+
 function fmNewSampler(opts: FmOptions, vocab: int): FmSampler
     result.temperature = opts.temperature
     result.topP = opts.topP

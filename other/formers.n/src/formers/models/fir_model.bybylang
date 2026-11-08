@@ -10,15 +10,34 @@ import "../sampling/sampler.bybylang"
 import "../runtime/console.bybylang"
 import "../runtime/signals.bybylang"
 
-function fmRunFir(det: FmDetection, opts: FmOptions): bool
+function fmRunFir(det: FmDetection, cliOpts: FmOptions): bool
+    var opts = cliOpts
     let path = if opts.firFile.len > 0: opts.firFile else: opts.modelsDir / "model.fir"
     var graph = firParse(path, det.files.configPath)
     if opts.firF32:
         graph = firF32Weights(graph)
     let cfg = parseFile(det.files.configPath)
-    let tok = native_hf_tokenizer.newHFTokenizer(det.files.tokenizerDir)
-    let eos = cfg{"eos_token_id"}.getInt(-1)
-    var ids = tok.encode(opts.prompt, false)
+    # A model may declare sampler defaults in config.json ("formers_sampler"). They apply only
+    # to settings still at the built-in default, so command-line flags always win.
+    let declared = cfg{"formers_sampler"}
+    if declared != nil and declared.kind == JObject:
+        let builtin = fmDefaultOptions()
+        if opts.temperature == builtin.temperature and declared.hasKey("temperature"):
+            opts.temperature = float32(declared["temperature"].getFloat())
+        if opts.topP == builtin.topP and declared.hasKey("top_p"):
+            opts.topP = float32(declared["top_p"].getFloat())
+        if opts.minP == builtin.minP and declared.hasKey("min_p"):
+            opts.minP = float32(declared["min_p"].getFloat())
+        if opts.repeatPenalty == builtin.repeatPenalty and declared.hasKey("repeat_penalty"):
+            opts.repeatPenalty = float32(declared["repeat_penalty"].getFloat())
+        if opts.repeatLastN == builtin.repeatLastN and declared.hasKey("repeat_last_n"):
+            opts.repeatLastN = declared["repeat_last_n"].getInt()
+    let useIds = opts.promptIds.len > 0
+    var tok: native_hf_tokenizer.HFTokenizer
+    if not useIds:
+        tok = native_hf_tokenizer.newHFTokenizer(det.files.tokenizerDir)
+    let eos = if not useIds and opts.addSpecialTokens and tok.eosId >= 0: tok.eosId else: cfg{"eos_token_id"}.getInt(-1)
+    var ids = if useIds: opts.promptIds else: tok.encode(opts.prompt, opts.addSpecialTokens)
     if ids.len == 0:
         let bos = cfg{"bos_token_id"}.getInt(eos)
         if bos < 0:
@@ -26,23 +45,60 @@ function fmRunFir(det: FmDetection, opts: FmOptions): bool
         ids = @[bos]
     if ids.len+opts.nPredict-1 > graph.symbols["positions"] or (opts.ctxSize > 0 and ids.len+opts.nPredict-1 > opts.ctxSize):
         raise newException(ValueError, "FIR graph: prompt and generation exceed context capacity")
-    if tok.totalVocabSize > graph.symbols["vocab"]:
+    if useIds:
+        for id in ids:
+            if id < 0 or id >= graph.symbols["vocab"]:
+                raise newException(ValueError, "FIR graph: prompt id " & $id & " is outside the model vocabulary")
+    elif tok.totalVocabSize > graph.symbols["vocab"]:
         raise newException(ValueError, "FIR graph: tokenizer exceeds model vocabulary")
     backend.setForbidCpuFallback(true)
     let ctx = newBackend(opts.backend)
     var model = firLoadGraph(graph, det.files.nimqPath, ctx)
     defer: firFreeGraph(model)
     var sampler = fmNewSampler(opts, graph.symbols["vocab"])
+    if not useIds:
+        for probe in ["\n", "\n\n", " ", "  ", "    ", "\t", "\n    ", "\n\t", "\r\n"]:
+            fmExemptFromPenalty(sampler, tok.encode(probe, false))
     var logits: seq[float32]
     let start = epochTime()
-    for id in ids:
+    var next = 0
+    # Multi-row phases consume the prompt: a phase with `logits=` that takes exactly the remaining
+    # tokens finishes the prompt in one pass (its last row is the next-token distribution);
+    # otherwise the largest state-only phase that leaves at least one token goes first. The rest
+    # runs as decode steps, the last token always producing logits.
+    var done = false
+    while not done and next < ids.len:
+        var chosen = ""
+        var width = 0
+        for name in graph.phaseOrder:
+            let rows = graph.phases[name]
+            if graph.phaseLogits.hasKey(name):
+                if rows == ids.len-next and rows > width:
+                    chosen = name
+                    width = rows
+                    done = true
+            elif rows <= ids.len-1-next and rows > width and not done:
+                chosen = name
+                width = rows
+        if width == 0:
+            break
         if fmStopRequested():
             return true
-        logits = firGraphStep(model, id, "prefill")
+        let phaseOut = firGraphPhase(model, chosen, ids[next ..< next+width])
+        next += width
+        if graph.phaseLogits.hasKey(chosen) and done:
+            let vocab = graph.symbols["vocab"]
+            logits = phaseOut[(width-1)*vocab ..< width*vocab]
+    for i in next ..< ids.len:
+        if fmStopRequested():
+            return true
+        logits = firGraphStep(model, ids[i], "prefill")
     let prefillSeconds = epochTime()-start
     var decodeSeconds = 0.0
     var decodeSteps = 0
-    var stream = initTokenStream(tok)
+    var stream: native_hf_tokenizer.HFTokenStream
+    if not useIds:
+        stream = initTokenStream(tok)
     var generated = 0
     fmSetGenerating(true)
     try:
@@ -50,22 +106,36 @@ function fmRunFir(det: FmDetection, opts: FmOptions): bool
             if fmStopRequested():
                 break
             let id = fmSample(sampler, logits, ids)
+            if getEnv("FIR_DEBUG_TOKENS", "0") != "0":
+                stderr.writeLine("[fir-tok] step=" & $(i + 1) & " id=" & $id & " logit=" & $logits[id])
+                var used = newSeq[bool](logits.len)
+                var line = "[fir-top5]"
+                for rank in 0 ..< 5:
+                    var best = 0
+                    var value: float32 = -1e30
+                    for j, v in logits:
+                        if not used[j] and v > value:
+                            value = v
+                            best = j
+                    used[best] = true
+                    line = line & " " & $best & ":" & $value
+                stderr.writeLine(line)
             if id == eos:
                 break
             ids.add(id)
             inc generated
-            fmOut().write(stream.pushTokens([id]))
+            fmOut().write(if useIds: $id & " " else: stream.pushTokens([id]))
             fmOut().flushFile()
             if i+1 < opts.nPredict:
                 let stepStart = epochTime()
                 logits = firGraphStep(model, id)
                 decodeSeconds += epochTime()-stepStart
                 inc decodeSteps
-        fmOut().write(stream.pushTokens(newSeq[int](), true) & "\n")
+        fmOut().write((if useIds: "" else: stream.pushTokens(newSeq[int](), true)) & "\n")
         fmOut().flushFile()
     finally:
         fmSetGenerating(false)
-    fmSay("[formers.n] FIR graph prefill (sequential): " & $(ids.len-generated) & " tokens, " & $prefillSeconds & " s, " & $(float64(ids.len-generated)/prefillSeconds) & " tok/s; decode: " & $decodeSteps & " steps, " & $decodeSeconds & " s, " & $(if decodeSteps > 0: float64(decodeSteps)/decodeSeconds else: 0.0) & " tok/s")
+    fmSay("[formers.n] FIR graph prefill (" & $graph.phaseOrder.len & " multi-row phases): " & $(ids.len-generated) & " tokens, " & $prefillSeconds & " s, " & $(float64(ids.len-generated)/prefillSeconds) & " tok/s; decode: " & $decodeSteps & " steps, " & $decodeSeconds & " s, " & $(if decodeSteps > 0: float64(decodeSteps)/decodeSeconds else: 0.0) & " tok/s")
     fmSay("[formers.n] FIR graph sessions=" & $model.sessions & ", logits reads=" & $model.logitsReads & ", weights=" & (if opts.firF32: "fp32" else: "FIR dtype") & "")
     fmSay("[formers.n] FIR graph: " & $generated & " generated tokens in " & $(epochTime()-start) & " s; FIR: " & $model.dispatched & " VM programs, backend=" & $ctx.kind)
     result = true

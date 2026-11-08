@@ -31,7 +31,7 @@ if opts.firCheck.len > 0:
         if opts.firF32 and firProgram.runtime == "graph":
             firProgram = firF32Weights(firProgram)
         firRegistry = firDefaultRegistry()
-        firBindings = if firProgram.runtime == "graph": firGraphBindings(firProgram) else: firMambaBindings(firProgram)
+        firBindings = if firProgram.runtime == "graph": firGraphBindings(firProgram, true) else: firMambaBindings(firProgram)
         firValidate(firProgram, firRegistry, firBindings)
         print firSummary(firProgram, firRegistry, firBindings)
         quit(0)

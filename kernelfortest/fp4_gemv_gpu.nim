@@ -23,7 +23,6 @@ import customfloat  # buildDecodeLUT, FP8_E4M3
 
 import fp4_gemv_vm                          # GemvTg (kernel = micro-VM bytecode, NO MSL)
 import vendor/bybylang/gpubackend as byby   # sessionUploadPrivate
-import vendor/bybylang/probe
 import session_vm_dispatch
 import prefill_profile   # BYBY_PREFILL_PROFILE: fp4.upload / fp4.gpu / fp4.read
 import vendor/bybylang/backends/vulkan/vulkan_driver as vkDrv
@@ -68,10 +67,6 @@ proc sessionUploadBytesShared*(backend: byby.GpuBackend, data: openArray[uint8])
     result.vulkanHandle = vkDrv.vulkanSessionUploadU8(@data)
   else:
     discard
-  if unlikely(firProbeOn):
-    byby.probePrepare(result, "upload")
-    byby.probeBytesResult(result, data.len)
-    probeTransfer("upload", " dst=" & byby.probeValue(result))
 
 proc sessionUploadFloatsShared*(backend: byby.GpuBackend;
                                 data: openArray[float32]): byby.SessionHandle =
@@ -95,9 +90,6 @@ proc uploadFp4WeightOnce*(ctx: Backend, name: string; wq: openArray[uint8];
   # Large weights: Shared (not wired). Small LUT: Private is fine.
   c.wBuf = sessionUploadBytesShared(be, wq)
   c.lutBuf = byby.sessionUploadPrivate(be, lut)
-  if unlikely(firProbeOn):
-    probeName(c.wBuf, name, "fp4", [rows, cols])
-    probeName(c.lutBuf, name & ".lut", "f32", [lut.len])
   c.residentReady = true
   gFp4CacheGpu[name] = c
 

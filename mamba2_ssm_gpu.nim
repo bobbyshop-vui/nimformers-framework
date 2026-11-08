@@ -7,7 +7,6 @@ import std/math
 import std/[times, os, strformat, strutils, sequtils]
 import backend
 import vendor/bybylang/gpubackend as byby
-import vendor/bybylang/probe
 import vendor/bybylang/backends/cpu/cpu_backend as cpu
 import session_vm
 import jit_vm
@@ -121,8 +120,6 @@ proc encodeMicroVm*(ctx: Backend; program: VmProgram; hMem: byby.SessionHandle;
               elif be == byby.gbVulkan: kernelNameFor(ctx, program, tag)
               else: jit_vm.dispatchProgramNoSession(gJitCache, program, tag)
 
-  if unlikely(firProbeOn): probePipeline(kname, program.words)
-
   if be == byby.gbVulkan:
     if tg <= 0 or tg > vkDrv.vulkanMaxTgThreads():
       raise newException(CatchableError,
@@ -137,9 +134,7 @@ proc encodeMicroVm*(ctx: Backend; program: VmProgram; hMem: byby.SessionHandle;
   # dispatchProgramNoSession (uses the remembered key, or a fallback key that needs no GPU).
   let useJit = kname.len > 0 and kname != "micro_vm_kernel"
   let pipeName = if useJit: kname else: "micro_vm_kernel"
-  if unlikely(firProbeOn): probePipeline(pipeName, program.words)
   if not sessionPipeline(pipeName):
-    if unlikely(firProbeOn): probePipeline("micro_vm_kernel", program.words)
     if not sessionPipeline("micro_vm_kernel"):
       raise newException(CatchableError, "encodeMicroVm: no pipeline " & pipeName)
 

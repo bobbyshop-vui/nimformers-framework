@@ -140,3 +140,20 @@ implementation ABI vào binary, không load động shared library Python.
 Trên macOS, thêm `caffeinate -i` trước lệnh cần giữ máy thức khi build/chạy.
 Tiến trình GPU phải truy cập được thiết bị; môi trường sandbox/headless
 có thể không thấy Metal.
+
+## Trace
+
+`trace.nim` ghi lại một lần chạy cho bộ lift FIR. Script BybyLang import nó như mọi module Nim và gọi
+đúng các hàm như code Nim:
+
+```bybylang
+import nim "../../trace"
+
+traceStart("run.fprobe", "decode:2", true, 0)   # path, steps, data, dataMax
+# ... dựng và chạy model ...
+traceStop()
+```
+
+Hãy bắt đầu trace **trước** khi compile kernel: recorder chỉ thấy chương trình được compile khi nó đang
+bật. Ngoài ra còn có `traceActive()`, `traceFile()`, `traceBegin`/`traceEnd` (đánh dấu bước) và các
+template `withTrace`/`traceStep`. Tham chiếu đầy đủ: [Trace API](trace-api.vi.md).

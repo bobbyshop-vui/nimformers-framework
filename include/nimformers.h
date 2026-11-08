@@ -71,6 +71,7 @@ typedef struct NimfTensor       NimfTensor;
 typedef struct NimfQuantTensor  NimfQuantTensor;
 typedef struct NimfStateDict    NimfStateDict;
 typedef struct NimfVmProgram    NimfVmProgram;
+typedef struct NimfBuffer       NimfBuffer;
 typedef struct NimfResidentQ4   NimfResidentQ4;
 typedef struct NimfResidentF32  NimfResidentF32;
 typedef struct NimfTokenizer    NimfTokenizer;
@@ -317,6 +318,36 @@ NIMF_API int32_t NIMF_CALL nimf_vm_run(NimfContext*, NimfVmProgram*, float* memo
 NIMF_API int32_t NIMF_CALL nimf_micro_vm_dispatch(NimfContext*, const uint32_t* code,
     int64_t code_len, float* memory, int64_t memory_len,
     int64_t n_threads, int64_t tg_floats, int64_t tg_size);
+
+/* ===================== resident buffers and sessions ================== */
+/* Metal only for dispatch.  Buffers stay on the GPU between dispatches; a session
+ * encodes many dispatches before one submit.  Offsets and sizes are in floats. */
+
+NIMF_API NimfBuffer* NIMF_CALL nimf_buf_alloc(NimfContext*, const float* data, int64_t n);
+NIMF_API int32_t NIMF_CALL nimf_buf_free(NimfContext*, NimfBuffer*);
+NIMF_API int32_t NIMF_CALL nimf_buf_read(NimfContext*, NimfBuffer*, int64_t offset,
+    int64_t n, float* out);                       /* session must be closed */
+NIMF_API int32_t NIMF_CALL nimf_sess_begin(NimfContext*);
+NIMF_API int32_t NIMF_CALL nimf_sess_end(NimfContext*);
+NIMF_API int32_t NIMF_CALL nimf_sess_set(NimfContext*, NimfBuffer*, int64_t offset,
+    const float* data, int64_t n);                /* inside an open session */
+NIMF_API int32_t NIMF_CALL nimf_sess_set_step_inputs(NimfContext*, NimfBuffer*,
+    int64_t token_offset, int64_t position_offset, int64_t token, int64_t position);
+NIMF_API const char* NIMF_CALL nimf_prog_compile(NimfContext*, NimfVmProgram*, const char* tag);
+NIMF_API int32_t NIMF_CALL nimf_sess_dispatch(NimfContext*, const char* kernel_name,
+    NimfBuffer* const* bufs /* 4: mem, u8, lut, input; NULL = unbound */,
+    const int64_t* offsets /* 4 */, int64_t n_threads, int64_t tg_size, int64_t tg_bytes);
+
+/* ================================ trace =============================== */
+/* Record a run into a FIR trace (see docs/trace-api.md).  steps may be NULL or "". */
+
+NIMF_API int32_t NIMF_CALL nimf_trace_start(const char* path, const char* steps,
+    int32_t data, int64_t data_max);
+NIMF_API int32_t NIMF_CALL nimf_trace_stop(void);
+NIMF_API int32_t NIMF_CALL nimf_trace_active(void);
+NIMF_API const char* NIMF_CALL nimf_trace_file(void);     /* valid until the next call */
+NIMF_API int32_t NIMF_CALL nimf_probe_step(int32_t begin, int32_t kind /* 0 prefill, 1 decode */,
+    int64_t index, int64_t position, int64_t token);
 
 /* ============================= tokenizers ============================ */
 
