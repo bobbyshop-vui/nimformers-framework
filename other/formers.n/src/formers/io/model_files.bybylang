@@ -26,7 +26,7 @@ function fmSearchDirs(dir: string): seq[string]
     result.add(subs)
 
 function fmHasTokenizer(dir: string): bool
-    result = fileExists(dir / "tokenizer.json") or fileExists(dir / "tokenizer.model")
+    result = fileExists(dir / "tokenizer.json") or fileExists(dir / "tokenizer.model") or fileExists(dir / "tokenizer.model.v3")
 
 function fmFilesWithExt(dir, ext: string): seq[string]
     for kind, p in walkDir(dir):

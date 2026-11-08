@@ -292,6 +292,63 @@ Threadgroup memory is requested in float slots via `tg_floats`; `tg_size`
 forces the threads per threadgroup (0 = backend default).
 
 
+## Resident buffers and sessions
+
+A model needs weights and state that stay on the GPU between dispatches. `Buffer` holds float32
+data on the device and `Session` encodes many dispatches before one submit. Dispatch needs the
+Metal backend (`ctx.backend == "metal"`); buffers and programs are created through the context.
+
+```python
+import numpy as np
+from nimformers import Buffer, Context, Op, Session
+
+with Context() as ctx:
+    x = Buffer(ctx, np.arange(64, dtype=np.float32))     # weights / input
+    y = Buffer(ctx, size=64)                              # zero-filled state
+    p = ctx.vm_program()
+    p.emit(Op.U_LID, 0)
+    p.emit(Op.U_LOAD_IN, 1, 0, value=0)                   # r1 = input[lane]
+    p.mul_const(1, 1, 2.0)
+    p.emit(Op.U_STORE_F32, 1, 0, value=0)                 # mem[lane] = r1
+    p.halt()
+    sess = Session(ctx)
+    kernel = sess.compile(p, "double")                    # JIT once, outside any session
+    with sess:                                            # one command buffer
+        sess.dispatch(kernel, threads=64, tg_size=64, mem=y, input=x)
+    print(y.read(0, 64))                                  # valid only after the session closed
+```
+
+| API | Meaning |
+| --- | --- |
+| `Buffer(ctx, data=None, size=None)` | Resident float32 buffer from `data`, or `size` zeros. `.size`, `.handle`. |
+| `Buffer.read(offset=0, n=None)` | Copy `n` floats back to NumPy. Only while no session is open. |
+| `Buffer.close()` | Free the device memory (also on garbage collection). |
+| `Session(ctx)` | A session; `with sess:` begins and submits. |
+| `Session.compile(program, tag="py")` | JIT a `VMProgram` and return its kernel name; cached per program and tag. Call it outside an open session. |
+| `Session.dispatch(kernel, *, threads, tg_size, tg_bytes=16, mem=None, u8=None, lut=None, input=None)` | Encode one dispatch. Each binding is a `Buffer` or `(Buffer, float_offset)`; `mem` is read/write float32, `u8` bytes, `lut` and `input` read-only float32. Addresses in the program are relative to the bound buffer plus its offset. |
+| `Session.set(buffer, offset, values)` | Inside an open session: write host floats into a buffer. |
+| `Session.step(token, position, kind="decode")` | Context manager that marks one host step for [tracing](trace-api.md). `kind` is `"decode"` or `"prefill"`. |
+| `Session.set_step_inputs(buffer, token_offset, position_offset, token, position)` | Inside a session: write the step's token and position scalars, annotated so a trace can be lifted. |
+
+A model step is usually `with sess.step(token, pos): with sess: set_step_inputs(...); dispatch(...)...`;
+see `examples/python/qwen3_moe_vm.py` and `examples/python/forge_vm.py` for complete models.
+
+## Tracing
+
+`nimformers.trace(path, steps="", data=True, data_max=0)` records a run so it can be lifted to
+`model.fir`. It is a context manager; `trace_active()`, `trace_file()` and `trace_stop()` query and
+stop the process-wide recorder. See the [Trace API](trace-api.md) for parameters, the Nim, BybyLang and
+C counterparts, and the trace → lift → run workflow.
+
+```python
+import nimformers as nf
+
+with nf.trace("run.fprobe", steps="decode:2"):
+    for pos, tok in enumerate(tokens):
+        model.step(tok)
+```
+
+
 ## Tokenizers
 
 ```python
@@ -356,6 +413,8 @@ program keys) must be released with `nimf_free_string()`.
 | `quant.nim` | `nimf_quantize` / `nimf_quant_dequantize`, payload accessors, NIMQ state dicts |
 | `customfloat.nim` | encode/decode, APF dtype selection, APF training cast |
 | `vendor/bybylang/micro_kernel` | program builder, `.bvm` I/O, lowering, dispatch |
+| `session_low.nim` / `session_vm_dispatch.nim` | resident buffers, sessions, stateful dispatch (`nimf_buf_*`, `nimf_sess_*`, `nimf_prog_compile`) |
+| `trace.nim` | FIR trace recorder (`nimf_trace_*`, `nimf_probe_step`) |
 | `test/deepseek-inference/native_hf_tokenizer.nim` | HF tokenizer |
 | `test/codestral/sentencepiece_native.nim` | SentencePiece tokenizer |
 | `test/deepseek-inference/nim_inference.nim` | Llama config load, weight load, generation |

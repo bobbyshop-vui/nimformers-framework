@@ -48,7 +48,9 @@ import backend
 import customfloat
 import quant
 import tensor_ops
+import trace
 
+export trace
 export nimformer
 export backend
 export customfloat

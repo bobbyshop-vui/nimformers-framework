@@ -49,6 +49,19 @@ function parseError(root, source, message: string)
         actual = e.msg
     doAssert actual.contains(message), "expected " & message & ", got " & actual
 
+function checkPhases(root: string)
+    let head = "layout script\nbuf a f32 4\nbuf b f32 4\n"
+    let graph = parseSource(root, head & "node n0 ext fir.embedding a b -> b\nphase warm rows=8\nnode n1 ext fir.embedding a b -> b\nphase score rows=3\nnode n2 ext fir.embedding a b -> b\nphase decode\nnode n3 ext fir.embedding a b -> b\n")
+    doAssert graph.phaseOrder == @["warm", "score"] and graph.phases["warm"] == 8 and graph.phases["score"] == 3
+    doAssert graph.nodes[0].phase == "" and graph.nodes[1].phase == "warm" and graph.nodes[2].phase == "score" and graph.nodes[3].phase == ""
+    let scored = parseSource(root, head & "phase score rows=4 logits=b\nnode n1 ext fir.embedding a b -> b\n")
+    doAssert scored.phaseLogits["score"] == "b" and scored.phases["score"] == 4
+    parseError(root, head & "phase score rows=4 extra=b\n", "expected 'phase NAME rows=N [logits=BUFFER]'")
+    parseError(root, head & "phase warm rows=1\n", "rows must be at least 2")
+    parseError(root, head & "phase warm\n", "expected 'phase NAME rows=N [logits=BUFFER]'")
+    parseError(root, head & "phase warm rows=2\nphase warm rows=4\n", "duplicate phase warm")
+    echo "PASS multi-row phases: arbitrary names and row counts, decode switch, malformed headers"
+
 function checkGates(root: string)
     let graph = parseSource(root, "script_abi 1\nrequire feature weights_bf16\nrequire feature weights_f16\nlayout script\n")
     doAssert graph.scriptAbi == 1 and graph.requiredFeatures == @["weights_bf16", "weights_f16"]
@@ -310,6 +323,7 @@ function main()
     writeFile(root / "config.json", "{}")
     checkConversions()
     checkGates(root)
+    checkPhases(root)
     checkWireConversions(root)
     checkCheckpoint(root)
     checkInstructions(root)

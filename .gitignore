@@ -87,3 +87,11 @@ skills/lethe-offload/SKILL.md
 test/mamba3/quantize_mamba3
 models/gpt2-125m/model.safetensors
 .venv-torch/
+
+# ===== model weights and trace data (model.fir and config stay tracked) =====
+models/**/*.safetensors
+models/**/*.pt
+models/**/*.bin
+models/**/trace.data
+models/**/*.fprobe
+models/**/*.fprobe.data

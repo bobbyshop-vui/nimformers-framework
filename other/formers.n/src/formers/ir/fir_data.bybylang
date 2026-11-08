@@ -1,0 +1,88 @@
+# Exact raw upload data and selective native checkpoint loading for lifted graphs.
+import nim "std/[os, tables, strutils]"
+import nim "vendor/bybylang/probe_weights"
+import nim "vendor/bybylang/probe_data"
+import nim "quant"
+import nim "customfloat"
+import "fir_types.bybylang"
+
+function firDataGraph(graph: FirProgram): bool
+    for name, kernel in graph.kernels:
+        if kernel.layout == "slots":
+            return true
+    for name, buffer in graph.buffers:
+        if buffer.dtype == "raw" or buffer.initFile.len > 0 or buffer.initialWords.len > 0:
+            return true
+
+function firInitPath(graph: FirProgram, buffer: FirBuffer, checkpoint: string): string
+    if buffer.initFile == "checkpoint":
+        return checkpoint
+    if buffer.initFile.isAbsolute():
+        return buffer.initFile
+    parentDir(graph.sourcePath) / buffer.initFile
+
+function firCheckDataWeights(graph: FirProgram, checkpoint: string)
+    let index = probeTensorIndex(checkpoint)
+    for name, buffer in graph.buffers:
+        if buffer.initFile.len > 0:
+            let path = firInitPath(graph, buffer, checkpoint)
+            if not fileExists(path) or int64(buffer.initOffset)+buffer.initBytes > getFileSize(path):
+                raise newException(ValueError, "FIR missing or truncated raw upload data: " & name & " in " & path)
+            if buffer.initFingerprint.len > 0 and fingerprintFile(path, buffer.initOffset, buffer.initBytes) != buffer.initFingerprint:
+                raise newException(ValueError, "FIR raw upload fingerprint mismatch: " & name & " in " & path)
+        elif buffer.kind == "weight":
+            var found = false
+            for tensor in index:
+                if tensor.name == buffer.tensorName and tensor.shape == buffer.dims:
+                    found = true
+            if buffer.dtype == "raw" or not found:
+                raise newException(ValueError, "FIR missing checkpoint tensor or raw initializer: " & buffer.tensorName)
+
+function firReadNativeF32(path: string, tensor: ProbeTensor): seq[float32]
+    if tensor.kind < 0 or tensor.kind > int(high(QuantKind)):
+        raise newException(ValueError, "FIR unsupported native tensor kind: " & tensor.name)
+    var f = open(path, fmRead)
+    defer: f.close()
+    var qt = QuantTensor(kind: QuantKind(tensor.kind), shape: tensor.shape, groupSize: tensor.groupSize, cf: newCustomFloat(tensor.eb, tensor.mb))
+    qt.scale = newSeq[float32](tensor.scales)
+    qt.zero_point = newSeq[float32](tensor.scales)
+    f.setFilePos(tensor.scaleOffset)
+    if tensor.scales > 0:
+        if f.readBuffer(addr qt.scale[0], tensor.scales*4) != tensor.scales*4 or f.readBuffer(addr qt.zero_point[0], tensor.scales*4) != tensor.scales*4:
+            raise newException(IOError, "FIR truncated native scales: " & tensor.name)
+    qt.data = newSeq[uint8](tensor.bytes)
+    f.setFilePos(tensor.offset)
+    if tensor.bytes > 0 and f.readBuffer(addr qt.data[0], tensor.bytes) != tensor.bytes:
+        raise newException(IOError, "FIR truncated native tensor: " & tensor.name)
+    dequantizeTensor(qt)
+
+function firInitializeData(graph: FirProgram, checkpoint: string, memory: var seq[float32], bindings: FirBindings)
+    for name, buffer in graph.buffers:
+        if bindings.separateRawWeights and firResidentRaw(graph, name):
+            continue
+        if buffer.initFile.len == 0 and buffer.initialWords.len == 0:
+            continue
+        let offset = bindings.memory[name]
+        if buffer.initialWords.len > 0:
+            for i, word in buffer.initialWords:
+                memory[offset+i] = cast[float32](word)
+        else:
+            var f = open(firInitPath(graph, buffer, checkpoint), fmRead)
+            try:
+                f.setFilePos(buffer.initOffset)
+                if f.readBuffer(addr memory[offset], buffer.initBytes) != buffer.initBytes:
+                    raise newException(IOError, "FIR truncated raw initializer: " & name)
+            finally:
+                f.close()
+
+function firReadRawInitializer(graph: FirProgram, checkpoint: string, buffer: FirBuffer): seq[float32]
+    result = newSeq[float32](buffer.elements)
+    if buffer.initialWords.len > 0:
+        for i, word in buffer.initialWords:
+            result[i] = cast[float32](word)
+    else:
+        var f = open(firInitPath(graph, buffer, checkpoint), fmRead)
+        defer: f.close()
+        f.setFilePos(buffer.initOffset)
+        if f.readBuffer(addr result[0], buffer.initBytes) != buffer.initBytes:
+            raise newException(IOError, "FIR truncated resident raw initializer: " & buffer.name)

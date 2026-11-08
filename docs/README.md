@@ -37,6 +37,7 @@ This directory is the user documentation for the public Nimformer APIs. Use the 
 
 - [GPU Session API](gpu-session-api.md): encode multiple operations per GPU session, resident buffers, and lifecycle rules.
 - [Micro-VM / JIT API](microkernel-api.md): bytecode instructions, lowering, JIT cache, and persistent-kernel constraints.
+- [Trace API](trace-api.md): `nf.trace` for Python, Nim, BybyLang and C: record a run into a FIR trace, then lift it to `model.fir`.
 - [FIR (formers IR)](fir.md): model-side graph file naming micro-kernels, backend kernels and dimensions; `--fir` and `--fir-check` in formers.n.
 - [BybyLang integration tests](../test/bybylang_test/README.md): BybyLang scripts that import `lib_c_api` and exercise the C ABI plus the native `gpu ...` DSL.
 - [BybyLang test API reference](bybylang-tests.md): run and extend the two `.bybylang` tests, with every DSL command and C ABI call explained.
@@ -53,6 +54,7 @@ This directory is the user documentation for the public Nimformer APIs. Use the 
 | `nimformers.nim` | [Getting Started](getting-started.md), [Backend](backend-api.md), [Tensor Ops](tensor-ops-api.md), [Base Model](base-model-api.md), [Quantization](quantization-nimq.md), [Micro-VM](microkernel-api.md) |
 | `backend.nim` | [Backend API](backend-api.md), [GPU Session API](gpu-session-api.md), [CPU Backend](cpu-backend.md) |
 | `tensor_ops.nim` | [Tensor Operations API](tensor-ops-api.md) |
+| `trace.nim` | [Trace API](trace-api.md) |
 | `nimformer.nim` | [Base Model API](base-model-api.md) |
 | `test/deepseek-inference/nim_inference.nim` | [LLaMA Inference API](llama-inference-api.md), [Tokenizer APIs](tokenizer-api.md) |
 | `test/codestral/jamba_hybrid.nim` | [Hybrid Jamba Model API](jamba-model-api.md) |

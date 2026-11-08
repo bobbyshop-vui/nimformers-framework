@@ -12,6 +12,8 @@ type
     noLora*, noMergeLora*: bool
     prompt*, systemText*: string
     rawPrompt*: bool
+    addSpecialTokens*: bool
+    promptIds*: seq[int]          ## --prompt-ids: FIR graph models read/print token ids, no tokenizer
     nPredict*: int
     temperature*, topP*, minP*, repeatPenalty*: float32
     repeatLastN*: int
@@ -63,6 +65,9 @@ function fmUsage(): string
     lines.add("  -f, --file FILE        read the prompt from a file")
     lines.add("  --system TEXT          system prompt (chat template)")
     lines.add("  --raw, --raw-prompt     do not apply the chat template")
+    lines.add("  --add-special-tokens   FIR graph: apply tokenizer BOS/EOS processing to the prompt")
+    lines.add("  --prompt-ids A,B,C     FIR graph: comma-separated prompt token ids; no tokenizer is needed and the")
+    lines.add("                         generated token ids are printed space-separated instead of text")
     lines.add("  -n, --n-predict N      maximum tokens to generate (default 128)")
     lines.add("  --temp T               temperature (default 0.7; 0 = greedy)")
     lines.add("  --top-p P              nucleus sampling (default 0.9; 1 = off)")
@@ -162,6 +167,12 @@ function fmParseOptions(args: seq[string]): FmOptions
             result.systemText = fmOptValue(args, i, flag, inlineVal, hasInline, result.errors)
         of "--raw", "--raw-prompt":
             result.rawPrompt = true
+        of "--add-special-tokens":
+            result.addSpecialTokens = true
+        of "--prompt-ids":
+            for part in fmOptValue(args, i, flag, inlineVal, hasInline, result.errors).split(','):
+                if part.strip().len > 0:
+                    result.promptIds.add(fmToInt(part.strip(), flag, result.errors))
         of "-n", "--n-predict", "--predict":
             result.nPredict = fmToInt(fmOptValue(args, i, flag, inlineVal, hasInline, result.errors), flag, result.errors)
             result.nPredictSet = true

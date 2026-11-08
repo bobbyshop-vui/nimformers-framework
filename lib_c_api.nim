@@ -35,8 +35,12 @@ import tensor_ops
 import customfloat
 import quant
 import vendor/bybylang/gpubackend as byby
+import vendor/bybylang/probe as fprobe
+import trace
 import vendor/bybylang/micro_kernel as micro
 import mamba2_ssm_gpu
+import session_vm_dispatch as svd
+import vendor/bybylang/micro_kernel/jit_vm as jitvm
 import vendor/bybylang/backends/cpu/cpu_backend as cpub
 import native_hf_tokenizer as hf
 import sentencepiece_native as sp
@@ -2302,6 +2306,200 @@ proc nimf_micro_vm_dispatch*(ctxHandle: pointer; code: ptr uint32; codeLen: int6
       tgBytes = max(4, int(tgFloats) * 4), tag = "capi-raw", tgSize = int(tgSize))
     if not dispatched: return fail("micro-VM dispatch failed")
     writeValues(memory, mem)
+    ok()
+  except CatchableError as e:
+    fail(e.msg)
+
+# =====================================================================
+# Persistent buffers + stateful sessions (Metal)
+# =====================================================================
+# `nimf_vm_run` uploads a fresh arena per call, so nothing survives between dispatches. These calls
+# keep weights and state resident in named GPU buffers and encode several dispatches into one
+# session, the way a model runner does; every call goes through the same probed backend entry points.
+
+type NimfBuf = object
+  h: byby.SessionHandle
+  n: int64
+
+proc nimf_buf_alloc*(ctxHandle: pointer; data: ptr cfloat; n: int64): pointer
+    {.exportc: "nimf_buf_alloc", cdecl, dynlib.} =
+  ## Resident GPU buffer of n floats, initialised from `data` (NULL = zeros).
+  if ctxHandle == nil or n <= 0: return failPtr("invalid buffer allocation arguments")
+  try:
+    let ctx = requireContext(ctxHandle)
+    let vals = if data == nil: newSeq[float32](int(n)) else: inputValues(data, int(n))
+    let b = cast[ptr NimfBuf](allocShared0(sizeof(NimfBuf)))
+    b.h = byby.sessionUploadPrivate(ctx.kind.toByby(), vals)
+    b.n = n
+    discard ok()
+    cast[pointer](b)
+  except CatchableError as e:
+    failPtr(e.msg)
+
+proc nimf_buf_free*(ctxHandle, bufHandle: pointer): cint
+    {.exportc: "nimf_buf_free", cdecl, dynlib.} =
+  if bufHandle == nil: return ok()
+  try:
+    let b = cast[ptr NimfBuf](bufHandle)
+    byby.sessionFree(requireContext(ctxHandle).kind.toByby(), b.h)
+    deallocShared(bufHandle)
+    ok()
+  except CatchableError as e:
+    fail(e.msg)
+
+proc nimf_buf_read*(ctxHandle, bufHandle: pointer; offset, n: int64; outData: ptr cfloat): cint
+    {.exportc: "nimf_buf_read", cdecl, dynlib.} =
+  ## Reads n floats starting at `offset`; the session must be closed (sessionEnd) first.
+  if ctxHandle == nil or bufHandle == nil or n <= 0 or offset < 0 or outData == nil:
+    return fail("invalid buffer read arguments")
+  try:
+    let b = cast[ptr NimfBuf](bufHandle)
+    if offset + n > b.n: return fail("buffer read out of range")
+    let vals = byby.sessionRead(requireContext(ctxHandle).kind.toByby(), b.h, int(offset + n))
+    writeValues(outData, vals[int(offset) ..< int(offset + n)])
+    ok()
+  except CatchableError as e:
+    fail(e.msg)
+
+proc nimf_sess_begin*(ctxHandle: pointer): cint
+    {.exportc: "nimf_sess_begin", cdecl, dynlib.} =
+  if ctxHandle == nil: return fail("null context")
+  try:
+    if not byby.sessionBegin(requireContext(ctxHandle).kind.toByby()):
+      return fail("sessionBegin failed")
+    ok()
+  except CatchableError as e:
+    fail(e.msg)
+
+proc nimf_sess_end*(ctxHandle: pointer): cint
+    {.exportc: "nimf_sess_end", cdecl, dynlib.} =
+  if ctxHandle == nil: return fail("null context")
+  try:
+    let be = requireContext(ctxHandle).kind.toByby()
+    if not byby.sessionEnd(be):
+      return fail("sessionEnd failed: " & byby.sessionGetLastError(be))
+    ok()
+  except CatchableError as e:
+    fail(e.msg)
+
+proc nimf_sess_set*(ctxHandle, bufHandle: pointer; offset: int64; data: ptr cfloat; n: int64): cint
+    {.exportc: "nimf_sess_set", cdecl, dynlib.} =
+  ## Inside an open session: buf[offset ..< offset+n] = host data (upload + device copy).
+  if ctxHandle == nil or bufHandle == nil or data == nil or n <= 0 or offset < 0:
+    return fail("invalid buffer write arguments")
+  try:
+    let be = requireContext(ctxHandle).kind.toByby()
+    let b = cast[ptr NimfBuf](bufHandle)
+    if offset + n > b.n: return fail("buffer write out of range")
+    var src = byby.sessionUpload(be, inputValues(data, int(n)))
+    if not byby.sessionCopyInto(be, src, b.h, 0, int(offset), int(n)):
+      return fail("buffer write failed")
+    ok()
+  except CatchableError as e:
+    fail(e.msg)
+
+proc nimf_trace_start*(path, steps: cstring; data: cint; dataMax: int64): cint
+    {.exportc: "nimf_trace_start", cdecl, dynlib.} =
+  ## Start a FIR trace at `path` (see trace.nim). `steps` may be NULL or "" (record everything),
+  ## `data` != 0 also writes `<path>.data`, `dataMax` > 0 skips larger uploads.
+  if path == nil or path.len == 0:
+    return fail("trace path is empty")
+  try:
+    trace.traceStart($path, (if steps == nil: "" else: $steps), data != 0, int(dataMax))
+    ok()
+  except CatchableError as e:
+    fail(e.msg)
+
+proc nimf_trace_stop*(): cint {.exportc: "nimf_trace_stop", cdecl, dynlib.} =
+  ## Flush and close the active trace. Safe when no trace is active.
+  try:
+    trace.traceStop()
+    ok()
+  except CatchableError as e:
+    fail(e.msg)
+
+proc nimf_trace_active*(): cint {.exportc: "nimf_trace_active", cdecl, dynlib.} =
+  if trace.traceActive(): 1 else: 0
+
+proc nimf_trace_file*(): cstring {.exportc: "nimf_trace_file", cdecl, dynlib.} =
+  ## Path of the trace file ("" when none). The pointer is valid until the next call.
+  var path {.global.}: string
+  path = trace.traceFile()
+  cstring(path)
+
+proc nimf_probe_step*(begin: cint; kind: cint; index, position, token: int64): cint
+    {.exportc: "nimf_probe_step", cdecl, dynlib.} =
+  ## Host-driver step marker for the FIR recorder (same records the Nim decode loops write).
+  ## begin=1 opens a step (kind 0 = prefill, 1 = decode), begin=0 closes it. No-op when
+  ## the recorder is off.
+  try:
+    if begin != 0:
+      fprobe.probeStepBegin(if kind == 0: "prefill" else: "decode", int(index), int(position), int(token))
+    else:
+      fprobe.probeStepEnd()
+    ok()
+  except CatchableError as e:
+    fail(e.msg)
+
+proc nimf_sess_set_step_inputs*(ctxHandle, bufHandle: pointer; tokenOffset, positionOffset: int64;
+    token, position: int64): cint
+    {.exportc: "nimf_sess_set_step_inputs", cdecl, dynlib.} =
+  ## Inside an open session: buf[tokenOffset] = token and buf[positionOffset] = position as the
+  ## step's two scalar host inputs, annotated with the `token` / `position` roles so a trace
+  ## of this driver can be lifted without any model-specific rule.
+  if ctxHandle == nil or bufHandle == nil or tokenOffset < 0 or positionOffset < 0:
+    return fail("invalid step input arguments")
+  try:
+    let be = requireContext(ctxHandle).kind.toByby()
+    let b = cast[ptr NimfBuf](bufHandle)
+    if tokenOffset >= b.n or positionOffset >= b.n: return fail("step input out of range")
+    var src = byby.sessionUpload(be, @[float32(token), float32(position)])
+    byby.probeRole(src, "token", 0, 4)
+    byby.probeRole(src, "position", 4, 4)
+    byby.probeRoleScalar(src, "token", 0, int(token))
+    byby.probeRoleScalar(src, "position", 4, int(position))
+    if not byby.sessionCopyInto(be, src, b.h, 0, int(tokenOffset), 1) or
+        not byby.sessionCopyInto(be, src, b.h, 1, int(positionOffset), 1):
+      return fail("step input write failed")
+    ok()
+  except CatchableError as e:
+    fail(e.msg)
+
+proc nimf_prog_compile*(ctxHandle, progHandle: pointer; tag: cstring): cstring
+    {.exportc: "nimf_prog_compile", cdecl, dynlib.} =
+  ## JIT-compiles a VM program (outside any session) and returns its kernel name.
+  if ctxHandle == nil: return failCString("null context")
+  let h = checkVm(progHandle)
+  if h == nil: return failCString("null VM program")
+  try:
+    let ctx = requireContext(ctxHandle)
+    result = allocCString(kernelNameFor(ctx, h.prog, if tag == nil: "" else: $tag))
+    if result == nil: discard fail("string allocation failed")
+    else: discard ok()
+  except CatchableError as e:
+    result = failCString(e.msg)
+
+proc nimf_sess_dispatch*(ctxHandle: pointer; kname: cstring; bufs: ptr pointer;
+    offsets: ptr int64; nThreads, tgSize, tgBytes: int64): cint
+    {.exportc: "nimf_sess_dispatch", cdecl, dynlib.} =
+  ## bufs / offsets: four entries for the mem, u8, lut and input domains (NULL = unbound);
+  ## offsets are in floats. Encodes one dispatch into the open session (Metal slots 1..4).
+  if ctxHandle == nil or kname == nil or bufs == nil or offsets == nil or nThreads <= 0 or tgSize <= 0:
+    return fail("invalid dispatch arguments")
+  try:
+    let be = requireContext(ctxHandle).kind.toByby()
+    if be != byby.gbMetal: return fail("stateful dispatch needs the Metal backend")
+    let bufArr = cast[ptr UncheckedArray[pointer]](bufs)
+    let offArr = cast[ptr UncheckedArray[int64]](offsets)
+    if not svd.sessionEncPipeline(false, $kname, ""): return fail("cannot bind pipeline")
+    for i in 0 ..< 4:
+      if bufArr[i] == nil: continue
+      let b = cast[ptr NimfBuf](bufArr[i])
+      if not svd.sessionEncBindVkOrMetal(false, i + 1, b.h.metalHandle, b.h.vulkanHandle, int(offArr[i])):
+        return fail("cannot bind buffer")
+    discard svd.sessionEncTgBytes(false, 0, max(int(tgBytes), 16))
+    if not svd.sessionEncDispatch(false, int(nThreads), int(tgSize), int(tgBytes)):
+      return fail("dispatch failed")
     ok()
   except CatchableError as e:
     fail(e.msg)

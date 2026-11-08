@@ -8,6 +8,60 @@ Read first: `docs/fir-script-lift.md` (recorder, lifter, library, builder),
 (where launches cross the runtime), `docs/fir-script-roadmap.md` (runtime
 roadmap), `models/FIR.md` and `docs/fir.md` (FIR format and runner).
 
+## Raw-dispatch update (CPU verification)
+
+The generic path now retains `disp` events and selects repeating complete
+session units without markers; `--slice A:B` and `--step N` override selection.
+Recorded programs use per-kernel `layout=slots` with verbatim hex words, shared
+buffer views and conservative state writes. Semantic session ops and raw nodes
+share physical buffers. Core upload instrumentation covers direct Metal/Vulkan
+driver uploads and mmap wrapping as well as CPU session uploads. Fingerprints
+support `--weights` payload matching; `BYBY_FIR_PROBE_DATA=1` preserves exact
+auxiliary upload bytes in a sidecar when no checkpoint tensor can identify them.
+Repeated `--weights` arguments also index auxiliary raw-FP32 NIMBIN checkpoints;
+the first argument remains the primary checkpoint/embedding source.
+The generic graph loader supports raw initializers and selective native NIMQ
+embedding loading. No traced model/runtime file needs a hook.
+Raw weights consumed exclusively by slot kernels have separate resident
+allocations, loaded individually, rather than occupying a checkpoint-sized
+shared arena. The CPU round trip also exercises an independent raw weight buffer.
+The graph CLI has an explicit `--add-special-tokens` option. The native-baseline
+comparison uses a SentencePiece-only tokenizer directory; the full HF directory's
+JSON tokenizer gives different IDs for wrapped prompts. Both raw and wrapped
+`hi` prompts are checked without loading a model.
+
+`make fir-lift-test` includes a CPU recorder/lifter/runner round trip that checks
+separate U8/LUT/input domains, subrange aliases, mixed ops, persistent state and
+reset bit-for-bit. It also checks unmarked embedding uploads, a unit spanning two
+sessions, and selection of one 605-dispatch session from `cs2.fprobe` when present.
+GPU session tests remain the existing tests; unavailable backends skip normally.
+
+The supplied legacy Codestral recording is insufficient for a runnable model:
+the selector chooses `243:244`, but 141 needed packed-weight bindings have no byte
+extent. LUT, adapter and composite-arena payloads are also absent. The lifter
+rejects this information loss; it does not infer identities from layer order or
+invent random/zero weights. Re-record with the updated core and upload data
+enabled. The fresh `cs3.fprobe` now exports with both the primary NIMQ and auxiliary
+`jamba_parallel_lora.bin`. The reproduced output is byte-identical to
+`models/codestral-fir/model.fir`: 960 buffers, 763 micro nodes, one embedding
+node and 24 kernel definitions (16 raw slot definitions). Its program check and CPU metadata/fingerprint preflight
+pass. Twelve large auxiliary uploads omitted by the capture cap require that
+second checkpoint; the primary-only command fails loudly.
+Metal slot execution and Codestral generation: the model loads and runs on the
+Intel Iris Plus 640. The lifter now also lifts the ops that produced the state the
+selected unit reads (a conservative backward data-flow slice over earlier ops, plus
+the host uploads of per-run buffers released later). For the Codestral recording this
+adds the 16-session batched T=8 prefill, emitted as `phase chunk1 rows=8` before
+`phase decode`. Phases are generic: any name, any row count, any number of them (each
+token-row upload of the replayed ops starts its own phase); its token-row embedding input becomes a multi-row `fir.embedding`
+and host-cleared (all-zero) scratch uploads become zero-initialised buffers. The
+runner consumes the prompt with the largest phase whose rows still fit (before the last
+token), then decodes the remaining tokens, always including the last. `--fir-check`
+passes (2189 nodes). Exact 60-token equality with `infer_lora_bin` has not been
+measured yet: it needs the 7B model run on Metal. The graph/native samplers still
+differ in formatting-token penalty exemptions, banned-token masks and secondary
+stop IDs.
+
 ## Done
 
 | Area | What exists | Verified |
@@ -19,7 +73,7 @@ roadmap), `models/FIR.md` and `docs/fir.md` (FIR format and runner).
 | Builder API | `firlift/builder.nim`: `BuilderConfig`, `BLinear`, `BRmsNorm`, `newBuilderModel`, `forwardStep`, `beginBuilderTrace`, `traceModel` | `firlift/builder_test` records, lifts and passes `--fir-check` |
 | q4 for `[out,in]` linears | `q4t` weight dtype (script layout only); `fir.linear_t` uses resident Q4 GEMV | TinyLlama q4t: 4.0 tok/s vs 1.3 tok/s f32 on Metal; lossy output |
 | Runner | `layout script`, `script_abi 1`, features, BF16/F16 loading, kernel tags, `fir.linear_t` q4t, unchanged classic path | `make build test fir-test`, all `models/*/model.fir`, 102 Python tests |
-| Session lifter | `firlift/sessionlift.nim` + `kernel_gen.nim`: every `session*` op of a raw trace becomes a generated micro-kernel (rmsnorm, layernorm, matmul NT/NN/Q4/FP4-KM, RoPE from position, KV scatter, attention decode/GQA/fused/flash/backward, SSD, small ops); host embedding, RoPE tables and the host final norm are recognised | 74 CPU-VM kernel tests, `test_session_gpu` on Metal (all kernels match the real ops), `firlift --coverage` on the recorded op trace, TinyLlama (Q4 group 128) lifts to 443 nodes / 15 kernels and generates on Metal |
+| Session lifter | `firlift/sessionlift.nim` + `kernel_gen.nim`: in raw replay the four elementwise/norm ops present in a decode unit (`sessionRmsnormEnc`, `sessionVecOp`, `sessionActivation`, `sessionCopyInto`) are emitted as exact session-replay nodes that call the backend API on staging buffers; every other `session*` op becomes a generated micro-kernel (rmsnorm, layernorm, matmul NT/NN/Q4/FP4-KM, RoPE from position, KV scatter, attention decode/GQA/fused/flash/backward, SSD, small ops); host embedding, RoPE tables and the host final norm are recognised | 74 CPU-VM kernel tests, `test_session_gpu` on Metal (all kernels match the real ops), `firlift --coverage` on the recorded op trace, TinyLlama (Q4 group 128) lifts to 443 nodes / 15 kernels and generates on Metal |
 | Runner dtypes | `f32a`, `q4b`/`q4b<G>`, `fp4km` arena matrices; `ushr`, `uloadu8`, `uloadu32` (script layout only) | `make fir-test`, `make test`, `--fir-check models/*` |
 | Python reference | `other/formers.n/python/formers/fir/` (unchanged); GPT-2/TinyLlama exports | 102 tests; used only as the independent reference |
 
@@ -34,10 +88,10 @@ than a lifter disagreement.
 
 | Area | Missing |
 | --- | --- |
-| Raw micro launches | traces with `disp` lines only (the Mamba runtimes' arena micro-VM launches) carry no tensor extents; they are not lifted by the session lifter. `sessionMamba2SsdPrefillEnc` is |
+| Legacy raw recordings | missing byte extents/identities/auxiliary bytes cannot be reconstructed; new complete slot traces are supported by the CPU-tested path above |
 | Speed | the lifted TinyLlama runs about 2-3 tok/s on Metal (native 9); peephole fusion cut nodes 443 -> 334 without a measurable change, the lane-per-column matmuls dominate; the threadgroup-parallel matmuls were slower on Intel Iris Plus 640 and are opt-in (`FIRLIFT_TG`) |
 | FP4-KM weights | the `fp4km` dtype and `genFp4Gemm` are tested on the CPU VM only; no Vulkan trace with FP4 weights was available |
-| Families | MoE, conv/pool, sort/top-k and vision/audio kernels are not in the library or the session-op rules |
+| Session-op coverage | MoE, conv/pool, sort/top-k and vision/audio semantic calls are not in the library/session-op rules; raw bytecode bypasses that library, within the limits above |
 | Ext staging | `fir.linear`/`fir.linear_t` still copy the arena input into a scratch handle; an input-offset session API would remove two copies per linear |
 | Numeric q4 | q4t is group 32 from the load-time F32/BF16 conversion; matching the native `.nimq` q4 (group 128) requires a verified export path |
 | Native core | the old `other/formers.n/native/` port was removed; its corpus and documents are gone. The reusable ideas (fgir, report, VM) were not retained |
@@ -52,8 +106,11 @@ than a lifter disagreement.
   tests.
 - No model-specific code in BybyLang. The lifter recognises operation idioms,
   not model names.
-- `vendor/bybylang` changes are small and listed: `probe.nim` (new),
-  `gpubackend.nim`, `backends/cpu/cpu_backend.nim`, `micro_kernel/jit_vm.nim`.
+- Core capture lives in `vendor/bybylang`: `probe.nim`, `probe_data.nim`,
+  `probe_weights.nim`, backend upload paths and `gpubackend.nim`.
+  Slot analysis is in `micro_kernel/slot_layout.nim`; CPU slot execution also
+  extends `backends/cpu/cpu_backend.nim`, `cpu_vm.c` and `cpu_kernels.h`.
+  Traced model/runtime files do not need changes.
 - Comments, help and docs in English; user chat in Vietnamese.
 
 ## How to run

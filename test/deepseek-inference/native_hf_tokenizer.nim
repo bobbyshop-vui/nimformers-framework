@@ -92,7 +92,7 @@ proc parseStage(node: JsonNode, purpose: string): Stage =
     if result.kind == "Punctuation": result.regex = compileTokenizerRegex("\\p{P}")
     if result.kind == "Metaspace" and node.hasKey("add_prefix_space"):
       result.scheme = if flag(node, "add_prefix_space"): "always" else: "never"
-  of "Lowercase", "Strip", "Prepend":
+  of "Lowercase", "Strip", "Prepend", "NFC":
     if result.kind == "Strip":
       if purpose == "decoder":
         result.replacement = text(node, "content", " ")
@@ -107,7 +107,7 @@ proc parseStage(node: JsonNode, purpose: string): Stage =
   of "Fuse", "ByteFallback", "BPEDecoder":
     if result.kind == "BPEDecoder": result.replacement = text(node, "suffix", "</w>")
   else: bad("unsupported " & purpose & " stage: " & result.kind)
-  if purpose == "normalizer" and result.kind notin ["Sequence", "Lowercase", "Strip", "Prepend", "Replace"]:
+  if purpose == "normalizer" and result.kind notin ["Sequence", "Lowercase", "Strip", "Prepend", "Replace", "NFC"]:
     bad("unsupported normalizer stage: " & result.kind)
   if purpose == "pretokenizer" and result.kind notin ["Sequence", "Split", "ByteLevel", "Digits", "Punctuation", "Whitespace", "WhitespaceSplit", "Metaspace"]:
     bad("unsupported pre-tokenizer stage: " & result.kind)
@@ -130,6 +130,14 @@ proc normalize(stage: Stage, value: string): string =
   of "Sequence":
     result = value
     for child in stage.children: result = normalize(child, result)
+  of "NFC":
+    # Every code point below U+0300 is already NFC-stable (no combining marks, nothing composes
+    # with a following mark), so NFC is the identity there. Anything above needs composition
+    # tables, which this tokenizer does not carry: refuse instead of silently mis-tokenizing.
+    for r in value.runes:
+      if int(r) >= 0x300: bad("NFC normalization of non-Latin text needs composition tables (U+" &
+                              toHex(int(r), 4) & ")")
+    result = value
   of "Lowercase": result = unicodeLower(value)
   of "Strip": result = unicodeStrip(value, leading = stage.prefixSpace, trailing = stage.useRegex)
   of "Prepend": result = stage.replacement & value

@@ -14,16 +14,23 @@
 ##    kernel (frequencies from the config), everything else is host-computed data;
 ##  - a host round trip (GPU read -> host math -> upload) that follows the layer stack and
 ##    ends in a head matmul is the final RMSNorm of the native runtime and is lifted as one.
-import std/[strutils, tables, json, sets, math, os]
+import std/[strutils, tables, json, sets, math, os, algorithm]
 import ./firlift
 import ./firvm
 import ./kernel_gen
+import ./fuse
+import micro_kernel/slot_layout
+import probe_weights
 
 type
   SBuf = object
     name: string
     elements: int
     role: string
+    base, initFile, tensor, fingerprint: string
+    offset, initOffset, initBytes: int
+    data: seq[uint32]
+    rawWeight: bool
 
   SWeight = object
     name, dtype, tensor: string
@@ -33,11 +40,14 @@ type
     name, body, tag: string
     threads, tg, tgBytes, ins, outs: int
     sizes: seq[int]
+    slots: string
+    raw: bool
 
   SNode = object
     kind, op, name: string
     ins, outs: seq[string]
     rmw: bool            ## the outputs are updated in place: their old contents are inputs too
+    phase: int           ## 0: the selected unit; k >= 1: k-th token-row unit replayed before it
 
   SessionLift = ref object
     trace: Trace
@@ -53,6 +63,7 @@ type
     kernelHints: Table[string, int]
     nodes: seq[SNode]
     cur: Table[(int, int), string]       # (trace buffer id, byte offset) -> FIR buffer
+    roleBufs: HashSet[int]               ## host scalar-input buffers (token/position roles) of a raw trace
     tainted: HashSet[string]
     hidden, positions, vocab: int
     eps: float
@@ -60,6 +71,9 @@ type
     coverage: bool                       ## lower every op, tolerate unnamed weights and unread inputs
     okCount: CountTable[string]
     failures: seq[string]
+    raw: bool
+    phaseRows: Table[int, int]           ## phase number -> token rows that phase consumes per run
+    phaseLogits: Table[int, (string, int)] ## phase number -> (buffer, rows) of vocabulary-sized output rows
 
 const Bookkeeping = [
   "sessionBegin", "sessionEnd", "sessionFree", "sessionAllocScratch", "sessionAllocHeap",
@@ -153,6 +167,23 @@ proc addBuf(l: SessionLift; name: string; elements: int; role = "") =
   l.bufs.add SBuf(name: name, elements: elements, role: role)
 
 proc rd(l: SessionLift; p: PortRef): string =
+  if l.raw:
+    if p.buffer in l.roleBufs:
+      if not l.cur.hasKey(p.key):
+        fail("host input buffer b" & $p.buffer & " is read at @" & $p.offset & ", which has no token/position role")
+      return l.cur[p.key]
+    let base = "b" & $p.buffer
+    if not l.bufIdx.hasKey(base): fail("missing raw buffer " & base)
+    let size = if p.bytes > 0: p.bytes else: l.bufs[l.bufIdx[base]].elements*4-p.offset
+    if p.offset == 0 and size == l.bufs[l.bufIdx[base]].elements*4: return base
+    if p.offset mod 4 != 0 or size mod 4 != 0 or size <= 0:
+      fail("unaligned or empty slot range " & base & "@" & $p.offset & ":" & $size)
+    let view = base & "_" & $p.offset & "_" & $size
+    if not l.bufIdx.hasKey(view):
+      l.addBuf(view, size div 4)
+      l.bufs[l.bufIdx[view]].base = base
+      l.bufs[l.bufIdx[view]].offset = p.offset div 4
+    return view
   if not l.cur.hasKey(p.key) and l.coverage:
     let name = "s" & $p.buffer
     l.addBuf(name, p.bytes div 4)
@@ -163,12 +194,14 @@ proc rd(l: SessionLift; p: PortRef): string =
   l.cur[p.key]
 
 proc wr(l: SessionLift; op: Op; p: PortRef; elements = -1): string =
+  if l.raw: return l.rd(p)
   result = "t" & $op.id & "_" & p.name
   l.addBuf(result, if elements >= 0: elements else: p.bytes div 4)
   l.cur[p.key] = result
 
 proc stateBuf(l: SessionLift; p: PortRef; elements: int): string =
   ## A buffer updated in place that keeps its contents between steps.
+  if l.raw: return l.rd(p)
   if l.cur.hasKey(p.key): return l.cur[p.key]
   result = "s" & $p.buffer
   l.addBuf(result, elements)
@@ -205,6 +238,7 @@ proc elementsOf(w: SWeight): int =
 
 proc rdWeight(l: SessionLift; p: PortRef; dtype: string): string =
   ## A registered weight read by a kernel. f32 vectors and `f32a`/`q4b` matrices live in the arena.
+  if l.raw: return l.rd(p)
   if l.coverage and not hasName(l.trace, p): return l.rd(p)
   let n = findName(l.trace, p)
   var dims = shapeOf(n)
@@ -268,19 +302,20 @@ proc lowerRope(l: SessionLift; op: Op; outScale = 1.0) =
   let hn = op.attrInt("Hn")
   let d = op.attrInt("D")
   let tabled = l.cur.getOrDefault(op.ins.port("cosT").key, "") != "ropetable"
-  if op.attrInt("T") != 1 or tabled:
-    # Tables that the graph itself computed (or several tokens): the table-driven kernel.
+  let rows = op.attrInt("T")
+  if tabled:
+    # Tables that the graph itself computed: the table-driven kernel.
     let xn = l.rd(x)
     for nm in ["cosT", "sinT"]:
       let p = op.ins.port(nm)
       if l.cur.getOrDefault(p.key, "") == "ropetable":
         if not l.coverage:
-          fail("RoPE with T=" & $op.attrInt("T") & " reads host tables; only a one-token step is liftable")
+          fail("RoPE tables are neither graph-computed nor position-derived")
         l.cur.del p.key
     l.addKernelNode(op, "rope_table", genRope(op.attrInt("T"), hn, d),
       @[xn, l.rd(op.ins.port("cosT")), l.rd(op.ins.port("sinT"))], @[xn])
     return
-  if x.bytes div 4 != hn*d: fail("RoPE port size does not match Hn*D")
+  if x.bytes div 4 != rows*hn*d: fail("RoPE port size does not match T*Hn*D")
   var theta = 10000.0
   if l.config.hasKey("rope_theta") and l.config["rope_theta"].kind in {JFloat, JInt}:
     theta = l.config["rope_theta"].getFloat()
@@ -292,7 +327,9 @@ proc lowerRope(l: SessionLift; op: Op; outScale = 1.0) =
       posScale = 1.0 / rs["factor"].getFloat()
     elif kind notin ["", "default"]:
       fail("rope_scaling type " & kind & " has no generated kernel")
-  let g = genRopePos(hn, d, pow(theta, -1.0 / float(d div 2)), posScale, outScale)
+  let ratio = pow(theta, -1.0 / float(d div 2))
+  let g = if rows == 1: genRopePos(hn, d, ratio, posScale, outScale)
+          else: genRopePosRows(rows, hn, d, ratio, posScale, outScale)
   let xn = l.rd(x)
   l.addKernelNode(op, "rope", g, @[xn, l.positionBuf()], @[xn])
 
@@ -348,7 +385,7 @@ proc lowerCopyGroup(l: SessionLift; ops: seq[Op]; first, last: int) =
       let maxSeq = (cs[1].dstOff - cs[0].dstOff) div n
       let pos = cs[0].dstOff div n
       if cs[0].srcOff != 0: fail("KV scatter source does not start at offset 0")
-      if not l.coverage and l.trace.stepPosition >= 0 and pos != l.trace.stepPosition:
+      if not l.coverage and cs[0].op.phase == 0 and l.trace.stepPosition >= 0 and pos != l.trace.stepPosition:
         fail("KV write at row " & $pos & " but the step position is " & $l.trace.stepPosition)
       if maxSeq < pos + 1: fail("KV cache stride is smaller than the position")
       if l.positions <= 0: fail("the config has no context length (max_position_embeddings)")
@@ -413,8 +450,72 @@ proc table(l: SessionLift; p: PortRef): seq[int] =
       return
   fail("table " & p.name & " (b" & $p.buffer & ") was not recorded; the table upload is outside the recorded step")
 
-proc lowerOp(l: SessionLift; op: Op) =
+const ExactSessionOps = ["sessionRmsnormEnc", "sessionVecOp", "sessionActivation", "sessionCopyInto"]
+
+proc lowerSessionExact(l: SessionLift; op: Op) =
+  ## Raw replay of a session API call. The runner stages the operands in dedicated
+  ## buffers and calls the same backend op, so the result is bit-identical to the
+  ## recorded runtime (generated VM kernels only approximate these shaders).
+  var ins, outs: seq[string]
+  var attrs = ""
   case op.implName
+  of "sessionRmsnormEnc":
+    ins = @[l.rd(op.ins.port("x")), l.rdWeight(op.ins.port("gamma"), "f32")]
+    outs = @[l.rd(op.outs.port("y"))]
+    attrs = "rows=" & $op.attrInt("rows") & ",cols=" & $op.attrInt("cols") &
+      ",eps=" & op.attrs.getOrDefault("eps", "h0")
+  of "sessionVecOp":
+    ins = @[l.rd(op.ins.port("a")), l.rd(op.ins.port("b"))]
+    outs = @[l.rd(op.outs.port("c"))]
+    attrs = "op=" & op.attrStr("op") & ",n=" & $op.attrInt("n")
+  of "sessionActivation":
+    ins = @[l.rd(op.ins.port("x"))]
+    outs = @[l.rd(op.outs.port("y"))]
+    attrs = "op=" & op.attrStr("op") & ",n=" & $op.attrInt("n") &
+      ",p=" & op.attrs.getOrDefault("p", "h0")
+  of "sessionCopyInto":
+    let src = op.ins.port("src")
+    var srcOff = op.attrInt("srcOffsetElems", 0)
+    if src.buffer in l.roleBufs:
+      # A host scalar buffer: each role (token / position) is its own one-element graph input.
+      var role = src
+      role.offset = src.offset + srcOff*4
+      ins = @[l.rd(role)]
+      srcOff = 0
+    else:
+      ins = @[l.rd(src)]
+    outs = @[l.rd(op.outs.port("dst"))]
+    attrs = "srcOff=" & $srcOff &
+      ",dstOff=" & $op.attrInt("dstOffsetElems", 0) & ",n=" & $op.attrInt("n")
+  else:
+    fail("no exact session replay for " & op.implName)
+  let label = op.implName[7 .. ^1]
+  l.nodes.add SNode(kind: "session", op: op.implName & ":" & attrs,
+    name: "session_" & label & "_" & $(-1-op.id), ins: ins, outs: outs, rmw: true)
+
+proc lowerOp(l: SessionLift; op: Op) =
+  if l.raw and not l.coverage and op.implName in ExactSessionOps:
+    l.lowerSessionExact(op)
+    return
+  case op.implName
+  of "raw:dispatch":
+    var ins, outs, slots: seq[string]
+    for p in op.ins:
+      slots.add p.name & ":in" & $ins.len
+      ins.add l.rd(p)
+    for p in op.outs: outs.add l.rd(p)
+    var body = "words"
+    for w in op.words: body.add " " & toHex(w, 8).toLowerAscii
+    let sig = body & slots.join(",") & "|" & $op.attrInt("threads") & ":" & $op.attrInt("tg") & ":" & $op.attrInt("tgbytes", 0)
+    var idx = l.kernelIdx.getOrDefault(sig, -1)
+    if idx < 0:
+      idx = l.kernels.len
+      l.kernelIdx[sig] = idx
+      l.kernels.add SKern(name: "raw" & $idx, body: body, threads: op.attrInt("threads"),
+        tg: op.attrInt("tg"), tgBytes: op.attrInt("tgbytes", 0), ins: ins.len,
+        outs: outs.len, slots: slots.join(","), raw: true)
+    l.nodes.add SNode(kind: "micro", op: l.kernels[idx].name, name: "dispatch" & $(-1-op.id),
+      ins: ins, outs: outs, rmw: true)
   of "sessionRmsnormEnc":
     let x = l.rd(op.ins.port("x"))
     let gamma = l.rdWeight(op.ins.port("gamma"), "f32")
@@ -462,7 +563,7 @@ proc lowerOp(l: SessionLift; op: Op) =
     l.lowerAttentionDecode(op)
   of "sessionKvScatterEnc":
     let pos = op.attrInt("pos")
-    if not l.coverage and l.trace.stepPosition >= 0 and pos != l.trace.stepPosition:
+    if not l.coverage and op.phase == 0 and l.trace.stepPosition >= 0 and pos != l.trace.stepPosition:
       fail("KV scatter at pos " & $pos & " but the step position is " & $l.trace.stepPosition)
     let hkv = op.attrInt("HKV")
     let d = op.attrInt("D")
@@ -716,20 +817,260 @@ proc tryFuse(l: SessionLift; ops: seq[Op]; i: int; consumed: var HashSet[int]): 
   else:
     return 0
 
-proc liftSession*(trace: Trace; configText, modelName, embeddingName: string;
-                  coverage = false): string =
+proc captureAllZero(l: SessionLift; tr: TransferRec): bool =
+  ## True when the recorded upload bytes are present and all zero (a host-cleared scratch).
+  if tr.captureOffset < 0 or tr.captureBytes <= 0 or tr.captureBytes != tr.dst.bytes: return false
+  let path = l.trace.sourcePath & ".data"
+  if l.trace.sourcePath.len == 0 or not fileExists(path): return false
+  let f = open(path, fmRead)
+  defer: f.close()
+  f.setFilePos(tr.captureOffset)
+  var buffer = newString(min(tr.captureBytes, 1 shl 20))
+  var left = tr.captureBytes
+  while left > 0:
+    let n = min(buffer.len, left)
+    if f.readBuffer(addr buffer[0], n) != n: return false
+    for c in buffer.toOpenArray(0, n-1):
+      if c != '\0': return false
+    left -= n
+  true
+
+proc prepareRaw(l: SessionLift; ops: seq[Op]; weightsPaths: seq[string]) =
+  var sizes = initTable[int, int]()
+  var firstUse = initTable[int, int]()
+  var firstPhase = initTable[int, int]()
+  var written = initHashSet[int]()
+  var seenWrites = initHashSet[int]()
+  var needsInitial = initHashSet[int]()
+  var unknown: seq[string]
+  for op in ops:
+    if op.impl == "raw:dispatch":
+      if op.words.len == 0: fail("dispatch d" & $(-1-op.id) & " has no recorded program words")
+      let access = vmAccess(op.words)
+      op.ins = @[]
+      op.outs = @[]
+      for domain in ["mem", "u8", "lut", "input", "u32"]:
+        var synchronizationSlot = false
+        if domain == "u32":
+          for p in op.bindings:
+            if p.name == domain: synchronizationSlot = true
+        if domain notin access.reads and domain notin access.writes and not synchronizationSlot: continue
+        var found = false
+        var binding: PortRef
+        for p in op.bindings:
+          if p.name == domain: binding = p; found = true
+        # The original CPU/single-arena API aliases its other domains to mem.
+        if not found and l.trace.backend == "cpu" and
+            (domain != "input" or op.attrInt("input", 0) == 0):
+          for p in op.bindings:
+            if p.name == "mem": binding = p; binding.name = domain; found = true
+        if not found: fail("dispatch d" & $(-1-op.id) & " missing binding " & domain)
+        if binding.bytes <= 0 and binding.buffer >= 0 and binding.buffer < l.trace.bufs.len:
+          binding.bytes = max(0, l.trace.bufs[binding.buffer].bytes-binding.offset)
+        if binding.bytes <= 0:
+          if l.coverage:
+            binding.bytes = 4
+          else:
+            unknown.add "d" & $(-1-op.id) & " " & domain & "=b" & $binding.buffer & " has zero recorded bytes"
+        op.ins.add binding
+        if domain in access.writes or synchronizationSlot: op.outs.add binding
+    if op.isBookkeeping or op.implName in UploadOps or op.implName == "sessionRead": continue
+    for p in op.ins & op.outs:
+      let extent = if p.bytes > 0: p.offset+p.bytes
+                   elif p.buffer >= 0 and p.buffer < l.trace.bufs.len: l.trace.bufs[p.buffer].bytes
+                   else: 0
+      sizes[p.buffer] = max(sizes.getOrDefault(p.buffer), extent)
+      if not firstUse.hasKey(p.buffer):
+        firstUse[p.buffer] = op.order
+        firstPhase[p.buffer] = op.phase
+    let access = if op.impl == "raw:dispatch": vmAccess(op.words) else: VmAccess()
+    for p in op.ins:
+      if op.impl == "raw:dispatch" and p.name notin access.reads: continue
+      if p.buffer notin seenWrites: needsInitial.incl p.buffer
+    for p in op.outs: written.incl p.buffer
+    for p in op.outs: seenWrites.incl p.buffer
+  if unknown.len > 0:
+    fail("raw capture is incomplete: " & $unknown.len & " required bindings have no byte extent; first: " &
+      unknown[0] & ". Re-record with the core upload recorder and BYBY_FIR_PROBE_DATA=1; checkpoint size/order cannot recover unnamed zero-sized buffers")
+  let index = block:
+    var combined: seq[ProbeTensor]
+    for path in weightsPaths:
+      if path.len > 0: combined.add probeTensorIndex(path)
+    combined
+  let primary = if weightsPaths.len > 0: weightsPaths[0] else: ""
+  let first = ops[0].order
+  var perStep = initTable[int, TransferRec]()
+  for tr in l.trace.transfers:
+    if tr.kind == "upload":
+      if tr.order >= first and tr.order <= ops[^1].order and firstUse.hasKey(tr.dst.buffer) and tr.order < firstUse[tr.dst.buffer]:
+        perStep[tr.dst.buffer] = tr
+      for op in ops:
+        if op.id == tr.op and op.implName in UploadOps: perStep[tr.dst.buffer] = tr
+  var embeddings: seq[int]
+  var zeroUploads = initHashSet[int]()
+  var embeddingPhase = initTable[int, int]()
+  var phaseCount = initCountTable[int]()
+  for id, tr in perStep:
+    if not l.coverage and l.captureAllZero(tr): zeroUploads.incl id
+  for id, tr in perStep:
+    if not l.coverage and sizes.hasKey(id) and id notin zeroUploads and l.hidden > 0 and
+        tr.n >= l.hidden and tr.n mod l.hidden == 0:
+      embeddings.add id
+      phaseCount.inc min(1, firstPhase.getOrDefault(id))
+  if phaseCount.getOrDefault(0) > 1:
+    fail("several per-step token-row uploads in the selected unit; choose a slice with one embedding input")
+  # Every token-row upload of the replayed ops starts a unit of its own (any row count, any
+  # number of units). Ops before the first upload belong to the first unit.
+  var starts: seq[(int, int)]
+  for id in embeddings:
+    if firstPhase.getOrDefault(id) > 0: starts.add (firstUse[id], id)
+  starts.sort()
+  for k, start in starts: embeddingPhase[start[1]] = k+1
+  for op in ops:
+    if op.phase == 0: continue
+    var k = 0
+    for j, start in starts:
+      if start[0] <= op.order: k = j
+    op.phase = k+1
+  # Host scalar inputs of a driver (token / position): the recorder tagged their offsets with
+  # roles, so they become the graph's role inputs instead of frozen uploads.
+  for r in l.trace.roles:
+    if r.buffer < 0 or r.role notin ["token", "position"] or not sizes.hasKey(r.buffer): continue
+    if r.bytes != 4: fail("role " & r.role & " on b" & $r.buffer & " covers " & $r.bytes & " bytes, expected one f32")
+    l.roleBufs.incl r.buffer
+    l.cur[(r.buffer, r.offset)] = (if r.role == "position": l.positionBuf() else: "token")
+  var ids: seq[int]
+  for id in sizes.keys: ids.add id
+  ids.sort()
+  for id in ids:
+    if id in l.roleBufs: continue
+    var bytes = sizes[id]
+    if id >= 0 and id < l.trace.bufs.len and l.trace.bufs[id].bytes > bytes:
+      bytes = l.trace.bufs[id].bytes
+    if bytes <= 0 and l.coverage: bytes = 4
+    if bytes <= 0 or bytes mod 4 != 0: fail("raw buffer b" & $id & " has invalid byte size " & $bytes)
+    let name = "b" & $id
+    l.addBuf(name, bytes div 4)
+    l.cur[(id, 0)] = name
+    if l.coverage: continue # Structural coverage needs ports/programs, not checkpoint payloads.
+    if id in embeddings: continue
+    var upload = TransferRec(captureOffset: -1)
+    var found = false
+    for tr in l.trace.transfers:
+      if tr.kind == "upload" and tr.dst.buffer == id and tr.dst.offset == 0 and
+          tr.order <= firstUse[id] and tr.dst.bytes > 0 and tr.dst.bytes <= bytes:
+        upload = tr; found = true
+    if perStep.hasKey(id): upload = perStep[id]; found = true
+    var b = l.bufs[l.bufIdx[name]]
+    b.rawWeight = id notin written
+    if found:
+      let match = if index.len > 0 and b.rawWeight:
+          matchProbeTensor(index, primary, upload.dst.bytes, upload.fingerprint) else: -1
+      if perStep.hasKey(id) and l.trace.selectionSession > 0 and id notin zeroUploads:
+        var constantWeight = match >= 0 and upload.fingerprint.len > 0
+        for transfer in l.trace.transfers:
+          if transfer.kind == "upload" and transfer.dst.buffer == id and transfer.fingerprint.len > 0 and
+              transfer.fingerprint != upload.fingerprint:
+            constantWeight = false
+        if not constantWeight:
+          fail("per-step host upload b" & $id & " has no token/position/embedding rule; refusing to freeze host-computed data")
+      if match >= 0:
+        b.tensor = index[match].name
+        b.initFile = if index[match].source == primary: "checkpoint"
+                     else: extractFilename(index[match].source) & ".raw"
+        b.initOffset = index[match].offset; b.initBytes = upload.dst.bytes
+        b.fingerprint = upload.fingerprint
+        var dims: seq[string]
+        for dim in index[match].shape: dims.add $dim
+        l.trace.names.add NameRec(buffer: id, bytes: bytes, name: index[match].name,
+          shape: "(" & dims.join(" ") & ")", dtype: "raw")
+      elif upload.captureOffset >= 0 and upload.captureBytes == upload.dst.bytes:
+        if l.trace.sourcePath.len == 0 or not fileExists(l.trace.sourcePath & ".data"):
+          fail("missing upload sidecar " & l.trace.sourcePath & ".data")
+        b.tensor = "capture." & upload.fingerprint
+        b.initFile = "trace.data"; b.initOffset = upload.captureOffset; b.initBytes = upload.captureBytes
+        b.fingerprint = upload.fingerprint
+      elif upload.data.len*4 == upload.dst.bytes:
+        b.data = upload.data
+        while b.data.len < b.elements: b.data.add 0'u32
+        b.rawWeight = false
+      else:
+        unknown.add name & " (" & $bytes & " bytes): " &
+          (if match == -2: "ambiguous checkpoint match" else: "no checkpoint identity or captured upload bytes")
+    elif b.rawWeight or id in needsInitial:
+      unknown.add name & " (" & $bytes & " bytes): no recorded upload or checkpoint identity"
+    # A never-uploaded scratch buffer starts undefined, and must be written before reads.
+    # Do not silently invent contents for externally initialized state.
+    l.bufs[l.bufIdx[name]] = b
+  if unknown.len > 0: fail("unresolved raw inputs:\n  " & unknown.join("\n  ") & "\nRe-record with BYBY_FIR_PROBE_DATA=1 (core recorder only)")
+  for id in embeddings:
+    let tr = perStep[id]
+    var emb = l.embeddingName
+    if emb.len == 0:
+      # The per-token upload is host f32 rows, so prefer a native f32 table in
+      # the primary checkpoint whose name identifies an embedding table.
+      var candidates: seq[string]
+      for tensor in index:
+        if tensor.shape == @[l.vocab, l.hidden] and (primary.len == 0 or tensor.source == primary):
+          candidates.add tensor.name
+      var f32Candidates: seq[string]
+      for name in candidates:
+        for tensor in index:
+          if tensor.name == name and tensor.kind == 0: f32Candidates.add name
+      var named: seq[string]
+      for name in (if f32Candidates.len > 0: f32Candidates else: candidates):
+        let lower = name.toLowerAscii()
+        if "embed" in lower or "token_embd" in lower or "wte" in lower: named.add name
+      let pool = if named.len > 0: named
+                 elif f32Candidates.len > 0: f32Candidates
+                 else: candidates
+      if pool.len == 1: emb = pool[0]
+      elif pool.len > 1:
+        # Fall back to a second checkpoint only when the primary cannot decide.
+        fail("ambiguous embedding tensor; use --embedding NAME (" & pool[0] & ", " & pool[1] & ")")
+      if emb.len == 0:
+        for tensor in index:
+          if tensor.shape == @[l.vocab, l.hidden]:
+            if emb.len > 0: fail("ambiguous embedding tensor; use --embedding NAME")
+            emb = tensor.name
+    if emb.len == 0: fail("per-step embedding upload needs --weights or --embedding NAME")
+    let w = l.weightName(NameRec(name: emb), "f32", @[l.vocab, l.hidden])
+    let phase = embeddingPhase.getOrDefault(id)
+    if phase != 0: l.phaseRows[phase] = tr.n div l.hidden
+    l.nodes.add SNode(kind: "ext", op: "fir.embedding", name: "embedding", ins: @["token", w], outs: @["b" & $id], phase: phase)
+
+proc liftSessionFiles*(trace: Trace; configText, modelName, embeddingName: string;
+                       coverage: bool; weightsPaths: seq[string]; fuseDispatches = false;
+                       gridTg = 0; dynamicGrid = false): string =
   ## With `coverage`, every recorded op is lowered on its own (unnamed weights and host inputs
   ## become plain buffers, failures are collected) and the result is a coverage report.
   let l = SessionLift(trace: trace, config: parseJson(configText), modelName: modelName,
     embeddingName: embeddingName, coverage: coverage, okCount: initCountTable[string]())
+  l.raw = weightsPaths.len > 0
   l.hidden = cfgInt(l.config, ["hidden_size", "n_embd", "d_model", "dim"])
   l.positions = cfgInt(l.config, ["max_position_embeddings", "n_positions", "n_ctx", "seq_length"])
   l.vocab = cfgInt(l.config, ["vocab_size"])
   var ops: seq[Op]
+  var rawParents = initHashSet[int]()
   for op in trace.ops:
-    if op.step == trace.steps and op.parent < 0: ops.add op
+    if op.impl == "raw:dispatch" and op.parent >= 0: rawParents.incl op.parent
+  for op in trace.ops:
+    if op.step == trace.steps:
+      if op.impl == "raw:dispatch":
+        # Semantic session ops already describe their child dispatches. Micro wrappers do not.
+        var keepDispatch = op.parent < 0
+        if op.parent >= 0:
+          for parent in trace.ops:
+            if parent.id == op.parent and parent.impl.startsWith("micro:"): keepDispatch = true
+        if keepDispatch: ops.add op; l.raw = true
+      elif op.parent < 0 and not (op.id in rawParents and op.impl.startsWith("micro:")): ops.add op
   if ops.len == 0: fail("the trace has no recorded step")
   l.addBuf("token", 1, "token")
+  if l.raw and l.positions <= 0:
+    # Recurrent raw graphs need no context-sized allocation. This is an I/O
+    # position counter limit; recorded buffer extents still constrain kernels.
+    l.positions = int(high(int32))
+  if l.raw: l.prepareRaw(ops, weightsPaths)
   for k in ["rms_norm_eps", "layer_norm_epsilon", "layer_norm_eps", "norm_eps"]:
     if l.eps == 0.0 and l.config.hasKey(k) and l.config[k].kind in {JFloat, JInt}:
       l.eps = l.config[k].getFloat()
@@ -739,13 +1080,22 @@ proc liftSession*(trace: Trace; configText, modelName, embeddingName: string;
   var logits = ""
   var consumed = initHashSet[int]()
   var i = 0
+  var stamped = l.nodes.len
+  var stampPhase = 0
   while i < ops.len:
+    while stamped < l.nodes.len:
+      l.nodes[stamped].phase = stampPhase
+      inc stamped
+    stampPhase = ops[i].phase
     let op = ops[i]
     let name = op.implName
     if i in consumed:
       inc i
       continue
     if name in UploadOps:
+      if l.raw:
+        inc i
+        continue
       let ti = trace.transferOf(op)
       if ti < 0:
         inc i
@@ -798,14 +1148,16 @@ proc liftSession*(trace: Trace; configText, modelName, embeddingName: string;
     if name == "sessionRead":
       let h = op.ins.port("h")
       let n = op.attrInt("n")
-      if not l.cur.hasKey(h.key):
+      if not l.raw and not l.cur.hasKey(h.key):
         if coverage:
           inc i
           continue
         fail("sessionRead of a buffer no op wrote")
-      let src = l.cur[h.key]
+      let src = if l.raw: l.rd(PortRef(buffer: h.buffer, offset: h.offset, bytes: n*4)) else: l.cur[h.key]
       if src in l.tainted:
         afterTaintedRead = true
+      elif l.raw and op.phase > 0 and l.vocab > 0 and n mod l.vocab == 0:
+        l.phaseLogits[op.phase] = (src, n div l.vocab)
       elif l.vocab > 0 and n == l.vocab:
         logits = src
       else:
@@ -823,7 +1175,7 @@ proc liftSession*(trace: Trace; configText, modelName, embeddingName: string;
         l.tainted.incl t
       inc i
       continue
-    if name == "sessionCopyInto":
+    if name == "sessionCopyInto" and not l.raw:
       var last = i
       while last + 1 < ops.len and (ops[last+1].implName == "sessionCopyInto" or
           (ops[last+1].isBookkeeping and ops[last+1].implName != "sessionBegin" and
@@ -832,7 +1184,7 @@ proc liftSession*(trace: Trace; configText, modelName, embeddingName: string;
       l.lowerCopyGroup(ops, i, last)
       i = last + 1
       continue
-    if getEnv("FIRLIFT_NOFUSE").len == 0 and not coverage and name in ["sessionActivation", "sessionVecOp", "sessionRope"]:
+    if not l.raw and getEnv("FIRLIFT_NOFUSE").len == 0 and not coverage and name in ["sessionActivation", "sessionVecOp", "sessionRope"]:
       if l.tryFuse(ops, i, consumed) > 0:
         inc i
         continue
@@ -845,6 +1197,9 @@ proc liftSession*(trace: Trace; configText, modelName, embeddingName: string;
     else:
       l.lowerOp(op)
     inc i
+  while stamped < l.nodes.len:
+    l.nodes[stamped].phase = stampPhase
+    inc stamped
   if coverage:
     result = "lowered ops:\n"
     for k, v in l.okCount: result.add "  " & k & " x" & $v & "\n"
@@ -863,7 +1218,7 @@ proc liftSession*(trace: Trace; configText, modelName, embeddingName: string;
   var keep = newSeq[bool](l.nodes.len)
   for idx in countdown(l.nodes.high, 0):
     let n = l.nodes[idx]
-    var needed = false
+    var needed = l.raw  # Preserve all writes to aliased persistent state, including non-logits outputs.
     for o in n.outs:
       if o in live: needed = true
     if needed:
@@ -874,6 +1229,209 @@ proc liftSession*(trace: Trace; configText, modelName, embeddingName: string;
   var nodes: seq[SNode]
   for idx, n in l.nodes:
     if keep[idx]: nodes.add n
+  if fuseDispatches and l.raw:
+    # Merge consecutive raw dispatches whose threadgroups are provably independent.
+    var roots = initTable[string, string]()
+    for b in l.bufs:
+      if b.base.len > 0: roots[b.name] = b.base
+    var kernelOf = initTable[string, int]()
+    for idx, k in l.kernels: kernelOf[k.name] = idx
+    proc asFuse(n: SNode): FuseKernel =
+      let k = l.kernels[kernelOf[n.op]]
+      let parts = k.body.splitWhitespace()
+      for w in parts[1 .. ^1]: result.words.add uint32(parseHexInt(w))
+      result.threads = k.threads; result.tg = k.tg; result.tgBytes = k.tgBytes
+      let slots = k.slots.split(',')
+      for i, sl in slots:
+        result.bindings.add (sl.split(':')[0], n.ins[i])
+    var merged: seq[SNode]
+    var cur: SNode
+    var curK: FuseKernel
+    var chain = false
+    proc flush() =
+      if chain: merged.add cur
+      chain = false
+    for n in nodes:
+      let isRaw = n.kind == "micro" and kernelOf.hasKey(n.op) and l.kernels[kernelOf[n.op]].raw
+      if not isRaw:
+        flush()
+        merged.add n
+        continue
+      let kn = asFuse(n)
+      if chain and cur.phase == n.phase:
+        var plan: FusePlan
+        let why = fusable(curK, kn, roots, plan)
+        record(why)
+        if bindingReason(curK, kn, roots).len == 0: inc fuseStats.bindable
+        if why.len == 0:
+          var ins = cur.ins
+          var slotText: seq[string]
+          var bindings: seq[(string, string)]
+          for (d, b) in curK.bindings & kn.bindings:
+            var at = ins.find(b)
+            if at < 0:
+              ins.add b
+              at = ins.high
+            var dup = false
+            for x in bindings:
+              if x[0] == d: dup = true
+            if not dup:
+              bindings.add (d, b)
+              slotText.add d & ":in" & $at
+          var outs = cur.outs
+          for o in n.outs:
+            if o notin outs: outs.add o
+          let words = concatWords(curK, kn, plan)
+          let threads = fusedThreads(curK, kn)
+          var body = "words"
+          for w in words: body.add " " & toHex(w, 8).toLowerAscii
+          let name = "fused" & $l.kernels.len
+          l.kernels.add SKern(name: name, body: body, threads: threads, tg: curK.tg,
+            tgBytes: max(curK.tgBytes, kn.tgBytes), ins: ins.len, outs: outs.len,
+            slots: slotText.join(","), raw: true)
+          kernelOf[name] = l.kernels.high
+          cur = SNode(kind: "micro", op: name, name: cur.name & "_" & n.name, ins: ins,
+            outs: outs, rmw: true, phase: cur.phase)
+          curK = FuseKernel(words: words, threads: threads, tg: curK.tg,
+            tgBytes: max(curK.tgBytes, kn.tgBytes), bindings: bindings)
+          continue
+      flush()
+      cur = n; curK = kn; chain = true
+    flush()
+    nodes = merged
+  if gridTg > 0 and l.raw:
+    # Persistent chains: consecutive raw dispatches become one launch of `gridTg` threadgroups.
+    const ChainWeightFloats = 48 * 1024 * 1024
+    var kernelOf = initTable[string, int]()
+    for idx, k in l.kernels: kernelOf[k.name] = idx
+    proc rootName(name: string): string =
+      let b = l.bufs[l.bufIdx[name]]
+      if b.base.len > 0: b.base else: name
+    proc viewOffset(name: string): int =
+      let b = l.bufs[l.bufIdx[name]]
+      if b.base.len > 0: b.offset else: 0
+    # The runner packs a raw weight into a pool only when every consumer is a slot kernel.
+    var offPool = initHashSet[string]()
+    for n in nodes:
+      let viaSlots = n.kind == "micro" and kernelOf.hasKey(n.op) and l.kernels[kernelOf[n.op]].raw
+      if not viaSlots:
+        for name in n.ins & n.outs:
+          offPool.incl (if l.bufIdx.hasKey(name) and l.bufs[l.bufIdx[name]].base.len > 0: l.bufs[l.bufIdx[name]].base else: name)
+    proc isRawWeight(name: string): bool =
+      let b = l.bufs[l.bufIdx[name]]
+      b.rawWeight and (if b.base.len > 0: b.base else: name) notin offPool
+    proc stageOf(n: SNode): PersistentStage =
+      let k = l.kernels[kernelOf[n.op]]
+      let parts = k.body.splitWhitespace()
+      for w in parts[1 .. ^1]: result.kernel.words.add uint32(parseHexInt(w))
+      result.kernel.threads = k.threads; result.kernel.tg = k.tg; result.kernel.tgBytes = k.tgBytes
+      let slotList = k.slots.split(',')
+      for i in 0 ..< slotList.len:
+        result.kernel.bindings.add (slotList[i].split(':')[0], n.ins[i])
+    let domains = ["mem", "u8", "lut", "input"]
+    proc compatible(chain: seq[SNode]; n: SNode): bool =
+      let b = stageOf(n)
+      var weights = 0
+      for c in chain & @[n]:
+        for name in c.ins:
+          if isRawWeight(name): weights += l.bufs[l.bufIdx[name]].elements
+      if weights > ChainWeightFloats: return false
+      for d in domains:
+        var other = ""
+        for (dd, nm) in b.kernel.bindings:
+          if dd == d: other = nm
+        if other.len == 0: continue
+        for c in chain:
+          var first = ""
+          for (dd, nm) in stageOf(c).kernel.bindings:
+            if dd == d: first = nm
+          if first.len == 0: continue
+          # Every buffer of a domain must live in one allocation: the same weight pool, or the same root.
+          if isRawWeight(first) != isRawWeight(other): return false
+          if not isRawWeight(first) and rootName(first) != rootName(other): return false
+      return true
+    proc build(chain: seq[SNode]): (SNode, string) =
+      var ins: seq[string]
+      var stages: seq[PersistentStage]
+      var outs: seq[string]
+      var memAnchor = high(int)
+      var memRoot = ""
+      var bound = initTable[string, int]()
+      for n in chain:
+        var st = stageOf(n)
+        for (d, nm) in st.kernel.bindings:
+          var at = ins.find(nm)
+          if at < 0:
+            ins.add nm
+            at = ins.high
+          if d == "mem":
+            memAnchor = min(memAnchor, viewOffset(nm))
+            memRoot = rootName(nm)
+          if d notin bound: bound[d] = at
+          st.rebase.add (d, at)
+        stages.add st
+        for o in n.outs:
+          if o notin outs: outs.add o
+      let root = l.bufs[l.bufIdx[memRoot]]
+      if root.data.len > 0:
+        return (SNode(), "mem buffer " & memRoot & " has initwords")
+      # --dynamic-grid-tg: prefer gridTg threadgroups, but a chain whose barrier stages cannot be
+      # split that way runs with the largest smaller count that works.
+      var chainTg = gridTg
+      var program: Persistent
+      var why = ""
+      while true:
+        (program, why) = persistentChain(stages, chainTg, 0xFFFFFFFF)
+        if why.len == 0 or not dynamicGrid or chainTg <= 1 or "divisible" notin why: break
+        dec chainTg
+      if why.len > 0: return (SNode(), why)
+      l.addBuf("gridctrl", 64)
+      if "gridctrl" notin ins: ins.add "gridctrl"
+      var slotText: seq[string]
+      for d in domains:
+        slotText.add d & ":in" & $bound.getOrDefault(d, bound["mem"])
+      slotText.add "u32:in" & $ins.find("gridctrl")
+      let name = "grid" & $l.kernels.len
+      l.kernels.add SKern(name: name, body: program.lines.join("\n"), threads: chainTg * PhysicalTg,
+        tg: PhysicalTg, tgBytes: program.tgBytes, ins: ins.len, outs: outs.len,
+        slots: slotText.join(","), raw: true)
+      kernelOf[name] = l.kernels.high
+      return (SNode(kind: "micro", op: name, name: chain[0].name & "_grid", ins: ins, outs: outs,
+        rmw: true, phase: chain[0].phase), "")
+    var merged: seq[SNode]
+    var run: seq[SNode]
+    proc isRaw(n: SNode): bool = n.kind == "micro" and kernelOf.hasKey(n.op) and l.kernels[kernelOf[n.op]].raw
+    proc settle() =
+      var pending = run
+      run = @[]
+      while pending.len > 0:
+        var take = pending.len
+        var built: SNode
+        while take >= 2:
+          let (node, why) = build(pending[0 ..< take])
+          if why.len == 0:
+            built = node
+            break
+          fuseStats.reasons.inc "persistent: " & why
+          dec take
+        if take >= 2:
+          merged.add built
+          inc fuseStats.chains
+          fuseStats.chained += take
+          pending = pending[take .. ^1]
+        else:
+          merged.add pending[0]
+          pending = pending[1 .. ^1]
+    for n in nodes:
+      if not isRaw(n):
+        settle()
+        merged.add n
+        continue
+      if run.len > 0 and (run[0].phase != n.phase or not compatible(run, n)):
+        settle()
+      run.add n
+    settle()
+    nodes = merged
   # Emit.
   var usedBuf = initHashSet[string]()
   var usedWeight = initHashSet[string]()
@@ -883,6 +1441,10 @@ proc liftSession*(trace: Trace; configText, modelName, embeddingName: string;
       usedBuf.incl b
       usedWeight.incl b
     if n.kind == "micro": usedKernel.incl n.op
+  for phase, output in l.phaseLogits:
+    usedBuf.incl output[0]
+  for b in l.bufs:
+    if b.name in usedBuf and b.base.len > 0: usedBuf.incl b.base
   var outText = "fir 1\nmodel " & modelName & "\nconfig config.json\nruntime graph\nlayout script\nscript_abi 1\n"
   let epsKey = l.config.cfgKey(["rms_norm_eps", "layer_norm_epsilon", "layer_norm_eps", "norm_eps"])
   if epsKey.len > 0: outText.add "epsilon " & epsKey & "\n"
@@ -898,7 +1460,25 @@ proc liftSession*(trace: Trace; configText, modelName, embeddingName: string;
   symLine("vocab", ["vocab_size"], l.vocab)
   for b in l.bufs:
     if b.name notin usedBuf and b.role notin ["token", "position", "logits"]: continue
-    outText.add "buf " & b.name & " f32 " & $b.elements
+    if b.base.len > 0: continue
+    if b.rawWeight:
+      outText.add "weight " & b.name & " raw " & b.tensor & " tensor [" & $b.elements & "]\n"
+    else:
+      outText.add "buf " & b.name & " f32 " & $b.elements
+      if b.role == "logits": outText.add " output:logits"
+      elif b.role.len > 0: outText.add " input:" & b.role
+      outText.add "\n"
+    if b.initFile.len > 0:
+      outText.add "init " & b.name & " " & b.initFile & " " & $b.initOffset & " " & $b.initBytes
+      if b.fingerprint.len > 0: outText.add " " & b.fingerprint
+      outText.add "\n"
+    if b.data.len > 0:
+      var data: seq[string]
+      for word in b.data: data.add toHex(word, 8).toLowerAscii
+      outText.add "initwords " & b.name & " " & data.join(" ") & "\n"
+  for b in l.bufs:
+    if b.name notin usedBuf or b.base.len == 0: continue
+    outText.add "view " & b.name & " " & b.base & " " & $b.offset & " " & $b.elements
     if b.role == "logits": outText.add " output:logits"
     elif b.role.len > 0: outText.add " input:" & b.role
     outText.add "\n"
@@ -910,16 +1490,45 @@ proc liftSession*(trace: Trace; configText, modelName, embeddingName: string;
   for k in l.kernels:
     if k.name notin usedKernel: continue
     var expect: seq[string]
-    for idx in 0 ..< k.ins: expect.add "in" & $idx & ":" & $k.sizes[idx]
-    for idx in 0 ..< k.outs: expect.add "out" & $idx & ":" & $k.sizes[k.ins + idx]
+    if not k.raw:
+      for idx in 0 ..< k.ins: expect.add "in" & $idx & ":" & $k.sizes[idx]
+      for idx in 0 ..< k.outs: expect.add "out" & $idx & ":" & $k.sizes[k.ins + idx]
     outText.add "kernel " & k.name & " in=" & $k.ins & " out=" & $k.outs & " threads=" & $k.threads &
       " tg=" & $k.tg & " tgbytes=" & $k.tgBytes
     if expect.len > 0: outText.add " expect=" & expect.join(",")
+    if k.raw:
+      outText.add " layout=slots"
+      if k.slots.len > 0: outText.add " slots=" & k.slots
     if k.tag.len > 0: outText.add " tag=" & k.tag
     outText.add "\n" & k.body & "\nendkernel\n"
   var seen = initCountTable[string]()
+  var ordered: seq[SNode]
+  var maxPhase = 0
+  for n in nodes: maxPhase = max(maxPhase, n.phase)
+  for phase in 1 .. maxPhase:
+    for n in nodes:
+      if n.phase == phase: ordered.add n
+  let hasPrefill = ordered.len > 0
   for n in nodes:
+    if n.phase == 0: ordered.add n
+  var emittedPhase = -1
+  for n in ordered:
     seen.inc n.name
     let nm = (if seen[n.name] > 1: n.name & "_" & $seen[n.name] else: n.name)
+    if hasPrefill and n.phase != emittedPhase:
+      emittedPhase = n.phase
+      if n.phase != 0:
+        if l.phaseRows.getOrDefault(n.phase) <= 0: fail("replayed unit " & $n.phase & " has no token-row embedding input")
+        outText.add "phase chunk" & $n.phase & " rows=" & $l.phaseRows[n.phase]
+        if l.phaseLogits.hasKey(n.phase): outText.add " logits=" & l.phaseLogits[n.phase][0]
+        outText.add "\n"
+      else:
+        outText.add "phase decode\n"
     outText.add "node " & nm & " " & n.kind & " " & n.op & " " & n.ins.join(" ") & " -> " & n.outs.join(" ") & "\n"
   result = outText
+
+proc liftSession*(trace: Trace; configText, modelName, embeddingName: string;
+                  coverage = false; weightsPath = ""): string =
+  ## Single-checkpoint convenience wrapper; the CLI passes every --weights file.
+  if weightsPath.len > 0: liftSessionFiles(trace, configText, modelName, embeddingName, coverage, @[weightsPath])
+  else: liftSessionFiles(trace, configText, modelName, embeddingName, coverage, newSeq[string]())

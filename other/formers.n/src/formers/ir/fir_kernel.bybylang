@@ -11,6 +11,8 @@
 # element offsets stay exact.
 import nim "std/[tables, strutils, math]"
 import nim "session_vm"
+import nim "micro_kernel/slot_layout"
+import nim "std/sets"
 import "fir_types.bybylang"
 
 type
@@ -239,6 +241,105 @@ function firAssembleKernel(def: FirKernelDef, model: FirProgram, node: FirNode, 
         if s.syms[key] != fkEval(s, parts[1]):
             raise newException(ValueError, "FIR kernel " & s.where & ": " & parts[0] & " has " & $int(s.syms[key]) & " elements, expected " & parts[1])
     var p: VmProgram
+    if def.layout == "slots":
+        # Words are copied exactly, including HALT; never rebase recorded operands. A
+        # `rebase DOMAIN inK` line re-points one memory domain at another buffer of the same
+        # allocation (persistent kernels run several dispatches over different buffers).
+        let domainNames = @["mem", "u8", "lut", "input"]
+        var anchor: array[5, int]
+        var anchored: array[5, bool]
+        var anchorUnit: array[5, string]
+        var hasRebase = false
+        let planned = model.rebaseUnit.len > 0
+        for line in def.body:
+            if line.mnemonic == "rebase":
+                hasRebase = true
+        if hasRebase:
+            for slot in def.slots:
+                let parts = slot.split(':')
+                if parts.len != 2 or parts[0] notin domainNames or not parts[1].startsWith("in"):
+                    continue
+                let domain = domainNames.find(parts[0])
+                let bound = ins[parseInt(parts[1][2 .. ^1])]
+                # Without a runner allocation plan (--fir-check) every buffer sits at offset 0 of one unit.
+                anchorUnit[domain] = if planned: model.rebaseUnit[bound] else: "check"
+                anchor[domain] = if planned: model.rebaseOff[bound] else: 0
+                anchored[domain] = true
+        # Pass 1 finds the lowest offset per domain (the bind point); pass 2 emits.
+        for pass in (if hasRebase: 0 else: 1) .. 1:
+            p.words.setLen(0)
+            for line in def.body:
+                if line.mnemonic == "rebase":
+                    if line.args.len != 2 or line.args[0] notin domainNames or not line.args[1].startsWith("in"):
+                        raise newException(ValueError, "FIR kernel " & def.name & ": expected 'rebase DOMAIN inK'")
+                    let index = parseInt(line.args[1][2 .. ^1])
+                    if index < 0 or index >= ins.len:
+                        raise newException(ValueError, "FIR kernel " & def.name & ": rebase input outside kernel arity")
+                    let domain = domainNames.find(line.args[0])
+                    let target = ins[index]
+                    let targetUnit = if planned: model.rebaseUnit[target] else: "check"
+                    let targetOff = if planned: model.rebaseOff[target] else: 0
+                    if not anchored[domain] or targetUnit != anchorUnit[domain]:
+                        raise newException(ValueError, "FIR kernel " & def.name & ": rebase target is not in the bound allocation: " & target)
+                    if pass == 0:
+                        anchor[domain] = min(anchor[domain], targetOff)
+                        continue
+                    var delta = targetOff - anchor[domain]
+                    if domain == 1:
+                        delta = delta * 4    # u8 addresses are bytes
+                    p.emitUConst(31, uint32(delta))
+                    if domain == 0:
+                        p.emitBaseF32(31)
+                    elif domain == 1:
+                        p.emitBaseU8(31)
+                    elif domain == 2:
+                        p.emitBaseLut(31)
+                    else:
+                        p.emitBaseIn(31)
+                    continue
+                if line.mnemonic != "words":
+                    raise newException(ValueError, "FIR slot kernel accepts only hex words: " & def.name)
+                if pass == 0:
+                    continue
+                for word in line.args:
+                    if word.len != 8 or not word.allCharsInSet(HexDigits):
+                        raise newException(ValueError, "FIR invalid raw VM word: " & word)
+                    p.words.add(uint32(parseHexInt(word)))
+        let access = vmAccess(p.words)
+        var bound = initHashSet[string]()
+        for i in 0 .. 4:
+            result.slotOffsets[i] = -1
+        for slot in def.slots:
+            let parts = slot.split(':')
+            let domains = @["mem", "u8", "lut", "input", "u32"]
+            if parts.len != 2 or parts[0] notin domains or parts[0] in bound:
+                raise newException(ValueError, "FIR invalid or duplicate slot: " & slot)
+            let port = parts[1]
+            if not port.startsWith("in") or port.len < 3:
+                raise newException(ValueError, "FIR slot needs an input port: " & slot)
+            let index = parseInt(port[2 .. ^1])
+            if index < 0 or index >= ins.len:
+                raise newException(ValueError, "FIR slot input outside kernel arity: " & slot)
+            let domain = domains.find(parts[0])
+            result.slotOffsets[domain] = 0
+            result.slotSizes[domain] = model.buffers[ins[index]].elements
+            result.slotBuffers[domain] = ins[index]
+            bound.incl(parts[0])
+        for i in 0 .. 4:
+            result.slotAnchor[i] = if i < 4 and anchored[i]: anchor[i] else: -1
+        for domain in access.reads + access.writes:
+            if domain notin bound:
+                raise newException(ValueError, "FIR recorded kernel missing slot " & domain)
+        result.program = p
+        result.slotLayout = true
+        result.threads = int(fkEval(s, def.threads))
+        result.tgSize = int(fkEval(s, def.tg))
+        result.tgBytes = int(fkEval(s, def.tgBytes))
+        if result.threads <= 0 or result.tgSize <= 0 or result.tgBytes < 0:
+            raise newException(ValueError, "FIR invalid recorded launch geometry")
+        return result
+    if def.slots.len > 0:
+        raise newException(ValueError, "FIR slots require kernel layout=slots")
     var scopes: seq[string]
     var loopCounts: seq[uint32]
     for line in def.body:

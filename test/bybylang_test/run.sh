@@ -16,7 +16,7 @@ if [ ! -x "$BYBY" ]; then
     make -C vendor/bybylang build
 fi
 
-for name in syntax_test native_gpu_test cpu_test capi_test; do
+for name in syntax_test native_gpu_test cpu_test capi_test trace_test; do
     echo ""
     echo "=== [bybylang-test] $name ==="
     "$BYBY" "test/bybylang_test/$name.bybylang" \

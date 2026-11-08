@@ -13,7 +13,6 @@
 import std/[tables, os, strutils, math, monotimes, times, algorithm, strformat]
 import backend
 import vendor/bybylang/gpubackend as byby
-import vendor/bybylang/probe
 import session_vm
 import session_vm_dispatch
 import jit_vm
@@ -279,9 +278,6 @@ proc uploadInt4WeightOnce(ctx: Backend; name: string; qt: QuantTensor; K, N: int
   for i in 0 ..< qt.zero_point.len: scZp[qt.scale.len + i] = qt.zero_point[i]
   c.scZpBuf = byby.sessionUploadPrivate(be, scZp)
   c.ready = true
-  if unlikely(firProbeOn):
-    probeName(c.wBuf, name, "q4", [N, K])
-    probeName(c.scZpBuf, name & ".scale_zero", "f32", [scZp.len])
   gInt4CacheGpu[name] = c
 
 proc markFp4Lin*(ctx: Backend; name: string; bias: seq[float32]; K, N: int): GpuLin
@@ -516,10 +512,6 @@ proc prepareGpuLinForLinear*(ctx: Backend; name: string; lin: var Linear): GpuLi
     result.isFp4 = false
     result.isInt4 = false
   discard prepareLoraGpu(ctx, name, lin.loraAValues, lin.loraBValues, lin.loraR, K, N, lin.loraScale)
-  if unlikely(firProbeOn):
-    if not result.isFp4 and not result.isInt4:
-      probeName(result.wF32, name, "f32", [N, K])
-    probeName(result.biasH, name & ".bias", "f32", [N])
   gLinCache[name] = result
 
 proc uploadBiasOrRaise(name: string; bias: seq[float32]; N: int): seq[float32] =

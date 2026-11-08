@@ -4,14 +4,22 @@ The recorder (`vendor/bybylang/probe.nim`) and the Nim lifter
 (`other/formers.n/firlift/`) rebuild a runnable `model.fir` from one recorded
 decode step. No Python is on the trace path.
 
+> Recording a trace from code (Python, Nim, BybyLang, C) is covered by the [Trace API](trace-api.md); this page covers what the lifter does with it.
+
 ## Record
 
 `BYBY_FIR_PROBE=<path>` enables the recorder; `BYBY_FIR_PROBE_STEPS=decode:2` selects
 steps. With the recorder off, every hook is one boolean test. The output is
-`fprobe 2`, structure only: buffers, programs, steps, ops and host transfers. No
-tensor payload is written. A step is flushed by `probeStepEnd`; a run without
-step markers has no output file, so use a runtime that marks its decode steps
-(the FIR runner and `nim_inference` do).
+`fprobe 2`: buffers, programs, optional steps, ops and host transfers. Snapshots
+are flushed periodically and at exit, including runs without step markers.
+Core CPU/Metal/Vulkan uploads record a versioned sampled fingerprint (size plus
+up to five 64-byte blocks). Set `BYBY_FIR_PROBE_DATA=1` to also stream exact host
+upload bytes to `<trace>.data`. This can use checkpoint-sized disk space. It
+preserves unnamed LUTs, adapters and composite arenas without model hooks;
+fingerprints alone cannot reconstruct these auxiliary values. No GPU readback
+is added. Keep the trace and its sidecar together.
+`BYBY_FIR_PROBE_DATA_MAX=0` (the default) leaves capture unlimited; a positive
+byte cap omits larger payloads while retaining their fingerprints.
 
 ```
 fprobe 2
@@ -31,8 +39,10 @@ end
   (`buffer@byteOffset:byteCount`), scalar attributes, implementation
   (`session:<proc>`, `micro:<hash>`, `ext:<op>`), parent op and program.
 - `disp` is one micro-kernel launch (CPU VM, Metal JIT or Vulkan dispatch).
-- `name` records the checkpoint tensor at upload, so weight names come from the
-  load sites. `-scales`/`-zeros` buffers are derived from a q4 tensor.
+- Optional `name` records preserve names supplied by an existing caller.
+  Unmodified runtimes need no naming hooks: the raw path uses core upload
+  fingerprints and `--weights` instead. `-scales`/`-zeros` named buffers may be
+  derived from a q4 tensor.
 - Buffer byte extents are set at allocation/upload for CPU, Metal, Vulkan and
   q4 weights. The backend field is the canonical name (`cpu`, `metal`,
   `vulkan`).
@@ -43,7 +53,7 @@ end
 
 ```
 other/formers.n/firlift/firlift --trace t.fprobe --config config.json --out DIR \
-  [--name NAME] [--q4] [--report]
+  [--weights model.nimq]... [--slice A:B | --step N] [--embedding TENSOR] [--report]
 ```
 
 The lifter:
@@ -109,9 +119,9 @@ it and passes `--fir-check`.
 
 - A raw trace is lifted by the session lifter (below). `--core-idiom` keeps the older
   decoder-idiom lifter, whose attention body is specialized to the TinyLlama dimensions.
-- Raw micro-VM launches that the runtime records without ports (`disp` lines on an arena, as the
-  Mamba runtimes produce) are not lifted by this stage: they carry no tensor extents. Mamba's
-  session SSD op (`sessionMamba2SsdPrefillEnc`) is lowered.
+- Raw dispatches with program words and complete slot extents are lifted as
+  described below. Historical zero-sized or opaque uploads cannot be recovered
+  retrospectively. Missing identities or initialization data fail explicitly.
 - Host computation between GPU sessions is invisible to the recorder. The one idiom handled is
   the native Llama runtime's final RMSNorm (see the session lifter).
 - `q4t` is script-layout only and applies to `fir.linear_t`; `fir.linear`
@@ -221,3 +231,146 @@ unfused graphs were indistinguishable, so the lane-per-column matmul kernels dom
 `firlift --coverage` lowers every op of a trace on its own, tolerates unnamed weights and
 host inputs, and fails when an op has no mapping. `make fir-lift-test` runs it on the trace
 that `test_session_gpu` records, which exercises every op family the Metal backend has.
+
+## Unmarked traces and raw slot kernels
+
+Unmarked traces are selected by repeating sequences of complete session
+signatures (semantic op kinds and dispatch pipeline kinds, without JIT hash
+prefixes). Units may span multiple sessions. The default chooses the first
+occurrence of the repetition with the greatest repeated work; incomplete trailing
+sessions are excluded. `--step N` selects another occurrence. `--slice A:B`
+selects zero-based complete sessions, with B exclusive. Ambiguous nonrepeating
+recordings require an explicit slice. Preceding host uploads and trailing reads
+are included. No model name, kernel kind, layer count or fixed dispatch count is
+used by the selector.
+
+Each raw launch emits a `micro` node and a kernel with `layout=slots`, for example:
+
+```text
+kernel raw0 in=2 out=1 threads=4 tg=4 tgbytes=16 layout=slots slots=mem:in0,input:in1
+words 00000081 0000018d 00000000 0000018e 00000000 00000001
+endkernel
+```
+
+The hex words, including HALT, are copied verbatim. Static instruction scanning
+classifies reads/writes of `mem`, `u8`, `lut`, `input` and synchronization storage.
+Programs with equal words, geometry and domain ports share one definition.
+`view NAME BASE OFFSET COUNT` preserves word-aligned subrange aliases; offsets
+and counts are float words. Mutable physical buffers stay in place across steps.
+Mixed semantic session ops use these same physical buffers. Elimination is
+conservative: all writes, including persistent state writes, are retained.
+Existing kernels keep their arena/script assembly behavior.
+Read-only raw weights used exclusively by slot kernels have separate resident
+allocations, loaded one buffer at a time. They are excluded from the shared
+activation/state arena; raw weights read by generated arena kernels stay there.
+The CPU VM also executes independent buffer views, so tests cover this storage
+path without a GPU. This avoids making a multi-GB checkpoint one Metal buffer.
+
+`--weights` indexes NIMQ2/NIMQ3, raw-FP32 NIMBIN or single-file safetensors headers
+without loading the checkpoint. Repeat the option for auxiliary weight files;
+the first file is the primary checkpoint and embedding source. Raw uploads match
+payload size and sampled fingerprint; a unique size is a legacy fallback, while
+ambiguous sizes fail. The runner's embedding loader supports `.nimq` and
+safetensors; NIMBIN files are auxiliary raw payload sources. Payload samples are read
+only when a fingerprint is available. `weight NAME raw TENSOR tensor [WORDS]`
+plus `init NAME checkpoint OFFSET BYTES [FINGERPRINT]` loads the original packed
+bytes, without dequantizing or requantizing them. Unmatched auxiliary uploads
+require captured bytes (`init NAME trace.data OFFSET BYTES [FINGERPRINT]`);
+short recorded tables may use `initwords`. File extents and recorded fingerprints
+are checked before execution. The lifter copies a needed sidecar as `DIR/trace.data`
+and links auxiliary checkpoint files as `BASENAME.raw` (copying if a symlink is unavailable).
+Allocation padding beyond the uploaded prefix is zero-filled; kernels must not
+depend on uninitialized storage.
+
+A single hidden-sized per-step upload becomes `fir.embedding`. Its tensor is
+selected by the checkpoint shape `[vocab,hidden]`, or `--embedding NAME` when
+ambiguous. The graph exposes the runner's token, position and logits roles. Native
+NIMQ embeddings are loaded selectively, one tensor at a time. Unrecognized host
+uploads inside later selected units are rejected; startup captures are replayed
+as initializers. Arbitrary host calculations and control flow have no general
+reconstruction rule. State initializers restore on
+`firGraphReset`; this does not reconstruct initialization performed only by GPU
+work outside the selected unit.
+
+The production CPU VM verifies separate slots, a resident raw weight outside
+the arena, shared subranges, three raw kernels mixed with copy/add session ops,
+state across steps and reset, plus
+per-token embedding uploads with an arbitrary checkpoint tensor name. The
+fixture compares output bits with the original recorded CPU runs. GPU slot
+execution, full-model tokens and performance have not been verified here.
+CPU slot execution rejects virtual threadgroups, device grid control, and a
+distinct MemU32 atomic buffer (it must alias MemF32); it retains the existing VM
+thread/step limits. Unaligned byte views are rejected.
+Recorded program constants and geometry remain fixed: automatic selection rejects
+changes to either across repeating units. Position-dependent program regeneration
+or host-side shape changes need a dynamic lowering rule. An explicit slice is
+only a fixed-launch replay in that case. The selector is a heuristic, so inspect its
+reported range or use an override.
+
+The supplied legacy `cs2.fprobe` was recorded before the core upload hook knew
+buffer sizes, so every packed weight binding has zero bytes and no fingerprint;
+it cannot become a runnable model. Record again with the updated core:
+
+```sh
+BYBY_MODEL_MMAP=1 BYBY_MERGE_LORA=0 BYBY_ONE_DISPATCH=0 \
+BYBY_FIR_PROBE="$TRACE" BYBY_FIR_PROBE_DATA=1 BYBY_FIR_PROBE_DATA_MAX=16777216 \
+  timeout 420 ./infer_lora_bin test/codestral/models/jamba_parallel_lora.bin \
+  "hi" 0 test/codestral/models/hf test/codestral/models/codestral_mamba_only.nimq
+```
+
+`BYBY_FIR_PROBE_DATA_MAX` caps the exact-bytes sidecar at 16 MiB per upload:
+state arenas (4.8-11 MB) and adapters are kept, checkpoint-sized packed weights
+are only fingerprinted. The cap is a recorder-only option; with the probe off it
+is a single environment lookup that is never executed.
+
+Lift with the primary NIMQ checkpoint and, when the model stores trained tensors
+outside it, one or more auxiliary checkpoints. Every `--weights` file is indexed
+(NIMQ2/3, safetensors or raw-fp32 NIMBIN), and each raw upload is matched by
+exact byte size plus sampled content fingerprint. Ambiguous or missing matches
+fails with the buffer name; nothing is guessed:
+
+```sh
+other/formers.n/firlift/firlift --trace "$TRACE" --config "$CONFIG" \
+  --weights test/codestral/models/codestral_mamba_only.nimq \
+  --weights test/codestral/models/jamba_parallel_lora.bin \
+  --out models/codestral-fir --report
+other/formers.n/formers-cli --fir-check models/codestral-fir/model.fir
+```
+
+The output directory is self-contained apart from explicit symlinks:
+
+```text
+model.fir            lifted graph (slot kernels + exact session-replay nodes)
+config.json          copied from --config
+trace.data           only the referenced sidecar ranges, deduplicated
+jamba_parallel_lora.bin.raw   symlink to the auxiliary checkpoint
+model.nimq           symlink to the primary checkpoint
+tokenizer.model      SentencePiece model, tokenizer_config.json
+```
+
+The `.raw` suffix keeps the auxiliary checkpoint from being mistaken for a LoRA
+adapter by model discovery. The tokenizer directory deliberately contains only
+`tokenizer.model` and `tokenizer_config.json`: the full HuggingFace directory's
+`tokenizer.json` maps `[INST]`/`[/INST]` to added special tokens, while the
+native baseline tokenizes them as ordinary BPE pieces.
+
+## Measured Codestral result
+
+`firlift` selects session `243:244` (605 dispatches). The lift contains 960
+buffers, 605 raw slot nodes, 158 exact session-replay nodes, one embedding node
+and 16 kernel definitions. `--fir-check` passes, the model loads on Metal and
+generates at about 0.25-1.0 tok/s.
+
+Decode replay itself matches the native runtime: the first three greedy tokens
+are identical (`781, 781, 29560`, the same top-5 order). The step-0 logits differ
+by 0.2-0.7 (native `781:8.655`, lifted `781:9.396`) because the native prompt
+uses its batched T=8 prefill path while a decode-only graph feeds the prompt
+through decode kernels. At token 4 that small state difference flips a 0.18-logit
+margin (`17057 "INST"` vs `3713 "INT"`), after which the text diverges from the
+baseline. Exact 60-token equality therefore requires replaying the prefill unit
+(the 16 prefill group sessions in the trace) before the decode unit; that is not
+implemented. The decode-only graph must not be claimed token-equivalent.
+
+The previous all-zero-weight failure and the missing auxiliary data are gone:
+the fresh trace records weight sizes, full-upload fingerprints and exact bytes
+for every upload below the cap.

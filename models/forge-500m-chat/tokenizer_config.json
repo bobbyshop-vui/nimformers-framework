@@ -1,0 +1,24 @@
+{
+  "profile": "standard",
+  "device": "cpu",
+  "vocab_size": 206464,
+  "special_tokens": {
+    "<|pad|>": 0,
+    "<|bos|>": 1,
+    "<|eos|>": 2,
+    "<|sep|>": 3,
+    "<|sys|>": 4,
+    "<|/sys|>": 5,
+    "<|usr|>": 6,
+    "<|/usr|>": 7,
+    "<|asst|>": 8,
+    "<|/asst|>": 9,
+    "<|tool|>": 10,
+    "<|tool_resp|>": 11,
+    "<|unk|>": 12
+  },
+  "special_token_offset": 13,
+  "add_bos": true,
+  "add_eos": true,
+  "max_length": 4096
+}

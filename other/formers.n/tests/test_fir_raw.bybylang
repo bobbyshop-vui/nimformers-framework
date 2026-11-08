@@ -1,0 +1,231 @@
+# Record real CPU VM launches through the core recorder, then lift and execute FIR.
+import nim "std/[os, tables, strutils]"
+import nim "std/osproc"
+import nim "backend"
+import nim "quant"
+import nim "session_vm"
+import nim "vendor/bybylang/gpubackend"
+import nim "vendor/bybylang/backends/cpu/cpu_backend"
+import nim "../firlift/firlift"
+import nim "../firlift/steps"
+import nim "../firlift/sessionlift"
+import nim "native_hf_tokenizer as graphTokenizer"
+import nim "hf_tokenizer as referenceTokenizer"
+import "../src/formers/cli/options.bybylang"
+import "../src/formers/ir/fir_parse.bybylang"
+import "../src/formers/ir/fir_graph.bybylang"
+
+function bitsEqual(a, b: seq[float32])
+    doAssert a.len == b.len
+    for i in 0 ..< a.len:
+        doAssert cast[uint32](a[i]) == cast[uint32](b[i]), "different output bits at " & $i & ": " & $a[i] & " vs " & $b[i]
+
+function fixture(root: string)
+    let cfg = "{\"hidden_size\":7,\"num_hidden_layers\":1,\"vocab_size\":4,\"max_position_embeddings\":8}"
+    writeFile(root / "config.json", cfg)
+    let rhs = @[1'f32, -2'f32, 0.5'f32, 8'f32]
+    let coefficients = @[2'f32, 3'f32, 5'f32, 7'f32]
+    saveQuantStateDict(root / "model.nimq", [4, 7, 1, 1, 1], @[("fixture.rhs", quantizeRaw(rhs, @[4])), ("fixture.coefficients", quantizeRaw(coefficients, @[4]))])
+    putEnv("BYBY_FIR_PROBE_DATA", "1")
+    putEnv("BYBY_FIR_PROBE_DATA_MAX", "0")
+    firProbeStart(root / "record.fprobe")
+    var initial = newSeq[float32](64)
+    for i in 0 ..< 4:
+        initial[4+i] = float32(i+5)
+        initial[8+i] = float32(i+2)
+    initial[12] = cast[float32](0x03020100'u32)
+    var arena = sessionUpload(gbCpu, initial)
+    var addend = sessionUploadPrivate(gbCpu, rhs)
+    var factor = sessionUploadPrivate(gbCpu, coefficients)
+    var logits = sessionAllocScratch(gbCpu, 4)
+    var p, state, final: VmProgram
+    p.emitULid(0)
+    p.emitULoadU8(1, 0)
+    p.emitULoadConstF(2, 1)
+    p.emitULoadIn(3, 0)
+    p.emitMul(4, 2, 3)
+    p.emitUStoreF32(4, 0)
+    p.emitHalt()
+    state.emitULid(0)
+    state.emitULoadF32(1, 0)
+    state.emitULoadIn(2, 0)
+    state.emitAdd(3, 1, 2)
+    state.emitUStoreF32(3, 0)
+    state.emitHalt()
+    final.emitULid(0)
+    final.emitULoadF32(1, 0)
+    final.emitULoadIn(2, 0)
+    final.emitMul(3, 1, 2)
+    final.emitUStoreF32(3, 0)
+    final.emitHalt()
+    var expected: seq[seq[float32]]
+    for step in 0 ..< 3:
+        doAssert sessionBegin(gbCpu)
+        doAssert cpu_backend.vmRunSlots(p.words, arena.cpuData, [0, 12, 8, 4, -1], [4, 4, 4, 4, 0], 4, 4, 4)
+        doAssert cpu_backend.vmRunSlots(state.words, arena.cpuData, [20, -1, -1, 0, -1], [4, 0, 0, 4, 0], 4, 4, 4)
+        doAssert sessionCopyInto(gbCpu, arena, logits, 20, 0, 4)
+        doAssert sessionVecOp(gbCpu, "add", logits, addend, logits, 4)
+        doAssert cpu_backend.vmRun(final.words, logits.cpuData, factor.cpuData, 4, 4, 4)
+        doAssert sessionEnd(gbCpu)
+        expected.add(sessionRead(gbCpu, logits, 4))
+    firProbeStop()
+    var trace = parseTrace(readFile(root / "record.fprobe"))
+    trace.sourcePath = root / "record.fprobe"
+    let selected = selectStep(trace)
+    doAssert selected.sessionCount == 1 and selected.dispatches == 3
+    let lifted = liftSession(selected.trace, cfg, "raw_fixture", "", false, root / "model.nimq")
+    discard liftSession(selectStep(trace, 1).trace, cfg, "raw_fixture", "", false, root / "model.nimq")
+    doAssert lifted.contains("layout=slots") and lifted.contains("fixture.rhs")
+    writeFile(root / "model.fir", lifted)
+    copyFile(root / "record.fprobe.data", root / "trace.data")
+    let graph = firParse(root / "model.fir")
+    var rawCount = 0
+    let bindings = firGraphBindings(graph)
+    for name, def in graph.kernels:
+        if def.layout == "slots":
+            inc rawCount
+    doAssert rawCount == 3
+    for node in graph.nodes:
+        if graph.kernels.hasKey(node.op) and graph.kernels[node.op].layout == "slots":
+            let actual = firMicroKernel(node, graph, firDefaultRegistry(), bindings).program.words
+            doAssert actual == p.words or actual == state.words or actual == final.words
+    let cli = parentDir(getAppDir()) / "formers-cli"
+    doAssert execCmd(quoteShell(cli) & " --fir-check " & quoteShell(root / "model.fir")) == 0
+    var model = firLoadGraph(graph, root / "model.nimq", newBackend("cpu"))
+    doAssert model.rawWeights.len == 1
+    doAssert model.bindings.memoryFloats < bindings.memoryFloats
+    if getEnv("FIR_RAW_DEBUG") == "1":
+        echo "bindings: ", model.bindings.memory
+        for name, handle in model.rawWeights:
+            echo "resident ", name, ": ", handle.cpuData
+        for name, prepared in model.programs:
+            if prepared.kernel.slotLayout:
+                echo "slots ", name, ": ", prepared.kernel.slotOffsets, " ", prepared.kernel.slotBuffers
+    try:
+        for i in 0 ..< 3:
+            let actual = firGraphStep(model, 1)
+            if getEnv("FIR_RAW_DEBUG") == "1":
+                for name, buffer in graph.buffers:
+                    if buffer.viewOf.len == 0 and not model.rawWeights.hasKey(name):
+                        let offset = model.bindings.memory[name]
+                        echo "value ", name, ": ", model.arena.cpuData[offset ..< offset+min(buffer.elements, 8)]
+            bitsEqual(expected[i], actual)
+        firGraphReset(model)
+        bitsEqual(expected[0], firGraphStep(model, 1))
+    finally:
+        firFreeGraph(model)
+    echo "PASS raw dispatch lift: 3 kernels, separate U8/LUT/input slots, resident raw weight outside arena, subrange aliases, mixed session ops, state/reset; bit-for-bit on production CPU VM"
+    # Removing an auxiliary upload must never substitute zero/random contents.
+    var missing = selected.trace
+    missing.transfers = @[]
+    var rejected = false
+    try:
+        discard liftSession(missing, cfg, "missing", "", false, root / "model.nimq")
+    except ValueError as e:
+        rejected = e.msg.contains("unresolved raw inputs")
+    doAssert rejected
+    echo "PASS missing raw data fails explicitly"
+    let saved = readFile(root / "trace.data")
+    var damaged = saved
+    damaged[0] = char(ord(damaged[0]) xor 1)
+    writeFile(root / "trace.data", damaged)
+    rejected = false
+    try:
+        discard firLoadGraph(graph, root / "model.nimq", Backend())
+    except ValueError as e:
+        rejected = e.msg.contains("fingerprint mismatch")
+    doAssert rejected
+    writeFile(root / "trace.data", saved)
+    echo "PASS raw initializer fingerprint mismatch fails before backend preparation"
+
+function embeddingFixture(root: string)
+    let cfg = "{\"hidden_size\":4,\"num_hidden_layers\":1,\"vocab_size\":3,\"max_position_embeddings\":8}"
+    writeFile(root / "config.json", cfg)
+    let table = @[1'f32, 2'f32, 3'f32, 4'f32, 10'f32, 20'f32, 30'f32, 40'f32, -1'f32, -2'f32, -3'f32, -4'f32]
+    saveQuantStateDict(root / "model.nimq", [3, 4, 1, 1, 1], @[("arbitrary.table", quantizeRaw(table, @[3, 4]))])
+    firProbeStart(root / "embedding.fprobe")
+    var logits = sessionAllocScratch(gbCpu, 3)
+    var program: VmProgram
+    program.emitULid(0)
+    program.emitULoadIn(1, 0)
+    program.emitAddConst(2, 1, 1'f32)
+    program.emitUStoreF32(2, 0)
+    program.emitHalt()
+    var expected: seq[seq[float32]]
+    for token in 0 ..< 3:
+        var row = sessionUpload(gbCpu, table[token*4 ..< token*4+4])
+        doAssert sessionBegin(gbCpu)
+        doAssert cpu_backend.vmRun(program.words, logits.cpuData, row.cpuData, 3, 0, 3)
+        doAssert sessionEnd(gbCpu)
+        expected.add(sessionRead(gbCpu, logits, 3))
+        sessionFree(gbCpu, row)
+    firProbeStop()
+    var trace = parseTrace(readFile(root / "embedding.fprobe"))
+    trace.sourcePath = root / "embedding.fprobe"
+    let selected = selectStep(trace, 1)
+    let lifted = liftSession(selected.trace, cfg, "embedding_fixture", "", false, root / "model.nimq")
+    doAssert lifted.contains("arbitrary.table") and lifted.contains("fir.embedding")
+    writeFile(root / "model.fir", lifted)
+    if lifted.contains(" trace.data "):
+        copyFile(root / "embedding.fprobe.data", root / "trace.data")
+    let graph = firParse(root / "model.fir")
+    var model = firLoadGraph(graph, root / "model.nimq", newBackend("cpu"))
+    try:
+        for token in 0 ..< 3:
+            bitsEqual(expected[token], firGraphStep(model, token))
+    finally:
+        firFreeGraph(model)
+    echo "PASS unmarked per-token embedding uploads: inferred arbitrary checkpoint name, native NIMQ loading, separate CPU input slot; bit-for-bit for three tokens"
+
+function selectionTest()
+    var synthetic = "fprobe 2\nbackend cpu\n"
+    var id = 0
+    for repeat in 0 ..< 3:
+        for kind in ["alpha", "beta"]:
+            synthetic.add("op o" & $id & " tag=fir::launch in=() out=() attrs() impl=session:sessionBegin parent=none prog=none\n")
+            synthetic.add("disp d" & $id & " prog=p0 nThreads=1 tgSize=1 tgbytes=0 pipe=\"jit_HASH_" & kind & "\" bind=() op=none\n")
+            inc id
+            synthetic.add("op o" & $id & " tag=fir::launch in=() out=() attrs() impl=session:sessionEnd parent=none prog=none\n")
+            inc id
+    let multi = selectStep(parseTrace(synthetic), 1)
+    doAssert multi.sessionCount == 2 and multi.dispatches == 2 and multi.firstSession == 2
+    echo "PASS marker-free repeating unit spans two sessions"
+    let path = getEnv("FIRLIFT_REAL_TRACE", "/private/tmp/claude-501/-Volumes-Data-Laptrinh-App-nimformers-framework/dda4b68f-9037-40a7-8307-40dea514d13a/scratchpad/cs2.fprobe")
+    if not fileExists(path):
+        echo "SKIP real trace selection (cs2.fprobe absent)"
+        return
+    let trace = parseTrace(readFile(path))
+    let selected = selectStep(trace)
+    doAssert selected.dispatches == 605 and selected.sessionCount == 1
+    doAssert selectStep(trace, 1).dispatches == 605
+    doAssert selectStep(trace, -1, $selected.firstSession & ":" & $(selected.firstSession+1)).dispatches == 605
+    echo "PASS cs2.fprobe selects one complete 605-dispatch session; --step and --slice agree"
+
+function tokenizerContract(root: string)
+    doAssert fmParseOptions(@["--models", ".", "--add-special-tokens"]).addSpecialTokens
+    let path = "test/codestral/models/hf"
+    if not fileExists(path / "tokenizer.model"):
+        echo "SKIP baseline tokenizer comparison (local assets absent)"
+        return
+    let native = referenceTokenizer.newHfTokenizer(path)
+    let target = root / "tokenizer"
+    createDir(target)
+    let source = if fileExists(path / "tokenizer.model.v3"): path / "tokenizer.model.v3" else: path / "tokenizer.model"
+    copyFile(source, target / "tokenizer.model")
+    copyFile(path / "tokenizer_config.json", target / "tokenizer_config.json")
+    let graph = graphTokenizer.newHFTokenizer(target)
+    for prompt in ["hi", "[INST] hi[/INST]"]:
+        doAssert referenceTokenizer.encodeHf(native, prompt) == graphTokenizer.encode(graph, prompt, true)
+    echo "PASS --add-special-tokens: raw and wrapped hi prompts have the same IDs and BOS as the native baseline (tokenizer only, no model load)"
+
+let root = getEnv("FIR_LIFT_TMP") / "raw"
+doAssert getEnv("FIR_LIFT_TMP").len > 0, "set FIR_LIFT_TMP to the scratch directory"
+createDir(root)
+try:
+    fixture(root)
+    embeddingFixture(root)
+    selectionTest()
+    tokenizerContract(root)
+finally:
+    if getEnv("FIR_KEEP", "0") == "0":
+        removeDir(root)

@@ -312,6 +312,20 @@ def _bind(lib: ct.CDLL) -> None:
     _fn(lib, "nimf_vm_key", [V, CSTR], V)
     _fn(lib, "nimf_vm_run", [V, V, F32, CI64, CI64, CI64, CI64], CINT)
     _fn(lib, "nimf_micro_vm_dispatch", [V, U32, CI64, F32, CI64, CI64, CI64, CI64], CINT)
+    _fn(lib, "nimf_buf_alloc", [V, F32, CI64], V)
+    _fn(lib, "nimf_buf_free", [V, V], CINT)
+    _fn(lib, "nimf_buf_read", [V, V, CI64, CI64, F32], CINT)
+    _fn(lib, "nimf_sess_begin", [V], CINT)
+    _fn(lib, "nimf_sess_end", [V], CINT)
+    _fn(lib, "nimf_sess_set", [V, V, CI64, F32, CI64], CINT)
+    _fn(lib, "nimf_trace_start", [CSTR, CSTR, CINT, CI64], CINT)
+    _fn(lib, "nimf_trace_stop", [], CINT)
+    _fn(lib, "nimf_trace_active", [], CINT)
+    _fn(lib, "nimf_trace_file", [], CSTR)
+    _fn(lib, "nimf_probe_step", [CINT, CINT, CI64, CI64, CI64], CINT)
+    _fn(lib, "nimf_sess_set_step_inputs", [V, V, CI64, CI64, CI64, CI64], CINT)
+    _fn(lib, "nimf_prog_compile", [V, V, CSTR], V)
+    _fn(lib, "nimf_sess_dispatch", [V, CSTR, ct.POINTER(V), ct.POINTER(CI64), CI64, CI64, CI64], CINT)
 
 
 def abi_version(lib: Optional[ct.CDLL] = None) -> int:

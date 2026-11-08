@@ -7,7 +7,7 @@ import ./builder
 import gpubackend as byby
 
 proc main() =
-  let outDir = "/tmp/fir-builder"
+  let outDir = getEnv("FIR_LIFT_TMP", getTempDir() / "fir-lift-tests") / "builder"
   createDir(outDir)
   let cfgText = """{"hidden_size":2048,"num_hidden_layers":1,"num_attention_heads":32,"num_key_value_heads":4,"intermediate_size":5632,"max_position_embeddings":2048,"vocab_size":64,"rms_norm_eps":1e-5,"torch_dtype":"float32"}"""
   writeFile(outDir / "config.json", cfgText)

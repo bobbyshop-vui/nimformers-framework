@@ -218,6 +218,25 @@ proc sessionTests2() =
     chk("rope_pos " & $pos & " theta " & $theta, genRopePos(Hn, D, pow(theta, -1.0 / float(half)), scale),
       @[xs, @[float32(pos)]], want, 2e-3'f32)
 
+  # multi-row RoPE: row t uses position + t, rows laid out [T, Hn, D]
+  for (pos, T, theta, scale) in [(0.0, 3, 10000.0, 1.0), (5.0, 4, 10000.0, 1.0), (96.0, 2, 500000.0, 0.25)]:
+    let Hn = 3
+    let D = 8
+    let half = D div 2
+    let xs = fill(T*Hn*D, 0.4, 1.0)
+    var want = xs
+    for t in 0 ..< T:
+      for h in 0 ..< Hn:
+        for i in 0 ..< half:
+          let angle = (pos + float(t)) * scale / pow(theta, float(i) / float(half))
+          let base = (t*Hn + h)*D
+          let x1 = float(xs[base + i])
+          let x2 = float(xs[base + i + half])
+          want[base + i] = float32(x1*cos(angle) - x2*sin(angle))
+          want[base + i + half] = float32(x2*cos(angle) + x1*sin(angle))
+    chk("rope_pos_rows T=" & $T & " pos " & $pos, genRopePosRows(T, Hn, D, pow(theta, -1.0 / float(half)), scale),
+      @[xs, @[float32(pos)]], want, 2e-3'f32)
+
   # asymmetric Q4 matmul: low nibble = even k, high = odd k
   for (K, gs) in [(10, 4), (9, 4), (6, 0), (8, 8)]:
     let M = 2

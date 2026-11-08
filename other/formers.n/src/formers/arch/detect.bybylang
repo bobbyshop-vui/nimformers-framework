@@ -18,6 +18,7 @@ import "../io/safetensors.bybylang"
 import "../ir/fir_parse.bybylang"
 import "../ir/fir_exec.bybylang"
 import "../ir/fir_graph_kernels.bybylang"
+import "../ir/fir_data.bybylang"
 
 type
   FmArch* = enum
@@ -415,10 +416,15 @@ function fmDetect(opts: FmOptions): FmDetection
         result.arch = faFir
         try:
             let graph = firParse(firPath, result.files.configPath)
-            firValidate(graph, firDefaultRegistry(), firGraphBindings(graph))
-            let header = fmReadSafeHeader(result.files.nimqPath)
+            firValidate(graph, firDefaultRegistry(), firGraphBindings(graph, true))
+            let rawData = firDataGraph(graph)
+            if rawData:
+                firCheckDataWeights(graph, result.files.nimqPath)
+            var header: FmSafeHeader
+            if not rawData:
+                header = fmReadSafeHeader(result.files.nimqPath)
             for name, buffer in graph.buffers:
-                if buffer.kind != "weight":
+                if buffer.kind != "weight" or rawData:
                     continue
                 for layer in 0 ..< (if buffer.tensorName.contains("{i}"): graph.symbols["layers"] else: 1):
                     let tensor = buffer.tensorName.replace("{i}", $layer)
@@ -429,8 +435,8 @@ function fmDetect(opts: FmOptions): FmDetection
                         discard fmValidateScriptTensor(header, source, buffer.dims)
                     elif source.len == 0 or header.tensors[source].dtype != "F32" or header.tensors[source].shape != buffer.dims:
                         raise newException(ValueError, "FIR graph safetensors shape/dtype mismatch: " & tensor)
-            if not fileExists(result.files.tokenizerDir / "tokenizer.json"):
-                raise newException(ValueError, "FIR graph text runner requires tokenizer.json")
+            if opts.promptIds.len == 0 and not fileExists(result.files.tokenizerDir / "tokenizer.json") and not fileExists(result.files.tokenizerDir / "tokenizer.model") and not fileExists(result.files.tokenizerDir / "tokenizer.model.v3"):
+                raise newException(ValueError, "FIR graph text runner requires tokenizer.json or tokenizer.model")
             if result.files.loraPath.len > 0:
                 raise newException(ValueError, "FIR graph models do not support LoRA")
             result.nLayers = graph.symbols["layers"]

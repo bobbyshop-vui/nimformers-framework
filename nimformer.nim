@@ -101,7 +101,6 @@ type
     residentFp32Ready*: bool           ## true once residentFp32 has been uploaded
     residentFp32NT*: bool              ## residentFp32 stores original [outF,inF] rows
     residentFp32Offset*: int           ## floats before the weight in residentFp32 (mmap wrap)
-    name*: string                 ## checkpoint tensor name, for the dispatch recorder
     loraA*, loraB*: seq[float32]  ## (see forward() below + mergeInUploadStreamingJamba
                                    ## in lora.nim): a detached LoRA adapter, NOT physically
                                    ## merged into the weight - the base (weightQ/useQuant) stays INTACT
@@ -189,11 +188,9 @@ proc uploadResident*(l: var Linear, ctx: Backend, sparsityPct: float32 = 0.0'f32
         l.inF, l.outF, l.weightQ.groupSize, nGroupsPerRow)
       l.residentW = up.w
       l.residentZeroCopy = up.zeroCopy
-      if unlikely(byby.firProbeOn): byby.probeName(l.residentW, l.name, "q4", [l.outF, l.inF])
     else:
       l.residentW = beResidentUploadQ4(ctx, @(l.weightQ.bytes), l.weightQ.scale, l.weightQ.zero_point,
                                         l.inF, l.outF, l.weightQ.groupSize, nGroupsPerRow)
-      if unlikely(byby.firProbeOn): byby.probeName(l.residentW, l.name, "q4", [l.outF, l.inF])
     l.residentReady = true
   elif l.useQuant and l.weightQ.kind == qkFp32Raw and l.weightQ.mappedData.owner != nil and
       l.weightQ.mappedData.len == l.inF * l.outF * 4:
@@ -205,7 +202,6 @@ proc uploadResident*(l: var Linear, ctx: Backend, sparsityPct: float32 = 0.0'f32
     l.residentFp32NT = true
     l.residentFp32Ready = true
     l.residentZeroCopy = wrapped.zeroCopy
-    if unlikely(byby.firProbeOn): byby.probeName(l.residentFp32, l.name, "f32", [l.outF, l.inF])
   elif l.useQuant:
     # qkInt8 / qkInt4 (symmetric) / qkFp32Raw ... : dequant + transpose 1
     # LẦN, upload resident fp32.
@@ -214,7 +210,6 @@ proc uploadResident*(l: var Linear, ctx: Backend, sparsityPct: float32 = 0.0'f32
     l.residentFp32NT = false
     l.residentFp32Offset = 0
     l.residentFp32Ready = true
-    if unlikely(byby.firProbeOn): byby.probeName(l.residentFp32, l.name, "f32", [l.outF, l.inF])
     # RAM saving: after the upload, forward() ONLY uses the residentFp32Ready path
     # (see forward() below) - l.weight.data (if any, e.g. after mergeIn() wrote
     # merged.data here) is no longer needed but used NOT to be freed =>
@@ -232,7 +227,6 @@ proc uploadResident*(l: var Linear, ctx: Backend, sparsityPct: float32 = 0.0'f32
     l.residentFp32NT = false
     l.residentFp32Offset = 0
     l.residentFp32Ready = true
-    if unlikely(byby.firProbeOn): byby.probeName(l.residentFp32, l.name, "f32", [l.outF, l.inF])
 
 proc residentLinearNt(l: Linear; x: seq[float32]; rows: int; ctx: Backend): seq[float32] =
   ## Share inference's original row-major GPU weight with sequence forward.
