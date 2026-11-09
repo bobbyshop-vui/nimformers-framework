@@ -46,6 +46,57 @@ nim c -d:release -o:bybylang bybylang.nim
   "Mode 3: High-level", "Mode 4: Web-level"; N khác in "Unknown mode".
 
 
+### Chẩn đoán: lỗi, `warn`, `error`, `traceback`
+
+**Lỗi biên dịch trỏ vào source `.bybylang`**, theo kiểu clang. Compiler gắn vào mỗi dòng Nim sinh ra số dòng nguồn của nó, rồi dịch lỗi của Nim ngược về:
+
+```text
+prog.bybylang:1:11: error: expected: ')', but got: 'echo'
+x = (1 + 2
+          ^
+1 error(s) generated.
+```
+
+- Mã thoát là `1` và không có stack trace của Nim. Thêm `-v` để xem log của compiler và stack trace, `--raw-nim` để in thêm đầu ra gốc của Nim, `--nim-warnings` để báo cảnh báo Nim của code sinh ra, `-Werror` để coi cảnh báo là lỗi.
+- Lỗi kiểu `expected ')'` được Nim phát hiện ở token sau chỗ sai. Dấu `^` được đặt ở cuối câu lệnh trước đó, đúng chỗ sai.
+- `import` không tìm thấy file được báo ngay tại dòng `import`.
+- Log của compiler (`[INFO]`, `[DEBUG]`) tắt mặc định. `-v` bật info, `-vv` bật debug.
+
+**Báo cáo từ chương trình.** Ba câu lệnh dùng được trong code BybyLang và báo file `.bybylang` cùng số dòng (ghi ra stderr):
+
+```text
+warn "buffer is larger than the tile"     # prog.bybylang:12: warning: buffer is ...   (chạy tiếp)
+traceback "unexpected state"              # in call stack và ghi chú                    (chạy tiếp)
+error "model.fir is truncated"            # prog.bybylang:14: error: ...  rồi thoát với mã 1
+```
+
+`traceback` liệt kê các hàm BybyLang đang chạy, cũ nhất trước, rồi tới dòng của câu lệnh `traceback`. Dùng nó thì compiler build chương trình với stack frame của Nim (`--stackTrace:on`), nên chỉ chương trình dùng `traceback` mới trả chi phí đó.
+
+**Báo cáo từ thư viện Nim.** `import diag` (module nằm cạnh `bybylang.nim`) rồi gọi đúng ba từ đó. Chúng báo file và dòng Nim của lời gọi:
+
+```nim
+import diag
+
+proc loadTable(path: string) =
+  if not fileExists(path):
+    warn "table missing, using the default"     # tables.nim:5:  warning: ...
+  if corrupted:
+    traceback "corrupted table"                 # in stack, chạy tiếp
+    error "cannot continue"                     # in, rồi raise BybyError
+```
+
+| Ký hiệu | Ý nghĩa |
+| --- | --- |
+| `warn(msg)`, `diagWarn(msg, file, line)` | In cảnh báo. |
+| `error(msg)`, `diagError(msg, file, line)` | In lỗi và raise `BybyError` (`BybyError` không bắt thì thoát với mã 1 và không in thêm gì). |
+| `traceback(msg = "")`, `diagTraceback(msg, file, line)` | In call stack; chương trình chạy tiếp. Frame cần `--stackTrace:on`. |
+| `diagEmit(severity, file, line, col, msg, source, caretLen, notes)` | In một chẩn đoán kiểu clang, có dòng nguồn và dấu `^` khi có `source` và `col`. |
+| `gDiagWarnings`, `gDiagErrors`, `gDiagWarningsAsErrors` | Bộ đếm và công tắc `-Werror`. |
+
+Màu chỉ dùng khi ra terminal và tắt khi đặt `NO_COLOR`.
+
+---
+
 ## 2. Lệnh `gpu ...`
 
 

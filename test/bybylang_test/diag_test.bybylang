@@ -1,0 +1,10 @@
+# warn and traceback report with the .bybylang position and never stop the program.
+function inner(n: int): int
+  traceback "called from inner"
+  return n + 1
+
+warn "this is only a warning"
+var got = inner(41)
+if got != 42:
+  error "inner returned the wrong value"
+print "diag_test: ok"
