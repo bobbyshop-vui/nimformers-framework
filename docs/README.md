@@ -38,6 +38,7 @@ This directory is the user documentation for the public Nimformer APIs. Use the 
 - [GPU Session API](gpu-session-api.md): encode multiple operations per GPU session, resident buffers, and lifecycle rules.
 - [Micro-VM / JIT API](microkernel-api.md): bytecode instructions, lowering, JIT cache, and persistent-kernel constraints.
 - [Trace API](trace-api.md): `nf.trace` for Python, Nim, BybyLang and C: record a run into a FIR trace, then lift it to `model.fir`.
+- [nfgraph2torch](nfgraph2torch.md): convert a torch module to FIR / `model.fir` (ATen replay plus micro-kernels).
 - [FIR (formers IR)](fir.md): model-side graph file naming micro-kernels, backend kernels and dimensions; `--fir` and `--fir-check` in formers.n.
 - [BybyLang integration tests](../test/bybylang_test/README.md): BybyLang scripts that import `lib_c_api` and exercise the C ABI plus the native `gpu ...` DSL.
 - [BybyLang test API reference](bybylang-tests.md): run and extend the two `.bybylang` tests, with every DSL command and C ABI call explained.

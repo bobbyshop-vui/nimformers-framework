@@ -9,6 +9,7 @@ compared step by step.
 import math
 import random
 from .scalar import plans, offset, unravel, broadcast_index, coordinates
+from . import custom
 
 
 def _sigmoid(x):
@@ -212,6 +213,8 @@ def run_node(node, graph, values):
     """Evaluate one node and return {value or storage name: flat list}."""
     inputs = [values[k] for k in node.inputs]
     shapes = [graph.values[k].shape for k in node.inputs]
+    if node.op in custom.OPS:
+        return custom.run_reference(node, graph, inputs, shapes)
     if node.op == "norm" or (node.op in ("layernorm", "rmsnorm") and node.extra):
         return _norm(node, graph, inputs, shapes)
     if node.op == "attention_decode":

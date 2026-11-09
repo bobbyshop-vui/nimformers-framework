@@ -20,6 +20,7 @@ limited to 8 by the CPU VM.
 import math
 
 from . import views as V
+from . import custom
 
 
 class LoweringError(ValueError):
@@ -438,6 +439,8 @@ class Kernel:
             s, c = self.sincos(r)
             self.copy(r, s if kind == "sin" else c)
             self.free_r(s, c)
+        elif kind in custom.EXT_TREE_OPS:
+            r = custom.EXT_TREE_OPS[kind](self, args)
         else:
             raise LoweringError("missing VM composition for " + kind)
         self.free_r(*args[1:])
