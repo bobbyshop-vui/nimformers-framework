@@ -77,9 +77,10 @@ with nf.Context() as ctx:
 | `nf.trace_file()` | Path of this process's trace, `""` if none was started. |
 | `nf.trace_stop()` | Stop whatever is active. |
 
-**Order does not matter in Python.** Kernels compiled before the recording started carry no bytecode in
-it. `nf.trace` therefore compiles every kernel of every live `Session` again right after starting, so
-the usual order (build the model, then `with nf.trace(...)`) produces a liftable trace.
+**Order does not matter.** The recorder keeps the bytecode of every kernel the moment it is compiled,
+whether or not a trace is running, so the usual order (build the model, then `with nf.trace(...)`)
+produces a liftable trace in every language. `nf.trace` also compiles the live `Session` kernels again
+right after starting, as a second safeguard.
 
 Marking steps is done by `Session.step()` and `Session.set_step_inputs()`
 (see [Python and C ABI](python-api.md#resident-buffers-and-sessions)). A step must write its token and
@@ -106,8 +107,8 @@ withTrace("run.fprobe", "decode:2"):
 | `traceBegin(kind, index, position, token, tokens = 1)` / `traceEnd()` | Open and close one step. `kind` is `tsPrefill` or `tsDecode`. No-op when no trace is active. |
 | `traceStep(kind, index, position, token): body` | `traceBegin` + `body` + `traceEnd` (closes on exceptions). |
 
-In Nim the recorder only sees kernels compiled **after** the trace started. Call `traceStart` before
-the model is built, or use the environment variables below.
+You may call `traceStart` before or after the model is built: kernels compiled earlier are already in
+the recorder's registry.
 
 ## BybyLang
 
@@ -121,7 +122,7 @@ traceStop()
 ```
 
 BybyLang passes `import nim` modules and calls straight through, so every Nim symbol above is
-available, with the same start-before-compile rule. `test/bybylang_test/trace_test.bybylang` is the
+available, with the same freedom in ordering. `test/bybylang_test/trace_test.bybylang` is the
 runnable example (`make bybylang-test`).
 
 ## C
@@ -142,7 +143,7 @@ nimf_trace_stop();
 | `const char* nimf_trace_file(void)` | Path, valid until the next call |
 | `int32_t nimf_probe_step(int32_t begin, int32_t kind, int64_t index, int64_t position, int64_t token)` | `0`, else `-1`. `kind`: `0` prefill, `1` decode. No-op when no trace is active. |
 
-Like Nim, C callers must start the trace before compiling kernels.
+As in Nim, C callers may start the trace before or after compiling kernels.
 
 ## Environment variables
 
