@@ -23,6 +23,7 @@ from pathlib import Path
 
 from . import views as V
 from . import codegen as C
+from . import custom
 from .codegen import LoweringError
 from .graph import ELEMENTWISE, Node
 from .repeat import extract_repeats
@@ -775,6 +776,8 @@ class _Emission:
             return "state_read", threads
         if op == "state_write":
             return self.gen_state_write(n, ctx, kb)
+        if op in custom.OPS:
+            return custom.OPS[op].lower(self, n, ctx, kb)
         raise LoweringError("unsupported traced operation %s; add a kernel generator in codegen.py" % op)
 
     def gen_state_write(self, n, ctx, kb):

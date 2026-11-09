@@ -56,6 +56,7 @@ lượng tử hóa, backend, session và micro-VM.
 - [API micro-VM/JIT](microkernel-api.vi.md): instruction bytecode, lower,
   cache JIT và giới hạn kernel persistent.
 - [Trace API](trace-api.vi.md): `nf.trace` cho Python, Nim, BybyLang và C: ghi một lần chạy thành trace FIR rồi lift thành `model.fir`.
+- [nfgraph2torch](nfgraph2torch.vi.md): chuyển module torch thành FIR / `model.fir` (replay ATen cộng micro-kernel).
 - [FIR (formers IR)](fir.vi.md): file đồ thị phía model khai báo micro-kernel, kernel backend và kích thước; cờ `--fir` / `--fir-check` của formers.n.
 - [Test tích hợp BybyLang](../test/bybylang_test/README.vi.md): import
   `lib_c_api`, kiểm tra C ABI và native DSL `gpu ...`.

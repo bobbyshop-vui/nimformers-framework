@@ -23,6 +23,7 @@ from .dtypes import (float32, float16, bfloat16, float64, int64, int32, int16, i
 from .nn import (Module, Parameter, ModuleList, ModuleDict, ParameterList, ParameterDict, Sequential,
                  Linear, Embedding, LayerNorm, RMSNorm, Conv1d, Dropout, Identity, GELU)
 from .tracer import trace, script
+from .custom import register_op, custom_op, register_tree_op
 from .reference import evaluate, random_parameters, compare_graphs
 from .report import report, fir_stats
 from .vm import FirModel, FirVmError
