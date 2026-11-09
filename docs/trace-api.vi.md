@@ -75,9 +75,10 @@ with nf.Context() as ctx:
 | `nf.trace_file()` | Đường dẫn trace của tiến trình, `""` nếu chưa bật. |
 | `nf.trace_stop()` | Dừng trace đang chạy. |
 
-**Python không phụ thuộc thứ tự.** Kernel compile trước khi bắt đầu ghi thì không có bytecode trong bản
-ghi. Vì vậy `nf.trace` compile lại mọi kernel của mọi `Session` còn sống ngay sau khi bắt đầu, nên cách
-dùng quen thuộc (dựng model rồi mới `with nf.trace(...)`) vẫn cho trace lift được.
+**Thứ tự không quan trọng.** Recorder giữ bytecode của mọi kernel ngay khi compile, dù trace có đang
+chạy hay không, nên cách dùng quen thuộc (dựng model rồi mới `with nf.trace(...)`) cho trace lift được ở
+mọi ngôn ngữ. `nf.trace` còn compile lại các kernel của `Session` còn sống ngay sau khi bắt đầu, như
+một lớp bảo vệ thứ hai.
 
 Đánh dấu bước do `Session.step()` và `Session.set_step_inputs()` làm
 (xem [Python và C ABI](python-api.vi.md#buffer-resident-và-session)). Mỗi bước phải ghi token và vị trí
@@ -103,8 +104,8 @@ withTrace("run.fprobe", "decode:2"):
 | `traceBegin(kind, index, position, token, tokens = 1)` / `traceEnd()` | Mở và đóng một bước. `kind` là `tsPrefill` hoặc `tsDecode`. Không làm gì khi không có trace. |
 | `traceStep(kind, index, position, token): body` | `traceBegin` + `body` + `traceEnd` (đóng cả khi có exception). |
 
-Ở Nim, recorder chỉ thấy kernel được compile **sau** khi trace bắt đầu. Hãy gọi `traceStart` trước khi
-dựng model, hoặc dùng biến môi trường bên dưới.
+Có thể gọi `traceStart` trước hoặc sau khi dựng model: kernel compile trước đó đã nằm sẵn trong
+registry của recorder.
 
 ## BybyLang
 
@@ -118,7 +119,7 @@ traceStop()
 ```
 
 BybyLang chuyển thẳng các module `import nim` và lời gọi, nên mọi ký hiệu Nim ở trên đều dùng được,
-với cùng quy tắc bắt đầu trước khi compile. `test/bybylang_test/trace_test.bybylang` là ví dụ chạy được
+với cùng sự tự do về thứ tự. `test/bybylang_test/trace_test.bybylang` là ví dụ chạy được
 (`make bybylang-test`).
 
 ## C
@@ -139,7 +140,7 @@ nimf_trace_stop();
 | `const char* nimf_trace_file(void)` | Đường dẫn, hợp lệ đến lần gọi kế tiếp |
 | `int32_t nimf_probe_step(int32_t begin, int32_t kind, int64_t index, int64_t position, int64_t token)` | `0`, nếu không `-1`. `kind`: `0` prefill, `1` decode. Không làm gì khi không có trace. |
 
-Giống Nim, C phải bắt đầu trace trước khi compile kernel.
+Giống Nim, C có thể bắt đầu trace trước hoặc sau khi compile kernel.
 
 ## Biến môi trường
 
