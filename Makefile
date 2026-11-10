@@ -80,7 +80,7 @@ CLEAN_BINS      := $(TEST_BIN) $(GRAFT_BIN) $(FINETUNE_BIN) $(INFER_LORA_BIN) $(
                    $(BYBYLANG_TEST_BINS) $(addsuffix .nim,$(BYBYLANG_TEST_BINS))
 
 .PHONY: shaders all build run run-cpu run-metal run-vulkan run-opencl run-cuda clean \
-        download-models download-datasets download-codestral-tokenizer \
+        download-models download-fir-models download-datasets download-codestral-tokenizer \
         build-graft build-finetune build-infer-lora build-compact-lora \
         build-migrate-lora build-nim-inference build-spectron build-for-python \
         python-test python-example c-example bybylang-test bench-gflops \
@@ -139,7 +139,7 @@ run-cuda:
 	./test/spectron/$(TEST_BIN)
 
 # Download public Hugging Face assets into the paths used by inference/training.
-download-models:
+download-models: download-fir-models
 	@set -eu; \
 	mkdir -p test/deepseek-inference/models test/codestral/models/hf \
 	  test/mamba3/models/mamba3-siso-187m test/mamba3/models/runs/mamba3-siso-187m-gated \
@@ -171,6 +171,16 @@ download-models:
 	  curl -fL --retry 3 -C - "https://huggingface.co/bobbydeveloper2014/mamba-siso-1.5b-nimq/resolve/main/$$file" -o "test/mamba3/models/runs/mamba3-siso-1.5b-gated/$$file"; \
 	done; \
 	echo 'test/mamba3/models/mamba3-siso-1.5b' > test/mamba3/models/runs/mamba3-siso-1.5b-gated/lora-g1.bin.hf_tokenizer_dir
+
+# FIR models used by formers-cli (weights, tokenizer and model.fir in each folder).
+# Needs the Hugging Face CLI: pip install -U huggingface_hub
+FIR_MODEL_REPOS := forge-500m-chat forge-500m-chat-fir gpt2-125m huihui-moe-fir
+download-fir-models:
+	@command -v hf >/dev/null 2>&1 || { echo "hf not found: pip install -U huggingface_hub"; exit 1; }
+	@set -eu; for m in $(FIR_MODEL_REPOS); do \
+	  echo "[download] bobbydeveloper2014/$$m -> models/$$m"; \
+	  hf download bobbydeveloper2014/$$m --local-dir models/$$m; \
+	done
 
 # Repair tokenizer assets without downloading multi-GB model weights again.
 download-codestral-tokenizer:

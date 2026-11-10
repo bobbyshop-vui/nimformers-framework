@@ -123,6 +123,12 @@ These repositories contain the model files used by the inference targets in this
 | [Codestral v0.1 QLoRA LinearAttention](https://huggingface.co/bobbydeveloper2014/codestral-v0.1-nimq-qlora-linearattention) | `jamba_parallel_lora.bin` adapter; uses the Codestral NimQ base above | [Codestral LoRA](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/test/codestral) | `infer-lora` adapter, `formers` |
 | [Mamba-3 SISO 187M NimQ + LoRA](https://huggingface.co/bobbydeveloper2014/mamba-siso-175m-nimq) | NimQ weights, root-level config/tokenizer, and gated LoRA checkpoint | [Mamba-3](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/test/mamba3) | `infer-lora`, `formers` |
 | [Mamba-3 SISO 1.5B NimQ + LoRA](https://huggingface.co/bobbydeveloper2014/mamba-siso-1.5b-nimq) | NimQ weights, root-level config/tokenizer, and gated LoRA checkpoint | [Mamba-3](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/test/mamba3) | `infer-lora`, `formers` |
+| [forge-500m-chat](https://huggingface.co/bobbydeveloper2014/forge-500m-chat) | Weights, tokenizer, and model code (`models/forge-500m-chat`) | [forge-500m-chat](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/models/forge-500m-chat) | `formers`, `download-fir-models` |
+| [forge-500m-chat-fir](https://huggingface.co/bobbydeveloper2014/forge-500m-chat-fir) | `model.fir`, `config.json`, weights, and tokenizer (`models/forge-500m-chat-fir`) | [forge-500m-chat-fir](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/models/forge-500m-chat-fir) | `formers`, `download-fir-models` |
+| [gpt2-125m](https://huggingface.co/bobbydeveloper2014/gpt2-125m) | `model.safetensors`, `model.fir`, and tokenizer files (`models/gpt2-125m`) | [gpt2-125m](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/models/gpt2-125m) | `formers`, `download-fir-models` |
+| [huihui-moe-fir](https://huggingface.co/bobbydeveloper2014/huihui-moe-fir) | `model.fir`, weights, and tokenizer files (`models/huihui-moe-fir`) | [huihui-moe-fir](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/models/huihui-moe-fir) | `formers`, `download-fir-models` |
+
+`make download-models` fetches all of the above into those paths (`make download-fir-models` fetches only the FIR ones; requires the `hf` CLI from `pip install -U huggingface_hub`).
 
 To make Hugging Face tools pick up your token from the local ignored environment file, load it in the shell before using `hf` or `huggingface_hub`:
 
@@ -245,6 +251,12 @@ The target creates the model directories under `test/` as needed and uses `curl`
 | [Codestral QLoRA LinearAttention](https://huggingface.co/bobbydeveloper2014/codestral-v0.1-nimq-qlora-linearattention) | `test/codestral/models/jamba_parallel_lora.bin` and its tokenizer sidecar |
 | [Mamba-3 SISO 187M NimQ + LoRA](https://huggingface.co/bobbydeveloper2014/mamba-siso-175m-nimq) | base `test/mamba3/models/`; config/tokenizer `test/mamba3/models/mamba3-siso-187m/`; adapter `test/mamba3/models/runs/mamba3-siso-187m-gated/` |
 | [Mamba-3 SISO 1.5B NimQ + LoRA](https://huggingface.co/bobbydeveloper2014/mamba-siso-1.5b-nimq) | base `test/mamba3/models/`; config/tokenizer `test/mamba3/models/mamba3-siso-1.5b/`; adapter `test/mamba3/models/runs/mamba3-siso-1.5b-gated/` |
+| [forge-500m-chat](https://huggingface.co/bobbydeveloper2014/forge-500m-chat) | `models/forge-500m-chat/` |
+| [forge-500m-chat-fir](https://huggingface.co/bobbydeveloper2014/forge-500m-chat-fir) | `models/forge-500m-chat-fir/` |
+| [gpt2-125m](https://huggingface.co/bobbydeveloper2014/gpt2-125m) | `models/gpt2-125m/` |
+| [huihui-moe-fir](https://huggingface.co/bobbydeveloper2014/huihui-moe-fir) | `models/huihui-moe-fir/` |
+
+The last four are FIR models. Each repo is the full folder (weights, tokenizer, `model.fir`) and is fetched with the `hf` CLI (`pip install -U huggingface_hub`); `make download-fir-models` downloads only these.
 
 All assets are public, so downloading them does not require `HF_TOKEN` or a Hugging Face login. The `HF_TOKEN` environment setup above is only needed for private or gated repositories and write operations.
 

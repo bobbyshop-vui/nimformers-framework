@@ -129,6 +129,12 @@ Các repository chứa file model dùng bởi target inference:
 | [Codestral v0.1 QLoRA LinearAttention](https://huggingface.co/bobbydeveloper2014/codestral-v0.1-nimq-qlora-linearattention) | checkpoint adapter `jamba_parallel_lora.bin`, dùng base Codestral NimQ trên | [Codestral LoRA](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/test/codestral) | adapter của `infer-lora`, `formers` |
 | [Mamba-3 SISO 187M NimQ + LoRA](https://huggingface.co/bobbydeveloper2014/mamba-siso-175m-nimq) | trọng số NimQ, config/tokenizer ở root repo và gated LoRA | [Mamba-3](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/test/mamba3) | `infer-lora`, `formers` |
 | [Mamba-3 SISO 1.5B NimQ + LoRA](https://huggingface.co/bobbydeveloper2014/mamba-siso-1.5b-nimq) | trọng số NimQ, config/tokenizer ở root repo và gated LoRA | [Mamba-3](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/test/mamba3) | `infer-lora`, `formers` |
+| [forge-500m-chat](https://huggingface.co/bobbydeveloper2014/forge-500m-chat) | Trọng số, tokenizer và code model (`models/forge-500m-chat`) | [forge-500m-chat](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/models/forge-500m-chat) | `formers`, `download-fir-models` |
+| [forge-500m-chat-fir](https://huggingface.co/bobbydeveloper2014/forge-500m-chat-fir) | `model.fir`, `config.json`, trọng số và tokenizer (`models/forge-500m-chat-fir`) | [forge-500m-chat-fir](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/models/forge-500m-chat-fir) | `formers`, `download-fir-models` |
+| [gpt2-125m](https://huggingface.co/bobbydeveloper2014/gpt2-125m) | `model.safetensors`, `model.fir` và tokenizer (`models/gpt2-125m`) | [gpt2-125m](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/models/gpt2-125m) | `formers`, `download-fir-models` |
+| [huihui-moe-fir](https://huggingface.co/bobbydeveloper2014/huihui-moe-fir) | `model.fir`, trọng số và tokenizer (`models/huihui-moe-fir`) | [huihui-moe-fir](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/models/huihui-moe-fir) | `formers`, `download-fir-models` |
+
+`make download-models` tải toàn bộ các repo trên về đúng các đường dẫn đó (`make download-fir-models` chỉ tải nhóm FIR; cần CLI `hf` từ `pip install -U huggingface_hub`).
 
 Để các công cụ Hugging Face tự nhận token từ file môi trường cục bộ đã được Git bỏ qua, nạp file trong shell trước khi dùng `hf` hoặc `huggingface_hub`:
 
@@ -230,6 +236,12 @@ lẫn nhau; sidecar tokenizer LoRA được lưu đúng vị trí mà checkpoint
 | [Codestral QLoRA LinearAttention](https://huggingface.co/bobbydeveloper2014/codestral-v0.1-nimq-qlora-linearattention) | `test/codestral/models/jamba_parallel_lora.bin` và sidecar tokenizer |
 | [Mamba-3 SISO 187M NimQ + LoRA](https://huggingface.co/bobbydeveloper2014/mamba-siso-175m-nimq) | base ở `test/mamba3/models/`; config/tokenizer ở `test/mamba3/models/mamba3-siso-187m/`; adapter ở `test/mamba3/models/runs/mamba3-siso-187m-gated/` |
 | [Mamba-3 SISO 1.5B NimQ + LoRA](https://huggingface.co/bobbydeveloper2014/mamba-siso-1.5b-nimq) | base ở `test/mamba3/models/`; config/tokenizer ở `test/mamba3/models/mamba3-siso-1.5b/`; adapter ở `test/mamba3/models/runs/mamba3-siso-1.5b-gated/` |
+| [forge-500m-chat](https://huggingface.co/bobbydeveloper2014/forge-500m-chat) | `models/forge-500m-chat/` |
+| [forge-500m-chat-fir](https://huggingface.co/bobbydeveloper2014/forge-500m-chat-fir) | `models/forge-500m-chat-fir/` |
+| [gpt2-125m](https://huggingface.co/bobbydeveloper2014/gpt2-125m) | `models/gpt2-125m/` |
+| [huihui-moe-fir](https://huggingface.co/bobbydeveloper2014/huihui-moe-fir) | `models/huihui-moe-fir/` |
+
+Bốn model cuối là model FIR. Mỗi repo là cả thư mục (weights, tokenizer, `model.fir`), tải bằng CLI `hf` (`pip install -U huggingface_hub`); `make download-fir-models` chỉ tải riêng nhóm này.
 
 Các asset này công khai nên không cần `HF_TOKEN` hoặc đăng nhập Hugging Face.
 Biến môi trường `HF_TOKEN` phía trên chỉ cần cho repo riêng tư/bị giới hạn hoặc
