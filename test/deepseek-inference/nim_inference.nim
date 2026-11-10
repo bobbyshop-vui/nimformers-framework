@@ -2753,6 +2753,20 @@ proc loadLlamaWeightsL*(m: var LlamaModelL, path: string) =
   echo &"  reading file {path} ..."
   let fileSize = getFileSize(path)
   echo &"  file size: {fileSize div (1024*1024)} MB"
+  # The weights are mapped, so every page is otherwise read from disk on its
+  # first touch: a 16 KB demand fault at a time, mid-decode (the embedding
+  # row of each new token, the GPU's first read of each tensor). On slow
+  # storage that costs seconds. One sequential pass with large reads fills
+  # the page cache instead. BYBY_PREFAULT=0 skips it.
+  if getEnv("BYBY_PREFAULT", "1") != "0" and getEnv("BYBY_MODEL_MMAP", "1") != "0":
+    let t0 = epochTime()
+    var f: File
+    if open(f, path, fmRead):
+      var chunk = newSeq[byte](16 * 1024 * 1024)
+      while readBuffer(f, addr chunk[0], chunk.len) > 0: discard
+      close(f)
+      stderr.writeLine "[load] read " & $(fileSize div (1024 * 1024)) & " MB sequentially in " &
+        formatFloat(epochTime() - t0, ffDecimal, 2) & " s (BYBY_PREFAULT=0 skips)"
   # mmap: packed weights stay in the page cache and uploadAllResidentWeights
   # hands that mapping to the GPU (in place on unified memory, at any payload
   # offset; NIMQ3 files from convert_nimq_aligned are page aligned).
