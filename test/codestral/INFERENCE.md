@@ -16,6 +16,20 @@ on the current input/weight shape; MPS is selected only when it wins by at
 least 3%. Other Macs and Vulkan use MSL/packed kernels. Logs report the device
 gate and per-shape choice as `[prefill-matrix] ... MSL=... MPS=... -> ...`.
 
+Metal prefill also has a native packed-FP4 GEMM (`kernels/gemm_fp4km.metal`): a 256-thread
+register-blocked kernel decodes each 32-value group of the packed weights once into threadgroup
+memory and reuses it for every row of the tile (BM = 16/32/64 chosen from the row count). On an
+Apple GPU `kernels/gemm_fp4km_sg.metal` runs the same math with `simdgroup_matrix` (8x8 float
+accumulators, 4 simdgroups per 64x64 tile); it lives in its own library that is compiled only on an
+Apple GPU, and it is admitted only after it reproduces the register-blocked kernel on 16 rows of a
+real projection (`[fp4-gemm] simdgroup_matrix parity ...`). `BYBY_PREFILL_FP4_GEMM=auto|rb|sg|off`
+selects the kernel; `BYBY_PREFILL_FP4_GEMM_MIN_ROWS` is the smallest prefill row count that uses it
+(default 8 on Apple GPUs, 32 elsewhere, where the 8-row micro-VM tiles are as fast below that).
+`BYBY_FP4_SG_COMPILE_CHECK=1` compiles the simdgroup source on any GPU without building a pipeline.
+
+The FP32 matmul kernels (`kernels/gemm_blocked.metal`) are register-blocked as well: 4x4, 2x4 or 1x4
+accumulators per thread over 64/32/16-row tiles. `BYBY_METAL_GEMM_RB=0` selects the older 8x8 kernels.
+
 Vulkan inference checks device features and the exact cooperative-matrix tile
 before selecting a low-precision path. For FP4-KM prefill it prefers E4M3 FP8
 when supported, decoding packed weights into FP8 only as each tile is loaded;

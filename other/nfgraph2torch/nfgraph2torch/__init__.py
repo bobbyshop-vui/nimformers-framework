@@ -36,7 +36,8 @@ def _locate_formers():
 _locate_formers()
 
 from . import micro, compose, window  # noqa: E402  (registers the micro-kernels and compositions)
+from .reverse import to_torch, FirTorch  # noqa: E402
 from .lower import from_torch, export, evaluate, Input, UnsupportedOp  # noqa: E402
 from .coverage import coverage, CoverageReport  # noqa: E402
 
-__all__ = ["from_torch", "export", "evaluate", "Input", "UnsupportedOp", "coverage", "CoverageReport", "micro"]
+__all__ = ["from_torch", "export", "evaluate", "Input", "UnsupportedOp", "coverage", "CoverageReport", "micro", "to_torch", "FirTorch"]

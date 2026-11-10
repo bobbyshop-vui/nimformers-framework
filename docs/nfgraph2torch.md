@@ -1,7 +1,7 @@
 # nfgraph2torch (torch graph → nimformers)
 
 `other/nfgraph2torch` converts a torch module into a nimformers FIR graph and writes `model.fir`.
-It is Python. The reverse direction (nimformers → torch) is not implemented yet.
+It is Python. The reverse direction (`to_torch`) is described below.
 
 ```python
 import nfgraph2torch as nf2t
@@ -55,6 +55,31 @@ Registered through the custom-op hook of `formers.fir` (`formers/fir/custom.py`)
 | `custom_op(name, inputs, shape, attrs=None, dtype="f32")` | Record the op on the active trace and return the result tensor. Parameters among `inputs` become checkpoint weights. |
 | `register_tree_op(kind, emit)` | Add a scalar operation to the pointwise kernel builder. |
 
+## Reverse direction: model.fir → torch
+
+```python
+back = nf2t.to_torch("out_dir/model.fir", weights=dict(model.state_dict()))   # a torch.nn.Module
+logits = back(token, position)
+```
+
+`to_torch(source, weights=None, config=None)` reads a `runtime graph` `model.fir` (path or text) and
+returns `FirTorch`, a module whose `forward(token, position)` returns the logits. `weights` maps
+checkpoint tensor names to tensors; they become `nn.Parameter`s with the same names. Only elementary
+ATen operations are used, so any FIR file the Python VM can run also runs in torch:
+
+- `ext` nodes: `fir.embedding` is an `index_select`; `fir.linear` / `fir.linear_t` are `torch.matmul`.
+- `micro` nodes: a vectorised interpreter runs the kernel bytecode with one tensor entry per thread.
+  `add`/`sub`/`mul`/`div`/`exp`/`sigmoid`/`rsqrt`... are the same ATen op, `uloadf32` is a gather,
+  `ustoref32` an `index_put_`, `ifbegin` a mask (`where`) and `forbegin` a Python loop over tensor ops.
+
+Speed is far below the native runner (a convolution costs one tensor op per multiply-accumulate; a
+ResNet-18 with 8 base channels on a 32×32 image takes about 35 s on CPU). Coverage is complete for
+everything the Python VM interprets; kernels using thread-group, atomic or barrier instructions are
+rejected, as in the VM. Stores to the same address from several threads have no defined order.
+
+A torch → FIR → torch round trip of a ResNet-18 (wrapped as a token → image → logits model, because
+the runner ABI only accepts `token` and `position`) matches the original to 4e-7.
+
 ## Limits
 
 - The FIR runner feeds only `token` and `position` and reads `logits`, so `model.fir` export needs an
@@ -69,6 +94,6 @@ Registered through the custom-op hook of `formers.fir` (`formers/fir/custom.py`)
 
 ```bash
 cd other/nfgraph2torch/tests
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest test_ops.py test_resnet.py   # reference evaluator
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest test_ops.py test_resnet.py test_reverse.py   # reference evaluator
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest test_vm.py                   # model.fir on the FIR VM
 ```

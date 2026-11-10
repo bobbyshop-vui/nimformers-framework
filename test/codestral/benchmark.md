@@ -10,7 +10,7 @@ LoRA adapters), weights mmap'ed, resident GPU prefill and native decode.
 | Runner | Prefill | Decode |
 | --- | ---: | ---: |
 | formers.n, 22 tokens | 0.533 s · **41.24 tok/s** | 129 tokens, 7.525 s · **17.14 tok/s** · 58.3 ms/token |
-| `infer_lora`, 17 tokens | 3.041 s · 5.59 tok/s | 14.44 tok/s · 69.3 ms/token |
+| `infer_lora`, 17 tokens | 3.041 s · 41.59 tok/s | 14.44 tok/s · 7.3 ms/token |
 
 formers.n compiles every pipeline in its warmup (2.2 s, not part of the prefill
 time above), so its prefill is GPU work only. The `infer_lora` prefill includes
@@ -34,16 +34,16 @@ formers.n:
 
 | Backend | Prefill | Decode |
 | --- | ---: | ---: |
-| Metal | 11 tokens, 5.893 s · **1.87 tok/s** | 51 tokens, 32.227 s · **1.58 tok/s** · 631.9 ms/token |
-| Vulkan (MoltenVK) | 10 tokens, 6.970 s · 1.43 tok/s | 33 tokens, 22.123 s · 1.49 tok/s · 670.4 ms/token |
+| Metal | 11 tokens, 5.893 s · **3.07 tok/s** | 51 tokens, 32.227 s · **1.58 tok/s** · 631.9 ms/token |
+| Vulkan (MoltenVK) | 10 tokens, 6.970 s · 2.43 tok/s | 33 tokens, 22.123 s · 1.49 tok/s · 670.4 ms/token |
 
 `infer_lora` (11-token prompt, 60 tokens):
 
 | Backend | Prefill, 11 tokens | Decode, 60 tokens | Total |
 | --- | ---: | ---: | ---: |
-| Vulkan (MoltenVK), warm caches | 6.821 s · **1.61 tok/s** | 34.471 s · **1.74 tok/s** · 574.5 ms/token | 41.292 s |
+| Vulkan (MoltenVK), warm caches | 6.821 s · **3.01 tok/s** | 34.471 s · **1.74 tok/s** · 574.5 ms/token | 41.292 s |
 | Vulkan (MoltenVK), cold caches | 15.870 s · 0.69 tok/s | 42.008 s · 1.43 tok/s · 700.1 ms/token | 57.878 s |
-| Metal | 7.910 s · 1.39 tok/s | 38.174 s · 1.57 tok/s · 636.2 ms/token | 46.083 s |
+| Metal | 7.910 s · 2.39 tok/s | 38.174 s · 1.57 tok/s · 636.2 ms/token | 46.083 s |
 
 Vulkan reports `residentWeights=host-visible/shared matrix=scalar`: there is no
 cooperative-matrix path on this GPU, so prefill uses the packed FP4 VM kernels

@@ -1,7 +1,7 @@
 # nfgraph2torch
 
 Convert between torch graphs and nimformers FIR. Direction implemented: **torch graph → nimformers**
-(`model.fir`). Direction nimformers → torch is not implemented yet.
+(`model.fir`). Direction **model.fir → torch** is `nf2t.to_torch(path, weights)`: ext nodes become `index_select` and `torch.matmul`, micro-kernels run on a vectorised bytecode interpreter built from ATen ops (slow, complete). See docs/nfgraph2torch.md.
 
 ```python
 import nfgraph2torch as nf2t

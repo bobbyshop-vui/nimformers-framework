@@ -82,7 +82,7 @@ def _map(value, env):
     return value
 
 
-def _adapter(program, specs):
+def _adapter(program, specs, quantize=()):
     import torch
     sig = program.graph_signature
     consts = _constants(program)
@@ -90,7 +90,8 @@ def _adapter(program, specs):
     for spec in sig.input_specs:
         if spec.kind.name == "PARAMETER":
             t = program.state_dict[spec.target]
-            p = fnn.Parameter(tuple(t.shape), _fir_dtype(t.dtype) or "f32", name=spec.target)
+            dtype = "q4" if spec.target in quantize else (_fir_dtype(t.dtype) or "f32")
+            p = fnn.Parameter(tuple(t.shape), dtype, name=spec.target)
             params[spec.arg.name] = by_target[spec.target] = p
 
     class Adapter(fnn.Module):
@@ -146,18 +147,20 @@ def _specs(program, example_inputs, inputs):
 
 
 def from_torch(module, example_inputs, *, inputs=None, kwargs=None, config=None, name="from_torch",
-               optimize=True, strict=False, decompositions=None):
+               optimize=True, strict=False, decompositions=None, quantize=()):
     """Convert a torch module into a ``formers.fir`` graph.
 
     ``example_inputs`` are the tensors passed to ``module(*example_inputs)``; ``inputs`` is an
     optional list of :class:`Input` (role/dtype per user input). ``config`` is a dict or an object
-    with ``to_dict()`` and is written to ``config.json`` by :func:`export`.
+    with ``to_dict()`` and is written to ``config.json`` by :func:`export`. ``quantize`` lists
+    state_dict names of ``[in, out]`` weights (used as ``x @ W``) that the runner keeps as resident Q4;
+    the checkpoint still holds f32 and the runner quantizes at load time.
     """
     if config is None and hasattr(getattr(module, "config", None), "to_dict"):
         config = module.config.to_dict()
     program = capture(module, example_inputs, kwargs=kwargs, strict=strict, decompositions=decompositions)
     specs = _specs(program, example_inputs, inputs)
-    return fir.trace(_adapter(program, specs), specs, config=config, name=name, optimize=optimize)
+    return fir.trace(_adapter(program, specs, quantize), specs, config=config, name=name, optimize=optimize)
 
 
 def export(module, example_inputs, directory, *, report=False, **options):

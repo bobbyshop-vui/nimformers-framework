@@ -86,7 +86,14 @@ function fgValidateExternal(model: FirProgram, node: FirNode)
     let dtypeOk = (node.op == "fir.linear" and w.dtype in ["q4", "f32"]) or (node.op == "fir.linear_t" and w.dtype in ["q4t", "f32"]) or (node.op == "fir.embedding" and w.dtype == "f32")
     if w.kind != "weight" or not dtypeOk or w.dims.len != 2 or x.kind == "weight" or y.kind == "weight":
         raise newException(ValueError, "FIR graph external requires matching weight dtype and f32 activations: " & node.name)
-    let expected = if node.op == "fir.linear": @[x.elements, y.elements] else: @[y.elements, x.elements]
+    # Several rows: w is [K,N] (fir.linear) or [N,K] (fir.linear_t); x holds M*K and y M*N floats.
+    var expected = if node.op == "fir.linear": @[x.elements, y.elements] else: @[y.elements, x.elements]
+    if node.op != "fir.embedding" and (w.dtype == "f32" or w.dtype == "q4"):
+        let inner = if node.op == "fir.linear": w.dims[0] else: w.dims[1]
+        if inner > 0 and x.elements mod inner == 0:
+            let rows = x.elements div inner
+            if y.elements mod rows == 0:
+                expected = if node.op == "fir.linear": @[inner, y.elements div rows] else: @[y.elements div rows, inner]
     if node.op == "fir.embedding":
         let rows = if node.phase.len > 0: model.phases[node.phase] else: 1
         if x.elements != 1 or w.dims[1]*rows != y.elements:

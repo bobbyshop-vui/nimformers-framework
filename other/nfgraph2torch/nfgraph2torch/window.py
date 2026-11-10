@@ -55,7 +55,11 @@ def _window_views(attrs, xview, wview, x_shape, w_shape):
     else:
         xdims.append((x_shape[1], xd[1][1], 1))
     xdims += [(out_sp[i], stride[i] * xd[2 + i][1], 1) for i in range(s)]
-    xdims.append((cig, xd[1][1], 1))
+    split = attrs.get("split", 1)
+    cc = cig // split
+    if split > 1:
+        xdims.append((split, cc * xd[1][1], 1))
+    xdims.append((cc, xd[1][1], 1))
     xdims += [(k[i], dil[i] * xd[2 + i][1], 1) for i in range(s)]
     xv = V.View(xview.offset, tuple(xdims))
     if attrs["mode"] != "conv":
@@ -64,7 +68,9 @@ def _window_views(attrs, xview, wview, x_shape, w_shape):
         return xv, None
     wd = wview.dims
     wdims = [(x_shape[0], 0, 1), (co, wd[0][1], 1)] + [(out_sp[i], 0, 1) for i in range(s)]
-    wdims.append((cig, wd[1][1], 1))
+    if split > 1:
+        wdims.append((split, cc * wd[1][1], 1))
+    wdims.append((cc, wd[1][1], 1))
     wdims += [(k[i], wd[2 + i][1], 1) for i in range(s)]
     return xv, V.View(wview.offset, tuple(wdims))
 
@@ -81,14 +87,14 @@ def _lower(em, node, ctx, kb):
     w_shape = g.values[node.inputs[1]].shape if w is not None else None
     xv, wv = _window_views(a, x.view, w.view if w is not None else None, x_shape, w_shape)
     space = tuple(d[0] for d in xv.dims)
-    n_out = 2 + s
-    inner = list(range(n_out, len(space))) if a["mode"] != "conv" else list(range(n_out, len(space)))
+    n_out = 2 + s + (1 if a.get("split", 1) > 1 else 0)
+    inner = list(range(n_out, len(space)))
     operands = [C.Mem(x.port, xv)] + ([C.Mem(w.port, wv)] if w is not None else [])
     if a["mode"] == "conv":
         tree, kind = ("mul", (("input", 0), ("input", 1))), "sum"
     else:
         tree, kind = ("input", 0), a["kind"]
-    threads = C.gen_reduce(kb, kind, tree, operands, out, space, inner, False)
+    threads = C.gen_reduce(kb, kind, tree, operands, out, space, inner, False, spread=True)
     return ("conv" if a["mode"] == "conv" else "pool_" + a["kind"]), threads
 
 
@@ -97,9 +103,9 @@ def _reference(ins, shapes, out_shape, a):
     x, x_shape = ins[0], shapes[0]
     w = ins[1] if a["mode"] == "conv" else None
     k, stride, dil, groups = a["kernel"], a["stride"], a["dilation"], a["groups"]
+    split = a.get("split", 1)
     n, c = x_shape[0], x_shape[1]
-    sp = x_shape[2:]
-    out_sp = out_shape[2:]
+    out_sp = out_shape[2:-1] if split > 1 else out_shape[2:]
     co = out_shape[1]
     cig = c // groups
     xs = _strides(x_shape)
@@ -107,23 +113,30 @@ def _reference(ins, shapes, out_shape, a):
     for b in range(n):
         for o in range(co):
             for pos in itertools.product(*(range(v) for v in out_sp)):
-                values = []
-                chans = range((o // (co // groups)) * cig, (o // (co // groups) + 1) * cig) \
-                    if a["mode"] == "conv" else [o]
-                for ci_i, ci in enumerate(chans):
-                    for kp in itertools.product(*(range(v) for v in k)):
-                        at = [pos[i] * stride[i] + kp[i] * dil[i] for i in range(s)]
-                        xv = x[b * xs[0] + ci * xs[1] + sum(at[i] * xs[2 + i] for i in range(s))]
-                        if w is not None:
-                            ws = _strides(shapes[1])
-                            xv *= w[o * ws[0] + ci_i * ws[1] + sum(kp[i] * ws[2 + i] for i in range(s))]
-                        values.append(xv)
-                if a["mode"] == "conv" or a["kind"] == "sum":
-                    result.append(sum(values))
-                elif a["kind"] == "mean":
-                    result.append(sum(values) / len(values))
-                else:
-                    result.append(max(values))
+                base = (o // (co // groups)) * cig if a["mode"] == "conv" else o
+                # split > 1: the input channels are cut into `split` chunks, one partial sum each.
+                for chunk in range(split):
+                    values = []
+                    if a["mode"] == "conv":
+                        cc = cig // split
+                        chans = range(base + chunk * cc, base + (chunk + 1) * cc)
+                    else:
+                        chans = [o]
+                    for ci in chans:
+                        ci_i = ci - base if a["mode"] == "conv" else 0
+                        for kp in itertools.product(*(range(v) for v in k)):
+                            at = [pos[i] * stride[i] + kp[i] * dil[i] for i in range(s)]
+                            xv = x[b * xs[0] + ci * xs[1] + sum(at[i] * xs[2 + i] for i in range(s))]
+                            if w is not None:
+                                ws = _strides(shapes[1])
+                                xv *= w[o * ws[0] + ci_i * ws[1] + sum(kp[i] * ws[2 + i] for i in range(s))]
+                            values.append(xv)
+                    if a["mode"] == "conv" or a["kind"] == "sum":
+                        result.append(sum(values))
+                    elif a["kind"] == "mean":
+                        result.append(sum(values) / len(values))
+                    else:
+                        result.append(max(values))
     return result
 
 
@@ -151,6 +164,18 @@ def _pad(x, padding, value):
     return F.pad(x, tuple(flat), "constant", value)
 
 
+SPLIT_TARGET_THREADS = 65536
+SPLIT_MAX = 32
+
+
+def _split_factor(outputs, cig, groups):
+    """Chunks of the input-channel reduction (a divisor of ``cig``) that give a GPU enough threads."""
+    if groups != 1 or cig < 2 or outputs >= SPLIT_TARGET_THREADS:
+        return 1
+    want = min(SPLIT_MAX, cig, -(-SPLIT_TARGET_THREADS // outputs))
+    return max((d for d in range(1, want + 1) if cig % d == 0), default=1)
+
+
 def conv(x, w, bias, stride, padding, dilation, groups):
     nsp = x.ndim - 2
     stride, padding, dilation = _tuple(stride, nsp), _tuple(padding, nsp), _tuple(dilation, nsp)
@@ -159,7 +184,14 @@ def conv(x, w, bias, stride, padding, dilation, groups):
     attrs = {"mode": "conv", "nsp": nsp, "kernel": k, "stride": stride, "dilation": dilation,
              "groups": int(groups), "co": w.shape[0]}
     out_sp = tuple(out_size(x.shape[2 + i], k[i], stride[i], dilation[i]) for i in range(nsp))
-    y = fir.custom_op("window", (x, w), (x.shape[0], w.shape[0]) + out_sp, attrs)
+    split = _split_factor(x.shape[0] * w.shape[0] * math.prod(out_sp), w.shape[1], int(groups))
+    if split > 1:
+        # Split the input-channel reduction over `split` threads per output, then add the partial sums.
+        attrs["split"] = split
+        y = fir.custom_op("window", (x, w), (x.shape[0], w.shape[0]) + out_sp + (split,), attrs)
+        y = y.sum(-1)
+    else:
+        y = fir.custom_op("window", (x, w), (x.shape[0], w.shape[0]) + out_sp, attrs)
     if bias is not None:
         y = y + bias.reshape((1, -1) + (1,) * nsp)
     return y

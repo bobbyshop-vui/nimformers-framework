@@ -532,8 +532,10 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
   let mr = m.blocks[0].mambaReal
   var useMps = false
   when defined(macosx):
-    useMps = be == gbMetal and getEnv("BYBY_PREFILL_MPS", "1") != "0" and
-      metalBackend.metalIsAppleSilicon() and metalBackend.metalMpsSupported()
+    # BYBY_PREFILL_MPS=force lets a non-Apple-Silicon Mac (e.g. Intel Iris) try MPS for benchmarking.
+    let mpsMode = getEnv("BYBY_PREFILL_MPS", "1")
+    useMps = be == gbMetal and mpsMode != "0" and
+      (metalBackend.metalIsAppleSilicon() or mpsMode == "force") and metalBackend.metalMpsSupported()
   if be == gbMetal:
     when defined(macosx):
       echo &"[prefill-matrix] Apple Silicon={metalBackend.metalIsAppleSilicon()} " &
@@ -824,6 +826,55 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
         buildF32GemmBatchProgram(lin.K, lin.N, GemvTg, T),
         "prefix_f32gemm_" & $lin.K & "x" & $lin.N & "_r" & $T, be)
   var f32Mps, f32Fallback, f32Batch: int
+  # ---- native FP4 GEMM (register-blocked on every Metal GPU, simdgroup_matrix on Apple GPUs) ----
+  # BYBY_PREFILL_FP4_GEMM = auto | rb | sg | off. The simdgroup kernel is admitted only after it
+  # reproduces the register-blocked kernel on a real projection; otherwise the portable kernel runs.
+  let fp4GemmMode = getEnv("BYBY_PREFILL_FP4_GEMM", "auto")
+  # Below ~32 rows the 8-row packed micro-VM tiles are as fast on a GPU without matrix hardware.
+  let fp4GemmMinRows = max(1, (try: parseInt(getEnv("BYBY_PREFILL_FP4_GEMM_MIN_ROWS",
+    (when defined(macosx): (if metalBackend.metalIsAppleGpu(): "8" else: "32") else: "32"))) except: 32))
+  var fp4GemmOk = false
+  var fp4GemmSimdgroup = false
+  var fp4SgChecked = false
+  when defined(macosx):
+    fp4GemmOk = be == gbMetal and fp4GemmMode != "off"
+    fp4GemmSimdgroup = fp4GemmOk and metalBackend.metalIsAppleGpu() and fp4GemmMode in ["auto", "sg"]
+  proc fp4SimdgroupParity(c: Fp4LinCacheGpu): bool =
+    ## Runs both kernels on 16 pseudo-random rows of a real packed projection.
+    if c.cols mod 32 != 0 or c.rows < 64: return false
+    if sessionOpen:
+      require(sessionEnd(be), "FP4 GEMM parity preflush failed")
+      sessionOpen = false
+    let rows = 16
+    var x = newSeq[float32](rows * c.cols)
+    var seed = 12345'u32
+    for v in x.mitems:
+      seed = seed * 1664525'u32 + 1013904223'u32
+      v = float32(int(seed shr 8) mod 2001 - 1000) / 1000'f32
+    let hx = sessionUpload(be, x)
+    var outs: array[2, SessionHandle]
+    for mode in 0 .. 1:
+      require(sessionBegin(be), "FP4 GEMM parity sessionBegin failed")
+      var o = sessionAllocScratch(be, rows * c.rows)
+      let ok = byby.sessionFp4GemmMetal(be, hx, c.wBuf, c.lutBuf, o, rows, c.cols, c.rows, mode == 1)
+      let ended = sessionEnd(be)
+      if not ok or not ended: return false
+      outs[mode] = o
+    let reference = sessionRead(be, outs[0], rows * c.rows)
+    let candidate = sessionRead(be, outs[1], rows * c.rows)
+    var peak, worst = 0.0'f64
+    for i in 0 ..< reference.len:
+      peak = max(peak, abs(float64(reference[i])))
+      worst = max(worst, abs(float64(reference[i] - candidate[i])))
+    result = worst <= 2e-3 * peak + 1e-4
+    echo &"[fp4-gemm] simdgroup_matrix parity {(if result: \"passed\" else: \"FAILED\")}: max|diff|={worst:.3e} peak={peak:.3e}"
+  proc fp4GemmReady(c: Fp4LinCacheGpu): bool =
+    if not fp4GemmOk: return false
+    if fp4GemmSimdgroup and not fp4SgChecked:
+      fp4SgChecked = true
+      if not fp4SimdgroupParity(c): fp4GemmSimdgroup = false
+    true
+
   proc mpsMslWins(name: string; input, weight: SessionHandle;
                   output: var SessionHandle; rows, k, cols: int;
                   batchKernel: bool): bool =
@@ -956,6 +1007,13 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
     elif lin.isFp4 and be == gbVulkan and byby.sessionFp4GemmTensorCore(be, input,
         gFp4CacheGpu[name].wBuf, gFp4CacheGpu[name].lutBuf, output, T, lin.K, lin.N):
       inc gPrefixTensorCore
+    elif lin.isFp4 and T >= fp4GemmMinRows and fp4GemmReady(gFp4CacheGpu[name]) and
+        byby.sessionFp4GemmMetal(be, input, gFp4CacheGpu[name].wBuf, gFp4CacheGpu[name].lutBuf,
+          output, T, lin.K, lin.N, fp4GemmSimdgroup):
+      # Native GEMM (register-blocked, or simdgroup_matrix on Apple GPUs): the packed weights are
+      # decoded once per 64 rows instead of once per 8-row micro-VM tile.
+      inc gPrefixPackedTiles
+      flushFine("fp4gemm_" & $lin.N & "x" & $lin.K)
     elif name in m8x2Kns:
       let c = gFp4CacheGpu[name]
       var row = 0
