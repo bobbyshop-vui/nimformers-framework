@@ -2686,6 +2686,10 @@ proc forwardPrefillFlash(m: LlamaModelL, xData: seq[float32], T: int, ctx: Backe
     result = prefillFlashChunk(m, xData[start * C ..< (start + rows) * C], rows, pos + start, ctx, cache)
     start += rows
 
+proc gpuSecondsTotal*(ctx: Backend): float =
+  ## GPU execution time spent in sessions so far (0 on backends that do not report it).
+  sessionGpuSeconds(ctx.kind.toByby())
+
 proc forwardStep*(m: LlamaModelL, ids: seq[int], ctx: Backend, cache: var KVCacheL,
                    isPrefill: bool): Tensor =
   ## isPrefill=true: ids = the whole prompt (T tokens). isPrefill=false: ids = exactly 1 new token.
