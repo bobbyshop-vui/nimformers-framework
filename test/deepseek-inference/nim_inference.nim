@@ -2298,6 +2298,7 @@ proc envNum(name: string, fallback: int): int =
 let gPrefillCbMs = float(max(10, envNum("BYBY_PREFILL_CB_MS", 300)))
 let gPrefillMaxRows = max(16, envNum("BYBY_PREFILL_MAX_ROWS", 512))
 let gPrefillSessionMb = max(16, envNum("BYBY_PREFILL_SESSION_MB", 1024))
+let gPrefillProfileLayer = envNum("BYBY_PREFILL_PROFILE", -1)  ## layer whose ops run one per command buffer, timed by BYBY_SESSION_LOG
 var gPrefillMsPerLayerRow = -1.0   ## measured GPU ms per layer per prompt row
 var gDecodeMsPerLayer = -1.0       ## measured GPU ms per layer of one decode token
 
@@ -2393,6 +2394,11 @@ proc encodePrefillLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMS
   template step(cond: bool, msg: string) =
     if not cond:
       raise newException(CatchableError, "[FLASH_PREFILL] " & msg & " (layer " & $layerIdx & ")")
+  template prof(label: string) =
+    if gPrefillProfileLayer == layerIdx:
+      stderr.writeLine "[op] " & label & ":"
+      if not sessionEnd(be): raise newException(CatchableError, "[FLASH_PREFILL] profile sessionEnd failed")
+      if not sessionBegin(be): raise newException(CatchableError, "[FLASH_PREFILL] profile sessionBegin failed")
   template linear(l: Linear, a: SessionHandle, rows: int, what: string): SessionHandle =
     var c = sessionAllocScratch(be, rows * l.outF)
     pending.add(c)
@@ -2413,11 +2419,17 @@ proc encodePrefillLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMS
                 else: (let h = sessionUpload(be, normQKV.weight.data); pending.add(h); h))
   var hNormed = sessionAllocScratch(be, T * C); pending.add(hNormed)
   step(sessionRmsnormEnc(be, hXIn, hGamma, hNormed, T, C, normQKV.eps), "RMSNorm input failed")
+  prof("rmsnorm input")
   let hQ = linear(attn.qProj, hNormed, T, "Q")
+  prof("Q matmul")
   let hK = linear(attn.kProj, hNormed, T, "K")
+  prof("K matmul")
   let hV = linear(attn.vProj, hNormed, T, "V")
+  prof("V matmul")
   step(sessionRope(be, hQ, hCos, hSin, T, H, D), "RoPE(Q) failed/not supported")
+  prof("rope Q")
   step(sessionRope(be, hK, hCos, hSin, T, HKV, D), "RoPE(K) failed/not supported")
+  prof("rope K")
 
   # ---- KV cache: merged [HKV, maxSeqLen, D] buffers, then the per-head copies ----
   ensureKvResident(cache.layers[layerIdx], be, HKV, cache.maxSeqLen, D)
@@ -2426,6 +2438,7 @@ proc encodePrefillLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMS
                            cache.maxSeqLen), "K cache scatter failed")
   step(sessionKvScatterEnc(be, hV, cache.layers[layerIdx].vResidentCombined, T, HKV, D, pos,
                            cache.maxSeqLen), "V cache scatter failed")
+  prof("kv scatter")
   for h in 0 ..< HKV:
     let off = h * cache.maxSeqLen * D + pos * D
     step(sessionCopyInto(be, cache.layers[layerIdx].kResidentCombined,
@@ -2434,6 +2447,7 @@ proc encodePrefillLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMS
     step(sessionCopyInto(be, cache.layers[layerIdx].vResidentCombined,
                          cache.layers[layerIdx].vResident[h], off, pos * D, T * D),
          "copyInto V resident failed (head " & $h & ")")
+  prof("kv per-head copies")
   cache.layers[layerIdx].filled = pos + T
 
   # ---- Flash attention -> oProj -> residual ----
@@ -2441,22 +2455,33 @@ proc encodePrefillLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMS
   step(sessionFlashAttentionPrefillEnc(be, hQ, cache.layers[layerIdx].kResidentCombined,
          cache.layers[layerIdx].vResidentCombined, hAttn, T, H, HKV, D, pos, cache.maxSeqLen,
          attn.scale), "flash attention failed")
+  prof("flash attention")
   let hO = linear(attn.oProj, hAttn, T, "oProj")
+  prof("oProj matmul")
   let hX2 = sVecOp(be, "add", hXIn, hO, T * C); pending.add(hX2)
+  prof("residual add")
 
   # ---- RMSNorm (post-attn) + SwiGLU FFN -> residual ----
   let hGammaFfn = (if normFFN.residentGammaReady: normFFN.residentGamma
                    else: (let h = sessionUpload(be, normFFN.weight.data); pending.add(h); h))
   var hNormedFfn = sessionAllocScratch(be, T * C); pending.add(hNormedFfn)
   step(sessionRmsnormEnc(be, hX2, hGammaFfn, hNormedFfn, T, C, normFFN.eps), "RMSNorm FFN failed")
+  prof("rmsnorm ffn")
   let interF = ff.gateProj.outF
   let hGate = linear(ff.gateProj, hNormedFfn, T, "gateProj")
+  prof("gate matmul")
   let hUp = linear(ff.upProj, hNormedFfn, T, "upProj")
+  prof("up matmul")
   let hSig = sActivation(be, "sigmoid", hGate, T * interF); pending.add(hSig)
+  prof("sigmoid")
   let hSilu = sVecOp(be, "mul", hGate, hSig, T * interF); pending.add(hSilu)
+  prof("silu mul")
   let hGated = sVecOp(be, "mul", hSilu, hUp, T * interF); pending.add(hGated)
+  prof("gated mul")
   let hDown = linear(ff.downProj, hGated, T, "downProj")
+  prof("down matmul")
   result = sVecOp(be, "add", hX2, hDown, T * C)
+  prof("residual add 2")
 
 proc tileRows(rows: int): int =
   ## The prefill GEMMs work in 64-row tiles (Metal matmul_q4_gemm, Vulkan
