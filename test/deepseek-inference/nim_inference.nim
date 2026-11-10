@@ -1948,6 +1948,35 @@ proc precheckLayerResident(attn: GQAAttention, ff: SwiGLUL, layerIdx: int,
     return false
   return true
 
+## BYBY_DECODE_PROFILE=<layer>: that layer's decode ops each run in their own
+## command buffer and their GPU time is summed per op (decodeProfileReport).
+let gDecodeProfileLayer = (try: parseInt(getEnv("BYBY_DECODE_PROFILE", "-1")) except ValueError: -1)
+var gDecodeProfileNames: seq[string]
+var gDecodeProfileSec: seq[float]
+var gDecodeProfileTokens = 0
+
+proc decodeProfileAdd(name: string, sec: float) =
+  for i in 0 ..< gDecodeProfileNames.len:
+    if gDecodeProfileNames[i] == name:
+      gDecodeProfileSec[i] += sec
+      return
+  gDecodeProfileNames.add(name)
+  gDecodeProfileSec.add(sec)
+
+proc decodeProfileReport*(): string =
+  ## Mean GPU ms per token of each op of the profiled layer since the last
+  ## report; empty when BYBY_DECODE_PROFILE is not set.
+  if gDecodeProfileTokens == 0: return ""
+  var total = 0.0
+  for i in 0 ..< gDecodeProfileNames.len:
+    let ms = gDecodeProfileSec[i] * 1000.0 / float(gDecodeProfileTokens)
+    total += ms
+    result.add(" " & gDecodeProfileNames[i] & " " & formatFloat(ms, ffDecimal, 3))
+  result = "layer " & $gDecodeProfileLayer & " ms/tok:" & result & " | sum " & formatFloat(total, ffDecimal, 3)
+  gDecodeProfileNames.setLen(0)
+  gDecodeProfileSec.setLen(0)
+  gDecodeProfileTokens = 0
+
 proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSNormL,
     ff: SwiGLUL, hXIn: SessionHandle, rope: RoPEL, be: GpuBackend, cache: var KVCacheL,
     layerIdx: int, pending: var seq[SessionHandle]): SessionHandle =
@@ -1988,12 +2017,26 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
     if not cond:
       raise newException(CatchableError, "[MERGED_SESSION] " & msg & " (layer " & $layerIdx & ")")
 
+  let profiled = layerIdx == gDecodeProfileLayer
+  var profLast = 0.0
+  template mark(name: string) =
+    # Closes the command buffer here so the GPU time since the last mark is this op's.
+    if profiled:
+      step(sessionEnd(be), "profile sessionEnd failed")
+      let now = sessionGpuSeconds(be)
+      if name.len > 0: decodeProfileAdd(name, now - profLast)
+      profLast = now
+      step(sessionBegin(be), "profile sessionBegin failed")
+  mark("")
+  if profiled: inc gDecodeProfileTokens
+
   # ---- RMSNorm (input) + QKV matmul ----
   let hX = hXIn
   let hGamma = (if normQKV.residentGammaReady: normQKV.residentGamma
                 else: (let h = sessionUpload(be, normQKV.weight.data); pending.add(h); h))
   var hNormed = sessionAllocScratch(be, C); pending.add(hNormed)
   step(sessionRmsnormEnc(be, hX, hGamma, hNormed, 1, C, normQKV.eps), "RMSNorm input failed")
+  mark("norm1")
 
   var hQ = sessionAllocScratch(be, H * D); pending.add(hQ)
   var hK = sessionAllocScratch(be, HKV * D); pending.add(hK)
@@ -2014,6 +2057,7 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
     step(sessionMatmul(be, hNormed, attn.kProj.residentFp32, hK, 1, attn.kProj.inF, attn.kProj.outF), "K matmul(fp32) failed")
     step(sessionMatmul(be, hNormed, attn.vProj.residentFp32, hV, 1, attn.vProj.inF, attn.vProj.outF), "V matmul(fp32) failed")
 
+  mark("qkv")
   # ---- RoPE(Q), RoPE(K) in THE SAME session ----
   let halfD = D div 2
   var cosSlice = newSeq[float32](halfD)
@@ -2030,6 +2074,7 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
 
   # ---- Multiply Q by attn.scale RIGHT ON THE GPU ----
   step(sessionScale(be, hQ, attn.scale, H * D), "Scale(Q) failed/not supported")
+  mark("rope+scale")
 
   # ---- KV-resident sync ----
   ensureKvResident(cache.layers[layerIdx], be, HKV, cache.maxSeqLen, D)
@@ -2054,6 +2099,7 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
                           h * D, h * cache.maxSeqLen * D + cache.seqLen * D, D),
          "copyInto V resident-combined failed (head " & $h & ")")
   cache.layers[layerIdx].filled = cache.seqLen + 1
+  mark("kvappend")
 
   # ---- Attention decode: TRY the FUSED kernel first (1 dispatch for ALL H
   # heads, instead of a loop of HKV*5 dispatch commands) - falls back to the old loop
@@ -2089,6 +2135,7 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
       step(sessionCopyInto(be, hOutGroup, hOutHeads, hkv * nRep * D, nRep * D),
            "copyInto outHeads failed (kv-head " & $hkv & ")")
 
+  mark("attention")
   # ---- oProj ----
   var hOProjOut = sessionAllocScratch(be, C); pending.add(hOProjOut)
   var hX2 = SessionHandle()
@@ -2108,6 +2155,7 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
     let hBias = sessionUpload(be, attn.oProj.bias.data); pending.add(hBias)
     hOProjFinal = sVecOp(be, "add", hOProjOut, hBias, C); pending.add(hOProjFinal)
 
+  mark("oproj")
   # ---- Residual #1 ----
   if not oFused:
     hX2 = sVecOp(be, "add", hX, hOProjFinal, C); pending.add(hX2)
@@ -2117,6 +2165,7 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
                    else: (let h = sessionUpload(be, normFFN.weight.data); pending.add(h); h))
   var hNormedFfn = sessionAllocScratch(be, C); pending.add(hNormedFfn)
   step(sessionRmsnormEnc(be, hX2, hGammaFfn, hNormedFfn, 1, C, normFFN.eps), "RMSNorm FFN failed")
+  mark("norm2")
 
   let interF = ff.gateProj.outF
   var hGate = sessionAllocScratch(be, interF); pending.add(hGate)
@@ -2147,12 +2196,14 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
     let hSig = sActivation(be, "sigmoid", hGate, interF); pending.add(hSig)
     let hSilu = sVecOp(be, "mul", hGate, hSig, interF); pending.add(hSilu)
     hGated = sVecOp(be, "mul", hSilu, hUp, interF); pending.add(hGated)
+  mark("gate+up")
   var hOut = sessionAllocScratch(be, ff.downProj.outF); pending.add(hOut)
   var downFused = false
   if downQ4 and ff.downProj.bias.data.len != ff.downProj.outF and ff.downProj.outF == C:
     result = sessionAllocScratch(be, C); pending.add(result)
     downFused = sessionMatmulQ4Fused(be, 0, hGated, [ff.downProj.residentW], [result], hX2, true)
   if downFused:
+    mark("down")
     return
   if downQ4:
     step(sessionMatmulQ4(be, hGated, ff.downProj.residentW, hOut, 1), "downProj matmul failed")
@@ -2165,6 +2216,7 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
 
   # ---- Residual #2 ----
   result = sVecOp(be, "add", hX2, hOut, C); pending.add(result)
+  mark("down")
 
 proc forwardDecodeFullMergeSingleSession(attn: GQAAttention, normQKV, normFFN: RMSNormL,
     ff: SwiGLUL, x: Tensor, rope: RoPEL, ctx: Backend, cache: var KVCacheL, layerIdx: int): Tensor =
