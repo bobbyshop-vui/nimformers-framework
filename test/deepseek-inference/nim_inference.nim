@@ -2034,7 +2034,10 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
   # ---- KV-resident sync ----
   ensureKvResident(cache.layers[layerIdx], be, HKV, cache.maxSeqLen, D)
   step(kvResidentUsable(cache, layerIdx), "KV resident is not ready for this layer")
-  for h in 0 ..< HKV:
+  let kvFused = sessionKvAppendEnc(be, hK, hV, cache.layers[layerIdx].kResidentCombined,
+                                   cache.layers[layerIdx].vResidentCombined, HKV, D,
+                                   cache.maxSeqLen, cache.seqLen)
+  for h in 0 ..< (if kvFused: 0 else: HKV):
     step(sessionCopyInto(be, hK, cache.layers[layerIdx].kResident[h], h * D, cache.seqLen * D, D),
          "copyInto K resident failed (head " & $h & ")")
     step(sessionCopyInto(be, hV, cache.layers[layerIdx].vResident[h], h * D, cache.seqLen * D, D),
@@ -2062,6 +2065,12 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
   let fusedOk = sessionAttentionDecodeAllHeadsEnc(be, hQ, cache.layers[layerIdx].kResidentCombined,
                     cache.layers[layerIdx].vResidentCombined, hOutHeads, H, HKV, D, S, cache.maxSeqLen)
   if not fusedOk:
+    if kvFused:
+      for h in 0 ..< HKV:
+        step(sessionCopyInto(be, hK, cache.layers[layerIdx].kResident[h], h * D, cache.seqLen * D, D),
+             "copyInto K resident failed (head " & $h & ")")
+        step(sessionCopyInto(be, hV, cache.layers[layerIdx].vResident[h], h * D, cache.seqLen * D, D),
+             "copyInto V resident failed (head " & $h & ")")
     for hkv in 0 ..< HKV:
       var hQGroup = sessionAllocScratch(be, nRep * D); pending.add(hQGroup)
       step(sessionCopyInto(be, hQ, hQGroup, hkv * nRep * D, 0, nRep * D),

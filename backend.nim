@@ -11,7 +11,7 @@ export byby.GpuBackend, byby.SessionHandle, byby.sessionBegin, byby.sessionUploa
        byby.sessionAllocHeap, byby.sessionAllocFromHeap, byby.sessionFreeHeap,
        byby.sessionRead, byby.sessionFree, byby.sessionCopyInto, byby.sessionScale,
        byby.ResidentWeightHandle, byby.residentUploadQ4, byby.sessionMatmulQ4, byby.residentFreeQ4,
-       byby.residentPrepareQ4, byby.sessionMatmulQ4Fused,
+       byby.residentPrepareQ4, byby.sessionMatmulQ4Fused, byby.sessionKvAppendEnc,
        byby.sessionLayernormEnc, byby.sessionRmsnormEnc, byby.sessionAttentionFusedEnc,
        byby.sessionAttentionDecodeGqaEnc, byby.cpuAttentionDecodeGqa,
        byby.gpuGather, byby.gpuArgmaxIndex, byby.gpuCompare, byby.gpuDropoutMask,
