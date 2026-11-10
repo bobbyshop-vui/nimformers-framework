@@ -2864,6 +2864,21 @@ proc uploadAllResidentWeights*(m: var LlamaModelL, ctx: Backend) =
     tune(m.blocks[l].ff.downProj)
     uploadResidentNorm(m.blocks[l].inputNorm, ctx)
     uploadResidentNorm(m.blocks[l].postAttnNorm, ctx)
+  # An untied fp32 lm_head is the largest matrix read per decode token
+  # (hidden * vocab * 4 bytes). Quantise it once to the same grouped Q4 the
+  # projections use, so it runs on the tuned Q4 GEMV and reads 8x fewer
+  # bytes. BYBY_LM_HEAD=fp32 keeps the original fp32 weights.
+  if getEnv("BYBY_LM_HEAD", "q4") == "q4" and m.lmHead.useQuant and
+      m.lmHead.weightQ.kind == qkFp32Raw and m.lmHead.weightQ.mappedData.owner != nil and
+      m.lmHead.inF mod 128 == 0 and
+      m.lmHead.weightQ.mappedData.len == m.lmHead.inF * m.lmHead.outF * 4:
+    let n = m.lmHead.inF * m.lmHead.outF
+    let src = cast[ptr UncheckedArray[float32]](m.lmHead.weightQ.mappedData.dataPtr)
+    let t0 = epochTime()
+    setQuantWeight(m.lmHead, quantizeInt4AsymmetricGrouped(
+      src.toOpenArray(0, n - 1), @[m.lmHead.outF, m.lmHead.inF], 128))
+    stderr.writeLine "[lm_head] fp32 -> grouped Q4 (" & $m.lmHead.outF & "x" & $m.lmHead.inF &
+      ") in " & formatFloat(epochTime() - t0, ffDecimal, 2) & " s; BYBY_LM_HEAD=fp32 keeps fp32"
   uploadResident(m.lmHead, ctx)  # no-op for tied embeddings (useQuant=false)
   tune(m.lmHead)
   var zeroCopy, residentQ4 = 0

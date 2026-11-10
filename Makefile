@@ -85,7 +85,7 @@ CLEAN_BINS      := $(TEST_BIN) $(GRAFT_BIN) $(FINETUNE_BIN) $(INFER_LORA_BIN) $(
         build-migrate-lora build-nim-inference build-spectron build-for-python \
         python-test python-example c-example bybylang-test bench-gflops \
         graft finetune-mamba hf-train build-hf-train infer-lora infer-mamba infer-deepseek run-spectron mamba-pipeline \
-        build-formers formers-cli formers flash-attention-test q4-gemm-test formers-test formers-fir-test formers-smoke formers-clean
+        build-formers formers-cli formers flash-attention-test q4-gemv-test q4-gemm-test formers-test formers-fir-test formers-smoke formers-clean
 
 all: build run
 
@@ -463,6 +463,11 @@ flash-attention-test:
 	nim c -d:release --hints:off --path:vendor/bybylang --nimcache:nimcache/test-flash \
 	  -o:nimcache/test-flash/test_flash_attention test/deepseek-inference/test_flash_attention.nim
 	nimcache/test-flash/test_flash_attention $(ARGS)
+
+q4-gemv-test:
+	nim c -d:release --hints:off --path:. --path:vendor/bybylang --path:kernelfortest --nimcache:nimcache/bench-q4gemv \
+	  -o:nimcache/bench-q4gemv/bench_q4_gemv test/deepseek-inference/bench_q4_gemv.nim
+	nimcache/bench-q4gemv/bench_q4_gemv $(ARGS)
 
 q4-gemm-test:
 	nim c -d:release --hints:off --path:. --path:vendor/bybylang --path:kernelfortest --nimcache:nimcache/test-q4gemm \
