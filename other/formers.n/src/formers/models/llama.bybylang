@@ -212,14 +212,19 @@ function fmLlamaChatLoop(m: LlamaModelL, tok: native_hf_tokenizer.HFTokenizer, c
             fmSay("[formers.n] context full (" & $chat.ids.len & "/" & $chat.capacity & " tok): restart with a larger -c")
             break
         let t0 = epochTime()
+        let gpu0 = gpuSecondsTotal(ctx)
         let logits = fmLlamaFeed(m, ctx, chat, newIds)
         let feedTime = epochTime() - t0
+        let gpu1 = gpuSecondsTotal(ctx)
         chat.text = full
         let reply = fmLlamaReplyTo(m, tok, ctx, chat, logits, opts.nPredict, opts)
+        let gpu2 = gpuSecondsTotal(ctx)
         fmOut().write("\n")
         fmOut().flushFile()
         fmLlamaStats("prompt eval", newIds.len, feedTime)
         fmLlamaStats("eval       ", reply.tokens, reply.seconds)
+        if gpu2 > gpu0 and reply.tokens > 0:
+            fmSay("[formers.n] gpu time   : prompt " & formatFloat((gpu1 - gpu0) * 1000.0, ffDecimal, 1) & " of " & formatFloat(feedTime * 1000.0, ffDecimal, 1) & " ms, eval " & formatFloat((gpu2 - gpu1) * 1000.0 / reply.tokens.float, ffDecimal, 2) & " of " & formatFloat(reply.seconds * 1000.0 / reply.tokens.float, ffDecimal, 2) & " ms/tok")
         chat.text = chat.text & reply.text
         chat.messages.add(%*{"role": "assistant", "content": reply.text})
         if reply.contextFull:
