@@ -17,6 +17,7 @@ unchanged model are byte-identical and small model edits give small diffs.
 
 import copy
 import json
+import math
 import re
 from dataclasses import replace
 from pathlib import Path
@@ -128,6 +129,9 @@ def kernel_tag(family):
     if tag is None:
         tag = "aten::" + "".join(c if (c.isalnum() or c == "_") else "_" for c in family)
     return tag
+
+
+KERNEL_TG = 64      # largest threadgroup the emitter asks for
 
 
 class _Emission:
@@ -353,7 +357,13 @@ class _Emission:
         if n.op in ("linear", "linear_t"):
             x = g.values[n.inputs[0]]
             w = g.values[n.inputs[1]]
-            return w.weight is not None and len(w.shape) == 2 and x.size == x.shape[-1]
+            if w.weight is None or len(w.shape) != 2:
+                return False
+            if x.size == x.shape[-1]:
+                return True
+            # Several rows: the runner calls sessionMatmul / sessionMatmulNT / sessionMatmulQ4 with M = rows.
+            k = w.shape[0] if n.op == "linear" else w.shape[1]
+            return w.weight.dtype in (("f32", "q4") if n.op == "linear" else ("f32",)) and x.shape[-1] == k and x.size % k == 0
         return False
 
     def physical(self, k):
@@ -580,10 +590,15 @@ class _Emission:
 
     # ---- kernels ---------------------------------------------------------------
     def kernel(self, kb, family, ins, outs, threads, size=None, out0=None):
+        # A threadgroup of one thread leaves all but one SIMD lane idle: group threads in powers of two.
+        tg = 1
+        if isinstance(threads, int):
+            while tg * 2 <= KERNEL_TG and threads % (tg * 2) == 0:   # the runner needs threads % tg == 0
+                tg *= 2
         if out0 is not None and threads == out0 and threads > 1:
             # A size expression lets same-shaped bodies of different widths share a kernel.
             threads = "out0.size"
-        body = kb.text("@", ins, outs, threads, size)
+        body = kb.text("@", ins, outs, threads, size, tg)
         body = body[body.index(" in="):]
         if body in self.kernels:
             return self.kernels[body]
@@ -630,8 +645,12 @@ class _Emission:
         if n.op == "embedding":
             if wv.shape[1] != yv.size:
                 raise LoweringError("embedding output width mismatch")
-        elif wv.shape != ((xv.size, yv.size) if n.op == "linear" else (yv.size, xv.size)):
-            raise LoweringError("resident linear checkpoint shape mismatch")
+        else:
+            inner = wv.shape[0] if n.op == "linear" else wv.shape[1]
+            rows = xv.size // inner if inner else 0
+            if rows < 1 or rows * inner != xv.size or yv.size % rows or \
+                    wv.shape != ((inner, yv.size // rows) if n.op == "linear" else (yv.size // rows, inner)):
+                raise LoweringError("resident linear checkpoint shape mismatch")
         xin = self.name_of(self.physical(x)) if not xv.role else self.name_of(x)
         wname = self.weight_name(w, True)
         out = self.output_buffer(n.output)
@@ -815,27 +834,56 @@ class _Emission:
         return "state_copy", threads
 
     def gen_cat(self, n, ctx, kb, o):
-        """Irregular concatenation: one serial copy loop nest per part (single thread)."""
+        """Concatenation with one thread per output element.
+
+        Each part owns a range [lo, hi) of the thread ids; a thread inside the range splits its local
+        index over the part's dims and copies one element (or stores the constant of a padding part)."""
         g = self.graph
         dim = n.attrs["dim"]
         shape = g.values[n.output].shape
+        total = math.prod(shape)
+        parts = []
         start = 0
         for k in n.inputs:
             part = self.operand(k, ctx)
             pshape = g.values[k].shape
-            spec = tuple((start, start + pshape[d], 1) if d == dim else (0, s, 1) for d, s in enumerate(shape))
+            spec = tuple((start, start + pshape[dim], 1) if d == dim else (0, s, 1) for d, s in enumerate(shape))
             target = C.Mem(o.port, V.slice_view(o.view, spec))
             start += pshape[dim]
             ai, ao = C.access(part, pshape), C.access(target, pshape)
             live = [a for a in (ai, ao) if a is not None]
-            sizes = C.plan(pshape, live, "outer")
+            parts.append((part, pshape, ai, ao, live, C.plan(pshape, live, "outer")))
+        if total >= (1 << 23):
+            for part, pshape, ai, ao, live, sizes in parts:
+                def body(r, part=part, ai=ai, ao=ao):
+                    v = kb.load(ai, r) if ai is not None else kb.const(part.value)
+                    kb.store(ao, r, v)
+                    kb.free_r(v)
+                kb.nest(sizes, list(range(len(sizes))), live, {}, body)
+            return 1
+        t = kb.r()
+        kb.emit("utor", t, kb.lane())
+        lo = 0
+        for part, pshape, ai, ao, live, sizes in parts:
+            hi = lo + math.prod(pshape)
+            below_hi, below_lo, local = kb.r(), kb.r(), kb.r()
+            kb.const(hi, below_hi)
+            kb.emit("cmplt", below_hi, t, below_hi)
+            kb.const(lo, below_lo)
+            kb.emit("cmplt", below_lo, t, below_lo)
+            kb.emit("sub", below_hi, below_hi, below_lo)
+            kb.emit("addconst", local, t, C.fnum(-lo))
 
-            def body(r, part=part, ai=ai, ao=ao):
-                v = kb.load(ai, r) if ai is not None else kb.const(part.value)
-                kb.store(ao, r, v)
+            def inside(part=part, ai=ai, ao=ao, live=live, sizes=sizes, local=local):
+                _, regs, _ = kb.lanes_flat(sizes, live, "outer", base=local)
+                v = kb.load(ai, regs) if ai is not None else kb.const(part.value)
+                kb.store(ao, regs, v)
                 kb.free_r(v)
-            kb.nest(sizes, list(range(len(sizes))), live, {}, body)
-        return 1
+            kb.cond(below_hi, inside)
+            kb.free_r(below_hi, below_lo, local)
+            lo = hi
+        kb.free_r(t)
+        return total
 
     def gen_attention(self, n, ctx, kb):
         g = self.graph

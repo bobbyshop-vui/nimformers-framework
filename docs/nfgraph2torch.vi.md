@@ -1,7 +1,7 @@
 # nfgraph2torch (graph torch → nimformers)
 
 `other/nfgraph2torch` chuyển một module torch thành graph FIR của nimformers và ghi `model.fir`.
-Viết bằng Python. Chiều ngược lại (nimformers → torch) chưa làm.
+Viết bằng Python. Chiều ngược lại (`to_torch`) mô tả bên dưới.
 
 ```python
 import nfgraph2torch as nf2t
@@ -55,6 +55,32 @@ python -m nfgraph2torch package.module:make_model --coverage
 | `custom_op(name, inputs, shape, attrs=None, dtype="f32")` | Ghi op vào trace đang chạy và trả tensor kết quả. Parameter trong `inputs` thành weight của checkpoint. |
 | `register_tree_op(kind, emit)` | Thêm phép toán scalar cho bộ dựng kernel pointwise. |
 
+## Chiều ngược: model.fir → torch
+
+```python
+back = nf2t.to_torch("out_dir/model.fir", weights=dict(model.state_dict()))   # một torch.nn.Module
+logits = back(token, position)
+```
+
+`to_torch(source, weights=None, config=None)` đọc `model.fir` dạng `runtime graph` (đường dẫn hoặc text)
+và trả về `FirTorch`, module có `forward(token, position)` trả logits. `weights` ánh xạ tên tensor
+checkpoint sang tensor; chúng thành `nn.Parameter` cùng tên. Chỉ dùng ATen cơ bản, nên file FIR nào
+VM Python chạy được thì cũng chạy được trong torch:
+
+- Node `ext`: `fir.embedding` là `index_select`; `fir.linear` / `fir.linear_t` là `torch.matmul`.
+- Node `micro`: một trình thông dịch vector hoá chạy bytecode của kernel, mỗi thread là một phần tử
+  tensor. `add`/`sub`/`mul`/`div`/`exp`/`sigmoid`/`rsqrt`... là đúng op ATen đó, `uloadf32` là gather,
+  `ustoref32` là `index_put_`, `ifbegin` là mask (`where`), `forbegin` là vòng lặp Python quanh các op
+  tensor.
+
+Tốc độ thấp hơn runner native rất nhiều (conv tốn một op tensor cho mỗi phép nhân-cộng; ResNet-18 với
+8 kênh gốc trên ảnh 32×32 mất khoảng 35 giây trên CPU). Độ phủ đầy đủ với mọi lệnh VM Python thông
+dịch được; kernel dùng lệnh thread-group, atomic hoặc barrier bị từ chối như trong VM. Nhiều thread ghi
+cùng một địa chỉ thì thứ tự không xác định.
+
+Vòng torch → FIR → torch của ResNet-18 (bọc thành model token → ảnh → logits vì ABI runner chỉ nhận
+`token` và `position`) khớp bản gốc tới 4e-7.
+
 ## Giới hạn
 
 - Runner FIR chỉ nạp `token` và `position` và đọc `logits`, nên xuất `model.fir` cần graph dạng LM. Graph
@@ -69,6 +95,6 @@ python -m nfgraph2torch package.module:make_model --coverage
 
 ```bash
 cd other/nfgraph2torch/tests
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest test_ops.py test_resnet.py   # evaluator reference
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest test_ops.py test_resnet.py test_reverse.py   # evaluator reference
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest test_vm.py                   # model.fir trên VM của FIR
 ```

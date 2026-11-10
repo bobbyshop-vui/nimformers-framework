@@ -603,8 +603,11 @@ class FirModel:
             if x["elements"] != 1 or w["dims"][1] != y["elements"]:
                 raise FirVmError("FIR graph embedding shape mismatch: " + node["name"])
         else:
-            expected = [x["elements"], y["elements"]] if node["op"] == "fir.linear" else [y["elements"], x["elements"]]
-            if w["dims"] != expected:
+            inner = w["dims"][0] if node["op"] == "fir.linear" else w["dims"][1]
+            rows = x["elements"] // inner if inner else 0
+            expected = [inner, y["elements"] // rows] if node["op"] == "fir.linear" and rows else \
+                [y["elements"] // rows, inner] if rows else None
+            if rows < 1 or rows * inner != x["elements"] or w["dims"] != expected:
                 raise FirVmError("FIR graph matrix shape mismatch: " + node["name"])
 
     def reset(self):
@@ -632,17 +635,20 @@ class FirModel:
                 raise FirVmError("FIR graph embedding index outside weight")
             self.mem[ob:ob + n] = weight[index * n:(index + 1) * n]
             return
-        k = buffers[xin]["elements"]
+        total = buffers[xin]["elements"]
         xb = self.binding(xin, layer)
-        x = list(self.mem[xb:xb + k])
+        x = list(self.mem[xb:xb + total])
         y = array("f", bytes(4 * n))
-        if node["op"] == "fir.linear":
-            for j in range(n):
-                y[j] = math.fsum(x[i] * weight[i * n + j] for i in range(k))
-        else:
-            for j in range(n):
-                row = j * k
-                y[j] = math.fsum(x[i] * weight[row + i] for i in range(k))
+        k = w["dims"][0] if node["op"] == "fir.linear" else w["dims"][1]
+        rows = total // k
+        cols = n // rows
+        for r in range(rows):
+            xr = x[r * k:(r + 1) * k]
+            for j in range(cols):
+                if node["op"] == "fir.linear":
+                    y[r * cols + j] = math.fsum(xr[i] * weight[i * cols + j] for i in range(k))
+                else:
+                    y[r * cols + j] = math.fsum(xr[i] * weight[j * k + i] for i in range(k))
         self.mem[ob:ob + n] = y
 
     def step(self, token):

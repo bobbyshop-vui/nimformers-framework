@@ -9,6 +9,7 @@ import nim "session_vm_dispatch"
 import nim "jit_vm"
 import nim "vendor/bybylang/gpubackend"
 import nim "vendor/bybylang/backends/cpu/cpu_backend"
+import nim "vendor/bybylang/backends/cpu/cpu_jit"
 import "fir_types.bybylang"
 import "fir_parse.bybylang"
 import "fir_exec.bybylang"
@@ -26,6 +27,7 @@ type
   FgResidentProgram* = object
     kernel*: FirKernel
     name*, source*: string
+    cpuFn*: pointer                 ## compiled CPU function (nil = interpret the bytecode)
     stage*: seq[FgStagePort]        ## arena-layout kernel in a handle graph: ports staged contiguously
   FirGraph* = object
     graph*: FirProgram
@@ -394,6 +396,8 @@ function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): 
     cfg.maxCacheEntries = 1024
     var jit = initJitCache(cfg)
     var jobs: seq[tuple[name, source: string]]
+    var cpuUnits: seq[CpuJitUnit]
+    var cpuSeen = initTable[string, bool]()
     for node in graph.nodes:
         if node.kind == "micro":
             for layer in 0 ..< (if node.perLayer: graph.symbols["layers"] else: 1):
@@ -429,10 +433,31 @@ function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): 
                     prepared.name = kernelNameFor(jit, kernel.program, node.op)
                     prepared.source = glslSourceFor(jit, kernel.program, node.op)
                     jobs.add((prepared.name, prepared.source))
+                elif be == gbCpu and cpuJitEnabled() and not kernel.slotLayout and staged.len == 0:
+                    # Compile the micro-kernel to native code; unsupported programs keep the interpreter.
+                    let cpuName = cpuJitFunctionName(kernel.program)
+                    if not cpuSeen.hasKey(cpuName):
+                        cpuSeen[cpuName] = false
+                        let cpuSource = cpuJitSource(kernel.program, cpuName)
+                        if cpuSource.len > 0:
+                            cpuUnits.add((name: cpuName, source: cpuSource))
+                            cpuSeen[cpuName] = true
+                    if cpuSeen[cpuName]:
+                        prepared.name = cpuName
                 result.programs[fgNodeKey(node, layer)] = prepared
         elif node.kind notin ["ext", "session"]:
             raise newException(ValueError, "FIR graph executor supports micro, ext and session nodes: " & node.name)
     sessionJitPrewarm(be, jobs)
+    if cpuUnits.len > 0:
+        let compiled = cpuJitBuild(cpuUnits)
+        var programKeys: seq[string]
+        for key, item in result.programs:
+            programKeys.add key
+        for key in programKeys:
+            var item = result.programs[key]
+            if item.name.len > 0 and compiled.hasKey(item.name):
+                item.cpuFn = compiled[item.name]
+                result.programs[key] = item
 
 function fgPortBase(model: FirGraph, name: string): string
     result = name
@@ -665,7 +690,7 @@ function fgDispatchArena(model: var FirGraph, prepared: FgResidentProgram, targe
     if result and unlikely(firProbeOn):
         probeGpuDispatch(probeProgram(k.program.words), prepared.name, k.threads, k.tgSize, k.tgBytes)
 
-function fgEncodeMicroBody(model: var FirGraph, prepared: FgResidentProgram): bool
+function fgEncodeMicroBody(model: var FirGraph, prepared: FgResidentProgram, node: FirNode, layer: int): bool
     let be = model.backend.kind.toByby()
     let k = prepared.kernel
     inc model.dispatched
@@ -704,6 +729,11 @@ function fgEncodeMicroBody(model: var FirGraph, prepared: FgResidentProgram): bo
         if not sessionEncTgBytes(vk, 0, k.tgBytes):
             return false
         return sessionEncDispatch(vk, k.threads, k.tgSize, k.tgBytes)
+    if be == gbCpu and prepared.cpuFn != nil and not model.useHandles and cpuJitRun(prepared.cpuFn, model.arena.cpuData, k.threads, k.tgSize):
+        return true
+    if be == gbCpu and prepared.stage.len == 0:
+        # `var arena = model.arena` would copy the CPU buffer and the VM would write the copy.
+        return cpu_backend.vmRun(k.program.words, model.arena.cpuData, newSeq[float32](), k.threads, max(4, k.tgBytes div 4), k.tgSize)
     var arena = model.arena
     if prepared.stage.len > 0:
         arena = model.stage
@@ -718,8 +748,8 @@ function fgEncodeMicroBody(model: var FirGraph, prepared: FgResidentProgram): bo
                 if index < 0 or not sessionCopyInto(be, arena, model.handles[index], port.offset, fgPortOffset(model, port.name), port.elements):
                     return false
 
-function fgEncodeMicro(model: var FirGraph, prepared: FgResidentProgram): bool
-    fgEncodeMicroBody(model, prepared)
+function fgEncodeMicro(model: var FirGraph, prepared: FgResidentProgram, node: FirNode, layer: int): bool
+    fgEncodeMicroBody(model, prepared, node, layer)
 
 function fgAttrTable(text: string): Table[string, string]
     result = initTable[string, string]()
@@ -891,7 +921,7 @@ function fgEncodeSession(model: var FirGraph, node: FirNode, layer: int): bool
 
 function fgEncodeNodeBody(model: var FirGraph, node: FirNode, layer, token: int): bool
     if node.kind == "micro":
-        return fgEncodeMicro(model, model.programs[fgNodeKey(node, layer)])
+        return fgEncodeMicro(model, model.programs[fgNodeKey(node, layer)], node, layer)
     if node.kind == "session":
         return fgEncodeSession(model, node, layer)
     let be = model.backend.kind.toByby()
@@ -935,6 +965,15 @@ function fgEncodeNodeBody(model: var FirGraph, node: FirNode, layer, token: int)
                 return false
         return true
     let k = model.graph.buffers[ins[0]].elements
+    if not model.useHandles and weight.dtype == "f32" and (node.op == "fir.linear" or node.op == "fir.linear_t"):
+        # MPS reads A and writes C in place inside the arena: no copy in, no copy out.
+        let wt = node.op == "fir.linear_t"
+        let inner = if wt: weight.dims[1] else: weight.dims[0]
+        let rows = k div inner
+        let aOff = bindings.memory[ins[0]]
+        let cOff = bindings.memory[output]
+        if sessionMatmulMps(be, model.arena, model.fp32[tensor], model.arena, rows, inner, n div rows, wt, aOff, cOff):
+            return true
     if model.useHandles:
         let source = fgPortHandle(model, ins[0])
         let sourceOffset = fgPortOffset(model, ins[0])
@@ -946,14 +985,22 @@ function fgEncodeNodeBody(model: var FirGraph, node: FirNode, layer, token: int)
     case node.op
     of "fir.linear":
         if weight.dtype == "q4":
-            ok = sessionMatmulQ4(be, model.linearInput, model.q4[tensor], model.linearOutput, 1)
+            ok = sessionMatmulQ4(be, model.linearInput, model.q4[tensor], model.linearOutput, k div weight.dims[0])
         else:
-            ok = sessionMatmul(be, model.linearInput, model.fp32[tensor], model.linearOutput, 1, k, n)
+            let inner = weight.dims[0]
+            let rows = k div inner
+            ok = sessionMatmulMps(be, model.linearInput, model.fp32[tensor], model.linearOutput, rows, inner, n div rows, false)
+            if not ok:
+                ok = sessionMatmul(be, model.linearInput, model.fp32[tensor], model.linearOutput, rows, inner, n div rows)
     of "fir.linear_t":
         if weight.dtype == "q4t":
             ok = sessionMatmulQ4(be, model.linearInput, model.q4[tensor], model.linearOutput, 1)
         else:
-            ok = sessionMatmulNT(be, model.linearInput, model.fp32[tensor], model.linearOutput, 1, k, n)
+            let inner = weight.dims[1]
+            let rows = k div inner
+            ok = sessionMatmulMps(be, model.linearInput, model.fp32[tensor], model.linearOutput, rows, inner, n div rows, true)
+            if not ok:
+                ok = sessionMatmulNT(be, model.linearInput, model.fp32[tensor], model.linearOutput, rows, inner, n div rows)
     else:
         raise newException(ValueError, "FIR graph unsupported resident external: " & node.op)
     if model.useHandles:

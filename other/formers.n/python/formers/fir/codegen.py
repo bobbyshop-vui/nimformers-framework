@@ -287,6 +287,75 @@ class Kernel:
         rest = [i for i in range(len(sizes)) if i != lane_dim]
         return sizes[lane_dim], regs, rest
 
+    def lanes_flat(self, sizes, accs, part="outer", base=None):
+        """One thread per element of the whole outer space (all dims flattened onto the thread id).
+
+        ``lanes`` spreads only the largest dim and loops over the rest inside each thread, which
+        leaves a GPU almost idle for small dims. Here the thread id is split into one index per dim
+        with float arithmetic (exact below 2**23 threads); the caller keeps no serial outer loops."""
+        total = math.prod(sizes) if sizes else 1
+        if base is None and (len(sizes) < 2 or total >= (1 << 23)):
+            return self.lanes(sizes, accs, part)
+        accs = [a for a in accs if a is not None]
+        regs = {}
+        for a in accs:
+            if a.dynamic is not None:
+                regs[id(a)] = a.dynamic
+        if not sizes:
+            return 1, regs, []
+        # ``base``: float register already holding the (local) element index, else the thread id.
+        cur = self.r()
+        if base is None:
+            self.emit("utor", cur, self.lane())
+        else:
+            self.copy(cur, base)
+        index = {}
+        tmp, quot = self.r(), self.r()
+        for d in range(len(sizes) - 1, 0, -1):
+            self.emit("addconst", quot, cur, 0.5)
+            self.emit("mulconst", quot, quot, repr(1.0 / sizes[d]))
+            qu = self.u()
+            self.emit("rtou", qu, quot)
+            self.emit("utor", quot, qu)
+            self.free_u(qu)
+            self.emit("mulconst", tmp, quot, repr(float(sizes[d])))
+            self.emit("sub", tmp, cur, tmp)
+            iu = self.u()
+            self.emit("rtou", iu, tmp)
+            index[d] = iu
+            self.copy(cur, quot)
+        iu = self.u()
+        self.emit("rtou", iu, cur)
+        index[0] = iu
+        self.free_r(cur, tmp, quot)
+        shared = {}
+        for a in accs:
+            strides = tuple(getattr(a, part)[d] for d in range(len(sizes)))
+            if not any(strides) and a.dynamic is None:
+                continue
+            key = (strides, a.dynamic)
+            if key not in shared:
+                total_u = None
+                for d, stride in enumerate(strides):
+                    if stride == 0:
+                        continue
+                    term = self.u()
+                    self.emit("umulk", term, index[d], stride)
+                    if total_u is None:
+                        total_u = term
+                    else:
+                        self.emit("uadd", total_u, total_u, term)
+                        self.free_u(term)
+                if total_u is None:
+                    total_u = self.u()
+                    self.emit("uconst", total_u, 0)
+                if a.dynamic is not None:
+                    self.emit("uadd", total_u, total_u, a.dynamic)
+                shared[key] = total_u
+            regs[id(a)] = shared[key]
+        self.free_u(*index.values())
+        return total, regs, []
+
     def nest(self, sizes, dims, accs, regs, body, part="outer"):
         """Nested loops over ``dims`` (indexes into sizes and acc.<part>)."""
         accs = [a for a in accs if a is not None]
@@ -532,11 +601,11 @@ class Kernel:
         self.free_r(x, sign, z, c, zero, z2, term_s, term_c)
         return out_s, out_c
 
-    def text(self, name, ins, outs, threads, size=None):
+    def text(self, name, ins, outs, threads, size=None, tg=1):
         head = f"kernel {name} in={ins} out={outs}"
         if size:
             head += " size=" + ",".join(size)
-        head += f" threads={threads} tg=1 tgbytes=16"
+        head += f" threads={threads} tg={tg} tgbytes=16"
         return head + "\n" + "\n".join(self.lines) + "\nendkernel\n"
 
 
@@ -570,7 +639,7 @@ def _reduce_split(space, dims):
     return [i for i in range(len(space)) if i in dims]
 
 
-def gen_reduce(k, kind, tree, operands, out, in_shape, dims, keepdim):
+def gen_reduce(k, kind, tree, operands, out, in_shape, dims, keepdim, spread=False):
     """out = reduce_kind over ``dims`` of tree(operands) evaluated on ``in_shape``."""
     inner_ids = _reduce_split(in_shape, dims)
     kept = [d for i, d in enumerate(in_shape) if i not in inner_ids]
@@ -582,7 +651,7 @@ def gen_reduce(k, kind, tree, operands, out, in_shape, dims, keepdim):
     oacc = access(Mem(out.port, oview), tuple(kept))
     sizes = plan(kept, accs + [oacc], "outer")
     inner = plan(red, accs, "inner")
-    threads, regs, rest = k.lanes(sizes, accs + [oacc])
+    threads, regs, rest = (k.lanes_flat if spread else k.lanes)(sizes, accs + [oacc])
     count = math.prod(red)
 
     def outer(regs):
@@ -764,7 +833,7 @@ def gen_matmul(k, a, b, out, ashape, bshape, oshape, a_is_weight_t=False):
     accs = [x for x in (acc_a, acc_b, oacc) if x is not None]
     sizes = plan(batch + (m, n), accs, "outer")
     inner = plan([kdim], [x for x in (acc_a, acc_b) if x is not None], "inner")
-    threads, regs, rest = k.lanes(sizes, accs)
+    threads, regs, rest = k.lanes_flat(sizes, accs)
 
     def cell(regs):
         acc = k.const(0)
