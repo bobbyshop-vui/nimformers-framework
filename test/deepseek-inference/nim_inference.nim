@@ -2592,7 +2592,9 @@ proc forwardStep*(m: LlamaModelL, ids: seq[int], ctx: Backend, cache: var KVCach
   ## isPrefill=true: ids = the whole prompt (T tokens). isPrefill=false: ids = exactly 1 new token.
   ## Returns logits [1, 1, vocab] for the last token only; nothing samples
   ## from the earlier prompt positions.
+  let stepT0 = epochTime()
   var x = m.embed.lookupBatch(@[ids], ctx)   # [1, T, C]
+  let stepEmbed = epochTime() - stepT0
   when defined(debugStates):
     let Tdbg = ids.len
     let Cdbg = m.config.hiddenSize
@@ -2693,8 +2695,13 @@ proc forwardStep*(m: LlamaModelL, ids: seq[int], ctx: Backend, cache: var KVCach
   if T > 1:
     x.data = x.data[(T - 1) * C ..< T * C]
     x.shape = @[x.shape[0], 1, C]
+  let stepLayersEnd = epochTime()
   let normed = m.finalNorm.forward(x, ctx)
   result = m.lmHead.forward(normed, ctx)
+  if not isPrefill and existsEnv("BYBY_SESSION_LOG"):
+    stderr.writeLine "[step] embed " & formatFloat(stepEmbed * 1000, ffDecimal, 2) &
+      " ms, layers " & formatFloat((stepLayersEnd - stepT0 - stepEmbed) * 1000, ffDecimal, 2) &
+      " ms, norm+lm_head " & formatFloat((epochTime() - stepLayersEnd) * 1000, ffDecimal, 2) & " ms"
   when defined(debugStates):
     let lastRow = result.data[0 ..< 8]
     stderr.writeLine "[debug] logits last_token[:8] = " & $lastRow
