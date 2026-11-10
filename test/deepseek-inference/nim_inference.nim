@@ -1998,7 +1998,14 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
   var hQ = sessionAllocScratch(be, H * D); pending.add(hQ)
   var hK = sessionAllocScratch(be, HKV * D); pending.add(hK)
   var hV = sessionAllocScratch(be, HKV * D); pending.add(hV)
+  var qkvFused = false
   if qkvQ4:
+    qkvFused = sessionMatmulQ4Fused(be, 0, hNormed,
+      [attn.qProj.residentW, attn.kProj.residentW, attn.vProj.residentW], [hQ, hK, hV],
+      SessionHandle(), false)
+  if qkvFused:
+    discard
+  elif qkvQ4:
     step(sessionMatmulQ4(be, hNormed, attn.qProj.residentW, hQ, 1), "Q matmul failed")
     step(sessionMatmulQ4(be, hNormed, attn.kProj.residentW, hK, 1), "K matmul failed")
     step(sessionMatmulQ4(be, hNormed, attn.vProj.residentW, hV, 1), "V matmul failed")
@@ -2075,7 +2082,14 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
 
   # ---- oProj ----
   var hOProjOut = sessionAllocScratch(be, C); pending.add(hOProjOut)
-  if oProjQ4:
+  var hX2 = SessionHandle()
+  var oFused = false
+  if oProjQ4 and attn.oProj.bias.data.len != C:
+    hX2 = sessionAllocScratch(be, C); pending.add(hX2)
+    oFused = sessionMatmulQ4Fused(be, 0, hOutHeads, [attn.oProj.residentW], [hX2], hX, true)
+  if oFused:
+    discard
+  elif oProjQ4:
     step(sessionMatmulQ4(be, hOutHeads, attn.oProj.residentW, hOProjOut, 1), "oProj matmul failed")
   else:
     step(sessionMatmul(be, hOutHeads, attn.oProj.residentFp32, hOProjOut, 1, attn.oProj.inF, attn.oProj.outF),
@@ -2086,7 +2100,8 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
     hOProjFinal = sVecOp(be, "add", hOProjOut, hBias, C); pending.add(hOProjFinal)
 
   # ---- Residual #1 ----
-  let hX2 = sVecOp(be, "add", hX, hOProjFinal, C); pending.add(hX2)
+  if not oFused:
+    hX2 = sVecOp(be, "add", hX, hOProjFinal, C); pending.add(hX2)
 
   # ---- RMSNorm (post-attn) + FFN ----
   let hGammaFfn = (if normFFN.residentGammaReady: normFFN.residentGamma
@@ -2097,7 +2112,15 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
   let interF = ff.gateProj.outF
   var hGate = sessionAllocScratch(be, interF); pending.add(hGate)
   var hUp = sessionAllocScratch(be, interF); pending.add(hUp)
-  if gateUpQ4:
+  var hGated = SessionHandle()
+  var gateFused = false
+  if gateUpQ4 and ff.gateProj.bias.data.len != interF and ff.upProj.bias.data.len != interF:
+    hGated = sessionAllocScratch(be, interF); pending.add(hGated)
+    gateFused = sessionMatmulQ4Fused(be, 1, hNormedFfn,
+      [ff.gateProj.residentW, ff.upProj.residentW], [hGated, hUp], SessionHandle(), false)
+  if gateFused:
+    discard
+  elif gateUpQ4:
     step(sessionMatmulQ4(be, hNormedFfn, ff.gateProj.residentW, hGate, 1), "gateProj matmul failed")
     step(sessionMatmulQ4(be, hNormedFfn, ff.upProj.residentW, hUp, 1), "upProj matmul failed")
   else:
@@ -2105,16 +2128,23 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
          "gateProj matmul(fp32) failed")
     step(sessionMatmul(be, hNormedFfn, ff.upProj.residentFp32, hUp, 1, ff.upProj.inF, ff.upProj.outF),
          "upProj matmul(fp32) failed")
-  if ff.gateProj.bias.data.len == interF:
+  if not gateFused and ff.gateProj.bias.data.len == interF:
     let hGB = sessionUpload(be, ff.gateProj.bias.data); pending.add(hGB)
     hGate = sVecOp(be, "add", hGate, hGB, interF); pending.add(hGate)
-  if ff.upProj.bias.data.len == interF:
+  if not gateFused and ff.upProj.bias.data.len == interF:
     let hUB = sessionUpload(be, ff.upProj.bias.data); pending.add(hUB)
     hUp = sVecOp(be, "add", hUp, hUB, interF); pending.add(hUp)
-  let hSig = sActivation(be, "sigmoid", hGate, interF); pending.add(hSig)
-  let hSilu = sVecOp(be, "mul", hGate, hSig, interF); pending.add(hSilu)
-  let hGated = sVecOp(be, "mul", hSilu, hUp, interF); pending.add(hGated)
+  if not gateFused:
+    let hSig = sActivation(be, "sigmoid", hGate, interF); pending.add(hSig)
+    let hSilu = sVecOp(be, "mul", hGate, hSig, interF); pending.add(hSilu)
+    hGated = sVecOp(be, "mul", hSilu, hUp, interF); pending.add(hGated)
   var hOut = sessionAllocScratch(be, ff.downProj.outF); pending.add(hOut)
+  var downFused = false
+  if downQ4 and ff.downProj.bias.data.len != ff.downProj.outF and ff.downProj.outF == C:
+    result = sessionAllocScratch(be, C); pending.add(result)
+    downFused = sessionMatmulQ4Fused(be, 0, hGated, [ff.downProj.residentW], [result], hX2, true)
+  if downFused:
+    return
   if downQ4:
     step(sessionMatmulQ4(be, hGated, ff.downProj.residentW, hOut, 1), "downProj matmul failed")
   else:
