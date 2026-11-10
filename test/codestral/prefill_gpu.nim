@@ -1032,10 +1032,12 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
             c.wBuf, c.lutBuf, input, row * lin.K)
           flushFine("tile4x2_" & $lin.N & "x" & $lin.K)
         else:
-          # For a 1..3 row tail, the 4-row program reads zero-padded input
-          # rows from hX and writes only into the already padded output arena.
-          let tailKernel = if name in m4x2Kns: m4x2Kns[name] else: m8x2Kns[name]
-          let tailRows = if name in m4x2Kns: 4 else: 8
+          # A 1..3 row tail runs the 4-row program and a 5..7 row tail the 8-row
+          # program; both read zero-padded input rows from hX and write only
+          # into the already padded output arena.
+          let use4 = name in m4x2Kns and T - row <= 4
+          let tailKernel = if use4: m4x2Kns[name] else: m8x2Kns[name]
+          let tailRows = if use4: 4 else: 8
           encodeVmKernel(tailKernel, (lin.N div 2) * GemvTg, GemvTg,
             (Fp4KmLutLen + tailRows * 2 * GemvTg) * 4, output, row * lin.N,
             c.wBuf, c.lutBuf, input, row * lin.K)
