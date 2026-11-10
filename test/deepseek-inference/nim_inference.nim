@@ -2381,8 +2381,16 @@ proc forwardDecodeAllLayersMergedSession(m: LlamaModelL, xData: seq[float32], ct
   # only once a measured token takes longer than BYBY_DECODE_CB_MS (default
   # 1500), since every extra commit slows the decode down on Intel Metal.
   let decodeCbMs = float(max(100, envNum("BYBY_DECODE_CB_MS", 1500)))
-  let layersPerCb = if not sessionPacesCommandBuffers(be) or gDecodeMsPerLayer <= 0 or
-                       gDecodeMsPerLayer * float(m.blocks.len) <= decodeCbMs: m.blocks.len
+  # Apple Silicon commits every few layers without waiting (about 40 dispatches
+  # per command buffer, as MLX does), so the GPU starts on the first layers
+  # while the CPU still encodes the rest. BYBY_DECODE_LAYERS_PER_CB overrides
+  # the split on any GPU (0 = one command buffer per token).
+  let layersPerCbEnv = envNum("BYBY_DECODE_LAYERS_PER_CB", -1)
+  let layersPerCb = if layersPerCbEnv > 0: layersPerCbEnv
+                    elif layersPerCbEnv == 0: m.blocks.len
+                    elif not sessionPacesCommandBuffers(be): 4
+                    elif gDecodeMsPerLayer <= 0 or
+                         gDecodeMsPerLayer * float(m.blocks.len) <= decodeCbMs: m.blocks.len
                     else: max(1, int(decodeCbMs / gDecodeMsPerLayer))
   let t0 = epochTime()
   if not sessionBegin(be):
