@@ -2808,8 +2808,17 @@ proc loadLlamaWeightsL*(m: var LlamaModelL, path: string) =
                   rawFloatView(byName["model.embed_tokens.weight"])
                 else: default(MappedView[float32])
   if embView.owner != nil and embView.len == m.config.vocabSize * m.config.hiddenSize:
-    m.embed.weight.data = @[]
-    m.embed.weight.mappedData = embView
+    if getEnv("BYBY_EMBED_RAM", "1") != "0" and byName.hasKey("lm_head.weight"):
+      # Untied embedding: a decode step reads one row of it, and a row that
+      # is not in the page cache costs a disk read in the middle of the
+      # step. Keep the table in process memory instead (BYBY_EMBED_RAM=0
+      # reads it from the mapping).
+      var table = newSeq[float32](embView.len)
+      copyMem(addr table[0], embView.dataPtr, embView.len * sizeof(float32))
+      m.embed.weight.data = table
+    else:
+      m.embed.weight.data = @[]
+      m.embed.weight.mappedData = embView
   else:
     embW = get("model.embed_tokens.weight")
     if embW.len > 0: m.embed.weight.data = embW
