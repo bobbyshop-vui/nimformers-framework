@@ -2530,6 +2530,9 @@ proc prefillFlashChunk(m: LlamaModelL, xData: seq[float32], T, pos: int, ctx: Ba
         raise newException(CatchableError, "[FLASH_PREFILL] sessionEnd failed: " & sessionGetLastError(be))
       for h in pending.mitems: sessionFree(be, h)
       pending.setLen(0)
+      if existsEnv("BYBY_SESSION_LOG"):
+        stderr.writeLine "[prefill] rows " & $T & ", layers " & $nLayers & ", encode+gpu " &
+          formatFloat((epochTime() - t0) * 1000.0, ffDecimal, 2) & " ms"
       let perLayerRow = (epochTime() - t0) * 1000.0 / float(nLayers * tileRows(T))
       gPrefillMsPerLayerRow = if gPrefillMsPerLayerRow <= 0: perLayerRow
                               else: 0.5 * gPrefillMsPerLayerRow + 0.5 * perLayerRow
@@ -2875,8 +2878,36 @@ proc uploadAllResidentWeights*(m: var LlamaModelL, ctx: Backend) =
     let n = m.lmHead.inF * m.lmHead.outF
     let src = cast[ptr UncheckedArray[float32]](m.lmHead.weightQ.mappedData.dataPtr)
     let t0 = epochTime()
-    setQuantWeight(m.lmHead, quantizeInt4AsymmetricGrouped(
-      src.toOpenArray(0, n - 1), @[m.lmHead.outF, m.lmHead.inF], 128))
+    # Same grouped asymmetric Q4 as quantizeInt4AsymmetricGrouped (group 128,
+    # low nibble first), written without a temporary seq per group.
+    const lmGroup = 128
+    let rows = m.lmHead.outF
+    let cols = m.lmHead.inF
+    let groups = cols div lmGroup
+    var qt = QuantTensor(kind: qkInt4Asymmetric, shape: @[rows, cols], groupSize: lmGroup,
+      data: newSeq[uint8](rows * (cols div 2)),
+      scale: newSeq[float32](rows * groups),
+      zero_point: newSeq[float32](rows * groups))
+    for row in 0 ..< rows:
+      for g in 0 ..< groups:
+        let base = row * cols + g * lmGroup
+        var lo = float32.high
+        var hi = -float32.high
+        for i in 0 ..< lmGroup:
+          let v = src[base + i]
+          if v < lo: lo = v
+          if v > hi: hi = v
+        let range = hi - lo
+        let scale = if range < 1e-12'f32: 1'f32 else: range / 15'f32
+        let zero = -lo / scale
+        qt.scale[row * groups + g] = scale
+        qt.zero_point[row * groups + g] = zero
+        let outBase = row * (cols div 2) + g * (lmGroup div 2)
+        for i in 0 ..< lmGroup div 2:
+          let q0 = uint8(clamp(int(round(src[base + 2 * i] / scale + zero)), 0, 15))
+          let q1 = uint8(clamp(int(round(src[base + 2 * i + 1] / scale + zero)), 0, 15))
+          qt.data[outBase + i] = q0 or (q1 shl 4)
+    setQuantWeight(m.lmHead, qt)
     stderr.writeLine "[lm_head] fp32 -> grouped Q4 (" & $m.lmHead.outF & "x" & $m.lmHead.inF &
       ") in " & formatFloat(epochTime() - t0, ffDecimal, 2) & " s; BYBY_LM_HEAD=fp32 keeps fp32"
   uploadResident(m.lmHead, ctx)  # no-op for tied embeddings (useQuant=false)
