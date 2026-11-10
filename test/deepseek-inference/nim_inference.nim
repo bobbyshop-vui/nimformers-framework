@@ -2341,10 +2341,27 @@ let gPrefillProfileLayer = envNum("BYBY_PREFILL_PROFILE", -1)  ## layer whose op
 var gPrefillMsPerLayerRow = -1.0   ## measured GPU ms per layer per prompt row
 var gDecodeMsPerLayer = -1.0       ## measured GPU ms per layer of one decode token
 
+var gLmHeadBiasFree = -1   ## 1 when the lm_head bias is absent or all zeros (checked once)
+
+proc lmHeadBiasFree(m: LlamaModelL): bool =
+  if gLmHeadBiasFree < 0:
+    gLmHeadBiasFree = 1
+    for v in m.lmHead.bias.data:
+      if v != 0'f32:
+        gLmHeadBiasFree = 0
+        break
+  gLmHeadBiasFree == 1
+
 proc forwardDecodeAllLayersMergedSession(m: LlamaModelL, xData: seq[float32], ctx: Backend,
-    cache: var KVCacheL): Tensor =
+    cache: var KVCacheL, logits: var seq[float32]): Tensor =
+  ## `logits` is filled when the final norm and lm_head ran in the same command
+  ## buffer as the layers (resident gamma, resident Q4 lm_head, no bias, no LoRA);
+  ## it stays empty otherwise and the caller runs them from the returned hidden state.
   let be = ctx.kind.toByby()
   let C = m.config.hiddenSize
+  let headInSession = getEnv("BYBY_HEAD_IN_SESSION", "1") != "0" and
+    m.finalNorm.residentGammaReady and m.lmHead.residentReady and
+    m.lmHead.inF == C and lmHeadBiasFree(m) and m.lmHead.loraR == 0
 
   # Checks UP FRONT (pure CPU, no GPU) whether ALL 32 layers are resident-
   # eligible - avoids opening a session only to fail at the first layer (wasting a GPU
@@ -2384,6 +2401,13 @@ proc forwardDecodeAllLayersMergedSession(m: LlamaModelL, xData: seq[float32], ct
       # in encodeDecodeLayerIntoOpenSession). The previous layer's hX is already
       # in pending (encodeDecodeLayerIntoOpenSession adds it), and is
       # freed TOGETHER in the finally below, after this session has closed.
+    var hLogits = SessionHandle()
+    var headOk = false
+    if headInSession:
+      var hNormF = sessionAllocScratch(be, C); pending.add(hNormF)
+      hLogits = sessionAllocScratch(be, m.lmHead.outF); pending.add(hLogits)
+      headOk = sessionRmsnormEnc(be, hX, m.finalNorm.residentGamma, hNormF, 1, C, m.finalNorm.eps) and
+               sessionMatmulQ4(be, hNormF, m.lmHead.residentW, hLogits, 1)
     let sessionOk = sessionEnd(be)
     if not sessionOk:
       raise newException(CatchableError, "[MODE3] sessionEnd failed: " & sessionGetLastError(be))
@@ -2391,7 +2415,10 @@ proc forwardDecodeAllLayersMergedSession(m: LlamaModelL, xData: seq[float32], ct
     gDecodeMsPerLayer = if gDecodeMsPerLayer <= 0: perLayer
                         else: 0.8 * gDecodeMsPerLayer + 0.2 * perLayer
     result = newTensor(@[1, 1, C])
-    result.data = sessionRead(be, hX, C)
+    if headOk:
+      logits = sessionRead(be, hLogits, m.lmHead.outF)
+    else:
+      result.data = sessionRead(be, hX, C)
   except CatchableError:
     failed = true
     raise
@@ -2670,6 +2697,7 @@ proc forwardStep*(m: LlamaModelL, ids: seq[int], ctx: Backend, cache: var KVCach
   # for the whole thing, falling STRAIGHT back to the old per-layer loop FOR THIS TOKEN (that loop
   # retries Mode 2 then Mode 1 for each layer as before - nothing changes).
   var mode3Done = false
+  var stepLogits: seq[float32]   # set when Mode 3 ran the final norm and lm_head itself
   if isPrefill and gFlashPrefill and ids.len > 1:
     let t0 = epochTime()
     try:
@@ -2684,7 +2712,7 @@ proc forwardStep*(m: LlamaModelL, ids: seq[int], ctx: Backend, cache: var KVCach
   if gMergeAllLayersSession and not isPrefill:
     inc gMode3Attempts
     try:
-      x = forwardDecodeAllLayersMergedSession(m, x.data, ctx, cache)
+      x = forwardDecodeAllLayersMergedSession(m, x.data, ctx, cache, stepLogits)
       mode3Done = true
       inc gMode3Success
     except CatchableError as e:
@@ -2760,8 +2788,12 @@ proc forwardStep*(m: LlamaModelL, ids: seq[int], ctx: Backend, cache: var KVCach
     x.data = x.data[(T - 1) * C ..< T * C]
     x.shape = @[x.shape[0], 1, C]
   let stepLayersEnd = epochTime()
-  let normed = m.finalNorm.forward(x, ctx)
-  result = m.lmHead.forward(normed, ctx)
+  if stepLogits.len == m.lmHead.outF:
+    result = newTensor(@[1, 1, m.lmHead.outF])
+    result.data = move stepLogits
+  else:
+    let normed = m.finalNorm.forward(x, ctx)
+    result = m.lmHead.forward(normed, ctx)
   if not isPrefill and existsEnv("BYBY_SESSION_LOG"):
     stderr.writeLine "[step] embed " & formatFloat(stepEmbed * 1000, ffDecimal, 2) &
       " ms, layers " & formatFloat((stepLayersEnd - stepT0 - stepEmbed) * 1000, ffDecimal, 2) &
