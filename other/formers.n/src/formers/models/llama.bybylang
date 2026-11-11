@@ -138,6 +138,7 @@ function fmLlamaWarmup(m: LlamaModelL, tok: native_hf_tokenizer.HFTokenizer, ctx
     let s0 = epochTime()
     discard fmLlamaFeed(m, ctx, chat, @[ids[^1]])
     let stepMs = (epochTime() - s0) * 1000
+    discard nim_inference.decodePipePrepare(m, ctx)
     fmLlamaReset(chat)
     fmSay("[formers.n] ready: warmup " & formatFloat(epochTime() - t0, ffDecimal, 1) & " s (decode ~" & $int(stepMs + 0.5) & " ms/tok)")
 

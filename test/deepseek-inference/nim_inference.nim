@@ -2568,6 +2568,19 @@ proc decodePipeAhead*(): bool =
   ## machines measured, so running ahead adds contention and saves nothing.
   getEnv("BYBY_GPU_SAMPLE_AHEAD", "0") == "1"
 
+proc decodePipePrepare*(m: LlamaModelL, ctx: Backend): bool =
+  ## Puts the embedding table and the token ring on the GPU (once per process). The chat
+  ## warmup calls it so the first reply does not pay for it.
+  let be = ctx.kind.toByby()
+  if not decodePipeWanted(m, be): return false
+  if gPipe.ready: return true
+  let n = m.config.vocabSize * m.config.hiddenSize
+  if m.embed.weight.floatValues.len < n: return false
+  gPipe.table = sessionUploadPrivate(be, m.embed.weight.floatValues.toOpenArray(0, n - 1))
+  gPipe.ring = sessionAllocScratch(be, DecodeRing)
+  gPipe.ready = true
+  true
+
 proc decodePipeStart*(m: LlamaModelL, ctx: Backend, firstToken: int): bool =
   ## Prepares a run whose first input token is firstToken; false when this model or
   ## GPU cannot run the pipeline (the caller keeps the normal decode).
@@ -2576,14 +2589,7 @@ proc decodePipeStart*(m: LlamaModelL, ctx: Backend, firstToken: int): bool =
   for idx in 0 ..< m.blocks.len:
     var failMsg: string
     if not precheckLayerResident(m.blocks[idx].attn, m.blocks[idx].ff, idx, failMsg): return false
-  if not gPipe.ready:
-    let n = m.config.vocabSize * m.config.hiddenSize
-    if m.embed.weight.floatValues.len < n: return false
-    var rows = newSeq[float32](n)
-    copyMem(addr rows[0], unsafeAddr m.embed.weight.floatValues[0], n * sizeof(float32))
-    gPipe.table = sessionUpload(be, rows)
-    gPipe.ring = sessionAllocScratch(be, DecodeRing)
-    gPipe.ready = true
+  if not decodePipePrepare(m, ctx): return false
   gPipe.step = 0
   gPipe.done = 0
   gPipe.inflight.setLen(0)
