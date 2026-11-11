@@ -2448,6 +2448,18 @@ proc decodeLayersPerCb(nLayers: int, be: GpuBackend): int =
   elif gDecodeMsPerLayer <= 0 or gDecodeMsPerLayer * float(nLayers) <= decodeCbMs: nLayers
   else: max(1, int(decodeCbMs / gDecodeMsPerLayer))
 
+proc decodeCommitBefore(idx, layersPerCb: int): bool =
+  ## True when the command buffer is committed before layer idx. BYBY_DECODE_FIRST_CB=n commits
+  ## after the first n layers so the GPU starts early, then every layersPerCb layers
+  ## (BYBY_DECODE_LAYERS_PER_CB=0: the rest in one command buffer).
+  if idx == 0: return false
+  let first = envNum("BYBY_DECODE_FIRST_CB", 0)
+  if first > 0:
+    if idx == first: return true
+    if idx < first: return false
+    return idx - first > 0 and (idx - first) mod layersPerCb == 0
+  idx mod layersPerCb == 0
+
 var gLmHeadBiasFree = -1   ## 1 when the lm_head bias is absent or all zeros (checked once)
 
 proc lmHeadBiasFree(m: LlamaModelL): bool =
@@ -2496,7 +2508,7 @@ proc forwardDecodeAllLayersMergedSession(m: LlamaModelL, xData: seq[float32], ct
   try:
     var hX = sessionUpload(be, xData); pending.add(hX)
     for idx in 0 ..< m.blocks.len:
-      if idx > 0 and idx mod layersPerCb == 0 and not sessionCommitContinue(be):
+      if decodeCommitBefore(idx, layersPerCb) and not sessionCommitContinue(be):
         raise newException(CatchableError, "[MODE3] sessionCommitContinue failed")
       hX = encodeDecodeLayerIntoOpenSession(m.blocks[idx].attn, m.blocks[idx].inputNorm,
              m.blocks[idx].postAttnNorm, m.blocks[idx].ff, hX, m.rope, be, cache, idx, pending)
@@ -2611,7 +2623,7 @@ proc decodePipeEnqueue*(m: LlamaModelL, ctx: Backend, cache: var KVCacheL): bool
     if not sessionEmbedTokenEnc(be, gPipe.table, gPipe.ring, hX, C, gPipe.step mod DecodeRing):
       raise newException(CatchableError, "[GPU_SAMPLE] embedding gather failed")
     for idx in 0 ..< m.blocks.len:
-      if idx > 0 and idx mod layersPerCb == 0 and not sessionCommitContinue(be):
+      if decodeCommitBefore(idx, layersPerCb) and not sessionCommitContinue(be):
         raise newException(CatchableError, "[GPU_SAMPLE] sessionCommitContinue failed")
       hX = encodeDecodeLayerIntoOpenSession(m.blocks[idx].attn, m.blocks[idx].inputNorm,
              m.blocks[idx].postAttnNorm, m.blocks[idx].ff, hX, m.rope, be, cache, idx, pending)
