@@ -2513,8 +2513,10 @@ proc forwardDecodeAllLayersMergedSession(m: LlamaModelL, xData: seq[float32], ct
 ## A greedy decode step reads its token id from a ring slot on the GPU, gathers
 ## the embedding row, runs every layer, the final norm and lm_head, and writes the
 ## argmax into the next slot. The step is committed without waiting, so the CPU
-## encodes step k+1 while the GPU runs step k and a token costs max(GPU, CPU)
-## instead of GPU + CPU. BYBY_GPU_SAMPLE=1/0 forces it on/off (default: Apple GPU).
+## encodes step k+1 while the GPU runs step k (BYBY_GPU_SAMPLE_AHEAD=1). By default a
+## step is committed and waited for before the next, which still saves reading the
+## logits back and choosing on the CPU. BYBY_GPU_SAMPLE=1/0 forces it on/off
+## (default: Apple GPU).
 const DecodeRing = 8
 type DecodePipe = object
   table, ring: SessionHandle
@@ -2532,6 +2534,12 @@ proc decodePipeWanted(m: LlamaModelL, be: GpuBackend): bool =
   gMergeAllLayersSession and m.finalNorm.residentGammaReady and m.lmHead.residentReady and
     m.lmHead.inF == m.config.hiddenSize and lmHeadBiasFree(m) and m.lmHead.loraR == 0 and
     m.blocks.len > 0
+
+proc decodePipeAhead*(): bool =
+  ## True when the next step is encoded while the current one still runs. Off by
+  ## default: encoding a token takes far less than the GPU needs for it on the
+  ## machines measured, so running ahead adds contention and saves nothing.
+  getEnv("BYBY_GPU_SAMPLE_AHEAD", "0") == "1"
 
 proc decodePipeStart*(m: LlamaModelL, ctx: Backend, firstToken: int): bool =
   ## Prepares a run whose first input token is firstToken; false when this model or
