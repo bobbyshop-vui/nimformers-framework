@@ -2415,14 +2415,23 @@ var gDecodeMsPerLayer = -1.0       ## measured GPU ms per layer of one decode to
 ## blocked waiting for the GPU (decodeCpuReport prints the means).
 var gDecEncSec = 0.0
 var gDecWaitSec = 0.0
+var gDecFreeSec = 0.0
 var gDecSteps = 0
 
-proc decodeCpuReport*(): string =
+proc decodeCpuReport*(totalSeconds = 0.0): string =
+  ## totalSeconds: wall time of the whole reply; what encode, wait and buffer release do
+  ## not cover is shown as "other" (sampling, detokenizing, printing).
   if gDecSteps == 0: return ""
-  result = "encode " & formatFloat(gDecEncSec * 1000.0 / float(gDecSteps), ffDecimal, 2) &
-           " ms/tok, waiting for the GPU " & formatFloat(gDecWaitSec * 1000.0 / float(gDecSteps), ffDecimal, 2) & " ms/tok"
+  let n = float(gDecSteps)
+  result = "encode " & formatFloat(gDecEncSec * 1000.0 / n, ffDecimal, 2) &
+           " ms/tok, waiting for the GPU " & formatFloat(gDecWaitSec * 1000.0 / n, ffDecimal, 2) &
+           " ms/tok, release " & formatFloat(gDecFreeSec * 1000.0 / n, ffDecimal, 2) & " ms/tok"
+  if totalSeconds > 0:
+    result &= ", other " & formatFloat((totalSeconds - gDecEncSec - gDecWaitSec - gDecFreeSec) * 1000.0 / n,
+                                        ffDecimal, 2) & " ms/tok"
   gDecEncSec = 0.0
   gDecWaitSec = 0.0
+  gDecFreeSec = 0.0
   gDecSteps = 0
 
 proc decodeLayersPerCb(nLayers: int, be: GpuBackend): int =
@@ -2627,9 +2636,11 @@ proc decodePipeNext*(ctx: Backend): int =
   let tWait = epochTime()
   let ok = sessionWaitOldest(be)
   gDecWaitSec += epochTime() - tWait
+  let tFree = epochTime()
   var buffers = gPipe.inflight[0]
   gPipe.inflight.delete(0)
   for h in buffers.mitems: sessionFree(be, h)
+  gDecFreeSec += epochTime() - tFree
   if not ok:
     stderr.writeLine "[GPU_SAMPLE] decode step failed: " & sessionGetLastError(be)
     return -1
@@ -2777,12 +2788,18 @@ proc tileRows(rows: int): int =
   (rows + 63) div 64 * 64
 
 proc prefillFlashChunk(m: LlamaModelL, xData: seq[float32], T, pos: int, ctx: Backend,
-                       cache: var KVCacheL): Tensor =
+                       cache: var KVCacheL, logits: var seq[float32], wantHead: bool): Tensor =
   ## All layers on rows pos .. pos + T - 1, in command buffers of at most
   ## BYBY_PREFILL_CB_MS each (from the measured ms per layer-row) and
-  ## BYBY_PREFILL_SESSION_MB of activations. Returns the last row [1, 1, C].
+  ## BYBY_PREFILL_SESSION_MB of activations. Returns the last row [1, 1, C]. When the final
+  ## norm and lm_head ran in the last command buffer too, `logits` holds the last row's logits.
   let be = ctx.kind.toByby()
   let C = m.config.hiddenSize
+  let headInSession = wantHead and getEnv("BYBY_HEAD_IN_SESSION", "1") != "0" and
+    m.finalNorm.residentGammaReady and m.lmHead.residentReady and
+    m.lmHead.inF == C and lmHeadBiasFree(m) and m.lmHead.loraR == 0
+  var hLogits: SessionHandle
+  var headOk = false
   let H = m.config.nHeads
   let D = C div H
   let ff0 = m.blocks[0].ff
@@ -2837,6 +2854,11 @@ proc prefillFlashChunk(m: LlamaModelL, xData: seq[float32], T, pos: int, ctx: Ba
         hLast = sessionAllocScratch(be, C)
         if not sessionCopyInto(be, hX, hLast, (T - 1) * C, 0, C):
           raise newException(CatchableError, "[FLASH_PREFILL] reading the last row failed")
+        if headInSession:
+          var hNormF = sessionAllocScratch(be, C); pending.add(hNormF)
+          hLogits = sessionAllocScratch(be, m.lmHead.outF)
+          headOk = sessionRmsnormEnc(be, hLast, m.finalNorm.residentGamma, hNormF, 1, C, m.finalNorm.eps) and
+                   sessionMatmulQ4(be, hNormF, m.lmHead.residentW, hLogits, 1)
       open = false
       if not sessionEnd(be):
         raise newException(CatchableError, "[FLASH_PREFILL] sessionEnd failed: " & sessionGetLastError(be))
@@ -2849,16 +2871,20 @@ proc prefillFlashChunk(m: LlamaModelL, xData: seq[float32], T, pos: int, ctx: Ba
       gPrefillMsPerLayerRow = if gPrefillMsPerLayerRow <= 0: perLayerRow
                               else: 0.5 * gPrefillMsPerLayerRow + 0.5 * perLayerRow
     result = newTensor(@[1, 1, C])
-    result.data = sessionRead(be, hLast, C)
+    if headOk:
+      logits = sessionRead(be, hLogits, m.lmHead.outF)
+    else:
+      result.data = sessionRead(be, hLast, C)
   finally:
     if open: discard sessionEnd(be)
+    sessionFree(be, hLogits)
     for h in pending.mitems: sessionFree(be, h)
     for h in keep.mitems: sessionFree(be, h)
     sessionFree(be, hX)
     sessionFree(be, hLast)
 
 proc forwardPrefillFlash(m: LlamaModelL, xData: seq[float32], T: int, ctx: Backend,
-                         cache: var KVCacheL): Tensor =
+                         cache: var KVCacheL, logits: var seq[float32]): Tensor =
   ## Runs every layer on the T prompt rows (see the comment above) and returns
   ## the last row's hidden state [1, 1, C]. Raises when a step is not available;
   ## nothing has been read back by then, so the caller can rerun the old path.
@@ -2896,7 +2922,8 @@ proc forwardPrefillFlash(m: LlamaModelL, xData: seq[float32], T: int, ctx: Backe
         let fit = int(gPrefillCbMs / gPrefillMsPerLayerRow)
         rows = clamp(if fit >= 64: fit div 64 * 64 else: fit div 16 * 16, 16, gPrefillMaxRows)
     rows = min(rows, T - start)
-    result = prefillFlashChunk(m, xData[start * C ..< (start + rows) * C], rows, pos + start, ctx, cache)
+    result = prefillFlashChunk(m, xData[start * C ..< (start + rows) * C], rows, pos + start, ctx, cache, logits,
+                              start + rows >= T)
     start += rows
 
 proc gpuSecondsTotal*(ctx: Backend): float =
@@ -2926,7 +2953,7 @@ proc forwardStep*(m: LlamaModelL, ids: seq[int], ctx: Backend, cache: var KVCach
   if isPrefill and gFlashPrefill and ids.len > 1:
     let t0 = epochTime()
     try:
-      x = forwardPrefillFlash(m, x.data, ids.len, ctx, cache)
+      x = forwardPrefillFlash(m, x.data, ids.len, ctx, cache, stepLogits)
       mode3Done = true
       gAttnTime += epochTime() - t0
     except CatchableError as e:
