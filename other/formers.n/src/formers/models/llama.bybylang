@@ -63,11 +63,11 @@ function fmLlamaPromptIds(tok: native_hf_tokenizer.HFTokenizer, opts: FmOptions)
     else:
         result = fmLlamaWithBos(tok, tok.applyChatTemplate(opts.prompt, opts.systemText))
 
-function fmLlamaKvMiB(m: LlamaModelL, capacity: int): int
-    ## GPU: per-head + combined K/V buffers (the host copy of KVCacheL is
-    ## allocated only by the fallback paths that use it).
+function fmLlamaKvMiB(m: LlamaModelL, capacity: int, fp16: bool): int
+    ## GPU: fp16 combined K/V on Metal; elsewhere per-head + combined fp32 buffers (the host
+    ## copy of KVCacheL is allocated only by the fallback paths that use it).
     let perCopy = m.config.nLayers * m.config.nKVHeads * capacity * (m.config.hiddenSize div m.config.nHeads) * 4 * 2
-    result = 2 * perCopy div (1024 * 1024)
+    result = (if fp16: perCopy div 2 else: 2 * perCopy) div (1024 * 1024)
 
 function fmLlamaNewChat(m: LlamaModelL, tok: native_hf_tokenizer.HFTokenizer, ctx: Backend, opts: FmOptions, capacity: int): FmLlamaChat
     ## KV cache + resident KV for every layer, allocated before the first
@@ -80,7 +80,7 @@ function fmLlamaNewChat(m: LlamaModelL, tok: native_hf_tokenizer.HFTokenizer, ct
     let be = ctx.kind.toByby()
     for idx in 0 ..< result.cache.layers.len:
         ensureKvResident(result.cache.layers[idx], be, m.blocks[idx].attn.nKVHeads, result.cache.maxSeqLen, m.blocks[idx].attn.headDim)
-    stderr.writeLine("[formers.n] KV: " & $capacity & " tok (~" & $fmLlamaKvMiB(m, capacity) & " MiB GPU+RAM), allocated before prefill in " & formatFloat(epochTime() - t0, ffDecimal, 3) & " s")
+    stderr.writeLine("[formers.n] KV: " & $capacity & " tok (~" & $fmLlamaKvMiB(m, capacity, nim_inference.kvHalfOn(be)) & " MiB GPU+RAM), allocated before prefill in " & formatFloat(epochTime() - t0, ffDecimal, 3) & " s")
     result.messages = newJArray()
     result.sampler = fmNewSampler(opts, cfg.vocabSize)
     for ws in ["\n", "\n\n", " ", "  ", "    ", "\t", ":\n", ":\n    "]:
