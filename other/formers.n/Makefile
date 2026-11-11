@@ -38,14 +38,11 @@ build: $(ROOT)/$(BYBYLANG)
 ifeq ($(shell uname -s),Darwin)
 ifeq ($(FORMERS_NO_ARM64),)
 	$(MAKE) -C $(ROOT)/$(HERE) build-arm64
-	lipo -create $(ROOT)/$(CLI_BIN) $(ROOT)/$(ARM64_BIN) -output $(ROOT)/$(CLI_BIN).universal
-	mv -f $(ROOT)/$(CLI_BIN).universal $(ROOT)/$(CLI_BIN)
-	@echo "[formers.n] $(CLI_BIN) is universal (x86_64 + arm64), native on Apple Silicon"
 endif
 endif
 
 # Apple Silicon binary built on an Intel Mac (formers-cli is x86_64 and runs under Rosetta there).
-ARM64_BIN   := $(HERE)/formers-cli-arm64
+ARM64_BIN   := $(HERE)/formers-cli_arm64
 build-arm64: $(ROOT)/$(BYBYLANG)
 	cd $(ROOT) && mkdir -p $(HERE)/build-arm64 && \
 	  BYBYLANG_NIMCACHE=$(ROOT)/nimcache/formers-n-arm64 \
