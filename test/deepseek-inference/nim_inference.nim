@@ -536,6 +536,11 @@ var gKvAllocCount = 0   ## counts the TOTAL number of times ensureKvResident rea
   ## log and counting by hand. If gKvAllocCount > the real nLayers after a run ->
   ## there is definitely a leak, not a hunch.
 
+proc kvHalfOn*(backend: GpuBackend): bool =
+  ## The combined K/V caches hold fp16 on Metal (half the memory, half the attention traffic);
+  ## BYBY_KV_FP16=0 is not supported because every Metal KV kernel reads fp16.
+  backend == gbMetal
+
 proc ensureKvResident*(cache: var LayerKVCache, backend: GpuBackend, nKVHeads, maxSeqLen, D: int) =
   ## NEW: allocates the resident buffers once per layer (lazy, called on the
   ## layer's first appendKV). No data is uploaded here - it only
@@ -548,6 +553,15 @@ proc ensureKvResident*(cache: var LayerKVCache, backend: GpuBackend, nKVHeads, m
     " heads, " & $(maxSeqLen * D * 4 * 2) & " bytes per head) - if this line prints MORE THAN 32 TIMES (the layer count) there is a real leak"
   cache.kResident = newSeq[SessionHandle](nKVHeads)
   cache.vResident = newSeq[SessionHandle](nKVHeads)
+  if kvHalfOn(backend):
+    sessionSetKvFp16(backend, true)
+    # fp16 combined caches only: the per-head fp32 buffers serve the unfused fallback paths,
+    # which are not available with fp16 KV.
+    let n = (nKVHeads * maxSeqLen * D + 1) div 2   # floats of storage = fp16 elements / 2
+    cache.kResidentCombined = sessionAllocScratch(backend, n)
+    cache.vResidentCombined = sessionAllocScratch(backend, n)
+    cache.residentReady = true
+    return
   # A REAL startup performance bug, measured with
   # BYBY_DECODE_PROFILE + Metal NSLog timestamps: BEFORE, the
   # for loop below called sessionAllocScratch (=1 FULL [gDevice
@@ -680,6 +694,7 @@ proc syncKvResidentEncode(cache: var KVCacheL, layer: int, kNew, vNew: seq[float
   let D = cache.headDim
   let H = cache.nKVHeads
   ensureKvResident(cache.layers[layer], backend, H, cache.maxSeqLen, D)
+  if kvHalfOn(backend): return   # fp16 KV is written by the fused decode/prefill kernels only
   if nTok == 1:
     var hKAll = sessionUpload(backend, kNew)
     var hVAll = sessionUpload(backend, vNew)
@@ -1195,6 +1210,11 @@ var gKvResidentVerifyLeft = 5
 proc kvResidentUsable(cache: KVCacheL, layerIdx: int): bool =
   (not gKvResidentDisabled) and cache.layers[layerIdx].residentReady
 
+proc kvPerHeadUsable(cache: KVCacheL, layerIdx: int): bool =
+  ## The per-head fp32 buffers of the legacy paths (absent with fp16 KV).
+  kvResidentUsable(cache, layerIdx) and cache.layers[layerIdx].kResident.len > 0 and
+    cache.layers[layerIdx].kResident[0].metalHandle != nil
+
 proc verifyKvResidentOnce(backend: GpuBackend, cache: KVCacheL, layerIdx, hkv: int,
                            kBlockRef, vBlockRef: seq[float32], S, D: int) =
   ## Compares the REAL data in the resident buffer (read back via sessionRead) with exactly
@@ -1281,7 +1301,7 @@ proc forwardDecode*(attn: GQAAttention, norm: RMSNormL, x: Tensor, rope: RoPEL, 
   # PER TOKEN -> O(S^2) PER RUN - a silent bottleneck growing with the conversation
   # length even without a crash. FIX: copy only when REALLY needed (resident
   # not ready, OR verify runs left).
-  let kvResUsableNow = kvResidentUsable(cache, layerIdx)
+  let kvResUsableNow = kvPerHeadUsable(cache, layerIdx)
   let needCpuKvBlocks = (not kvResUsableNow) or gKvResidentVerifyLeft > 0
   var kBlocks = newSeq[seq[float32]](HKV)
   var vBlocks = newSeq[seq[float32]](HKV)
@@ -1380,7 +1400,7 @@ proc forwardDecode*(attn: GQAAttention, norm: RMSNormL, x: Tensor, rope: RoPEL, 
       let hQ = sessionUpload(backend, qGroups[hkv])
       allHandles.add(hQ)
       var hK, hV: SessionHandle
-      if kvResidentUsable(cache, layerIdx):
+      if kvPerHeadUsable(cache, layerIdx):
         hK = cache.layers[layerIdx].kResident[hkv]
         hV = cache.layers[layerIdx].vResident[hkv]
         # verifyKvResidentOnce is NO longer called here - the sessionRead
@@ -1474,7 +1494,7 @@ proc forwardDecode*(attn: GQAAttention, norm: RMSNormL, x: Tensor, rope: RoPEL, 
     # bug). Only head 0 is verified as a representative (enough to catch systematic errors, no
     # need to verify all HKV heads every time - gAttnDecodeGqaVerifyLeft/
     # gKvResidentVerifyLeft already cap the total verify count for the whole run).
-    if usedMergedSession and kvResidentUsable(cache, layerIdx):
+    if usedMergedSession and kvPerHeadUsable(cache, layerIdx):
       verifyKvResidentOnce(backend, cache, layerIdx, 0, kBlocks[0], vBlocks[0], S, D)
     if oProjOutMerged.len == 0:
       usedMergedSession = false   # sessionCopyInto/matmul failed -> falls through to the old 2-session path below, false is NOT treated as done
@@ -1511,7 +1531,7 @@ proc forwardDecode*(attn: GQAAttention, norm: RMSNormL, x: Tensor, rope: RoPEL, 
       let hQ = sessionUpload(backend, qGroups[hkv])
       allHandles.add(hQ)
       var hK, hV: SessionHandle
-      if kvResidentUsable(cache, layerIdx):
+      if kvPerHeadUsable(cache, layerIdx):
         hK = cache.layers[layerIdx].kResident[hkv]
         hV = cache.layers[layerIdx].vResident[hkv]
         # The verify moved to AFTER sessionEnd (see the reason in the merged branch above)
@@ -1551,7 +1571,7 @@ proc forwardDecode*(attn: GQAAttention, norm: RMSNormL, x: Tensor, rope: RoPEL, 
     for h in allHandles.mitems: sessionFree(backend, h)
     for h in outHandles.mitems: sessionFree(backend, h)
     # verify AFTER sessionEnd - safe (see the explanation in the merged branch above)
-    if usedSession and kvResidentUsable(cache, layerIdx):
+    if usedSession and kvPerHeadUsable(cache, layerIdx):
       verifyKvResidentOnce(backend, cache, layerIdx, 0, kBlocks[0], vBlocks[0], S, D)
 
   if not usedSession:
@@ -2108,6 +2128,7 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
                 sessionKvAppendEnc(be, hK, hV, cache.layers[layerIdx].kResidentCombined,
                                    cache.layers[layerIdx].vResidentCombined, HKV, D,
                                    cache.maxSeqLen, cache.seqLen)
+  step(kvFused or not kvHalfOn(be), "fp16 KV needs the fused KV append kernel")
   for h in 0 ..< (if kvFused: 0 else: HKV):
     step(sessionCopyInto(be, hK, cache.layers[layerIdx].kResident[h], h * D, cache.seqLen * D, D),
          "copyInto K resident failed (head " & $h & ")")
@@ -2137,6 +2158,7 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
   let fusedOk = sessionAttentionDecodeAllHeadsEnc(be, hQ, cache.layers[layerIdx].kResidentCombined,
                     cache.layers[layerIdx].vResidentCombined, hOutHeads, H, HKV, D, S, cache.maxSeqLen)
   if not fusedOk:
+    step(not kvHalfOn(be), "the fused decode attention kernel is required with fp16 KV")
     step(not ropeKvFused, "per-head attention needs the unfused RoPE/KV path (set BYBY_FUSE_ROPE=0)")
     if kvFused:
       for h in 0 ..< HKV:
@@ -2835,7 +2857,7 @@ proc encodePrefillLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMS
   # The per-head copies only serve the unfused attention fallback (decode on Metal reads the
   # combined buffers and never refreshes them either), so Metal skips them:
   # 2 x HKV dispatches fewer per layer. BYBY_PREFILL_HEAD_COPIES=1 keeps them.
-  let headCopies = be != gbMetal or getEnv("BYBY_PREFILL_HEAD_COPIES", "0") == "1"
+  let headCopies = (be != gbMetal and not kvHalfOn(be)) or (not kvHalfOn(be) and getEnv("BYBY_PREFILL_HEAD_COPIES", "0") == "1")
   for h in 0 ..< (if headCopies: HKV else: 0):
     let off = h * cache.maxSeqLen * D + pos * D
     step(sessionCopyInto(be, cache.layers[layerIdx].kResidentCombined,
