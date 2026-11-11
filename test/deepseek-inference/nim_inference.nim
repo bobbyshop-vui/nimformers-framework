@@ -2034,15 +2034,20 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
   let hX = hXIn
   let hGamma = (if normQKV.residentGammaReady: normQKV.residentGamma
                 else: (let h = sessionUpload(be, normQKV.weight.data); pending.add(h); h))
-  var hNormed = sessionAllocScratch(be, C); pending.add(hNormed)
-  step(sessionRmsnormEnc(be, hX, hGamma, hNormed, 1, C, normQKV.eps), "RMSNorm input failed")
-  mark("norm1")
-
   var hQ = sessionAllocScratch(be, H * D); pending.add(hQ)
   var hK = sessionAllocScratch(be, HKV * D); pending.add(hK)
   var hV = sessionAllocScratch(be, HKV * D); pending.add(hV)
   var qkvFused = false
-  if qkvQ4:
+  var hNormed = hX
+  if qkvQ4:   # RMSNorm folded into the fused QKV kernel
+    qkvFused = sessionMatmulQ4Fused(be, 0, hX,
+      [attn.qProj.residentW, attn.kProj.residentW, attn.vProj.residentW], [hQ, hK, hV],
+      SessionHandle(), false, hGamma, normQKV.eps, true)
+  if not qkvFused:
+    hNormed = sessionAllocScratch(be, C); pending.add(hNormed)
+    step(sessionRmsnormEnc(be, hX, hGamma, hNormed, 1, C, normQKV.eps), "RMSNorm input failed")
+  mark("norm1")
+  if qkvQ4 and not qkvFused:
     qkvFused = sessionMatmulQ4Fused(be, 0, hNormed,
       [attn.qProj.residentW, attn.kProj.residentW, attn.vProj.residentW], [hQ, hK, hV],
       SessionHandle(), false)
@@ -2163,17 +2168,23 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
   # ---- RMSNorm (post-attn) + FFN ----
   let hGammaFfn = (if normFFN.residentGammaReady: normFFN.residentGamma
                    else: (let h = sessionUpload(be, normFFN.weight.data); pending.add(h); h))
-  var hNormedFfn = sessionAllocScratch(be, C); pending.add(hNormedFfn)
-  step(sessionRmsnormEnc(be, hX2, hGammaFfn, hNormedFfn, 1, C, normFFN.eps), "RMSNorm FFN failed")
-  mark("norm2")
-
   let interF = ff.gateProj.outF
   var hGate = sessionAllocScratch(be, interF); pending.add(hGate)
   var hUp = sessionAllocScratch(be, interF); pending.add(hUp)
   var hGated = SessionHandle()
   var gateFused = false
-  if gateUpQ4 and ff.gateProj.bias.data.len != interF and ff.upProj.bias.data.len != interF:
+  var hNormedFfn = hX2
+  let gateOk = gateUpQ4 and ff.gateProj.bias.data.len != interF and ff.upProj.bias.data.len != interF
+  if gateOk:   # RMSNorm folded into the fused gate/up kernel
     hGated = sessionAllocScratch(be, interF); pending.add(hGated)
+    gateFused = sessionMatmulQ4Fused(be, 1, hX2,
+      [ff.gateProj.residentW, ff.upProj.residentW], [hGated, hUp], SessionHandle(), false,
+      hGammaFfn, normFFN.eps, true)
+  if not gateFused:
+    hNormedFfn = sessionAllocScratch(be, C); pending.add(hNormedFfn)
+    step(sessionRmsnormEnc(be, hX2, hGammaFfn, hNormedFfn, 1, C, normFFN.eps), "RMSNorm FFN failed")
+  mark("norm2")
+  if gateOk and not gateFused:
     gateFused = sessionMatmulQ4Fused(be, 1, hNormedFfn,
       [ff.gateProj.residentW, ff.upProj.residentW], [hGated, hUp], SessionHandle(), false)
   if gateFused:
