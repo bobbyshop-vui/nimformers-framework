@@ -25,7 +25,7 @@ proc runCase(name, body: string; ins, outs: int; inData: seq[seq[float32]];
   mem.setLen(total + expected.len)
   let program = assemble(body, ins, outs, inSize, outSize, eps)
   if not cpu.vmRun(program.words, mem, newSeq[float32](), threads, tgFloats, tgSize):
-    raise newException(ValueError, name & ": CPU VM rejected the program")
+    raise newException(ValueError, name & ": CPU VM rejected the program: " & cpu.cpuLastErrorMessage())
   for i in 0 ..< expected.len:
     if not near(mem[total + i], expected[i]):
       raise newException(ValueError, name & " mismatch at " & $i & ": got " &
@@ -42,7 +42,7 @@ proc chk(name: string; g: Gen; inData: seq[seq[float32]]; expected: seq[float32]
   mem.setLen(total + expected.len)
   let program = assemble(g.body, g.ins, g.outs, inSize, @[expected.len], 1e-5'f32)
   if not cpu.vmRun(program.words, mem, newSeq[float32](), g.threads, max(4, g.tgBytes div 4), max(1, g.tg)):
-    raise newException(ValueError, name & ": CPU VM rejected the program")
+    raise newException(ValueError, name & ": CPU VM rejected the program: " & cpu.cpuLastErrorMessage())
   for i in 0 ..< expected.len:
     if not near(mem[total + i], expected[i], tol):
       raise newException(ValueError, name & " mismatch at " & $i & ": got " & $mem[total + i] & " want " & $expected[i])
@@ -93,8 +93,8 @@ proc runMem(g: Gen; ins: seq[seq[float32]]; outLens: seq[int]): seq[float32] =
   for n in outLens: outTotal += n
   mem.setLen(total + outTotal)
   let program = assemble(g.body, g.ins, g.outs, sizes, outLens, 1e-5'f32)
-  if not cpu.vmRun(program.words, mem, newSeq[float32](), g.threads, 4, 1):
-    raise newException(ValueError, "CPU VM rejected the program")
+  if not cpu.vmRun(program.words, mem, newSeq[float32](), g.threads, max(4, g.tgBytes div 4), max(1, g.tg)):
+    raise newException(ValueError, "CPU VM rejected the program: " & cpu.cpuLastErrorMessage())
   mem
 
 proc chkN(name: string; g: Gen; ins: seq[seq[float32]]; expected: seq[seq[float32]]; tol = 1e-4'f32) =
@@ -172,6 +172,7 @@ proc sessionTests2() =
     var normed = newSeq[float32](n)
     for i in 0 ..< n: normed[i] = float32(float(sum[i]) * inv * float(gamma[i]))
     chkN("add_rmsnorm", genAddRmsnorm(n, 1e-5), @[a, b, gamma], @[sum, normed])
+    chkN("add_rmsnorm_par", genAddRmsnormPar(n, 1e-5), @[a, b, gamma], @[sum, normed])
     var want = newSeq[float32](n)
     for i in 0 ..< n:
       let x = float(a[i])
@@ -730,6 +731,7 @@ proc sessionTests() =
       ln1[r*cols + c] = float32((v - mean) / sqrt(varr + 1e-5) * float(gamma[c]) + float(beta[c]))
   chk("softmax", genSoftmax(rows, cols), @[x], sm)
   chk("rmsnorm.rows", genRmsnorm(rows, cols, 1e-5), @[x, gamma], rn)
+  chk("rmsnorm_par.rows", genRmsnormPar(rows, cols, 1e-5), @[x, gamma], rn)
   chk("layernorm", genLayernorm(rows, cols, 1e-5), @[x, gamma, beta], ln1, 1e-3'f32)
 
   # RoPE with [T, D/2] tables
@@ -831,6 +833,8 @@ proc sessionTests() =
         for s in 0 ..< S: o += sc[s] / den * float(vc[(hk*maxSeq + s)*D + d])
         want[h*D + d] = float32(o)
     chk("attention_decode", genAttentionDecode(H, HKV, D, maxSeq), @[q, kc, vc, @[float32(S)]], want)
+    # threadgroup version: in3 is the position (S - 1); also a longer cache than lanes
+    chk("attention_decode_par", genAttentionDecodePar(H, HKV, D, maxSeq, 32), @[q, kc, vc, @[float32(S - 1)]], want)
 
   # KV scatter writes into its cache port
   block:
