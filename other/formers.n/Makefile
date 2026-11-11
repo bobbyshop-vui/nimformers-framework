@@ -35,6 +35,14 @@ build: $(ROOT)/$(BYBYLANG)
 	  $(BYBYLANG) $(CLI_SRC) --aot=$(HERE)/build/formers_cli --quiet && \
 	  cp $(HERE)/build/formers_cli $(CLI_BIN)
 	@echo "[formers.n] built $(CLI_BIN)"
+ifeq ($(shell uname -s),Darwin)
+ifeq ($(FORMERS_NO_ARM64),)
+	$(MAKE) -C $(ROOT)/$(HERE) build-arm64
+	lipo -create $(ROOT)/$(CLI_BIN) $(ROOT)/$(ARM64_BIN) -output $(ROOT)/$(CLI_BIN).universal
+	mv -f $(ROOT)/$(CLI_BIN).universal $(ROOT)/$(CLI_BIN)
+	@echo "[formers.n] $(CLI_BIN) is universal (x86_64 + arm64), native on Apple Silicon"
+endif
+endif
 
 # Apple Silicon binary built on an Intel Mac (formers-cli is x86_64 and runs under Rosetta there).
 ARM64_BIN   := $(HERE)/formers-cli-arm64
