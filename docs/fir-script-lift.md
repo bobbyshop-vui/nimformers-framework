@@ -393,12 +393,31 @@ other/formers.n/formers-cli --models models/tinyllama -m models/tinyllama/model.
 
 ### Kernels that follow the Metal ones
 
-The lifter emits, for decode, kernels built the way the Metal ones are: the Q4 GEMV is one
-simdgroup per four rows with `simd_sum` (`genMatmulQ4Simd`), RMSNorm and add+RMSNorm are one
-threadgroup per row (`genRmsnormPar`, `genAddRmsnormPar`), and decode attention is one
-threadgroup per query head with the scores in threadgroup memory (`genAttentionDecodePar`).
-`FIRLIFT_GENERIC=1` selects the lane-per-output kernels that also run on the CPU VM.
-The lifted TinyLlama graph is in `models/tinyllama/lifted/`:
+The lifter emits kernels built the way the Metal ones are:
+
+| Op | Generator | Structure |
+| --- | --- | --- |
+| Q4 GEMV (M = 1) | `genMatmulQ4Simd` | one simdgroup per 4 rows, `simd_sum` |
+| Q4 GEMM (M > 1, `FIRLIFT_TARGET=apple`) | `genMatmulQ4Mm` | 32 x 32 tile, 4 simdgroups, 8 x 8 `simdgroup_matrix` (the `matmul_q4_mm_sg` kernel) |
+| RMSNorm, add + RMSNorm | `genRmsnormPar`, `genAddRmsnormPar` | one threadgroup per row |
+| decode attention, flash prefill | `genAttentionDecodePar` | one threadgroup per (row, head), scores in threadgroup memory |
+
+`FIRLIFT_GENERIC=1` selects the lane-per-output kernels that also run on the CPU VM. Intel and AMD
+Metal devices cannot create `simdgroup_matrix` pipelines, so the GEMM kernel is only emitted for
+`FIRLIFT_TARGET=apple`.
+
+A recorded prefill step before the decode step becomes the graph's multi-row phase (`phase chunk1`),
+which the runner repeats over the prompt in chunks of that many rows. The runtime prefills in chunks of
+64 tokens, so trace a 64-token prompt:
+
+```sh
+BYBY_FIR_PROBE=/tmp/t64.fprobe BYBY_FIR_PROBE_STEPS=prefill:1,decode:1 \
+  other/formers.n/formers-cli --models models/tinyllama -p "$(yes a | head -46 | tr '\n' ' ')" -n 2 --temp 0 --no-progress --backend metal
+FIRLIFT_TARGET=apple other/formers.n/firlift/firlift --trace /tmp/t64.fprobe --config models/tinyllama/config.json --out /tmp/t64a
+```
+
+The lifted TinyLlama graphs are `models/tinyllama/lifted/model.fir` (Apple GPU) and
+`models/tinyllama/lifted/model_intel.fir`:
 
 ```sh
 other/formers.n/formers-cli_arm64 --models models/tinyllama -m models/tinyllama/model.safetensors \

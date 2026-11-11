@@ -348,6 +348,33 @@ proc sessionTests2() =
     chk("matmul_q4_simd K" & $K & " gs" & $gs & " rows" & $rows & " sg" & $sg, g,
         @[a, bytesAsFloats(bytes) & scales & zeros], want, 1e-3'f32)
 
+  # simdgroup_matrix Q4 GEMM (the Metal matmul_q4_mm_sg structure): full and partial tiles
+  for (M, K, N, gs) in [(32, 64, 32, 32), (40, 64, 40, 32), (3, 96, 5, 32), (33, 128, 70, 128)]:
+    let nG = K div gs
+    let bpr = K div 2
+    var q = newSeq[int](N*K)
+    var bytes = newSeq[uint8](N*bpr)
+    for i in 0 ..< N*K: q[i] = (i*7 + 1) mod 16
+    for n in 0 ..< N:
+      for kk in 0 ..< K:
+        let b = n*bpr + kk div 2
+        bytes[b] = bytes[b] or uint8(q[n*K + kk] shl (if kk mod 2 == 0: 0 else: 4))
+    let scales = fill(N*nG, 0.4, 0.3)
+    let zeros = fill(N*nG, 1.1, 2.0)
+    let a = fill(M*K, 0.8)
+    var want = newSeq[float32](M*N)
+    for m in 0 ..< M:
+      for n in 0 ..< N:
+        var sum = 0.0'f32
+        for kk in 0 ..< K:
+          let gi = n*nG + kk div gs
+          sum += a[m*K + kk] * ((float32(q[n*K + kk]) - zeros[gi]) * scales[gi])
+        want[m*N + n] = sum
+    let g = genMatmulQ4Mm(M, K, N, gs, nG)
+    doAssert g.tg == 128, "mm variant not selected"
+    chk("matmul_q4_mm M" & $M & " K" & $K & " N" & $N, g,
+        @[a, bytesAsFloats(bytes) & scales & zeros], want, 1e-3'f32)
+
   # argmax keeps the first maximum
   block:
     let outer = 2
@@ -606,6 +633,8 @@ proc sessionTests2() =
           for key in 0 ..< n: a += raw[key]*vc[base + key*D + d]
           o[(t*H + h)*D + d] = a / tot
     chk("flash_prefill", genFlashPrefill(T, H, HKV, D, maxSeq, sc), @[q, kc, vc, @[float32(pos)]], o, 1e-3'f32)
+    if (H and (H - 1)) == 0:
+      chk("flash_prefill_par", genAttentionDecodePar(H, HKV, D, maxSeq, 32, T, sc), @[q, kc, vc, @[float32(pos)]], o, 1e-3'f32)
 
   # Mamba-2 state-space scan
   for cont in 0 .. 1:

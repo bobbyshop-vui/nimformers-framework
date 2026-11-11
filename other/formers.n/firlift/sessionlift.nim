@@ -314,6 +314,11 @@ proc ropeKernel(l: SessionLift; rows, hn, d: int; outScale: float): Gen =
   result = if rows == 1: genRopePos(hn, d, ratio, posScale, outScale)
        else: genRopePosRows(rows, hn, d, ratio, posScale, outScale)
 
+proc appleTarget(): bool =
+  ## FIRLIFT_TARGET=apple: the graph is for an Apple GPU, so GEMMs may use simdgroup_matrix
+  ## (Intel and AMD Metal devices cannot create those pipelines).
+  getEnv("FIRLIFT_TARGET") == "apple" and getEnv("FIRLIFT_GENERIC").len == 0
+
 proc genericKernels(): bool =
   ## FIRLIFT_GENERIC=1: lane-per-output kernels that every VM backend can run. The default kernels
   ## follow the Metal ones (threadgroups, simdgroups) and need simd ops.
@@ -470,6 +475,8 @@ proc lowerMatmulQ4(l: SessionLift; op: Op) =
   # FIRLIFT_GENERIC=1 keeps the lane-per-column kernels, which every VM backend can run.
   let gen = (if m == 1 and not genericKernels():
                genMatmulQ4Simd(k, n, group, op.attrInt("groupsPerRow"))
+             elif m > 1 and appleTarget():
+               genMatmulQ4Mm(m, k, n, group, op.attrInt("groupsPerRow"))
              else: genMatmulQ4Par(m, k, n, group, op.attrInt("groupsPerRow"), parLanes()))
   l.addKernelNode(op, "matmul_q4", gen, @[a, wn], @[c])
 
@@ -629,8 +636,9 @@ proc lowerOp(l: SessionLift; op: Op) =
     let kAll = l.stateBuf(op.ins.port("kAll"), hkv*l.positions*d)
     let vAll = l.stateBuf(op.ins.port("vAll"), hkv*l.positions*d)
     let o = l.wr(op, op.outs.port("o"))
-    l.addKernelNode(op, "flash_prefill", genFlashPrefill(op.attrInt("T"), op.attrInt("H"), hkv, d,
-      l.positions, op.attrFloat("scale")), @[q, kAll, vAll, l.positionBuf()], @[o])
+    let flash = (if genericKernels(): genFlashPrefill(op.attrInt("T"), op.attrInt("H"), hkv, d, l.positions, op.attrFloat("scale"))
+                 else: genAttentionDecodePar(op.attrInt("H"), hkv, d, l.positions, 128, op.attrInt("T"), op.attrFloat("scale")))
+    l.addKernelNode(op, "flash_prefill", flash, @[q, kAll, vAll, l.positionBuf()], @[o])
   of "sessionSoftmax":
     let x = l.rd(op.ins.port("x"))
     let y = l.wr(op, op.outs.port("y"))
@@ -1108,8 +1116,20 @@ proc liftSessionFiles*(trace: Trace; configText, modelName, embeddingName: strin
   var rawParents = initHashSet[int]()
   for op in trace.ops:
     if op.impl == "raw:dispatch" and op.parent >= 0: rawParents.incl op.parent
+  # A recorded multi-row prefill step before the decode step becomes the multi-row phase of the graph.
+  var prefillStep = 0
+  if not coverage:
+    for i in countdown(trace.steps - 1, 1):
+      if i <= trace.stepKinds.len and trace.stepKinds[i-1] == "prefill" and trace.stepRows[i-1] > 1:
+        prefillStep = i
+        break
   for op in trace.ops:
-    if op.step == trace.steps:
+    if prefillStep > 0 and op.step == prefillStep:
+      if op.impl == "raw:dispatch": continue
+      if op.parent < 0 and not (op.id in rawParents and op.impl.startsWith("micro:")):
+        op.phase = 1
+        ops.add op
+    elif op.step == trace.steps:
       if op.impl == "raw:dispatch":
         # Semantic session ops already describe their child dispatches. Micro wrappers do not.
         var keepDispatch = op.parent < 0
@@ -1156,7 +1176,7 @@ proc liftSessionFiles*(trace: Trace; configText, modelName, embeddingName: strin
         continue
       let tr = trace.transfers[ti]
       let (consumer, portName) = ops.consumerOf(i, tr.dst.buffer)
-      if consumer != nil and consumer.implName == "sessionRope" and portName in ["cosT", "sinT"]:
+      if consumer != nil and consumer.implName in ["sessionRope", "sessionRopeKvEnc"] and portName in ["cosT", "sinT"]:
         # RoPE tables: the lifted RoPE derives them from `position`.
         l.cur[tr.dst.key] = "ropetable"
       elif consumer != nil and consumer.implName == "sessionPermuteEnc" and
@@ -1176,6 +1196,20 @@ proc liftSessionFiles*(trace: Trace; configText, modelName, embeddingName: strin
         l.cur[tr.dst.key] = outName
         l.addKernelNode(op, "rmsnorm", (if genericKernels(): genRmsnorm(1, l.hidden, l.eps) else: genRmsnormPar(1, l.hidden, l.eps)), @[lastCleanRead, gamma], @[outName])
         afterTaintedRead = false
+      elif op.phase > 0 and trace.stepToken >= 0:
+        # Token rows of the multi-row prefill phase: the embedding of `rows` tokens.
+        if l.hidden <= 0 or tr.n mod l.hidden != 0: fail("the prefill upload has " & $tr.n & " elements, hidden is " & $l.hidden)
+        var emb = embeddingName
+        if emb.len == 0:
+          emb = (if l.config.hasKey("tie_word_embeddings") and l.config["tie_word_embeddings"].getBool(false):
+                   "lm_head.weight" else: "model.embed_tokens.weight")
+        if l.vocab <= 0: fail("the config has no vocab_size")
+        let w = l.weightName(NameRec(name: emb), "f32", @[l.vocab, l.hidden])
+        let outName = "t" & $op.id & "_embedding"
+        l.addBuf(outName, tr.n)
+        l.cur[tr.dst.key] = outName
+        l.phaseRows[op.phase] = tr.n div l.hidden
+        l.nodes.add SNode(kind: "ext", op: "fir.embedding", name: "embedding_p" & $op.phase, ins: @["token", w], outs: @[outName], phase: op.phase)
       elif not embedded and trace.stepToken >= 0:
         embedded = true
         if l.hidden > 0 and tr.n != l.hidden: fail("the first upload has " & $tr.n & " elements, hidden is " & $l.hidden)
@@ -1198,6 +1232,9 @@ proc liftSessionFiles*(trace: Trace; configText, modelName, embeddingName: strin
     if op.isBookkeeping:
       if name == "sessionBegin": afterTaintedRead = false
       inc i
+      continue
+    if name == "sessionRead" and op.phase > 0 and not l.raw:
+      inc i                      # the prefill phase only updates state; decode produces the logits
       continue
     if name == "sessionRead":
       let h = op.ins.port("h")
