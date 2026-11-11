@@ -297,6 +297,8 @@ proc positionBuf(l: SessionLift): string =
   l.addBuf("position", 1, "position")
   "position"
 
+proc genericKernels(): bool
+
 proc ropeKernel(l: SessionLift; rows, hn, d: int; outScale: float): Gen =
   ## RoPE derived from the position (theta and scaling from the config), optionally scaling the output.
   var theta = 10000.0
@@ -311,8 +313,11 @@ proc ropeKernel(l: SessionLift; rows, hn, d: int; outScale: float): Gen =
     elif kind notin ["", "default"]:
       fail("rope_scaling type " & kind & " has no generated kernel")
   let ratio = pow(theta, -1.0 / float(d div 2))
-  result = if rows == 1: genRopePos(hn, d, ratio, posScale, outScale)
-       else: genRopePosRows(rows, hn, d, ratio, posScale, outScale)
+  let half = d div 2
+  result = if not genericKernels() and half >= 2 and (half and (half - 1)) == 0 and rows * hn * half <= 65536:
+             genRopePosPar(rows, hn, d, ratio, posScale, outScale)
+           elif rows == 1: genRopePos(hn, d, ratio, posScale, outScale)
+           else: genRopePosRows(rows, hn, d, ratio, posScale, outScale)
 
 proc appleTarget(): bool =
   ## FIRLIFT_TARGET=apple: the graph is for an Apple GPU, so GEMMs may use simdgroup_matrix
@@ -347,9 +352,13 @@ proc lowerRope(l: SessionLift; op: Op; outScale = 1.0) =
   let xn = l.rd(x)
   l.addKernelNode(op, "rope", g, @[xn, l.positionBuf()], @[xn])
 
+proc kvScatterKernel(t, hkv, d, positions: int): Gen =
+  if genericKernels(): genKvScatter(t, hkv, d, positions)
+  else: genKvScatterPar(t, hkv, d, positions)
+
 proc lowerKvScatterOne(l: SessionLift; op: Op; src: string; dstPort: PortRef; hkv, d: int) =
   let dst = l.stateBuf(dstPort, hkv*l.positions*d)
-  l.addKernelNode(op, "kv_scatter", genKvScatter(1, hkv, d, l.positions),
+  l.addKernelNode(op, "kv_scatter", kvScatterKernel(1, hkv, d, l.positions),
     @[src, l.positionBuf(), dst], @[], @[2])
 
 proc checkKvPosition(l: SessionLift; op: Op) =
@@ -439,7 +448,7 @@ proc lowerCopyGroup(l: SessionLift; ops: seq[Op]; first, last: int) =
       let op = cs[0].op
       let src = l.rd(op.ins.port("src"))
       let dst = l.stateBuf(op.outs.port("dst"), hkv*l.positions*n)
-      l.addKernelNode(op, "kv_scatter", genKvScatter(1, hkv, n, l.positions),
+      l.addKernelNode(op, "kv_scatter", kvScatterKernel(1, hkv, n, l.positions),
         @[src, l.positionBuf(), dst], @[], @[2])
     else:
       for c in cs:
@@ -456,6 +465,14 @@ proc parLanes(): int =
   ## where they win.
   let v = getEnv("FIRLIFT_TG")
   if v.len > 0: parseInt(v) else: 1
+
+proc tunerKnob(name: string; default: int; allowed: openArray[int]): int =
+  ## Tuner variant knobs of the simdgroup Q4 GEMV (rows per simdgroup, simdgroups per threadgroup,
+  ## 8-weight packs per lane step), set per device through the environment when lifting.
+  let v = getEnv(name)
+  if v.len == 0: return default
+  result = parseInt(v)
+  if result notin allowed: fail(name & "=" & v & " is not one of " & $allowed)
 
 proc lowerMatmulQ4(l: SessionLift; op: Op) =
   let m = op.attrInt("M")
@@ -474,7 +491,8 @@ proc lowerMatmulQ4(l: SessionLift; op: Op) =
   # Decode (M=1) is the structure of the Metal matmul_q4_simd kernel (simdgroup per rows, simd_sum);
   # FIRLIFT_GENERIC=1 keeps the lane-per-column kernels, which every VM backend can run.
   let gen = (if m == 1 and not genericKernels():
-               genMatmulQ4Simd(k, n, group, op.attrInt("groupsPerRow"))
+               genMatmulQ4Simd(k, n, group, op.attrInt("groupsPerRow"), tunerKnob("FIRLIFT_Q4_ROWS", 4, [1, 2, 4, 8]),
+                               tunerKnob("FIRLIFT_Q4_SG", 2, [1, 2, 4, 8]), tunerKnob("FIRLIFT_Q4_PACKS", 1, [1, 2]))
              elif m > 1 and appleTarget():
                genMatmulQ4Mm(m, k, n, group, op.attrInt("groupsPerRow"))
              else: genMatmulQ4Par(m, k, n, group, op.attrInt("groupsPerRow"), parLanes()))
@@ -491,8 +509,13 @@ proc lowerMatmulNT(l: SessionLift; op: Op; bPort = "b") =
   if l.cur.hasKey(b.key): bn = l.cur[b.key]
   else: bn = l.rdWeight(b, "f32a")
   let c = l.wr(op, op.outs.port("c"))
-  l.addKernelNode(op, "matmul_nt", (if off == 0: genMatmulNTPar(m, k, n, parLanes()) else: genMatmulNT(m, k, n, off)),
-    @[a, bn], @[c])
+  let g =
+    if off != 0: genMatmulNT(m, k, n, off)
+    elif genericKernels(): genMatmulNTPar(m, k, n, parLanes())
+    elif m == 1: genMatmulNTSimd(k, n)
+    elif appleTarget(): genMatmulNTMm(m, k, n)
+    else: genMatmulNTPar(m, k, n, parLanes())
+  l.addKernelNode(op, "matmul_nt", g, @[a, bn], @[c])
 
 proc table(l: SessionLift; p: PortRef): seq[int] =
   ## A short host table (permute strides) the recorder kept with its upload.
@@ -627,7 +650,7 @@ proc lowerOp(l: SessionLift; op: Op) =
     let d = op.attrInt("D")
     let src = l.rd(op.ins.port("src"))
     let dst = l.stateBuf(op.outs.port("dst"), hkv*l.positions*d)
-    l.addKernelNode(op, "kv_scatter", genKvScatter(op.attrInt("T"), hkv, d, l.positions),
+    l.addKernelNode(op, "kv_scatter", kvScatterKernel(op.attrInt("T"), hkv, d, l.positions),
       @[src, l.positionBuf(), dst], @[], @[2])
   of "sessionFlashAttentionPrefillEnc":
     let hkv = op.attrInt("HKV")

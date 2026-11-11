@@ -814,6 +814,104 @@ proc genRopePosRows*(T, Hn, D: int; ratio: float; posScale = 1.0; outScale = 1.0
     k.e("uaddk", xb, xb, Hn*D - half))
   k.done(Hn, 2, 1)
 
+proc ilog2(n: int): int =
+  while (1 shl (result + 1)) <= n: inc result
+
+proc divFloorU(k: KB; dst, src: int; n: int) =
+  ## U[dst] = U[src] / n for small values, through float (exact while src < 2^20).
+  let r = k.r()
+  k.e("utor", r, src)
+  k.e("addconst", r, r, "0.5")
+  k.e("mulconst", r, r, fnum(1.0 / float(n)))
+  k.e("rtou", dst, r)
+
+proc modU(k: KB; dst, src, q: int; n: int) =
+  ## U[dst] = U[src] - U[q] * n, through float (small values).
+  let a = k.r()
+  let b = k.r()
+  k.e("utor", a, src)
+  k.e("utor", b, q)
+  k.e("mulconst", b, b, fnum(float(n)))
+  k.e("sub", a, a, b)
+  k.e("rtou", dst, a)
+
+proc genRopePosPar*(T, Hn, D: int; ratio: float; posScale = 1.0; outScale = 1.0): Gen =
+  ## Rotate-half RoPE with one thread per (row, head, frequency) pair, the shape of the Metal
+  ## rope kernels. Row t sits at position + t; x is [T, Hn, D]. Needs D/2 to be a power of two.
+  ## ports in0=x in1=position (scalar) out0=y (may alias x).
+  let half = D div 2
+  let k = newKB()
+  let zero = k.cu(0)
+  let pos = k.r()
+  let freq = k.r()
+  let ang = k.r()
+  let sn = k.r()
+  let cs = k.r()
+  let x1 = k.r()
+  let x2 = k.r()
+  let o = k.r()
+  let fi = k.r()
+  let i = k.u()
+  let q = k.u()
+  let t = k.u()
+  let xb = k.u()
+  k.e("uandk", i, 0, half - 1)
+  k.e("ushrk", q, 0, ilog2(half))
+  k.e("umulk", xb, q, D)
+  k.e("uadd", xb, xb, i)
+  k.e("uloadf32", pos, zero, "@in1")
+  if T > 1:
+    k.divFloorU(t, q, Hn)
+    k.e("utor", fi, t)
+    k.e("add", pos, pos, fi)
+  if posScale != 1.0: k.e("mulconst", pos, pos, fnum(posScale))
+  k.e("utor", fi, i)
+  k.e("mulconst", fi, fi, fnum(ln(ratio)))
+  k.e("exp", freq, fi)
+  k.e("mul", ang, pos, freq)
+  k.sincosOf(ang, sn, cs)
+  k.e("uloadf32", x1, xb, "@in0")
+  k.e("uloadf32", x2, xb, "@in0+" & $half)
+  k.e("mul", o, x1, cs)
+  k.e("mul", ang, x2, sn)
+  k.e("sub", o, o, ang)
+  if outScale != 1.0: k.e("mulconst", o, o, fnum(outScale))
+  k.e("ustoref32", o, xb, "@out0")
+  k.e("mul", o, x2, cs)
+  k.e("mul", ang, x1, sn)
+  k.e("add", o, o, ang)
+  if outScale != 1.0: k.e("mulconst", o, o, fnum(outScale))
+  k.e("ustoref32", o, xb, "@out0+" & $half)
+  k.done(T * Hn * half, 2, 1)
+
+proc genKvScatterPar*(T, HKV, D, maxSeqLen: int): Gen =
+  ## KV scatter with one thread per element: dst[h, pos + t, d] = src[t, h, d].
+  ## ports in0=src in1=pos (scalar) in2=dst (written).
+  let k = newKB()
+  let zero = k.cu(0)
+  let p = k.r()
+  let v = k.r()
+  let pu = k.u()
+  let q = k.u()
+  let t = k.u()
+  let h = k.u()
+  let d = k.u()
+  let a = k.u()
+  k.e("uloadf32", p, zero, "@in1")
+  k.e("rtou", pu, p)
+  k.divFloorU(q, 0, D)
+  k.modU(d, 0, q, D)
+  k.divFloorU(t, q, HKV)
+  k.modU(h, q, t, HKV)
+  k.e("uadd", a, pu, t)
+  k.e("umulk", h, h, maxSeqLen)
+  k.e("uadd", a, a, h)
+  k.e("umulk", a, a, D)
+  k.e("uadd", a, a, d)
+  k.e("uloadf32", v, 0, "@in0")
+  k.e("ustoref32", v, a, "@in2")
+  k.done(T * HKV * D, 3, 0)
+
 proc genMatmulQ4*(M, K, N, groupSize, nGroups: int; wqByteOffset = 0; packed = false): Gen =
   ## sessionMatmulQ4(a, w, c, M): C[m,n] = sum_k A[m,k] * (nib(n,k) - zero[n,g]) * scale[n,g],
   ## nibble low = even k, high = odd k, g = k / groupSize.
@@ -1127,15 +1225,16 @@ proc genMatmulQ4Par*(M, K, N, groupSize, nGroups: int; T = 32): Gen =
     )
   result = Gen(body: k.text, threads: N * t, ins: 2, outs: 1, tg: t, tgBytes: max(16, t * 4))
 
-proc genMatmulQ4Simd*(K, N, groupSize, nGroups: int; rows = 4; sg = 2): Gen =
+proc genMatmulQ4Simd*(K, N, groupSize, nGroups: int; rows = 4; sg = 2; packs = 1): Gen =
   ## Decode (M=1) Q4 GEMV built the way the Metal kernel matmul_q4_simd is: one simdgroup per
   ## `rows` output rows, a lane takes 8 weights (one aligned 4-byte pack) per step and the lanes
   ## stride over K, the dot is the same fma chain, the group is corrected once per step with
   ##   sum = fma(scale, dot - zero * sum(a), sum)
-  ## and the lanes are combined with simd_sum. Same ports as genMatmulQ4Par (packed q4b layout).
+  ## and the lanes are combined with simd_sum. `packs` is how many such 8-weight packs a lane takes
+  ## per step (the tuner knob next to rows and sg). Same ports as genMatmulQ4Par (packed q4b layout).
   ## Needs K % 8 == 0, a power-of-two group that divides K, and N % rows == 0.
   let gs = if groupSize > 0: groupSize else: K
-  if K mod 8 != 0 or K mod gs != 0 or (gs and (gs - 1)) != 0 or N mod rows != 0 or gs < 8:
+  if K mod (8 * packs) != 0 or K mod gs != 0 or (gs and (gs - 1)) != 0 or N mod rows != 0 or gs < 8 * packs:
     return genMatmulQ4Par(1, K, N, groupSize, nGroups)
   var gShift = 0
   while (1 shl gShift) < gs: inc gShift
@@ -1143,7 +1242,7 @@ proc genMatmulQ4Simd*(K, N, groupSize, nGroups: int; rows = 4; sg = 2): Gen =
   let wqF = (N * rowBytes + 3) div 4
   let scalesAddr = "@in1+" & $wqF
   let zerosAddr = "@in1+" & $(wqF + N * nGroups)
-  let stepsK = (K + 127) div 128            # at least 16 lanes x 8 weights per step (width is read at run time)
+  let stepsK = (K + 128 * packs - 1) div (128 * packs)            # at least 16 lanes x 8 weights per step (width is read at run time)
   # The step count is rounded up to a power of two: the surplus steps are skipped by the k < K guard.
   # On Intel Iris (Metal) a non-power-of-two trip count made this loop return wrong sums.
   var pow2Steps = 1
@@ -1164,15 +1263,16 @@ proc genMatmulQ4Simd*(K, N, groupSize, nGroups: int; rows = 4; sg = 2): Gen =
   let nr = k.u()
   let kh = k.u()
   let gb = k.u()
+  let kt = k.u()
   k.e("utgid", tg)
   k.e("simdlane", lane)
   k.e("simdw", sw)
   k.e("simdgid", sid)                 # grid-wide simdgroup index, whatever the simdgroup width is
   k.e("umulk", row0, sid, rows)
-  k.e("umulk", stepU, sw, 8)
+  k.e("umulk", stepU, sw, 8 * packs)
   k.e("uconst", wqb, "@in1")
   k.e("umulk", wqb, wqb, 4)
-  k.e("umulk", kk, lane, 8)
+  k.e("umulk", kk, lane, 8 * packs)
   let sums = newSeq[int](rows)
   var sumR = sums
   for r in 0 ..< rows: sumR[r] = k.cf(0)
@@ -1199,38 +1299,40 @@ proc genMatmulQ4Simd*(K, N, groupSize, nGroups: int; rows = 4; sg = 2): Gen =
       k.e("utor", kf, kk)
       k.e("cmplt", c, kf, kLimit)
       k.cond(c, proc() =
-        for j in 0 ..< 8:
-          k.e("uloadf32", a[j], kk, "@in0+" & $j)
-        # act.sum = ((x0 + x1) + (x2 + x3)) + ((x4 + x5) + (x6 + x7))
-        k.e("add", t0, a[0], a[1])
-        k.e("add", t1, a[2], a[3])
-        k.e("add", t0, t0, t1)
-        k.e("add", t1, a[4], a[5])
-        k.e("add", d, a[6], a[7])
-        k.e("add", t1, t1, d)
-        k.e("add", asum, t0, t1)
-        k.e("ushrk", gb, kk, gShift)
-        k.e("ushrk", kh, kk, 1)
-        for r in 0 ..< rows:
-          k.e("uaddk", nr, row0, r)
-          k.e("umulk", ad, nr, rowBytes)
-          k.e("uadd", ad, ad, wqb)
-          k.e("uadd", ad, ad, kh)
-          k.e("uloadu32", pk, ad, 0)
-          # d = fma(a0,q0, fma(a1,q1, ... fma(a6,q6, a7*q7)))
-          for j in countdown(7, 0):
-            k.e("ushrk", tmp, pk, 4 * j)
-            if j < 7: k.e("uandk", tmp, tmp, 15)
-            k.e("utor", q, tmp)
-            if j == 7: k.e("mul", d, a[7], q)
-            else: k.e("fma", d, a[j], q, d)
-          k.e("umulk", gi, nr, nGroups)
-          k.e("uadd", gi, gi, gb)
-          k.e("uloadf32", sc, gi, scalesAddr)
-          k.e("uloadf32", zp, gi, zerosAddr)
-          k.e("mul", zp, zp, asum)
-          k.e("sub", d, d, zp)
-          k.e("fma", sumR[r], sc, d, sumR[r]))
+        for pp in 0 ..< packs:
+          for j in 0 ..< 8:
+            k.e("uloadf32", a[j], kk, "@in0+" & $(j + 8 * pp))
+          # act.sum = ((x0 + x1) + (x2 + x3)) + ((x4 + x5) + (x6 + x7))
+          k.e("add", t0, a[0], a[1])
+          k.e("add", t1, a[2], a[3])
+          k.e("add", t0, t0, t1)
+          k.e("add", t1, a[4], a[5])
+          k.e("add", d, a[6], a[7])
+          k.e("add", t1, t1, d)
+          k.e("add", asum, t0, t1)
+          k.e("uaddk", kt, kk, 8 * pp)
+          k.e("ushrk", gb, kt, gShift)
+          k.e("ushrk", kh, kt, 1)
+          for r in 0 ..< rows:
+            k.e("uaddk", nr, row0, r)
+            k.e("umulk", ad, nr, rowBytes)
+            k.e("uadd", ad, ad, wqb)
+            k.e("uadd", ad, ad, kh)
+            k.e("uloadu32", pk, ad, 0)
+            # d = fma(a0,q0, fma(a1,q1, ... fma(a6,q6, a7*q7)))
+            for j in countdown(7, 0):
+              k.e("ushrk", tmp, pk, 4 * j)
+              if j < 7: k.e("uandk", tmp, tmp, 15)
+              k.e("utor", q, tmp)
+              if j == 7: k.e("mul", d, a[7], q)
+              else: k.e("fma", d, a[j], q, d)
+            k.e("umulk", gi, nr, nGroups)
+            k.e("uadd", gi, gi, gb)
+            k.e("uloadf32", sc, gi, scalesAddr)
+            k.e("uloadf32", zp, gi, zerosAddr)
+            k.e("mul", zp, zp, asum)
+            k.e("sub", d, d, zp)
+            k.e("fma", sumR[r], sc, d, sumR[r]))
       k.e("uadd", kk, kk, stepU))
     k.e("utor", kf, lane)
     k.e("cmplt", c, kf, one)
@@ -1589,6 +1691,231 @@ proc genMatmulQ4Mm*(M, K, N, groupSize, nGroups: int): Gen =
         k.e("utor", v[j], t2)
         k.e("sub", v[j], v[j], zp)
         k.e("mul", v[j], v[j], sc))
+    for j in 0 ..< 8: k.e("tgstoref32", v[j], xi, WS + j)
+    k.e("barriertg")
+    for kk in 0 ..< 4:
+      k.e("uaddk", t1, xoff0, kk * 8)
+      k.e("mmload", 4, t1, LD)
+      k.e("uaddk", t1, xoff1, kk * 8)
+      k.e("mmload", 5, t1, LD)
+      k.e("uaddk", t1, woff0, kk * 8)
+      k.e("mmloadt", 6, t1, LD)
+      k.e("uaddk", t1, woff1, kk * 8)
+      k.e("mmloadt", 7, t1, LD)
+      for i in 0 ..< 2:
+        for j in 0 ..< 2:
+          k.e("mmmac", i * 2 + j, 4 + i, 6 + j)
+    k.e("barriertg")
+    k.e("uaddk", k0, k0, 32))
+  # epilogue: a full tile goes straight to memory, a partial one through threadgroup memory
+  k.e("utor", tf, m0)
+  k.e("addconst", tf, tf, 31)
+  k.e("cmplt", c, tf, mf)
+  k.e("utor", tf, n0)
+  k.e("addconst", tf, tf, 31)
+  k.e("cmplt", c2, tf, nf)
+  k.e("mul", c, c, c2)
+  k.cond(c, proc() =
+    k.e("uconst", t1, "@out0")
+    k.e("umulk", t2, sm, 16)
+    k.e("uadd", t2, t2, m0)
+    k.e("umulk", t2, t2, N)
+    k.e("uadd", t1, t1, t2)
+    k.e("umulk", t2, sn, 16)
+    k.e("uadd", t2, t2, n0)
+    k.e("uadd", t1, t1, t2)
+    for i in 0 ..< 2:
+      for j in 0 ..< 2:
+        k.e("uaddk", t2, t1, i * 8 * N + j * 8)
+        k.e("mmstoremem", i * 2 + j, t2, N))
+  k.e("sub", c, one, c)
+  k.cond(c, proc() =
+    for i in 0 ..< 2:
+      for j in 0 ..< 2:
+        k.e("umulk", t2, sn, 16)
+        k.e("uadd", t2, t2, xoff0)
+        k.e("uaddk", t2, t2, i * 8 * LD + j * 8)
+        k.e("mmstoretg", i * 2 + j, t2, LD)
+    k.e("barriertg")
+    for it in 0 ..< 8:
+      # element (r, col) of the tile: r = lid / 32 + 4 * it, col = lid % 32
+      k.e("ushrk", t1, lid, 5)
+      k.e("uaddk", t1, t1, 4 * it)          # r
+      k.e("uandk", t2, lid, 31)             # col
+      k.e("uadd", gk, m0, t1)               # global row
+      k.e("uadd", gb, n0, t2)               # global col
+      k.e("utor", tf, gk)
+      k.e("cmplt", c, tf, mf)
+      k.e("utor", tf, gb)
+      k.e("cmplt", c2, tf, nf)
+      k.e("mul", c, c, c2)
+      k.cond(c, proc() =
+        k.e("umulk", t1, t1, LD)
+        k.e("uadd", t1, t1, t2)
+        k.e("utor", tf, t1)
+        k.e("tgloadf32", sc, tf, 0)
+        k.e("umulk", gk, gk, N)
+        k.e("uadd", gk, gk, gb)
+        k.e("ustoref32", sc, gk, "@out0")))
+  result = Gen(body: k.text, threads: nTM * nTN * 128, ins: 2, outs: 1, tg: 128, tgBytes: 2 * WS * 4)
+
+proc genMatmulNTSimd*(K, N: int; rows = 4; sg = 2): Gen =
+  ## f32 GEMV C[1,N] = A[1,K] * B[N,K]^T like the Metal simdgroup GEMV: one simdgroup per `rows`
+  ## output rows, a lane takes 4 floats per step with an fma chain, lanes combined by simd_sum.
+  ## Needs K % 4 == 0 and N % rows == 0; otherwise the threadgroup kernel.
+  if K mod 4 != 0 or N mod rows != 0:
+    return genMatmulNTPar(1, K, N)
+  var pow2Steps = 1
+  while pow2Steps < (K + 63) div 64: pow2Steps *= 2     # see genMatmulQ4Simd: Intel needs 2^n trips
+  let k = newKB()
+  let lane = k.u()
+  let sid = k.u()
+  let sw = k.u()
+  let stepU = k.u()
+  let row0 = k.u()
+  let kk = k.u()
+  let bi = k.u()
+  let nr = k.u()
+  var sumR: seq[int]
+  for r in 0 ..< rows: sumR.add k.cf(0)
+  var a: seq[int]
+  var b: seq[int]
+  for j in 0 ..< 4:
+    a.add k.r()
+    b.add k.r()
+  let c = k.r()
+  let kf = k.r()
+  let kLimit = k.cf(float(K))
+  let rowf = k.r()
+  let nLimit = k.cf(float(N))
+  let one = k.cf(1)
+  let d = k.r()
+  k.e("simdlane", lane)
+  k.e("simdw", sw)
+  k.e("simdgid", sid)
+  k.e("umulk", row0, sid, rows)
+  k.e("umulk", stepU, sw, 4)
+  k.e("umulk", kk, lane, 4)
+  k.e("utor", rowf, row0)
+  k.e("cmplt", c, rowf, nLimit)
+  k.cond(c, proc() =
+    k.forN(pow2Steps, proc() =
+      k.e("utor", kf, kk)
+      k.e("cmplt", c, kf, kLimit)
+      k.cond(c, proc() =
+        for j in 0 ..< 4:
+          k.e("uloadf32", a[j], kk, "@in0+" & $j)
+        for r in 0 ..< rows:
+          k.e("uaddk", nr, row0, r)
+          k.e("umulk", bi, nr, K)
+          k.e("uadd", bi, bi, kk)
+          for j in 0 ..< 4:
+            k.e("uloadf32", b[j], bi, "@in1+" & $j)
+            k.e("fma", sumR[r], a[j], b[j], sumR[r]))
+      k.e("uadd", kk, kk, stepU))
+    k.e("utor", kf, lane)
+    k.e("cmplt", c, kf, one)
+    for r in 0 ..< rows:
+      k.e("simdsum", d, sumR[r])
+      k.cond(c, proc() =
+        k.e("uaddk", nr, row0, r)
+        k.e("ustoref32", d, nr, "@out0")))
+  result = Gen(body: k.text, threads: ((N div rows + sg - 1) div sg) * sg * 32, ins: 2, outs: 1,
+    tg: sg * 32, tgBytes: 16)
+
+proc genMatmulNTMm*(M, K, N: int): Gen =
+  ## f32 GEMM C[M,N] = A[M,K] * B[N,K]^T built like the Metal simdgroup GEMM: 32 x 32 output tile
+  ## per threadgroup, K in steps of 32, both tiles staged in threadgroup memory, four simdgroups
+  ## (2 x 2) multiplying 16 x 16 blocks with 8 x 8 simdgroup matrices. Same ports as genMatmulNT
+  ## (in0=A in1=B out0=C). Needs K % 32 == 0; otherwise the lane-per-column kernel.
+  if K mod 32 != 0:
+    return genMatmulNTPar(M, K, N)
+  const LD = 36
+  const WS = 32 * LD
+  let nTN = (N + 31) div 32
+  let nTM = (M + 31) div 32
+  let k = newKB()
+  let tg = k.u()
+  let lid = k.u()
+  let sg = k.u()
+  let tm = k.u()
+  let tn = k.u()
+  let n0 = k.u()
+  let m0 = k.u()
+  let lr = k.u()
+  let lc = k.u()
+  let sm = k.u()
+  let sn = k.u()
+  let k0 = k.u()
+  let gk = k.u()
+  let t1 = k.u()
+  let t2 = k.u()
+  let xoff0 = k.u()
+  let xoff1 = k.u()
+  let woff0 = k.u()
+  let woff1 = k.u()
+  let rowW = k.u()
+  let gb = k.u()
+  let xi = k.r()
+  let tf = k.r()
+  let tq = k.r()
+  let tilesN = k.cf(float(nTN))
+  let mf = k.cf(float(M))
+  let nf = k.cf(float(N))
+  let one = k.cf(1)
+  let c = k.r()
+  let c2 = k.r()
+  let sc = k.r()
+  var v: seq[int]
+  for j in 0 ..< 8: v.add k.r()
+  k.e("utgid", tg)
+  k.e("ulid", lid)
+  k.e("simdid", sg)
+  k.e("utor", tf, tg)
+  k.e("div", tq, tf, tilesN)
+  k.e("rtou", tm, tq)                    # truncating: tile row = tg / nTN
+  k.e("utor", tq, tm)
+  k.e("mul", tq, tq, tilesN)
+  k.e("sub", tf, tf, tq)
+  k.e("rtou", tn, tf)                    # tile column = tg - tm * nTN
+  k.e("umulk", n0, tn, 32)
+  k.e("umulk", m0, tm, 32)
+  k.e("ushrk", lr, lid, 2)
+  k.e("uandk", lc, lid, 3)
+  k.e("umulk", lc, lc, 8)
+  k.e("ushrk", sm, sg, 1)
+  k.e("uandk", sn, sg, 1)
+  k.e("umulk", t1, lr, LD)
+  k.e("uadd", t1, t1, lc)
+  k.e("utor", xi, t1)
+  k.e("umulk", xoff0, sm, 16 * LD)
+  k.e("uaddk", xoff1, xoff0, 8 * LD)
+  k.e("umulk", woff0, sn, 16 * LD)
+  k.e("uaddk", woff0, woff0, WS)
+  k.e("uaddk", woff1, woff0, 8 * LD)
+  k.e("uconst", k0, 0)
+  for i in 0 ..< 4: k.e("mmzero", i)
+  k.forN(K div 32, proc() =
+    k.e("uadd", gk, k0, lc)
+    # activation tile row lr (zeros past M)
+    for j in 0 ..< 8: k.e("loadconstf32", v[j], 0)
+    k.e("uadd", t1, m0, lr)
+    k.e("utor", tf, t1)
+    k.e("cmplt", c, tf, mf)
+    k.cond(c, proc() =
+      k.e("umulk", t1, t1, K)
+      k.e("uadd", t1, t1, gk)
+      for j in 0 ..< 8: k.e("uloadf32", v[j], t1, "@in0+" & $j))
+    for j in 0 ..< 8: k.e("tgstoref32", v[j], xi, j)
+    # weight tile row lr (zeros past N)
+    for j in 0 ..< 8: k.e("loadconstf32", v[j], 0)
+    k.e("uadd", t1, n0, lr)
+    k.e("utor", tf, t1)
+    k.e("cmplt", c, tf, nf)
+    k.cond(c, proc() =
+      k.e("umulk", t1, t1, K)
+      k.e("uadd", t1, t1, gk)
+      for j in 0 ..< 8: k.e("uloadf32", v[j], t1, "@in1+" & $j))
     for j in 0 ..< 8: k.e("tgstoref32", v[j], xi, WS + j)
     k.e("barriertg")
     for kk in 0 ..< 4:

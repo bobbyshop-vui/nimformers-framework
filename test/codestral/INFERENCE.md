@@ -4,6 +4,11 @@
 and `BYBY_DEBUG_SAMPLING=0`. Explicit environment settings override defaults.
 The executable applies the same defaults when invoked directly.
 
+The decode FP4 GEMV autotuner also tries `simd4-tg<N>` candidates on Metal: the same loads as the
+`wide4` kernels, reduced with `simd_sum` and one partial per simdgroup instead of the barrier tree
+(`buildFp4KmGemvSimdProgram`). A candidate is used only when it matches the baseline kernel.
+Mamba-3 shares this tuner through `gpu_layers`.
+
 Metal prefill uses the packed FP4 kernels by default. The old MPS path expanded
 one weight region at a time to FP32 before every matmul; on an integrated GPU
 that rewrite costs more bandwidth than the GEMM it feeds, so it is now opt-in
