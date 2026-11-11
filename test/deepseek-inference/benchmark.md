@@ -35,10 +35,10 @@ Prefill GEMMs at M=64 run on the tensor cores (tiled, split-K over the 40 SMs):
 
 ## MacBook Pro (Intel Iris Plus 640)
 
-| Backend | Prefill, 80 tokens | Decode, 127 tokens |
+| Backend | Prefill | Decode, 127 tokens |
 | --- | ---: | ---: |
-| Metal | 17.039 s · **4.70 tok/s** | 83.203 s · **1.53 tok/s** · 655.1 ms/token |
-| Vulkan (MoltenVK) | 21.873 s · 3.66 tok/s | 92.290 s · 1.38 tok/s · 726.7 ms/token |
+| Metal (86 tokens) | 10.157 s · **8.47 tok/s** | 42.273 s · **3.00 tok/s** · 332.9 ms/token |
+| Vulkan (MoltenVK, 80 tokens) | 21.873 s · 3.66 tok/s | 92.290 s · 1.38 tok/s · 726.7 ms/token |
 
 Metal prefill uses the tiled Q4 GEMM (64x128 tiles) and the flash attention
 kernel. Long GPU work is split into command buffers of about 300 ms so the
@@ -71,12 +71,16 @@ BYBY_MODEL_MMAP=1 BYBY_VULKAN_DEVICE_LOCAL=auto BYBY_VULKAN_TENSOR_CORES=1 \
   "Write a Python function to return the n-th Fibonacci number." 256 0.0 0.9
 ```
 
-MacBook (128 new tokens):
+MacBook, Metal through formers.n (127 new tokens):
 
 ```sh
-./nim_inference test/deepseek-inference/models \
-  test/deepseek-inference/models/model.nimq metal \
-  "Write a Python function to return the n-th Fibonacci number." 128 0 0.9
+other/formers.n/formers-cli --models test/deepseek-inference/models -cnv --temp 0 --backend metal -n 127 \
+  <<< $'Write a Python function to return the n-th Fibonacci number.\n/exit'
+```
+
+MacBook, Vulkan (128 new tokens):
+
+```sh
 ./nim_inference test/deepseek-inference/models \
   test/deepseek-inference/models/model.nimq vulkan \
   "Write a Python function to return the n-th Fibonacci number." 128 0 0.9
