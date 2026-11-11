@@ -95,3 +95,5 @@ models/**/*.bin
 models/**/trace.data
 models/**/*.fprobe
 models/**/*.fprobe.data
+other/formers.n/formers-cli-arm64
+other/formers.n/build-arm64/
