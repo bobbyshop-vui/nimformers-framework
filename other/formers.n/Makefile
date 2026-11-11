@@ -20,7 +20,7 @@ SOURCES     := $(shell find $(ROOT)/$(HERE)/src -name '*.bybylang')
 export BYBYLANG_NIMCACHE ?= $(ROOT)/nimcache/formers-n
 export FIR_LIFT_TMP ?= /tmp/fir-lift-tests
 
-.PHONY: all build test fir-test fir-graph-test fir-probe fir-lift-test smoke clean
+.PHONY: all build build-arm64 test fir-test fir-graph-test fir-probe fir-lift-test smoke clean
 
 all: build
 
@@ -35,6 +35,16 @@ build: $(ROOT)/$(BYBYLANG)
 	  $(BYBYLANG) $(CLI_SRC) --aot=$(HERE)/build/formers_cli --quiet && \
 	  cp $(HERE)/build/formers_cli $(CLI_BIN)
 	@echo "[formers.n] built $(CLI_BIN)"
+
+# Apple Silicon binary built on an Intel Mac (formers-cli is x86_64 and runs under Rosetta there).
+ARM64_BIN   := $(HERE)/formers-cli-arm64
+build-arm64: $(ROOT)/$(BYBYLANG)
+	cd $(ROOT) && mkdir -p $(HERE)/build-arm64 && \
+	  BYBYLANG_NIMCACHE=$(ROOT)/nimcache/formers-n-arm64 \
+	  BYBYLANG_NIM_FLAGS='--cpu:arm64 --passC:"-arch arm64" --passL:"-arch arm64"' \
+	  $(BYBYLANG) $(CLI_SRC) --aot=$(HERE)/build-arm64/formers_cli --quiet && \
+	  cp $(HERE)/build-arm64/formers_cli $(ARM64_BIN)
+	@echo "[formers.n] built $(ARM64_BIN)"
 
 test: $(ROOT)/$(BYBYLANG)
 	cd $(ROOT) && mkdir -p $(HERE)/build && \
