@@ -2634,8 +2634,11 @@ proc graphSignature(cache: KVCacheL): seq[int] =
     result.add cast[int](l.vResidentCombined.metalHandle)
 
 proc decodeGraphWanted(be: GpuBackend): bool =
-  ## BYBY_GRAPH=1 turns the recorded decode graph on (Metal, not with BYBY_DECODE_PROFILE).
-  be == gbMetal and getEnv("BYBY_GRAPH", "0") == "1" and gDecodeProfileLayer < 0
+  ## Metal decode replays a recorded graph (not with BYBY_DECODE_PROFILE). On by default on
+  ## Apple Silicon; BYBY_GRAPH=1/0 forces it on/off on any Metal GPU.
+  let env = getEnv("BYBY_GRAPH", "")
+  be == gbMetal and gDecodeProfileLayer < 0 and
+    (env == "1" or (env != "0" and not sessionPacesCommandBuffers(be)))
 
 proc decodePipeEnqueue*(m: LlamaModelL, ctx: Backend, cache: var KVCacheL): bool =
   ## Encodes and commits one step for the token in the current ring slot, and
