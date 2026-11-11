@@ -3019,8 +3019,11 @@ proc forwardPrefillFlash(m: LlamaModelL, xData: seq[float32], T: int, ctx: Backe
   while start < T:
     # Rows per chunk: one 64-row GEMM tile until the speed is known, then what
     # one layer runs in the time budget (whole tiles, 16 .. BYBY_PREFILL_MAX_ROWS).
-    # Apple Silicon (no pacing) takes the whole prompt in one chunk.
+    # Apple Silicon (no pacing) splits the prompt into micro-batches of BYBY_UBATCH rows
+    # (default 512, like llama.cpp's n_ubatch); 0 takes the whole prompt in one chunk.
     var rows = T
+    let ubatch = envNum("BYBY_UBATCH", 512)
+    if ubatch > 0 and not sessionPacesCommandBuffers(be): rows = ubatch
     if sessionPacesCommandBuffers(be):
       rows = 64
       if gPrefillMsPerLayerRow > 0:
