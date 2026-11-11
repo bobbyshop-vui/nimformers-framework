@@ -331,6 +331,18 @@ proc tuneFp4Plan(ctx: Backend; c: Fp4LinCacheGpu; batch: int): Fp4Plan =
         bytes: (Fp4KmLutLen + rows * tg) * 4)
     except CatchableError as e:
       stderr.writeLine "[gpu-tune] skip " & label & ": " & e.msg
+  if batch == 1 and be != byby.gbVulkan:
+    # Metal simdgroup reduction (simd_sum + per-simdgroup partials), the Llama GEMV structure.
+    for tg in fp4KmTgCandidates(c.cols, rows, maxThreads, maxShared, setting):
+      if c.rows mod rows != 0: continue
+      let label = "simd4-tg" & $tg
+      try:
+        let kn = vmKernelForBe(buildFp4KmGemvSimdProgram(c.cols, c.rows, tg, rows),
+          "fp4_" & label & "_" & key, be)
+        candidates.add Fp4Plan(kn: kn, label: label, tg: tg, rows: rows,
+          bytes: (Fp4KmLutLen + rows * tg) * 4)
+      except CatchableError as e:
+        stderr.writeLine "[gpu-tune] skip " & label & ": " & e.msg
   if candidates.len == 1: return baseline
   if getEnv("BYBY_GPU_AUTOTUNE", "1") == "0":
     return baseline

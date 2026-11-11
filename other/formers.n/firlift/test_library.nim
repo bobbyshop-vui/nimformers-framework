@@ -219,6 +219,26 @@ proc sessionTests2() =
     chk("rope_pos " & $pos & " theta " & $theta, genRopePos(Hn, D, pow(theta, -1.0 / float(half)), scale),
       @[xs, @[float32(pos)]], want, 2e-3'f32)
 
+  # per-element RoPE (Metal-shaped): one thread per (row, head, frequency)
+  for (pos, T, theta, scale) in [(0.0, 1, 10000.0, 1.0), (137.0, 1, 10000.0, 1.0), (5.0, 4, 10000.0, 1.0),
+                                 (96.0, 3, 500000.0, 0.25)]:
+    let Hn = 3
+    let D = 8
+    let half = D div 2
+    let xs = fill(T*Hn*D, 0.4, 1.0)
+    var want = xs
+    for t in 0 ..< T:
+      for h in 0 ..< Hn:
+        for i in 0 ..< half:
+          let angle = (pos + float(t)) * scale / pow(theta, float(i) / float(half))
+          let base = (t*Hn + h)*D
+          let x1 = float(xs[base + i])
+          let x2 = float(xs[base + i + half])
+          want[base + i] = float32(x1*cos(angle) - x2*sin(angle))
+          want[base + i + half] = float32(x2*cos(angle) + x1*sin(angle))
+    chk("rope_pos_par T=" & $T & " pos " & $pos, genRopePosPar(T, Hn, D, pow(theta, -1.0 / float(half)), scale),
+      @[xs, @[float32(pos)]], want, 5e-3'f32)
+
   # multi-row RoPE: row t uses position + t, rows laid out [T, Hn, D]
   for (pos, T, theta, scale) in [(0.0, 3, 10000.0, 1.0), (5.0, 4, 10000.0, 1.0), (96.0, 2, 500000.0, 0.25)]:
     let Hn = 3
@@ -343,10 +363,12 @@ proc sessionTests2() =
         let gi = n*nG + kk div gs
         s += a[kk] * ((float32(q[n*K + kk]) - zeros[gi]) * scales[gi])
       want[n] = s
-    let g = genMatmulQ4Simd(K, N, gs, nG, rows, sg)
-    doAssert g.tg == sg * 32, "simd variant not selected"
-    chk("matmul_q4_simd K" & $K & " gs" & $gs & " rows" & $rows & " sg" & $sg, g,
-        @[a, bytesAsFloats(bytes) & scales & zeros], want, 1e-3'f32)
+    for packs in [1, 2]:
+      if K mod (8 * packs) != 0 or gs < 8 * packs: continue
+      let g = genMatmulQ4Simd(K, N, gs, nG, rows, sg, packs)
+      doAssert g.tg == sg * 32, "simd variant not selected"
+      chk("matmul_q4_simd K" & $K & " gs" & $gs & " rows" & $rows & " sg" & $sg & " packs" & $packs, g,
+          @[a, bytesAsFloats(bytes) & scales & zeros], want, 1e-3'f32)
 
   # simdgroup_matrix Q4 GEMM (the Metal matmul_q4_mm_sg structure): full and partial tiles
   for (M, K, N, gs) in [(32, 64, 32, 32), (40, 64, 40, 32), (3, 96, 5, 32), (33, 128, 70, 128)]:
@@ -812,6 +834,21 @@ proc sessionTests() =
       let pg = genMatmulNTPar(pm, pk, pn)
       doAssert pg.tg >= 2
       chk("matmul_nt_par K" & $pk & " tg" & $pg.tg, pg, @[pa, pb], pw, 1e-3'f32)
+      if pm == 1:
+        let sg = genMatmulNTSimd(pk, pn, 1)
+        chk("matmul_nt_simd K" & $pk & " N" & $pn, sg, @[pa, pb], pw, 1e-3'f32)
+    for (pm, pk, pn) in [(32, 64, 32), (40, 64, 40), (3, 96, 5), (33, 128, 70)]:
+      let pa = fill(pm*pk, 0.3)
+      let pb = fill(pn*pk, 0.8)
+      var pw = newSeq[float32](pm*pn)
+      for m in 0 ..< pm:
+        for j in 0 ..< pn:
+          var s = 0.0'f32
+          for q in 0 ..< pk: s += pa[m*pk + q] * pb[j*pk + q]
+          pw[m*pn + j] = s
+      let mg = genMatmulNTMm(pm, pk, pn)
+      doAssert mg.tg == 128, "mm variant not selected"
+      chk("matmul_nt_mm M" & $pm & " K" & $pk & " N" & $pn, mg, @[pa, pb], pw, 1e-3'f32)
     let bnn = fill(K*N, 1.9)
     for m in 0 ..< M:
       for j in 0 ..< N:
@@ -874,21 +911,22 @@ proc sessionTests() =
     let pos = 1
     let src = fill(T*HKV*D, 0.9)
     var cache = newSeq[float32](HKV*maxSeq*D)
-    let g = genKvScatter(T, HKV, D, maxSeq)
-    var mem = src
-    mem.add float32(pos)
-    mem.add cache
-    let program = assemble(g.body, g.ins, g.outs, @[src.len, 1, cache.len], @[], 1e-5'f32)
-    if not cpu.vmRun(program.words, mem, newSeq[float32](), g.threads, 4, 1):
-      raise newException(ValueError, "kv_scatter: CPU VM rejected the program")
-    for t in 0 ..< T:
-      for h in 0 ..< HKV:
-        for d in 0 ..< D:
-          cache[(h*maxSeq + pos + t)*D + d] = src[(t*HKV + h)*D + d]
-    for i in 0 ..< cache.len:
-      if not near(mem[src.len + 1 + i], cache[i]):
-        raise newException(ValueError, "kv_scatter mismatch at " & $i)
-    echo "PASS session kernel kv_scatter"
+    for par in [false, true]:
+      let g = if par: genKvScatterPar(T, HKV, D, maxSeq) else: genKvScatter(T, HKV, D, maxSeq)
+      var mem = src
+      mem.add float32(pos)
+      mem.add cache
+      let program = assemble(g.body, g.ins, g.outs, @[src.len, 1, cache.len], @[], 1e-5'f32)
+      if not cpu.vmRun(program.words, mem, newSeq[float32](), g.threads, 4, 1):
+        raise newException(ValueError, "kv_scatter: CPU VM rejected the program")
+      for t in 0 ..< T:
+        for h in 0 ..< HKV:
+          for d in 0 ..< D:
+            cache[(h*maxSeq + pos + t)*D + d] = src[(t*HKV + h)*D + d]
+      for i in 0 ..< cache.len:
+        if not near(mem[src.len + 1 + i], cache[i]):
+          raise newException(ValueError, "kv_scatter mismatch at " & $i)
+      echo "PASS session kernel kv_scatter"
 
 sessionTests2()
 sessionTests()

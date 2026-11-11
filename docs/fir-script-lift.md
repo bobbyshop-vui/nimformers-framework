@@ -401,6 +401,14 @@ The lifter emits kernels built the way the Metal ones are:
 | Q4 GEMM (M > 1, `FIRLIFT_TARGET=apple`) | `genMatmulQ4Mm` | 32 x 32 tile, 4 simdgroups, 8 x 8 `simdgroup_matrix` (the `matmul_q4_mm_sg` kernel) |
 | RMSNorm, add + RMSNorm | `genRmsnormPar`, `genAddRmsnormPar` | one threadgroup per row |
 | decode attention, flash prefill | `genAttentionDecodePar` | one threadgroup per (row, head), scores in threadgroup memory |
+| RoPE | `genRopePosPar` | one thread per (row, head, frequency) |
+| KV scatter | `genKvScatterPar` | one thread per element |
+| f32 GEMV, `matmul_nt` (M = 1) | `genMatmulNTSimd` | one simdgroup per 4 rows, `simd_sum` |
+| f32 GEMM, `matmul_nt` (M > 1, `FIRLIFT_TARGET=apple`) | `genMatmulNTMm` | 32 x 32 tile, 4 simdgroups, 8 x 8 `simdgroup_matrix` |
+
+The Q4 GEMV variant is set per device when lifting: `FIRLIFT_Q4_ROWS` (1, 2, 4, 8 rows per simdgroup,
+default 4), `FIRLIFT_Q4_SG` (1, 2, 4, 8 simdgroups per threadgroup, default 2) and `FIRLIFT_Q4_PACKS`
+(1 or 2 eight-weight packs per lane step, default 1).
 
 `FIRLIFT_GENERIC=1` selects the lane-per-output kernels that also run on the CPU VM. Intel and AMD
 Metal devices cannot create `simdgroup_matrix` pipelines, so the GEMM kernel is only emitted for

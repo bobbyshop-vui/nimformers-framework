@@ -560,6 +560,78 @@ proc buildFp4KmGemvTunedProgram*(K, N, tg, rows: int): VmProgram =
   p.emitKmReduceDynamic(acc.toOpenArray(0, rows - 1), tg, false, N)
   p
 
+proc emitKmReduceSimd(p: var VmProgram; accum: openArray[uint32]; tg: int) =
+  ## simd_sum inside each simdgroup, one partial per simdgroup in threadgroup memory, then every
+  ## lane adds the partials (their count, tg / simdgroup width, is read at run time) and lane 0
+  ## stores. Correct for any simdgroup width, so Intel (16) and Apple (32) share the program.
+  for reg in accum: p.emitSimdSum(reg, reg)
+  p.emitSimdLane(3); p.emitSimdId(4); p.emitSimdW(5)
+  p.emitUToR(7, 1)                                    # R7 = float(lid)
+  p.emitUToR(1, 3)                                    # R1 = float(simd lane)
+  p.emitLoadConstF32(8, 1.0'f32)
+  p.emitCmpLt(9, 1, 8)
+  sessionVmIfGpu(p, 9):
+    p.emitUToR(2, 4)                                  # R2 = float(simdgroup index)
+    for r, reg in accum: p.emitTgStoreF32(reg, 2, uint32(Fp4KmLutLen + r * tg))
+  p.emitBarrierTg()
+  p.emitUToR(1, 5)
+  p.emitLoadConstF32(2, float32(tg))
+  p.emitDiv(2, 2, 1)                                  # R2 = simdgroups per threadgroup
+  for reg in accum: p.emitLoadConstF32(reg, 0)
+  p.emitLoadConstF32(6, 0)
+  p.emitLoadConstF32(5, float32(max(1, tg div 8)))    # upper bound on the simdgroup count (width >= 8)
+  sessionVmForGpu(p, 5):
+    p.emitCmpLt(9, 6, 2)
+    sessionVmIfGpu(p, 9):
+      for r, reg in accum:
+        p.emitTgLoadF32(1, 6, uint32(Fp4KmLutLen + r * tg))
+        p.emitAdd(reg, reg, 1)
+    p.emitAddConst(6, 6, 1.0'f32)
+  p.emitLoadConstF32(8, 1.0'f32)
+  p.emitCmpLt(9, 7, 8)
+  sessionVmIfGpu(p, 9):
+    for r, reg in accum: p.emitUStoreF32(reg, 2, uint32(r))
+  p.emitHalt()
+
+proc buildFp4KmGemvSimdProgram*(K, N, tg, rows: int): VmProgram =
+  ## The tuned FP4-KM decode GEMV with the Metal simdgroup reduction (simd_sum + one partial per
+  ## simdgroup) in place of the log2(tg) barrier tree; same loads, same per-lane accumulation.
+  doAssert tg in [32, 64, 128, 256, 512, 1024] and rows in [2, 4]
+  doAssert K > 0 and K mod (tg * 8) == 0 and N > 0 and N mod rows == 0
+  const acc = [4'u32, 12'u32, 13'u32, 14'u32]
+  const partial = [8'u32, 9'u32, 10'u32, 11'u32]
+  var p: VmProgram
+  p.emitUTgid(0); p.emitULid(1); p.emitKmLutCopyDynamic(tg)
+  p.emitUMulK(2, 0, uint32(rows))
+  p.emitUShrK(3, 1, 2); p.emitUAndK(4, 1, 3)
+  p.emitUMulK(5, 2, uint32(K div 2))
+  p.emitUShlK(10, 3, 4); p.emitUAdd(5, 5, 10)
+  p.emitUShlK(10, 4, 2); p.emitUAdd(5, 5, 10)
+  p.emitUMulK(6, 2, uint32(K div 32))
+  p.emitUAddK(6, 6, uint32(N * (K div 2))); p.emitUAdd(6, 6, 3)
+  p.emitUShlK(7, 3, 5); p.emitUAdd(7, 7, 10)
+  for r in 0 ..< rows: p.emitLoadConstF32(acc[r], 0)
+  p.emitLoadConstF32(5, float32(K div (tg * 8)))
+  sessionVmForGpu(p, 5):
+    for r in 0 ..< rows:
+      p.emitULoadU32(uint32(8 + r), 5, uint32(r * (K div 2)))
+      p.emitULoadU8(uint32(12 + r), 6, uint32(r * (K div 32)))
+      p.emitLoadConstF32(partial[r], 0)
+    for t in 0 ..< 4:
+      for hi in 0 ..< 2:
+        p.emitULoadIn(3, 7, uint32(t + 16 * hi))
+        for r in 0 ..< rows:
+          p.emitUShrK(3, uint32(8 + r), uint32(8 * t + 4 * hi)); p.emitUAndK(3, 3, 15)
+          p.emitUToR(1, 3); p.emitTgLoadF32(1, 1, 0)
+          p.emitFma(partial[r], 1, 3, partial[r])
+    for r in 0 ..< rows:
+      p.emitUToR(2, uint32(12 + r)); p.emitTgLoadF32(2, 2, 16)
+      p.emitFma(acc[r], 2, partial[r], acc[r])
+    p.emitUAddK(5, 5, uint32(tg * 4)); p.emitUAddK(6, 6, uint32(tg div 4))
+    p.emitUAddK(7, 7, uint32(tg * 8))
+  p.emitKmReduceSimd(acc.toOpenArray(0, rows - 1), tg)
+  p
+
 proc buildFp4KmGemmTunedProgram*(K, N, tg, batchRows: int): VmProgram =
   ## Batched variant: decode one packed word/scale for all input rows.
   doAssert tg in [32, 64, 128, 256, 512, 1024] and batchRows in [4, 8]

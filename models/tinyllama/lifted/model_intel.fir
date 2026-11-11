@@ -1063,242 +1063,252 @@ ustoref32 1 5 @out0
 uaddk 5 5 256
 forend 
 endkernel
-kernel s.rope in=2 out=1 threads=32 tg=32 tgbytes=16 expect=in0:131072,in1:1,out0:131072
+kernel s.rope in=2 out=1 threads=65536 tg=64 tgbytes=16 expect=in0:131072,in1:1,out0:131072
+rtou 0 0
+uconst 1 0
+uandk 2 0 31
+ushrk 3 0 5
+umulk 5 3 64
+uadd 5 5 2
+uloadf32 1 1 @in1
+utor 10 3
+addconst 10 10 0.5
+mulconst 10 10 0.03125
+rtou 4 10
+utor 9 4
+add 1 1 9
+utor 9 2
+mulconst 9 9 -0.28782313662426
+exp 2 9
+mul 3 1 2
+mulconst 11 3 0.1591549430919
+addconst 11 11 0.5
+rtou 6 11
+utor 11 6
+mulconst 13 11 6.28125
+sub 12 3 13
+mulconst 13 11 0.0019353071795864769
+sub 12 12 13
+mul 14 12 12
+mulconst 15 12 1
+mulconst 4 12 1
+loadconstf32 16 1
+loadconstf32 5 1
+mul 15 15 14
+mulconst 15 15 -0.16666666666667
+add 4 4 15
+mul 16 16 14
+mulconst 16 16 -0.5
+add 5 5 16
+mul 15 15 14
+mulconst 15 15 -0.05
+add 4 4 15
+mul 16 16 14
+mulconst 16 16 -0.08333333333333
+add 5 5 16
+mul 15 15 14
+mulconst 15 15 -0.02380952380952
+add 4 4 15
+mul 16 16 14
+mulconst 16 16 -0.03333333333333
+add 5 5 16
+mul 15 15 14
+mulconst 15 15 -0.01388888888889
+add 4 4 15
+mul 16 16 14
+mulconst 16 16 -0.01785714285714
+add 5 5 16
+mul 15 15 14
+mulconst 15 15 -0.00909090909091
+add 4 4 15
+mul 16 16 14
+mulconst 16 16 -0.01111111111111
+add 5 5 16
+mul 15 15 14
+mulconst 15 15 -0.00641025641026
+add 4 4 15
+mul 16 16 14
+mulconst 16 16 -0.00757575757576
+add 5 5 16
+mul 15 15 14
+mulconst 15 15 -0.0047619047619
+add 4 4 15
+mul 16 16 14
+mulconst 16 16 -0.00549450549451
+add 5 5 16
+mul 15 15 14
+mulconst 15 15 -0.00367647058824
+add 4 4 15
+mul 16 16 14
+mulconst 16 16 -0.00416666666667
+add 5 5 16
+mul 15 15 14
+mulconst 15 15 -0.00292397660819
+add 4 4 15
+mul 16 16 14
+mulconst 16 16 -0.00326797385621
+add 5 5 16
+mul 15 15 14
+mulconst 15 15 -0.00238095238095
+add 4 4 15
+mul 16 16 14
+mulconst 16 16 -0.00263157894737
+add 5 5 16
+mul 15 15 14
+mulconst 15 15 -0.00197628458498
+add 4 4 15
+mul 16 16 14
+mulconst 16 16 -0.0021645021645
+add 5 5 16
+uloadf32 6 5 @in0
+uloadf32 7 5 @in0+32
+mul 8 6 5
+mul 3 7 4
+sub 8 8 3
+ustoref32 8 5 @out0
+mul 8 7 5
+mul 3 6 4
+add 8 8 3
+ustoref32 8 5 @out0+32
+endkernel
+kernel s.rope_2 in=2 out=1 threads=8192 tg=64 tgbytes=16 expect=in0:16384,in1:1,out0:16384
+rtou 0 0
+uconst 1 0
+uandk 2 0 31
+ushrk 3 0 5
+umulk 5 3 64
+uadd 5 5 2
+uloadf32 1 1 @in1
+utor 10 3
+addconst 10 10 0.5
+mulconst 10 10 0.25
+rtou 4 10
+utor 9 4
+add 1 1 9
+utor 9 2
+mulconst 9 9 -0.28782313662426
+exp 2 9
+mul 3 1 2
+mulconst 11 3 0.1591549430919
+addconst 11 11 0.5
+rtou 6 11
+utor 11 6
+mulconst 13 11 6.28125
+sub 12 3 13
+mulconst 13 11 0.0019353071795864769
+sub 12 12 13
+mul 14 12 12
+mulconst 15 12 1
+mulconst 4 12 1
+loadconstf32 16 1
+loadconstf32 5 1
+mul 15 15 14
+mulconst 15 15 -0.16666666666667
+add 4 4 15
+mul 16 16 14
+mulconst 16 16 -0.5
+add 5 5 16
+mul 15 15 14
+mulconst 15 15 -0.05
+add 4 4 15
+mul 16 16 14
+mulconst 16 16 -0.08333333333333
+add 5 5 16
+mul 15 15 14
+mulconst 15 15 -0.02380952380952
+add 4 4 15
+mul 16 16 14
+mulconst 16 16 -0.03333333333333
+add 5 5 16
+mul 15 15 14
+mulconst 15 15 -0.01388888888889
+add 4 4 15
+mul 16 16 14
+mulconst 16 16 -0.01785714285714
+add 5 5 16
+mul 15 15 14
+mulconst 15 15 -0.00909090909091
+add 4 4 15
+mul 16 16 14
+mulconst 16 16 -0.01111111111111
+add 5 5 16
+mul 15 15 14
+mulconst 15 15 -0.00641025641026
+add 4 4 15
+mul 16 16 14
+mulconst 16 16 -0.00757575757576
+add 5 5 16
+mul 15 15 14
+mulconst 15 15 -0.0047619047619
+add 4 4 15
+mul 16 16 14
+mulconst 16 16 -0.00549450549451
+add 5 5 16
+mul 15 15 14
+mulconst 15 15 -0.00367647058824
+add 4 4 15
+mul 16 16 14
+mulconst 16 16 -0.00416666666667
+add 5 5 16
+mul 15 15 14
+mulconst 15 15 -0.00292397660819
+add 4 4 15
+mul 16 16 14
+mulconst 16 16 -0.00326797385621
+add 5 5 16
+mul 15 15 14
+mulconst 15 15 -0.00238095238095
+add 4 4 15
+mul 16 16 14
+mulconst 16 16 -0.00263157894737
+add 5 5 16
+mul 15 15 14
+mulconst 15 15 -0.00197628458498
+add 4 4 15
+mul 16 16 14
+mulconst 16 16 -0.0021645021645
+add 5 5 16
+uloadf32 6 5 @in0
+uloadf32 7 5 @in0+32
+mul 8 6 5
+mul 3 7 4
+sub 8 8 3
+ustoref32 8 5 @out0
+mul 8 7 5
+mul 3 6 4
+add 8 8 3
+ustoref32 8 5 @out0+32
+endkernel
+kernel s.kv_scatter in=3 out=1 threads=16384 tg=64 tgbytes=16 expect=in0:16384,in1:1,in2:524288,out0:524288
 rtou 0 0
 uconst 1 0
 uloadf32 1 1 @in1
-umulk 2 0 64
-loadconstf32 10 64
-forbegin 10
-loadconstf32 3 1
-mulconst 2 1 1
-loadconstf32 11 32
-forbegin 11
-mul 4 2 3
-mulconst 12 4 0.1591549430919
-addconst 12 12 0.5
-rtou 3 12
-utor 12 3
-mulconst 14 12 6.28125
-sub 13 4 14
-mulconst 14 12 0.0019353071795864769
-sub 13 13 14
-mul 15 13 13
-mulconst 16 13 1
-mulconst 5 13 1
-loadconstf32 17 1
-loadconstf32 6 1
-mul 16 16 15
-mulconst 16 16 -0.16666666666667
-add 5 5 16
-mul 17 17 15
-mulconst 17 17 -0.5
-add 6 6 17
-mul 16 16 15
-mulconst 16 16 -0.05
-add 5 5 16
-mul 17 17 15
-mulconst 17 17 -0.08333333333333
-add 6 6 17
-mul 16 16 15
-mulconst 16 16 -0.02380952380952
-add 5 5 16
-mul 17 17 15
-mulconst 17 17 -0.03333333333333
-add 6 6 17
-mul 16 16 15
-mulconst 16 16 -0.01388888888889
-add 5 5 16
-mul 17 17 15
-mulconst 17 17 -0.01785714285714
-add 6 6 17
-mul 16 16 15
-mulconst 16 16 -0.00909090909091
-add 5 5 16
-mul 17 17 15
-mulconst 17 17 -0.01111111111111
-add 6 6 17
-mul 16 16 15
-mulconst 16 16 -0.00641025641026
-add 5 5 16
-mul 17 17 15
-mulconst 17 17 -0.00757575757576
-add 6 6 17
-mul 16 16 15
-mulconst 16 16 -0.0047619047619
-add 5 5 16
-mul 17 17 15
-mulconst 17 17 -0.00549450549451
-add 6 6 17
-mul 16 16 15
-mulconst 16 16 -0.00367647058824
-add 5 5 16
-mul 17 17 15
-mulconst 17 17 -0.00416666666667
-add 6 6 17
-mul 16 16 15
-mulconst 16 16 -0.00292397660819
-add 5 5 16
-mul 17 17 15
-mulconst 17 17 -0.00326797385621
-add 6 6 17
-mul 16 16 15
-mulconst 16 16 -0.00238095238095
-add 5 5 16
-mul 17 17 15
-mulconst 17 17 -0.00263157894737
-add 6 6 17
-mul 16 16 15
-mulconst 16 16 -0.00197628458498
-add 5 5 16
-mul 17 17 15
-mulconst 17 17 -0.0021645021645
-add 6 6 17
-uloadf32 7 2 @in0
-uloadf32 8 2 @in0+32
-mul 9 7 6
-mul 4 8 5
-sub 9 9 4
-ustoref32 9 2 @out0
-mul 9 8 6
-mul 4 7 5
-add 9 9 4
-ustoref32 9 2 @out0+32
-mulconst 3 3 0.74989420933246
-uaddk 2 2 1
-forend 
-addconst 1 1 1
-uaddk 2 2 2016
-forend 
-endkernel
-kernel s.rope_2 in=2 out=1 threads=4 tg=4 tgbytes=16 expect=in0:16384,in1:1,out0:16384
-rtou 0 0
-uconst 1 0
-uloadf32 1 1 @in1
-umulk 2 0 64
-loadconstf32 10 64
-forbegin 10
-loadconstf32 3 1
-mulconst 2 1 1
-loadconstf32 11 32
-forbegin 11
-mul 4 2 3
-mulconst 12 4 0.1591549430919
-addconst 12 12 0.5
-rtou 3 12
-utor 12 3
-mulconst 14 12 6.28125
-sub 13 4 14
-mulconst 14 12 0.0019353071795864769
-sub 13 13 14
-mul 15 13 13
-mulconst 16 13 1
-mulconst 5 13 1
-loadconstf32 17 1
-loadconstf32 6 1
-mul 16 16 15
-mulconst 16 16 -0.16666666666667
-add 5 5 16
-mul 17 17 15
-mulconst 17 17 -0.5
-add 6 6 17
-mul 16 16 15
-mulconst 16 16 -0.05
-add 5 5 16
-mul 17 17 15
-mulconst 17 17 -0.08333333333333
-add 6 6 17
-mul 16 16 15
-mulconst 16 16 -0.02380952380952
-add 5 5 16
-mul 17 17 15
-mulconst 17 17 -0.03333333333333
-add 6 6 17
-mul 16 16 15
-mulconst 16 16 -0.01388888888889
-add 5 5 16
-mul 17 17 15
-mulconst 17 17 -0.01785714285714
-add 6 6 17
-mul 16 16 15
-mulconst 16 16 -0.00909090909091
-add 5 5 16
-mul 17 17 15
-mulconst 17 17 -0.01111111111111
-add 6 6 17
-mul 16 16 15
-mulconst 16 16 -0.00641025641026
-add 5 5 16
-mul 17 17 15
-mulconst 17 17 -0.00757575757576
-add 6 6 17
-mul 16 16 15
-mulconst 16 16 -0.0047619047619
-add 5 5 16
-mul 17 17 15
-mulconst 17 17 -0.00549450549451
-add 6 6 17
-mul 16 16 15
-mulconst 16 16 -0.00367647058824
-add 5 5 16
-mul 17 17 15
-mulconst 17 17 -0.00416666666667
-add 6 6 17
-mul 16 16 15
-mulconst 16 16 -0.00292397660819
-add 5 5 16
-mul 17 17 15
-mulconst 17 17 -0.00326797385621
-add 6 6 17
-mul 16 16 15
-mulconst 16 16 -0.00238095238095
-add 5 5 16
-mul 17 17 15
-mulconst 17 17 -0.00263157894737
-add 6 6 17
-mul 16 16 15
-mulconst 16 16 -0.00197628458498
-add 5 5 16
-mul 17 17 15
-mulconst 17 17 -0.0021645021645
-add 6 6 17
-uloadf32 7 2 @in0
-uloadf32 8 2 @in0+32
-mul 9 7 6
-mul 4 8 5
-sub 9 9 4
-ustoref32 9 2 @out0
-mul 9 8 6
-mul 4 7 5
-add 9 9 4
-ustoref32 9 2 @out0+32
-mulconst 3 3 0.74989420933246
-uaddk 2 2 1
-forend 
-addconst 1 1 1
-uaddk 2 2 224
-forend 
-endkernel
-kernel s.kv_scatter in=3 out=1 threads=4 tg=4 tgbytes=16 expect=in0:16384,in1:1,in2:524288,out0:524288
-rtou 0 0
-uconst 4 0
-uloadf32 1 4 @in1
-rtou 1 1
-umulk 1 1 64
-umulk 3 0 131072
-uadd 3 3 1
-umulk 2 0 64
-loadconstf32 3 64
-forbegin 3
-loadconstf32 4 64
-forbegin 4
-uloadf32 2 2 @in0
-ustoref32 2 3 @in2
-uaddk 2 2 1
-uaddk 3 3 1
-forend 
-uaddk 2 2 192
-forend 
+rtou 2 1
+utor 3 0
+addconst 3 3 0.5
+mulconst 3 3 0.015625
+rtou 3 3
+utor 4 0
+utor 5 3
+mulconst 5 5 64
+sub 4 4 5
+rtou 6 4
+utor 6 3
+addconst 6 6 0.5
+mulconst 6 6 0.25
+rtou 4 6
+utor 7 3
+utor 8 4
+mulconst 8 8 4
+sub 7 7 8
+rtou 5 7
+uadd 7 2 4
+umulk 5 5 2048
+uadd 7 7 5
+umulk 7 7 64
+uadd 7 7 6
+uloadf32 2 0 @in0
+ustoref32 2 7 @in2
 endkernel
 kernel s.flash_prefill in=4 out=1 threads=262144 tg=128 tgbytes=8704 expect=in0:131072,in1:524288,in2:524288,in3:1,out0:131072 tag=aten::scaled_dot_product_attention
 rtou 0 0
@@ -1837,8 +1847,9 @@ add 15 9 10
 add 16 11 12
 add 15 15 16
 add 13 14 15
-ushrk 15 7 7
-ushrk 14 7 1
+uaddk 16 7 0
+ushrk 15 16 7
+ushrk 14 16 1
 uaddk 13 6 0
 umulk 9 13 1024
 uadd 9 9 8
@@ -2079,8 +2090,9 @@ add 15 9 10
 add 16 11 12
 add 15 15 16
 add 13 14 15
-ushrk 15 7 7
-ushrk 14 7 1
+uaddk 16 7 0
+ushrk 15 16 7
+ushrk 14 16 1
 uaddk 13 6 0
 umulk 9 13 1024
 uadd 9 9 8
@@ -2321,8 +2333,9 @@ add 15 9 10
 add 16 11 12
 add 15 15 16
 add 13 14 15
-ushrk 15 7 7
-ushrk 14 7 1
+uaddk 16 7 0
+ushrk 15 16 7
+ushrk 14 16 1
 uaddk 13 6 0
 umulk 9 13 1024
 uadd 9 9 8
@@ -2522,19 +2535,22 @@ ustoref32 16 13 @out0
 ifend 
 ifend 
 endkernel
-kernel s.rope_3 in=2 out=1 threads=32 tg=32 tgbytes=16 expect=in0:2048,in1:1,out0:2048
+kernel s.rope_3 in=2 out=1 threads=1024 tg=64 tgbytes=16 expect=in0:2048,in1:1,out0:2048
 rtou 0 0
 uconst 1 0
+uandk 2 0 31
+ushrk 3 0 5
+umulk 5 3 64
+uadd 5 5 2
 uloadf32 1 1 @in1
-loadconstf32 2 1
-umulk 2 0 64
-loadconstf32 9 32
-forbegin 9
+utor 9 2
+mulconst 9 9 -0.28782313662426
+exp 2 9
 mul 3 1 2
 mulconst 10 3 0.1591549430919
 addconst 10 10 0.5
-rtou 3 10
-utor 10 3
+rtou 6 10
+utor 10 6
 mulconst 12 10 6.28125
 sub 11 3 12
 mulconst 12 10 0.0019353071795864769
@@ -2610,35 +2626,35 @@ add 4 4 14
 mul 15 15 13
 mulconst 15 15 -0.0021645021645
 add 5 5 15
-uloadf32 6 2 @in0
-uloadf32 7 2 @in0+32
+uloadf32 6 5 @in0
+uloadf32 7 5 @in0+32
 mul 8 6 5
 mul 3 7 4
 sub 8 8 3
 mulconst 8 8 0.125
-ustoref32 8 2 @out0
+ustoref32 8 5 @out0
 mul 8 7 5
 mul 3 6 4
 add 8 8 3
 mulconst 8 8 0.125
-ustoref32 8 2 @out0+32
-mulconst 2 2 0.74989420933246
-uaddk 2 2 1
-forend 
+ustoref32 8 5 @out0+32
 endkernel
-kernel s.rope_4 in=2 out=1 threads=4 tg=4 tgbytes=16 expect=in0:256,in1:1,out0:256
+kernel s.rope_4 in=2 out=1 threads=128 tg=64 tgbytes=16 expect=in0:256,in1:1,out0:256
 rtou 0 0
 uconst 1 0
+uandk 2 0 31
+ushrk 3 0 5
+umulk 5 3 64
+uadd 5 5 2
 uloadf32 1 1 @in1
-loadconstf32 2 1
-umulk 2 0 64
-loadconstf32 9 32
-forbegin 9
+utor 9 2
+mulconst 9 9 -0.28782313662426
+exp 2 9
 mul 3 1 2
 mulconst 10 3 0.1591549430919
 addconst 10 10 0.5
-rtou 3 10
-utor 10 3
+rtou 6 10
+utor 10 6
 mulconst 12 10 6.28125
 sub 11 3 12
 mulconst 12 10 0.0019353071795864769
@@ -2714,40 +2730,47 @@ add 4 4 14
 mul 15 15 13
 mulconst 15 15 -0.0021645021645
 add 5 5 15
-uloadf32 6 2 @in0
-uloadf32 7 2 @in0+32
+uloadf32 6 5 @in0
+uloadf32 7 5 @in0+32
 mul 8 6 5
 mul 3 7 4
 sub 8 8 3
-ustoref32 8 2 @out0
+ustoref32 8 5 @out0
 mul 8 7 5
 mul 3 6 4
 add 8 8 3
-ustoref32 8 2 @out0+32
-mulconst 2 2 0.74989420933246
-uaddk 2 2 1
-forend 
+ustoref32 8 5 @out0+32
 endkernel
-kernel s.kv_scatter_2 in=3 out=1 threads=4 tg=4 tgbytes=16 expect=in0:256,in1:1,in2:524288,out0:524288
+kernel s.kv_scatter_2 in=3 out=1 threads=256 tg=64 tgbytes=16 expect=in0:256,in1:1,in2:524288,out0:524288
 rtou 0 0
-uconst 4 0
-uloadf32 1 4 @in1
-rtou 1 1
-umulk 1 1 64
-umulk 3 0 131072
-uadd 3 3 1
-umulk 2 0 64
-loadconstf32 3 1
-forbegin 3
-loadconstf32 4 64
-forbegin 4
-uloadf32 2 2 @in0
-ustoref32 2 3 @in2
-uaddk 2 2 1
-uaddk 3 3 1
-forend 
-uaddk 2 2 192
-forend 
+uconst 1 0
+uloadf32 1 1 @in1
+rtou 2 1
+utor 3 0
+addconst 3 3 0.5
+mulconst 3 3 0.015625
+rtou 3 3
+utor 4 0
+utor 5 3
+mulconst 5 5 64
+sub 4 4 5
+rtou 6 4
+utor 6 3
+addconst 6 6 0.5
+mulconst 6 6 0.25
+rtou 4 6
+utor 7 3
+utor 8 4
+mulconst 8 8 4
+sub 7 7 8
+rtou 5 7
+uadd 7 2 4
+umulk 5 5 2048
+uadd 7 7 5
+umulk 7 7 64
+uadd 7 7 6
+uloadf32 2 0 @in0
+ustoref32 2 7 @in2
 endkernel
 kernel s.attention in=4 out=1 threads=4096 tg=128 tgbytes=8704 expect=in0:2048,in1:524288,in2:524288,in3:1,out0:2048 tag=aten::scaled_dot_product_attention
 rtou 0 0
@@ -3167,8 +3190,9 @@ add 15 9 10
 add 16 11 12
 add 15 15 16
 add 13 14 15
-ushrk 15 7 7
-ushrk 14 7 1
+uaddk 16 7 0
+ushrk 15 16 7
+ushrk 14 16 1
 uaddk 13 6 0
 umulk 9 13 1024
 uadd 9 9 8
@@ -3418,8 +3442,9 @@ add 15 9 10
 add 16 11 12
 add 15 15 16
 add 13 14 15
-ushrk 15 7 7
-ushrk 14 7 1
+uaddk 16 7 0
+ushrk 15 16 7
+ushrk 14 16 1
 uaddk 13 6 0
 umulk 9 13 2816
 uadd 9 9 8
