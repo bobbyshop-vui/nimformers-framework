@@ -1336,19 +1336,26 @@ proc genNormPar(rows, cols: int; eps: float; addInput: bool; T = 256): Gen =
 proc genRmsnormPar*(rows, cols: int; eps: float): Gen = genNormPar(rows, cols, eps, false)
 proc genAddRmsnormPar*(cols: int; eps: float): Gen = genNormPar(1, cols, eps, true)
 
-proc genAttentionDecodePar*(H, HKV, D, maxSeqLen: int; T = 128): Gen =
+proc genFlashPrefill*(T, H, HKV, D, maxSeqLen: int; scale: float): Gen
+
+proc genAttentionDecodePar*(H, HKV, D, maxSeqLen: int; T = 128; flashT = 0; scale = 1.0): Gen =
   ## Decode attention with one threadgroup of T lanes per query head, as the Metal decode kernels
   ## do: lanes take the keys s = lane, lane+T, ... (score = q . K[s], kept in threadgroup memory),
   ## the max and the sum of exp are reduced across the group, then lane d < D accumulates
   ## sum_s p[s] * V[s][d]. Ports as genAttentionDecode with countFromPosition (in3 = position).
+  ## flashT > 0: the prefill form, one threadgroup per (row t, head h) over `flashT` rows, row t sees
+  ## position + t + 1 keys and the scores are multiplied by `scale` (q and o are [flashT, H, D]).
   let nRep = if HKV > 0: H div HKV else: 0
   if HKV <= 0 or H mod HKV != 0 or (nRep and (nRep - 1)) != 0 or D > T or
-     (maxSeqLen + T) * 4 > 24000:
+     (maxSeqLen + T) * 4 > 24000 or (flashT > 0 and (H and (H - 1)) != 0):
+    if flashT > 0: return genFlashPrefill(flashT, H, HKV, D, maxSeqLen, scale)
     return genAttentionDecode(H, HKV, D, maxSeqLen, true)
   var nShift = 0
   while (1 shl nShift) < nRep: inc nShift
   var tShift = 0
   while (1 shl tShift) < T: inc tShift
+  var hShift = 0
+  while (1 shl hShift) < H: inc hShift
   let k = newKB()
   let h = k.u()
   let kvh = k.u()
@@ -1381,7 +1388,15 @@ proc genAttentionDecodePar*(H, HKV, D, maxSeqLen: int; T = 128): Gen =
   k.e("loadlid", lf)
   k.e("uloadf32", sCnt, zeroU, "@in3")
   k.e("addconst", sCnt, sCnt, 1)
-  k.e("ushrk", kvh, h, nShift)
+  if flashT > 0:
+    # tgid = t * H + h: the row adds t keys, the kv head comes from h, q/o rows start at tgid * D
+    k.e("ushrk", tmp, h, hShift)
+    k.e("utor", dot, tmp)
+    k.e("add", sCnt, sCnt, dot)
+    k.e("uandk", kvh, h, H - 1)
+    k.e("ushrk", kvh, kvh, nShift)
+  else:
+    k.e("ushrk", kvh, h, nShift)
   k.e("umulk", qb, h, D)
   k.e("umulk", kvb, kvh, maxSeqLen * D)
   k.e("rtou", stepsU, sCnt)
@@ -1410,6 +1425,7 @@ proc genAttentionDecodePar*(H, HKV, D, maxSeqLen: int; T = 128): Gen =
         k.e("add", dot, dot, qv)
         k.e("uaddk", qi, qi, 1)
         k.e("uaddk", ki, ki, 1))
+      if flashT > 0: k.e("mulconst", dot, dot, fnum(scale))
       k.e("tgstoref32", dot, sF, 0)
       k.e("cmplt", c, m, dot)
       k.cond(c, proc() = k.cp(m, dot)))
@@ -1449,7 +1465,197 @@ proc genAttentionDecodePar*(H, HKV, D, maxSeqLen: int; T = 128): Gen =
     k.e("div", dot, dot, gl)
     k.e("uadd", tmp, qb, lane)
     k.e("ustoref32", dot, tmp, "@out0"))
-  result = Gen(body: k.text, threads: H * T, ins: 4, outs: 1, tg: T, tgBytes: (maxSeqLen + T) * 4)
+  result = Gen(body: k.text, threads: (if flashT > 0: flashT else: 1) * H * T, ins: 4, outs: 1, tg: T,
+    tgBytes: (maxSeqLen + T) * 4)
+
+proc genMatmulQ4Mm*(M, K, N, groupSize, nGroups: int): Gen =
+  ## Prefill Q4 GEMM built like the Metal kernel matmul_q4_mm_sg (simdgroup_matrix): a 32 x 32
+  ## output tile per threadgroup, K walked in steps of 32, the activation tile and the dequantised
+  ## weight tile staged in threadgroup memory, four simdgroups (2 x 2) multiplying 16 x 16 blocks
+  ## with 8 x 8 simdgroup matrices. Same ports as genMatmulQ4Par. Needs K % 32 == 0 and a
+  ## power-of-two group of at least 8 that divides K; otherwise the lane-per-column kernel.
+  let gs = if groupSize > 0: groupSize else: K
+  if K mod 32 != 0 or K mod gs != 0 or (gs and (gs - 1)) != 0 or gs < 8:
+    return genMatmulQ4Par(M, K, N, groupSize, nGroups)
+  var gShift = 0
+  while (1 shl gShift) < gs: inc gShift
+  const LD = 36
+  const WS = 32 * LD
+  let rowBytes = K div 2
+  let wqF = (N * rowBytes + 3) div 4
+  let scalesAddr = "@in1+" & $wqF
+  let zerosAddr = "@in1+" & $(wqF + N * nGroups)
+  let nTN = (N + 31) div 32
+  let nTM = (M + 31) div 32
+  let k = newKB()
+  let tg = k.u()
+  let lid = k.u()
+  let sg = k.u()
+  let tm = k.u()
+  let tn = k.u()
+  let n0 = k.u()
+  let m0 = k.u()
+  let lr = k.u()
+  let lc = k.u()
+  let sm = k.u()
+  let sn = k.u()
+  let k0 = k.u()
+  let gk = k.u()
+  let t1 = k.u()
+  let t2 = k.u()
+  let xoff0 = k.u()
+  let xoff1 = k.u()
+  let woff0 = k.u()
+  let woff1 = k.u()
+  let rowW = k.u()
+  let wqb = k.u()
+  let gb = k.u()
+  let pk = k.u()
+  let xi = k.r()
+  let tf = k.r()
+  let tq = k.r()
+  let tilesN = k.cf(float(nTN))
+  let mf = k.cf(float(M))
+  let nf = k.cf(float(N))
+  let one = k.cf(1)
+  let c = k.r()
+  let c2 = k.r()
+  let sc = k.r()
+  let zp = k.r()
+  var v: seq[int]
+  for j in 0 ..< 8: v.add k.r()
+  k.e("utgid", tg)
+  k.e("ulid", lid)
+  k.e("simdid", sg)
+  k.e("utor", tf, tg)
+  k.e("div", tq, tf, tilesN)
+  k.e("rtou", tm, tq)                    # truncating: tile row = tg / nTN
+  k.e("utor", tq, tm)
+  k.e("mul", tq, tq, tilesN)
+  k.e("sub", tf, tf, tq)
+  k.e("rtou", tn, tf)                    # tile column = tg - tm * nTN
+  k.e("umulk", n0, tn, 32)
+  k.e("umulk", m0, tm, 32)
+  k.e("ushrk", lr, lid, 2)
+  k.e("uandk", lc, lid, 3)
+  k.e("umulk", lc, lc, 8)
+  k.e("ushrk", sm, sg, 1)
+  k.e("uandk", sn, sg, 1)
+  k.e("umulk", t1, lr, LD)
+  k.e("uadd", t1, t1, lc)
+  k.e("utor", xi, t1)
+  k.e("umulk", xoff0, sm, 16 * LD)
+  k.e("uaddk", xoff1, xoff0, 8 * LD)
+  k.e("umulk", woff0, sn, 16 * LD)
+  k.e("uaddk", woff0, woff0, WS)
+  k.e("uaddk", woff1, woff0, 8 * LD)
+  k.e("uconst", wqb, "@in1")
+  k.e("umulk", wqb, wqb, 4)
+  k.e("uaddk", t1, n0, 0)
+  k.e("uadd", t1, t1, lr)                # n = n0 + lr
+  k.e("umulk", rowW, t1, rowBytes)
+  k.e("uadd", rowW, rowW, wqb)
+  k.e("uconst", k0, 0)
+  for i in 0 ..< 4: k.e("mmzero", i)
+  k.forN(K div 32, proc() =
+    k.e("uadd", gk, k0, lc)
+    # activation tile row lr (zeros past M)
+    for j in 0 ..< 8: k.e("loadconstf32", v[j], 0)
+    k.e("uadd", t1, m0, lr)
+    k.e("utor", tf, t1)
+    k.e("cmplt", c, tf, mf)
+    k.cond(c, proc() =
+      k.e("umulk", t1, t1, K)
+      k.e("uadd", t1, t1, gk)
+      for j in 0 ..< 8: k.e("uloadf32", v[j], t1, "@in0+" & $j))
+    for j in 0 ..< 8: k.e("tgstoref32", v[j], xi, j)
+    # dequantised weight tile row lr (zeros past N)
+    for j in 0 ..< 8: k.e("loadconstf32", v[j], 0)
+    k.e("uadd", t1, n0, lr)
+    k.e("utor", tf, t1)
+    k.e("cmplt", c, tf, nf)
+    k.cond(c, proc() =
+      k.e("ushrk", t2, gk, 1)
+      k.e("uadd", t2, t2, rowW)
+      k.e("uloadu32", pk, t2, 0)
+      k.e("umulk", t1, t1, nGroups)
+      k.e("ushrk", gb, gk, gShift)
+      k.e("uadd", t1, t1, gb)
+      k.e("uloadf32", sc, t1, scalesAddr)
+      k.e("uloadf32", zp, t1, zerosAddr)
+      for j in 0 ..< 8:
+        k.e("ushrk", t2, pk, 4 * j)
+        if j < 7: k.e("uandk", t2, t2, 15)
+        k.e("utor", v[j], t2)
+        k.e("sub", v[j], v[j], zp)
+        k.e("mul", v[j], v[j], sc))
+    for j in 0 ..< 8: k.e("tgstoref32", v[j], xi, WS + j)
+    k.e("barriertg")
+    for kk in 0 ..< 4:
+      k.e("uaddk", t1, xoff0, kk * 8)
+      k.e("mmload", 4, t1, LD)
+      k.e("uaddk", t1, xoff1, kk * 8)
+      k.e("mmload", 5, t1, LD)
+      k.e("uaddk", t1, woff0, kk * 8)
+      k.e("mmloadt", 6, t1, LD)
+      k.e("uaddk", t1, woff1, kk * 8)
+      k.e("mmloadt", 7, t1, LD)
+      for i in 0 ..< 2:
+        for j in 0 ..< 2:
+          k.e("mmmac", i * 2 + j, 4 + i, 6 + j)
+    k.e("barriertg")
+    k.e("uaddk", k0, k0, 32))
+  # epilogue: a full tile goes straight to memory, a partial one through threadgroup memory
+  k.e("utor", tf, m0)
+  k.e("addconst", tf, tf, 31)
+  k.e("cmplt", c, tf, mf)
+  k.e("utor", tf, n0)
+  k.e("addconst", tf, tf, 31)
+  k.e("cmplt", c2, tf, nf)
+  k.e("mul", c, c, c2)
+  k.cond(c, proc() =
+    k.e("uconst", t1, "@out0")
+    k.e("umulk", t2, sm, 16)
+    k.e("uadd", t2, t2, m0)
+    k.e("umulk", t2, t2, N)
+    k.e("uadd", t1, t1, t2)
+    k.e("umulk", t2, sn, 16)
+    k.e("uadd", t2, t2, n0)
+    k.e("uadd", t1, t1, t2)
+    for i in 0 ..< 2:
+      for j in 0 ..< 2:
+        k.e("uaddk", t2, t1, i * 8 * N + j * 8)
+        k.e("mmstoremem", i * 2 + j, t2, N))
+  k.e("sub", c, one, c)
+  k.cond(c, proc() =
+    for i in 0 ..< 2:
+      for j in 0 ..< 2:
+        k.e("umulk", t2, sn, 16)
+        k.e("uadd", t2, t2, xoff0)
+        k.e("uaddk", t2, t2, i * 8 * LD + j * 8)
+        k.e("mmstoretg", i * 2 + j, t2, LD)
+    k.e("barriertg")
+    for it in 0 ..< 8:
+      # element (r, col) of the tile: r = lid / 32 + 4 * it, col = lid % 32
+      k.e("ushrk", t1, lid, 5)
+      k.e("uaddk", t1, t1, 4 * it)          # r
+      k.e("uandk", t2, lid, 31)             # col
+      k.e("uadd", gk, m0, t1)               # global row
+      k.e("uadd", gb, n0, t2)               # global col
+      k.e("utor", tf, gk)
+      k.e("cmplt", c, tf, mf)
+      k.e("utor", tf, gb)
+      k.e("cmplt", c2, tf, nf)
+      k.e("mul", c, c, c2)
+      k.cond(c, proc() =
+        k.e("umulk", t1, t1, LD)
+        k.e("uadd", t1, t1, t2)
+        k.e("utor", tf, t1)
+        k.e("tgloadf32", sc, tf, 0)
+        k.e("umulk", gk, gk, N)
+        k.e("uadd", gk, gk, gb)
+        k.e("ustoref32", sc, gk, "@out0")))
+  result = Gen(body: k.text, threads: nTM * nTN * 128, ins: 2, outs: 1, tg: 128, tgBytes: 2 * WS * 4)
 
 proc genArgmax*(outer, dimSize, inner: int): Gen =
   ## sessionArgmaxIndexEnc(x, val, idx, outer, dimSize, inner): first maximum along dim.

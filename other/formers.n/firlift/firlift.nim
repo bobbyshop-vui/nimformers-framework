@@ -69,6 +69,8 @@ type
     decodeFirst*: int
     stepPosition*, stepToken*: int   ## of the last recorded step (-1 when absent)
     stepPositions*, stepTokens*: seq[int]
+    stepKinds*: seq[string]          ## "prefill" / "decode" per recorded step
+    stepRows*: seq[int]              ## tokens the step consumed
 
   BufferDef* = object
     name*: string
@@ -310,9 +312,14 @@ proc parseTrace*(text: string): Trace =
       inc result.steps
       result.stepPosition = -1
       result.stepToken = -1
+      var rows = 1
+      let head = raw.splitWhitespace()
+      result.stepKinds.add (if head.len > 1: head[1] else: "")
       for tok in raw.splitWhitespace():
+        if tok.startsWith("tokens="): rows = parseInt(tok[7 .. ^1])
         if tok.startsWith("position="): result.stepPosition = parseInt(tok[9 .. ^1])
         elif tok.startsWith("token="): result.stepToken = parseInt(tok[6 .. ^1])
+      result.stepRows.add rows
       result.stepPositions.add result.stepPosition
       result.stepTokens.add result.stepToken
     elif raw == "end step":
