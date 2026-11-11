@@ -1977,6 +1977,19 @@ proc decodeProfileReport*(): string =
   gDecodeProfileSec.setLen(0)
   gDecodeProfileTokens = 0
 
+var gRopeCos, gRopeSin: SessionHandle   ## resident [maxSeq][D/2] RoPE tables read by the fused RoPE kernel
+var gRopeTabsLen = 0                      ## cosT.len of the uploaded tables (0: none)
+
+proc ensureRopeTables*(be: GpuBackend, rope: RoPEL) =
+  ## Uploads the cos/sin tables once (outside any session).
+  if gRopeTabsLen == rope.cosT.len or rope.cosT.len == 0 or be != gbMetal: return
+  if gRopeTabsLen > 0:
+    sessionFree(be, gRopeCos)
+    sessionFree(be, gRopeSin)
+  gRopeCos = sessionUpload(be, rope.cosT)
+  gRopeSin = sessionUpload(be, rope.sinT)
+  gRopeTabsLen = rope.cosT.len
+
 proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSNormL,
     ff: SwiGLUL, hXIn: SessionHandle, rope: RoPEL, be: GpuBackend, cache: var KVCacheL,
     layerIdx: int, pending: var seq[SessionHandle]): SessionHandle =
@@ -2065,23 +2078,25 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
   mark("qkv")
   # ---- RoPE(Q), RoPE(K) in THE SAME session ----
   let halfD = D div 2
-  var cosSlice = newSeq[float32](halfD)
-  var sinSlice = newSeq[float32](halfD)
   let pos = cache.seqLen
   doAssert pos < rope.maxSeqLen, "RoPE: position exceeds max_seq_len"
-  for i in 0 ..< halfD:
-    cosSlice[i] = rope.cosT[pos * halfD + i]
-    sinSlice[i] = rope.sinT[pos * halfD + i]
-  let hCosT = sessionUpload(be, cosSlice); pending.add(hCosT)
-  let hSinT = sessionUpload(be, sinSlice); pending.add(hSinT)
   ensureKvResident(cache.layers[layerIdx], be, HKV, cache.maxSeqLen, D)
   step(kvResidentUsable(cache, layerIdx), "KV resident is not ready for this layer")
-  # RoPE(Q,K) + Q scale + KV append in one dispatch when the backend has it
-  let ropeKvFused = sessionRopeKvEnc(be, hQ, hK, hV, hCosT, hSinT,
+  # RoPE(Q,K) + Q scale + KV append in one dispatch when the backend has it; it reads the
+  # resident cos/sin tables at `pos`, so nothing per-token is uploaded.
+  let ropeKvFused = gRopeTabsLen == rope.cosT.len and
+                    sessionRopeKvEnc(be, hQ, hK, hV, gRopeCos, gRopeSin,
                                      cache.layers[layerIdx].kResidentCombined,
                                      cache.layers[layerIdx].vResidentCombined,
                                      H, HKV, D, cache.maxSeqLen, cache.seqLen, attn.scale)
   if not ropeKvFused:
+    var cosSlice = newSeq[float32](halfD)
+    var sinSlice = newSeq[float32](halfD)
+    for i in 0 ..< halfD:
+      cosSlice[i] = rope.cosT[pos * halfD + i]
+      sinSlice[i] = rope.sinT[pos * halfD + i]
+    let hCosT = sessionUpload(be, cosSlice); pending.add(hCosT)
+    let hSinT = sessionUpload(be, sinSlice); pending.add(hSinT)
     step(sessionRope(be, hQ, hCosT, hSinT, 1, H, D), "RoPE(Q) failed/not supported")
     step(sessionRope(be, hK, hCosT, hSinT, 1, HKV, D), "RoPE(K) failed/not supported")
     # ---- Multiply Q by attn.scale RIGHT ON THE GPU ----
@@ -2499,6 +2514,7 @@ proc forwardDecodeAllLayersMergedSession(m: LlamaModelL, xData: seq[float32], ct
   # A token normally fits one command buffer (as before pacing): it is split
   # only once a measured token takes longer than BYBY_DECODE_CB_MS (default
   # 1500), since every extra commit slows the decode down on Intel Metal.
+  ensureRopeTables(be, m.rope)
   let layersPerCb = decodeLayersPerCb(m.blocks.len, be)
   let t0 = epochTime()
   if not sessionBegin(be):
@@ -2608,44 +2624,102 @@ proc decodePipeStart*(m: LlamaModelL, ctx: Backend, firstToken: int): bool =
   sessionTokenRingSet(be, gPipe.ring, 0, firstToken)
   true
 
+var gGraphValid = false                    ## a decode graph is recorded (see metal_graph_* in the Metal shim)
+var gGraphSig: seq[int]                    ## KV buffers the graph was recorded against
+
+proc graphSignature(cache: KVCacheL): seq[int] =
+  result = @[cache.maxSeqLen]
+  for l in cache.layers:
+    result.add cast[int](l.kResidentCombined.metalHandle)
+    result.add cast[int](l.vResidentCombined.metalHandle)
+
+proc decodeGraphWanted(be: GpuBackend): bool =
+  ## BYBY_GRAPH=1 turns the recorded decode graph on (Metal, not with BYBY_DECODE_PROFILE).
+  be == gbMetal and getEnv("BYBY_GRAPH", "0") == "1" and gDecodeProfileLayer < 0
+
 proc decodePipeEnqueue*(m: LlamaModelL, ctx: Backend, cache: var KVCacheL): bool =
   ## Encodes and commits one step for the token in the current ring slot, and
   ## advances cache.seqLen by one. False (nothing advanced) if encoding failed.
+  ## On Metal the first step is recorded into a replayable graph; later steps only replay it,
+  ## so the CPU does not encode the layers again.
   let be = ctx.kind.toByby()
   let C = m.config.hiddenSize
   let layersPerCb = decodeLayersPerCb(m.blocks.len, be)
   let tEnc = epochTime()
-  if not sessionBegin(be): return false
-  var pending = newSeq[SessionHandle]()
-  var ok = false
-  try:
-    var hX = sessionAllocScratch(be, C); pending.add(hX)
-    if not sessionEmbedTokenEnc(be, gPipe.table, gPipe.ring, hX, C, gPipe.step mod DecodeRing):
-      raise newException(CatchableError, "[GPU_SAMPLE] embedding gather failed")
-    for idx in 0 ..< m.blocks.len:
-      if decodeCommitBefore(idx, layersPerCb) and not sessionCommitContinue(be):
-        raise newException(CatchableError, "[GPU_SAMPLE] sessionCommitContinue failed")
-      hX = encodeDecodeLayerIntoOpenSession(m.blocks[idx].attn, m.blocks[idx].inputNorm,
-             m.blocks[idx].postAttnNorm, m.blocks[idx].ff, hX, m.rope, be, cache, idx, pending)
-    var hNormF = sessionAllocScratch(be, C); pending.add(hNormF)
-    var hLogits = sessionAllocScratch(be, m.lmHead.outF); pending.add(hLogits)
-    if not (sessionRmsnormEnc(be, hX, m.finalNorm.residentGamma, hNormF, 1, C, m.finalNorm.eps) and
-            sessionMatmulQ4(be, hNormF, m.lmHead.residentW, hLogits, 1) and
-            sessionArgmaxTokenEnc(be, hLogits, gPipe.ring, m.lmHead.outF, (gPipe.step + 1) mod DecodeRing)):
-      raise newException(CatchableError, "[GPU_SAMPLE] final norm / lm_head / argmax failed")
-    ok = sessionEndAsync(be)
-  except CatchableError as e:
-    stderr.writeLine "[GPU_SAMPLE] " & e.msg
-  if not ok:
-    discard sessionEnd(be)
-    for h in pending.mitems: sessionFree(be, h)
-    return false
-  gPipe.inflight.add(pending)
-  cache.seqLen += 1
-  inc gPipe.step
-  gDecEncSec += epochTime() - tEnc
-  inc gDecSteps
-  true
+  let slotIn = gPipe.step mod DecodeRing
+  let slotOut = (gPipe.step + 1) mod DecodeRing
+  var graphOk = decodeGraphWanted(be)
+  ensureRopeTables(be, m.rope)
+  if gGraphValid and (not graphOk or graphSignature(cache) != gGraphSig):
+    sessionGraphReset(be)
+    gGraphValid = false
+  if gGraphValid:
+    if sessionBegin(be):
+      if sessionGraphRun(be, cache.seqLen, cache.seqLen + 1, slotIn, slotOut) and sessionEndAsync(be):
+        gPipe.inflight.add(newSeq[SessionHandle]())
+        cache.seqLen += 1
+        for l in 0 ..< cache.layers.len: cache.layers[l].filled = cache.seqLen
+        inc gPipe.step
+        gDecEncSec += epochTime() - tEnc
+        inc gDecSteps
+        return true
+      discard sessionEnd(be)
+    sessionGraphReset(be)
+    gGraphValid = false
+  var recording = false
+  for attempt in 0 .. 1:
+    if not sessionBegin(be): return false
+    recording = graphOk and attempt == 0 and sessionGraphBegin(be, cache.maxSeqLen)
+    var pending = newSeq[SessionHandle]()
+    var ok = false
+    try:
+      var hX = sessionAllocScratch(be, C); pending.add(hX)
+      if not sessionEmbedTokenEnc(be, gPipe.table, gPipe.ring, hX, C, slotIn):
+        raise newException(CatchableError, "[GPU_SAMPLE] embedding gather failed")
+      for idx in 0 ..< m.blocks.len:
+        if not recording and decodeCommitBefore(idx, layersPerCb) and not sessionCommitContinue(be):
+          raise newException(CatchableError, "[GPU_SAMPLE] sessionCommitContinue failed")
+        hX = encodeDecodeLayerIntoOpenSession(m.blocks[idx].attn, m.blocks[idx].inputNorm,
+               m.blocks[idx].postAttnNorm, m.blocks[idx].ff, hX, m.rope, be, cache, idx, pending)
+      var hNormF = sessionAllocScratch(be, C); pending.add(hNormF)
+      var hLogits = sessionAllocScratch(be, m.lmHead.outF); pending.add(hLogits)
+      if not (sessionRmsnormEnc(be, hX, m.finalNorm.residentGamma, hNormF, 1, C, m.finalNorm.eps) and
+              sessionMatmulQ4(be, hNormF, m.lmHead.residentW, hLogits, 1) and
+              sessionArgmaxTokenEnc(be, hLogits, gPipe.ring, m.lmHead.outF, slotOut)):
+        raise newException(CatchableError, "[GPU_SAMPLE] final norm / lm_head / argmax failed")
+      if recording:
+        recording = false
+        if sessionGraphEnd(be):
+          gGraphValid = true
+          gGraphSig = graphSignature(cache)
+          ok = sessionGraphRun(be, cache.seqLen, cache.seqLen + 1, slotIn, slotOut) and sessionEndAsync(be)
+          if not ok:
+            sessionGraphReset(be)
+            gGraphValid = false
+        else:
+          # Nothing was encoded into the command buffer: close it and encode normally.
+          discard sessionEnd(be)
+          for h in pending.mitems: sessionFree(be, h)
+          graphOk = false
+          continue
+      else:
+        ok = sessionEndAsync(be)
+    except CatchableError as e:
+      stderr.writeLine "[GPU_SAMPLE] " & e.msg
+      if recording:
+        discard sessionGraphEnd(be)
+        recording = false
+    if not ok:
+      discard sessionEnd(be)
+      for h in pending.mitems: sessionFree(be, h)
+      return false
+    gPipe.inflight.add(pending)
+    cache.seqLen += 1
+    inc gPipe.step
+    gDecEncSec += epochTime() - tEnc
+    inc gDecSteps
+    return true
+  false
 
 proc decodePipeNext*(ctx: Backend): int =
   ## Waits for the oldest enqueued step and returns the token it chose; -1 if it failed.
