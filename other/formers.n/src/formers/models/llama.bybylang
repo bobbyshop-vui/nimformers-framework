@@ -299,7 +299,7 @@ function fmLlamaChatLoop(m: LlamaModelL, tok: native_hf_tokenizer.HFTokenizer, c
         fmLlamaStats("eval       ", reply.tokens, reply.seconds)
         if gpu2 > gpu0 and reply.tokens > 0:
             fmSay("[formers.n] gpu time   : prompt " & formatFloat((gpu1 - gpu0) * 1000.0, ffDecimal, 1) & " of " & formatFloat(feedTime * 1000.0, ffDecimal, 1) & " ms, eval " & formatFloat((gpu2 - gpu1) * 1000.0 / reply.tokens.float, ffDecimal, 2) & " of " & formatFloat(reply.seconds * 1000.0 / reply.tokens.float, ffDecimal, 2) & " ms/tok")
-        let cpuLine = decodeCpuReport()
+        let cpuLine = decodeCpuReport(reply.seconds)
         if cpuLine.len > 0:
             fmSay("[formers.n] cpu time   : " & cpuLine)
         let profile = decodeProfileReport()
