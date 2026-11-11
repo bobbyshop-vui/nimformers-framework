@@ -2393,6 +2393,20 @@ let gPrefillProfileLayer = envNum("BYBY_PREFILL_PROFILE", -1)  ## layer whose op
 var gPrefillMsPerLayerRow = -1.0   ## measured GPU ms per layer per prompt row
 var gDecodeMsPerLayer = -1.0       ## measured GPU ms per layer of one decode token
 
+## Per decode token: CPU seconds spent encoding the command buffers and seconds
+## blocked waiting for the GPU (decodeCpuReport prints the means).
+var gDecEncSec = 0.0
+var gDecWaitSec = 0.0
+var gDecSteps = 0
+
+proc decodeCpuReport*(): string =
+  if gDecSteps == 0: return ""
+  result = "encode " & formatFloat(gDecEncSec * 1000.0 / float(gDecSteps), ffDecimal, 2) &
+           " ms/tok, waiting for the GPU " & formatFloat(gDecWaitSec * 1000.0 / float(gDecSteps), ffDecimal, 2) & " ms/tok"
+  gDecEncSec = 0.0
+  gDecWaitSec = 0.0
+  gDecSteps = 0
+
 proc decodeLayersPerCb(nLayers: int, be: GpuBackend): int =
   ## Layers encoded into one command buffer of a decode token.
   let decodeCbMs = float(max(100, envNum("BYBY_DECODE_CB_MS", 1500)))
@@ -2471,7 +2485,11 @@ proc forwardDecodeAllLayersMergedSession(m: LlamaModelL, xData: seq[float32], ct
       hLogits = sessionAllocScratch(be, m.lmHead.outF); pending.add(hLogits)
       headOk = sessionRmsnormEnc(be, hX, m.finalNorm.residentGamma, hNormF, 1, C, m.finalNorm.eps) and
                sessionMatmulQ4(be, hNormF, m.lmHead.residentW, hLogits, 1)
+    let tWait = epochTime()
     let sessionOk = sessionEnd(be)
+    gDecEncSec += tWait - t0
+    gDecWaitSec += epochTime() - tWait
+    inc gDecSteps
     if not sessionOk:
       raise newException(CatchableError, "[MODE3] sessionEnd failed: " & sessionGetLastError(be))
     let perLayer = (epochTime() - t0) * 1000.0 / float(m.blocks.len)
@@ -2543,6 +2561,7 @@ proc decodePipeEnqueue*(m: LlamaModelL, ctx: Backend, cache: var KVCacheL): bool
   let be = ctx.kind.toByby()
   let C = m.config.hiddenSize
   let layersPerCb = decodeLayersPerCb(m.blocks.len, be)
+  let tEnc = epochTime()
   if not sessionBegin(be): return false
   var pending = newSeq[SessionHandle]()
   var ok = false
@@ -2571,13 +2590,17 @@ proc decodePipeEnqueue*(m: LlamaModelL, ctx: Backend, cache: var KVCacheL): bool
   gPipe.inflight.add(pending)
   cache.seqLen += 1
   inc gPipe.step
+  gDecEncSec += epochTime() - tEnc
+  inc gDecSteps
   true
 
 proc decodePipeNext*(ctx: Backend): int =
   ## Waits for the oldest enqueued step and returns the token it chose; -1 if it failed.
   let be = ctx.kind.toByby()
   if gPipe.inflight.len == 0: return -1
+  let tWait = epochTime()
   let ok = sessionWaitOldest(be)
+  gDecWaitSec += epochTime() - tWait
   var buffers = gPipe.inflight[0]
   gPipe.inflight.delete(0)
   for h in buffers.mitems: sessionFree(be, h)
