@@ -111,6 +111,7 @@ type
     mappedLoraA*, mappedLoraB*: MappedView[float32]
     loraR*: int                   ## rank r; 0 = NO LoRA attached (default, old code unchanged)
     loraScale*: float32           ## alpha / r
+    tensorName*: string           ## checkpoint tensor name, given to the FIR recorder at upload
     gpuCacheName*: string         ## name in gFp4CacheGpu after prepareGpuLinForLinear (FP4-KM)
 
 template loraAValues*(l: Linear): untyped = weightValues(l.loraA, l.mappedLoraA)
@@ -191,6 +192,7 @@ proc uploadResident*(l: var Linear, ctx: Backend, sparsityPct: float32 = 0.0'f32
     else:
       l.residentW = beResidentUploadQ4(ctx, @(l.weightQ.bytes), l.weightQ.scale, l.weightQ.zero_point,
                                         l.inF, l.outF, l.weightQ.groupSize, nGroupsPerRow)
+    if l.tensorName.len > 0: probeName(l.residentW, l.tensorName, "q4", [l.outF, l.inF])
     l.residentReady = true
   elif l.useQuant and l.weightQ.kind == qkFp32Raw and l.weightQ.mappedData.owner != nil and
       l.weightQ.mappedData.len == l.inF * l.outF * 4:

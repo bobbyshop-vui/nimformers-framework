@@ -374,3 +374,19 @@ implemented. The decode-only graph must not be claimed token-equivalent.
 The previous all-zero-weight failure and the missing auxiliary data are gone:
 the fresh trace records weight sizes, full-upload fingerprints and exact bytes
 for every upload below the cap.
+
+## Tracing the Llama runtime (fused decode)
+
+`nim_inference` marks every prefill chunk and decode token as a probe step, gives each
+quantized linear and RMSNorm weight its checkpoint tensor name at upload, and records the
+fused Metal ops (`sessionRopeKvEnc`, `sessionKvAppendEnc`). While the recorder is on, the
+fused matmul, the GPU token pipeline and the decode graph are skipped, so the trace holds
+the plain ATen-level ops. Do not pass `--weights` (it selects the raw-slot lift).
+
+```sh
+BYBY_FIR_PROBE=/tmp/tl.fprobe BYBY_FIR_PROBE_STEPS=decode:1 \
+  other/formers.n/formers-cli --models models/tinyllama -p "Hi" -n 2 --temp 0 --no-progress --backend metal
+other/formers.n/firlift/firlift --trace /tmp/tl.fprobe --config models/tinyllama/config.json --out /tmp/tl --report
+other/formers.n/formers-cli --models models/tinyllama -m models/tinyllama/model.safetensors \
+  --fir /tmp/tl/model.fir --raw -p "The capital of France is" -n 14 --temp 0 --backend metal
+```
