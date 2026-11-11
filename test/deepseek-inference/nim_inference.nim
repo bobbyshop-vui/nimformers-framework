@@ -2074,17 +2074,23 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
     sinSlice[i] = rope.sinT[pos * halfD + i]
   let hCosT = sessionUpload(be, cosSlice); pending.add(hCosT)
   let hSinT = sessionUpload(be, sinSlice); pending.add(hSinT)
-  step(sessionRope(be, hQ, hCosT, hSinT, 1, H, D), "RoPE(Q) failed/not supported")
-  step(sessionRope(be, hK, hCosT, hSinT, 1, HKV, D), "RoPE(K) failed/not supported")
-
-  # ---- Multiply Q by attn.scale RIGHT ON THE GPU ----
-  step(sessionScale(be, hQ, attn.scale, H * D), "Scale(Q) failed/not supported")
+  ensureKvResident(cache.layers[layerIdx], be, HKV, cache.maxSeqLen, D)
+  step(kvResidentUsable(cache, layerIdx), "KV resident is not ready for this layer")
+  # RoPE(Q,K) + Q scale + KV append in one dispatch when the backend has it
+  let ropeKvFused = sessionRopeKvEnc(be, hQ, hK, hV, hCosT, hSinT,
+                                     cache.layers[layerIdx].kResidentCombined,
+                                     cache.layers[layerIdx].vResidentCombined,
+                                     H, HKV, D, cache.maxSeqLen, cache.seqLen, attn.scale)
+  if not ropeKvFused:
+    step(sessionRope(be, hQ, hCosT, hSinT, 1, H, D), "RoPE(Q) failed/not supported")
+    step(sessionRope(be, hK, hCosT, hSinT, 1, HKV, D), "RoPE(K) failed/not supported")
+    # ---- Multiply Q by attn.scale RIGHT ON THE GPU ----
+    step(sessionScale(be, hQ, attn.scale, H * D), "Scale(Q) failed/not supported")
   mark("rope+scale")
 
   # ---- KV-resident sync ----
-  ensureKvResident(cache.layers[layerIdx], be, HKV, cache.maxSeqLen, D)
-  step(kvResidentUsable(cache, layerIdx), "KV resident is not ready for this layer")
-  let kvFused = sessionKvAppendEnc(be, hK, hV, cache.layers[layerIdx].kResidentCombined,
+  let kvFused = ropeKvFused or
+                sessionKvAppendEnc(be, hK, hV, cache.layers[layerIdx].kResidentCombined,
                                    cache.layers[layerIdx].vResidentCombined, HKV, D,
                                    cache.maxSeqLen, cache.seqLen)
   for h in 0 ..< (if kvFused: 0 else: HKV):
@@ -2116,6 +2122,7 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
   let fusedOk = sessionAttentionDecodeAllHeadsEnc(be, hQ, cache.layers[layerIdx].kResidentCombined,
                     cache.layers[layerIdx].vResidentCombined, hOutHeads, H, HKV, D, S, cache.maxSeqLen)
   if not fusedOk:
+    step(not ropeKvFused, "per-head attention needs the unfused RoPE/KV path (set BYBY_FUSE_ROPE=0)")
     if kvFused:
       for h in 0 ..< HKV:
         step(sessionCopyInto(be, hK, cache.layers[layerIdx].kResident[h], h * D, cache.seqLen * D, D),
