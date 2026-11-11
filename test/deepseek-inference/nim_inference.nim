@@ -3336,6 +3336,7 @@ proc uploadAllResidentWeights*(m: var LlamaModelL, ctx: Backend) =
     if lin.residentReady:
       discard residentPrepareQ4(lin.residentW, 1)
       discard residentPrepareQ4(lin.residentW, 8)
+      discard residentPrepareQ4(lin.residentW, 256)   # long-prompt GEMM tile (Apple GPUs)
   for l in 0 ..< m.config.nLayers:
     uploadResident(m.blocks[l].attn.qProj, ctx)
     uploadResident(m.blocks[l].attn.kProj, ctx)
