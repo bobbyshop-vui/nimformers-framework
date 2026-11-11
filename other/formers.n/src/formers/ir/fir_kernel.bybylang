@@ -139,10 +139,10 @@ function fkSignature(mnemonic: string): string
     # r = register (0..31), k = integer immediate or address offset, f = float constant.
     case mnemonic
     of "nop", "forend", "ifend", "barriertg": ""
-    of "forbegin", "ifbegin", "loadlid", "loadtgid", "utgid", "ulid": "r"
+    of "forbegin", "ifbegin", "loadlid", "loadtgid", "utgid", "ulid", "simdlane", "simdid", "simdw", "simdgid": "r"
     of "add", "sub", "mul", "div", "cmplt", "uadd", "umul", "ushr": "rrr"
     of "fma": "rrrr"
-    of "exp", "neg", "sigmoid", "softplus", "rsqrt", "rtou", "utor": "rr"
+    of "exp", "neg", "sigmoid", "softplus", "rsqrt", "rtou", "utor", "simdsum": "rr"
     of "uconst": "rk"
     of "uaddk", "umulk", "uandk", "ushrk", "ushlk": "rrk"
     of "uloadf32", "ustoref32", "uatomicadd", "loadf32", "storef32", "tgloadf32", "tgstoref32", "uloadu8", "uloadu32": "rrk"
@@ -162,6 +162,11 @@ function fkEmit(p: var VmProgram, mnemonic: string, a: seq[uint32], f: float32)
     of "loadtgid": p.emitLoadTgid(a[0])
     of "utgid": p.emitUTgid(a[0])
     of "ulid": p.emitULid(a[0])
+    of "simdlane": p.emitSimdLane(a[0])
+    of "simdid": p.emitSimdId(a[0])
+    of "simdw": p.emitSimdW(a[0])
+    of "simdgid": p.emitSimdGid(a[0])
+    of "simdsum": p.emitSimdSum(a[0], a[1])
     of "add": p.emitAdd(a[0], a[1], a[2])
     of "sub": p.emitSub(a[0], a[1], a[2])
     of "mul": p.emitMul(a[0], a[1], a[2])

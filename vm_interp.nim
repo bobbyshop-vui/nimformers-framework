@@ -8,6 +8,8 @@ type Th = object
   U: array[32, uint32]
   stack: seq[tuple[pc, reg, it: int]]
   done, wait: bool
+  simdReg: int            ## >= 0: waiting in OP_SIMD_SUM for this destination register
+  simdVal: float32
 
 proc skipBlock(p: VmProgram; pc: var int; openOp, closeOp: uint32) =
   var d = 1
@@ -78,6 +80,12 @@ proc stepUntilBarrier(t: var Th; p: VmProgram; mem: var seq[float32];
     of OP_U_STORE_F32: mem[int(U[b] + k)] = R[a]
     of OP_U_TGID: U[a] = uint32(tgid)
     of OP_U_LID: U[a] = uint32(lid)
+    of OP_SIMD_LANE: U[a] = uint32(lid mod 32)
+    of OP_SIMD_W: U[a] = 32
+    of OP_SIMD_GID: U[a] = uint32(tid div 32)
+    of OP_SIMD_ID: U[a] = uint32(lid div 32)
+    of OP_SIMD_SUM:
+      t.simdReg = a; t.simdVal = R[b]; t.wait = true
     of OP_U_MUL: U[a] = U[b] * U[c]
     of OP_U_ANDK: U[a] = U[b] and k
     of OP_U_SHRK: U[a] = U[b] shr k
@@ -101,6 +109,7 @@ proc runGrid*(p: VmProgram; mem: var seq[float32]; nThreads, tgSize: int; tgFloa
   for g in 0 ..< nTg:
     var tg = newSeq[float32](tgFloats)
     var ths = newSeq[Th](tgSize)
+    for l in 0 ..< tgSize: ths[l].simdReg = -1
     while true:
       var alive = 0
       for l in 0 ..< tgSize:
@@ -108,5 +117,14 @@ proc runGrid*(p: VmProgram; mem: var seq[float32]; nThreads, tgSize: int; tgFloa
           stepUntilBarrier(ths[l], p, mem, tg, g * tgSize + l, l, g)
           if not ths[l].done: inc alive
       if alive == 0: break
+      # A simdgroup reduction: the lanes that reached OP_SIMD_SUM are summed together in lane order.
+      for base in countup(0, tgSize - 1, 32):
+        var total = 0'f32
+        for l in base ..< min(base + 32, tgSize):
+          if ths[l].simdReg >= 0: total += ths[l].simdVal
+        for l in base ..< min(base + 32, tgSize):
+          if ths[l].simdReg >= 0:
+            ths[l].R[ths[l].simdReg] = total
+            ths[l].simdReg = -1
       for l in 0 ..< tgSize: ths[l].wait = false
 
