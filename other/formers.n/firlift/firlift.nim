@@ -214,6 +214,8 @@ proc parseTrace*(text: string): Trace =
   result.programs = initTable[string, seq[uint32]]()
   result.bufs = @[]
   result.roles = @[]
+  result.stepPosition = -1   # no step markers: the position is unknown, not 0
+  result.stepToken = -1
   var inWords = ""
   var words: seq[uint32]
   var seenStep = false

@@ -297,6 +297,23 @@ proc positionBuf(l: SessionLift): string =
   l.addBuf("position", 1, "position")
   "position"
 
+proc ropeKernel(l: SessionLift; rows, hn, d: int; outScale: float): Gen =
+  ## RoPE derived from the position (theta and scaling from the config), optionally scaling the output.
+  var theta = 10000.0
+  if l.config.hasKey("rope_theta") and l.config["rope_theta"].kind in {JFloat, JInt}:
+    theta = l.config["rope_theta"].getFloat()
+  var posScale = 1.0
+  if l.config.hasKey("rope_scaling") and l.config["rope_scaling"].kind == JObject:
+    let rs = l.config["rope_scaling"]
+    let kind = rs.getOrDefault("type").getStr(rs.getOrDefault("rope_type").getStr(""))
+    if kind == "linear":
+      posScale = 1.0 / rs["factor"].getFloat()
+    elif kind notin ["", "default"]:
+      fail("rope_scaling type " & kind & " has no generated kernel")
+  let ratio = pow(theta, -1.0 / float(d div 2))
+  result = if rows == 1: genRopePos(hn, d, ratio, posScale, outScale)
+       else: genRopePosRows(rows, hn, d, ratio, posScale, outScale)
+
 proc lowerRope(l: SessionLift; op: Op; outScale = 1.0) =
   let x = op.ins.port("x")
   let hn = op.attrInt("Hn")
@@ -316,22 +333,41 @@ proc lowerRope(l: SessionLift; op: Op; outScale = 1.0) =
       @[xn, l.rd(op.ins.port("cosT")), l.rd(op.ins.port("sinT"))], @[xn])
     return
   if x.bytes div 4 != rows*hn*d: fail("RoPE port size does not match T*Hn*D")
-  var theta = 10000.0
-  if l.config.hasKey("rope_theta") and l.config["rope_theta"].kind in {JFloat, JInt}:
-    theta = l.config["rope_theta"].getFloat()
-  var posScale = 1.0
-  if l.config.hasKey("rope_scaling") and l.config["rope_scaling"].kind == JObject:
-    let rs = l.config["rope_scaling"]
-    let kind = rs.getOrDefault("type").getStr(rs.getOrDefault("rope_type").getStr(""))
-    if kind == "linear":
-      posScale = 1.0 / rs["factor"].getFloat()
-    elif kind notin ["", "default"]:
-      fail("rope_scaling type " & kind & " has no generated kernel")
-  let ratio = pow(theta, -1.0 / float(d div 2))
-  let g = if rows == 1: genRopePos(hn, d, ratio, posScale, outScale)
-          else: genRopePosRows(rows, hn, d, ratio, posScale, outScale)
+  let g = l.ropeKernel(rows, hn, d, outScale)
   let xn = l.rd(x)
   l.addKernelNode(op, "rope", g, @[xn, l.positionBuf()], @[xn])
+
+proc lowerKvScatterOne(l: SessionLift; op: Op; src: string; dstPort: PortRef; hkv, d: int) =
+  let dst = l.stateBuf(dstPort, hkv*l.positions*d)
+  l.addKernelNode(op, "kv_scatter", genKvScatter(1, hkv, d, l.positions),
+    @[src, l.positionBuf(), dst], @[], @[2])
+
+proc checkKvPosition(l: SessionLift; op: Op) =
+  let pos = op.attrInt("pos")
+  if not l.coverage and op.phase == 0 and l.trace.stepPosition >= 0 and pos != l.trace.stepPosition:
+    fail("KV append at pos " & $pos & " but the step position is " & $l.trace.stepPosition)
+  if l.positions <= 0: fail("the config has no context length (max_position_embeddings)")
+
+proc lowerKvAppend(l: SessionLift; op: Op) =
+  ## sessionKvAppendEnc: K and V of one token into the combined caches.
+  l.checkKvPosition(op)
+  let hkv = op.attrInt("hkv")
+  let d = op.attrInt("d")
+  l.lowerKvScatterOne(op, l.rd(op.ins.port("k")), op.outs.port("kAll"), hkv, d)
+  l.lowerKvScatterOne(op, l.rd(op.ins.port("v")), op.outs.port("vAll"), hkv, d)
+
+proc lowerRopeKv(l: SessionLift; op: Op) =
+  ## sessionRopeKvEnc: RoPE and scale on Q, RoPE on K, then K and V into the caches.
+  l.checkKvPosition(op)
+  let h = op.attrInt("h")
+  let hkv = op.attrInt("hkv")
+  let d = op.attrInt("d")
+  let q = l.rd(op.ins.port("q"))
+  l.addKernelNode(op, "rope", l.ropeKernel(1, h, d, op.attrFloat("scale")), @[q, l.positionBuf()], @[q])
+  let k = l.rd(op.ins.port("k"))
+  l.addKernelNode(op, "rope", l.ropeKernel(1, hkv, d, 1.0), @[k, l.positionBuf()], @[k])
+  l.lowerKvScatterOne(op, k, op.outs.port("kAll"), hkv, d)
+  l.lowerKvScatterOne(op, l.rd(op.ins.port("v")), op.outs.port("vAll"), hkv, d)
 
 proc lowerAttentionDecode(l: SessionLift; op: Op) =
   let h = op.attrInt("H")
@@ -559,6 +595,10 @@ proc lowerOp(l: SessionLift; op: Op) =
     l.addKernelNode(op, "scale", genScale(op.attrInt("n"), op.attrFloat("scalar")), @[x], @[x])
   of "sessionRope":
     l.lowerRope(op)
+  of "sessionKvAppendEnc":
+    l.lowerKvAppend(op)
+  of "sessionRopeKvEnc":
+    l.lowerRopeKv(op)
   of "sessionAttentionDecodeAllHeadsEnc":
     l.lowerAttentionDecode(op)
   of "sessionKvScatterEnc":
@@ -948,7 +988,9 @@ proc prepareRaw(l: SessionLift; ops: seq[Op]; weightsPaths: seq[string]) =
     if id >= 0 and id < l.trace.bufs.len and l.trace.bufs[id].bytes > bytes:
       bytes = l.trace.bufs[id].bytes
     if bytes <= 0 and l.coverage: bytes = 4
-    if bytes <= 0 or bytes mod 4 != 0: fail("raw buffer b" & $id & " has invalid byte size " & $bytes)
+    # A mapped checkpoint view can start at any byte (NIMQ2): the arena is rounded up to whole words.
+    if bytes > 0 and bytes mod 4 != 0: bytes = (bytes + 3) div 4 * 4
+    if bytes <= 0: fail("raw buffer b" & $id & " has invalid byte size " & $bytes)
     let name = "b" & $id
     l.addBuf(name, bytes div 4)
     l.cur[(id, 0)] = name

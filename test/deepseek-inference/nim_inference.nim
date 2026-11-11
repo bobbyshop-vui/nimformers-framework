@@ -6,6 +6,7 @@ import std/[math, random, sequtils, tables, algorithm, os, strformat, strutils, 
 when defined(posix): import std/posix
 import nimformers  # Tensor, Linear, newLinear, flatten2D, transpose, Embedding, addT...
 import native_hf_tokenizer
+from probe import firProbeOn, probeStepBegin, probeStepEnd
 export native_hf_tokenizer
 
 # ─────────────────────────────────────────────────────────────
@@ -159,6 +160,7 @@ type
     weight*: Tensor
     eps*: float32
     dim*: int
+    tensorName*: string             # checkpoint tensor name, given to the FIR recorder
     residentGamma*: SessionHandle   # OPTIMISATION: gamma is a fixed constant
       # (does not change between tokens/layers) - uploaded ONCE at model
       # load (see uploadResidentNorm below), instead of sessionUpload()
@@ -178,6 +180,7 @@ proc uploadResidentNorm*(rn: var RMSNormL, ctx: Backend) =
   ## gbVulkan branch was fixed earlier) instead of writing a new function - less
   ## risk of introducing a new bug.
   rn.residentGamma = beResidentUploadFp32(ctx, rn.weight.data)
+  if rn.tensorName.len > 0: probeName(rn.residentGamma, rn.tensorName, "f32", [rn.dim])
   rn.residentGammaReady = true
 
 proc rmsNormPrep*(rn: RMSNormL, x: Tensor, ctx: Backend): tuple[invBroadcast, wBroadcast: seq[float32], n: int] =
@@ -2606,7 +2609,7 @@ var gPipe: DecodePipe
 
 proc decodePipeWanted(m: LlamaModelL, be: GpuBackend): bool =
   let env = getEnv("BYBY_GPU_SAMPLE", "")
-  if env == "0" or be != gbMetal: return false
+  if firProbeOn or env == "0" or be != gbMetal: return false   # the recorder traces the plain decode
   if env != "1" and sessionPacesCommandBuffers(be): return false
   gMergeAllLayersSession and m.finalNorm.residentGammaReady and m.lmHead.residentReady and
     m.lmHead.inF == m.config.hiddenSize and lmHeadBiasFree(m) and m.lmHead.loraR == 0 and
@@ -3060,7 +3063,7 @@ proc gpuSecondsTotal*(ctx: Backend): float =
   ## GPU execution time spent in sessions so far (0 on backends that do not report it).
   sessionGpuSeconds(ctx.kind.toByby())
 
-proc forwardStep*(m: LlamaModelL, ids: seq[int], ctx: Backend, cache: var KVCacheL,
+proc forwardStepImpl(m: LlamaModelL, ids: seq[int], ctx: Backend, cache: var KVCacheL,
                    isPrefill: bool): Tensor =
   ## isPrefill=true: ids = the whole prompt (T tokens). isPrefill=false: ids = exactly 1 new token.
   ## Returns logits [1, 1, vocab] for the last token only; nothing samples
@@ -3188,6 +3191,20 @@ proc forwardStep*(m: LlamaModelL, ids: seq[int], ctx: Backend, cache: var KVCach
 # ===================================================================
 # Read local config.json directly; quant.nim loads the compressed weights.
 # ===================================================================
+
+proc forwardStep*(m: LlamaModelL, ids: seq[int], ctx: Backend, cache: var KVCacheL,
+                  isPrefill: bool): Tensor =
+  ## One host step (a prefill chunk or a decode token); the FIR recorder, when on, marks it
+  ## so the lifter knows the step's position, token and where it ends.
+  if firProbeOn and ids.len > 0:
+    ensureRopeTables(ctx.kind.toByby(), m.rope)   # constant tables are uploaded before the step opens
+    probeStepBegin(if isPrefill: "prefill" else: "decode", cache.seqLen, cache.seqLen, ids[^1], ids.len)
+    try:
+      return forwardStepImpl(m, ids, ctx, cache, isPrefill)
+    finally:
+      probeStepEnd()
+  forwardStepImpl(m, ids, ctx, cache, isPrefill)
+
 proc newLlamaLConfig*(modelPath: string): LlamaLConfig =
   let path = if fileExists(modelPath) and modelPath.endsWith(".json"): modelPath
              else: modelPath / "config.json"
@@ -3269,6 +3286,7 @@ proc loadLlamaWeightsL*(m: var LlamaModelL, path: string) =
     ## during "Building model..."). Keeping them compressed takes only ~4GB, dequantized temporarily on each
     ## forward() and dropped right away (see nimformer.nim Linear.forward).
     let wName = prefix & ".weight"
+    lin.tensorName = wName
     if byName.hasKey(wName):
       setQuantWeight(lin, byName[wName])
     # Zero biases (exporters write them for bias-free Llama/DeepSeek layers)
@@ -3303,14 +3321,17 @@ proc loadLlamaWeightsL*(m: var LlamaModelL, path: string) =
 
   let normW = get("model.norm.weight")
   if normW.len > 0: m.finalNorm.weight.data = normW
+  m.finalNorm.tensorName = "model.norm.weight"
 
   for l in 0 ..< m.config.nLayers:
     echo &"  loading layer {l+1}/{m.config.nLayers} ..."
     let p = "model.layers." & $l
     let ln1 = get(p & ".input_layernorm.weight")
     if ln1.len > 0: m.blocks[l].inputNorm.weight.data = ln1
+    m.blocks[l].inputNorm.tensorName = p & ".input_layernorm.weight"
     let ln2 = get(p & ".post_attention_layernorm.weight")
     if ln2.len > 0: m.blocks[l].postAttnNorm.weight.data = ln2
+    m.blocks[l].postAttnNorm.tensorName = p & ".post_attention_layernorm.weight"
 
     loadLinear(m.blocks[l].attn.qProj, p & ".self_attn.q_proj")
     loadLinear(m.blocks[l].attn.kProj, p & ".self_attn.k_proj")
@@ -3328,6 +3349,7 @@ proc loadLlamaWeightsL*(m: var LlamaModelL, path: string) =
   # (acceptable since lm_head runs forward ONCE per token, not 224 times).
   if byName.hasKey("lm_head.weight"):
     setQuantWeight(m.lmHead, byName["lm_head.weight"])
+    m.lmHead.tensorName = "lm_head.weight"
   elif embW.len > 0 or m.embed.weight.mappedData.owner != nil:
     # Tied embeddings: lm_head reads the same rows as the embedding.
     m.lmHead.weight.data = embW
