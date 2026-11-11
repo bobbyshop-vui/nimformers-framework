@@ -187,7 +187,7 @@ function fmLlamaReplyTo(m: LlamaModelL, tok: native_hf_tokenizer.HFTokenizer, ct
                 var reason = -1                # 0 limit, 1 EOS, 2 stop, 4 feed the last token normally
                 if nim_inference.decodePipeEnqueue(m, ctx, chat.cache):
                     enq = 1
-                    var prefetch = true
+                    var prefetch = nim_inference.decodePipeAhead()
                     while reason < 0:
                         if fmStopRequested():
                             reason = 2
@@ -217,7 +217,11 @@ function fmLlamaReplyTo(m: LlamaModelL, tok: native_hf_tokenizer.HFTokenizer, ct
                         if gen.len >= maxNew or result.contextFull:
                             reason = 0
                         elif enq == rel:
-                            reason = 4                   # the next step could not be encoded
+                            # Not run ahead: this token is fed by the next step.
+                            if nim_inference.decodePipeEnqueue(m, ctx, chat.cache):
+                                inc enq
+                            else:
+                                reason = 4               # the step could not be encoded
                     let fedEnd = if reason == 0 or reason == 4: gen.len - 1 else: gen.len
                     for k in s0 - 1 ..< fedEnd:
                         chat.ids.add(gen[k])
