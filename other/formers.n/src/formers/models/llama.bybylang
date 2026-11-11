@@ -141,6 +141,16 @@ function fmLlamaWarmup(m: LlamaModelL, tok: native_hf_tokenizer.HFTokenizer, ctx
     fmLlamaReset(chat)
     fmSay("[formers.n] ready: warmup " & formatFloat(epochTime() - t0, ffDecimal, 1) & " s (decode ~" & $int(stepMs + 0.5) & " ms/tok)")
 
+function fmLlamaGreedy(s: FmSampler): bool
+    ## True when the next token is just the largest logit, which the GPU can pick
+    ## itself (no sampling, no repeat penalty, no banned token).
+    if s.temperature > 0 or (s.repeatPenalty != 1.0'f32 and s.repeatLastN > 0):
+        return false
+    for b in s.banned:
+        if b:
+            return false
+    result = true
+
 function fmLlamaReplyTo(m: LlamaModelL, tok: native_hf_tokenizer.HFTokenizer, ctx: Backend, chat: var FmLlamaChat, firstLogits: seq[float32], maxNew: int, opts: FmOptions): FmLlamaReply
     ## Samples and streams up to maxNew tokens. The last sampled token stays
     ## in chat.pending; EOS is never fed, the chat template text supplies it.
@@ -149,6 +159,7 @@ function fmLlamaReplyTo(m: LlamaModelL, tok: native_hf_tokenizer.HFTokenizer, ct
     var gen: seq[int]
     let live = fmLiveProgress(opts)
     let t0 = epochTime()
+    var gpuTry = fmLlamaGreedy(chat.sampler)
     fmSetGenerating(true)
     while gen.len < maxNew and not fmStopRequested():
         let stepStart = epochTime()
@@ -163,7 +174,66 @@ function fmLlamaReplyTo(m: LlamaModelL, tok: native_hf_tokenizer.HFTokenizer, ct
         if gen.len >= maxNew or result.contextFull:
             chat.pending = @[id]
             break
-        logits = fmLlamaFeed(m, ctx, chat, @[id])
+        var recovered = false
+        if gpuTry:
+            # Greedy decoding: the GPU picks each next token itself and the next step is
+            # encoded while this one runs (nim_inference.decodePipe*). A step is: feed the
+            # last token, choose the next. Token s0 + k comes from step k.
+            gpuTry = false
+            if nim_inference.decodePipeStart(m, ctx, id):
+                let f0 = chat.ids.len          # tokens fed before `id`
+                let s0 = gen.len               # tokens emitted so far; the last one is unfed
+                var enq = 0
+                var reason = -1                # 0 limit, 1 EOS, 2 stop, 4 feed the last token normally
+                if nim_inference.decodePipeEnqueue(m, ctx, chat.cache):
+                    enq = 1
+                    var prefetch = true
+                    while reason < 0:
+                        if fmStopRequested():
+                            reason = 2
+                            break
+                        let rel = gen.len + 1 - s0       # the step that produces the next token
+                        # That token gets fed (a further step) unless it ends the reply.
+                        if prefetch and enq == rel and gen.len + 1 < maxNew and f0 + rel + 1 < chat.capacity:
+                            if nim_inference.decodePipeEnqueue(m, ctx, chat.cache):
+                                inc enq
+                            else:
+                                prefetch = false
+                        let stepStart2 = epochTime()
+                        let nxt = nim_inference.decodePipeNext(ctx)
+                        if nxt < 0:
+                            reason = 4
+                            break
+                        if nxt == tok.eosId:
+                            reason = 1
+                            break
+                        gen.add(nxt)
+                        fmOut().write(stream.pushTokens([nxt]))
+                        fmOut().flushFile()
+                        if live:
+                            fmShowProgress(gen.len, maxNew, epochTime() - stepStart2)
+                        if f0 + (gen.len - s0) + 1 >= chat.capacity:
+                            result.contextFull = true
+                        if gen.len >= maxNew or result.contextFull:
+                            reason = 0
+                        elif enq == rel:
+                            reason = 4                   # the next step could not be encoded
+                    let fedEnd = if reason == 0 or reason == 4: gen.len - 1 else: gen.len
+                    for k in s0 - 1 ..< fedEnd:
+                        chat.ids.add(gen[k])
+                    nim_inference.decodePipeFinish(ctx, chat.cache, chat.ids.len)
+                    if reason == 0:
+                        chat.pending = @[gen[^1]]
+                    if reason == 4:
+                        recovered = true
+                    else:
+                        break
+                else:
+                    nim_inference.decodePipeFinish(ctx, chat.cache, f0)
+        if recovered:
+            logits = fmLlamaFeed(m, ctx, chat, @[gen[^1]])
+        else:
+            logits = fmLlamaFeed(m, ctx, chat, @[id])
         if live:
             fmShowProgress(gen.len, maxNew, epochTime() - stepStart)
     fmSetGenerating(false)

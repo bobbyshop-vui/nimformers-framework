@@ -2393,6 +2393,20 @@ let gPrefillProfileLayer = envNum("BYBY_PREFILL_PROFILE", -1)  ## layer whose op
 var gPrefillMsPerLayerRow = -1.0   ## measured GPU ms per layer per prompt row
 var gDecodeMsPerLayer = -1.0       ## measured GPU ms per layer of one decode token
 
+proc decodeLayersPerCb(nLayers: int, be: GpuBackend): int =
+  ## Layers encoded into one command buffer of a decode token.
+  let decodeCbMs = float(max(100, envNum("BYBY_DECODE_CB_MS", 1500)))
+  # Apple Silicon commits every few layers without waiting (about 40 dispatches
+  # per command buffer, as MLX does), so the GPU starts on the first layers
+  # while the CPU still encodes the rest. BYBY_DECODE_LAYERS_PER_CB overrides
+  # the split on any GPU (0 = one command buffer per token).
+  let layersPerCbEnv = envNum("BYBY_DECODE_LAYERS_PER_CB", -1)
+  if layersPerCbEnv > 0: layersPerCbEnv
+  elif layersPerCbEnv == 0: nLayers
+  elif not sessionPacesCommandBuffers(be): 4
+  elif gDecodeMsPerLayer <= 0 or gDecodeMsPerLayer * float(nLayers) <= decodeCbMs: nLayers
+  else: max(1, int(decodeCbMs / gDecodeMsPerLayer))
+
 var gLmHeadBiasFree = -1   ## 1 when the lm_head bias is absent or all zeros (checked once)
 
 proc lmHeadBiasFree(m: LlamaModelL): bool =
@@ -2432,18 +2446,7 @@ proc forwardDecodeAllLayersMergedSession(m: LlamaModelL, xData: seq[float32], ct
   # A token normally fits one command buffer (as before pacing): it is split
   # only once a measured token takes longer than BYBY_DECODE_CB_MS (default
   # 1500), since every extra commit slows the decode down on Intel Metal.
-  let decodeCbMs = float(max(100, envNum("BYBY_DECODE_CB_MS", 1500)))
-  # Apple Silicon commits every few layers without waiting (about 40 dispatches
-  # per command buffer, as MLX does), so the GPU starts on the first layers
-  # while the CPU still encodes the rest. BYBY_DECODE_LAYERS_PER_CB overrides
-  # the split on any GPU (0 = one command buffer per token).
-  let layersPerCbEnv = envNum("BYBY_DECODE_LAYERS_PER_CB", -1)
-  let layersPerCb = if layersPerCbEnv > 0: layersPerCbEnv
-                    elif layersPerCbEnv == 0: m.blocks.len
-                    elif not sessionPacesCommandBuffers(be): 4
-                    elif gDecodeMsPerLayer <= 0 or
-                         gDecodeMsPerLayer * float(m.blocks.len) <= decodeCbMs: m.blocks.len
-                    else: max(1, int(decodeCbMs / gDecodeMsPerLayer))
+  let layersPerCb = decodeLayersPerCb(m.blocks.len, be)
   let t0 = epochTime()
   if not sessionBegin(be):
     raise newException(CatchableError, "[MODE3] sessionBegin failed")
@@ -2487,6 +2490,115 @@ proc forwardDecodeAllLayersMergedSession(m: LlamaModelL, xData: seq[float32], ct
       discard sessionEnd(be)
     for h in pending.mitems:
       sessionFree(be, h)
+
+## ---- Decode pipeline: the next token is chosen on the GPU ----
+## A greedy decode step reads its token id from a ring slot on the GPU, gathers
+## the embedding row, runs every layer, the final norm and lm_head, and writes the
+## argmax into the next slot. The step is committed without waiting, so the CPU
+## encodes step k+1 while the GPU runs step k and a token costs max(GPU, CPU)
+## instead of GPU + CPU. BYBY_GPU_SAMPLE=1/0 forces it on/off (default: Apple GPU).
+const DecodeRing = 8
+type DecodePipe = object
+  table, ring: SessionHandle
+  ready: bool
+  step: int                            ## steps enqueued in this run
+  done: int                            ## steps whose token was read back
+  inflight: seq[seq[SessionHandle]]    ## buffers of each enqueued step, freed once it completes
+
+var gPipe: DecodePipe
+
+proc decodePipeWanted(m: LlamaModelL, be: GpuBackend): bool =
+  let env = getEnv("BYBY_GPU_SAMPLE", "")
+  if env == "0" or be != gbMetal: return false
+  if env != "1" and sessionPacesCommandBuffers(be): return false
+  gMergeAllLayersSession and m.finalNorm.residentGammaReady and m.lmHead.residentReady and
+    m.lmHead.inF == m.config.hiddenSize and lmHeadBiasFree(m) and m.lmHead.loraR == 0 and
+    m.blocks.len > 0
+
+proc decodePipeStart*(m: LlamaModelL, ctx: Backend, firstToken: int): bool =
+  ## Prepares a run whose first input token is firstToken; false when this model or
+  ## GPU cannot run the pipeline (the caller keeps the normal decode).
+  let be = ctx.kind.toByby()
+  if not decodePipeWanted(m, be): return false
+  for idx in 0 ..< m.blocks.len:
+    var failMsg: string
+    if not precheckLayerResident(m.blocks[idx].attn, m.blocks[idx].ff, idx, failMsg): return false
+  if not gPipe.ready:
+    let n = m.config.vocabSize * m.config.hiddenSize
+    if m.embed.weight.floatValues.len < n: return false
+    var rows = newSeq[float32](n)
+    copyMem(addr rows[0], unsafeAddr m.embed.weight.floatValues[0], n * sizeof(float32))
+    gPipe.table = sessionUpload(be, rows)
+    gPipe.ring = sessionAllocScratch(be, DecodeRing)
+    gPipe.ready = true
+  gPipe.step = 0
+  gPipe.done = 0
+  gPipe.inflight.setLen(0)
+  sessionTokenRingSet(be, gPipe.ring, 0, firstToken)
+  true
+
+proc decodePipeEnqueue*(m: LlamaModelL, ctx: Backend, cache: var KVCacheL): bool =
+  ## Encodes and commits one step for the token in the current ring slot, and
+  ## advances cache.seqLen by one. False (nothing advanced) if encoding failed.
+  let be = ctx.kind.toByby()
+  let C = m.config.hiddenSize
+  let layersPerCb = decodeLayersPerCb(m.blocks.len, be)
+  if not sessionBegin(be): return false
+  var pending = newSeq[SessionHandle]()
+  var ok = false
+  try:
+    var hX = sessionAllocScratch(be, C); pending.add(hX)
+    if not sessionEmbedTokenEnc(be, gPipe.table, gPipe.ring, hX, C, gPipe.step mod DecodeRing):
+      raise newException(CatchableError, "[GPU_SAMPLE] embedding gather failed")
+    for idx in 0 ..< m.blocks.len:
+      if idx > 0 and idx mod layersPerCb == 0 and not sessionCommitContinue(be):
+        raise newException(CatchableError, "[GPU_SAMPLE] sessionCommitContinue failed")
+      hX = encodeDecodeLayerIntoOpenSession(m.blocks[idx].attn, m.blocks[idx].inputNorm,
+             m.blocks[idx].postAttnNorm, m.blocks[idx].ff, hX, m.rope, be, cache, idx, pending)
+    var hNormF = sessionAllocScratch(be, C); pending.add(hNormF)
+    var hLogits = sessionAllocScratch(be, m.lmHead.outF); pending.add(hLogits)
+    if not (sessionRmsnormEnc(be, hX, m.finalNorm.residentGamma, hNormF, 1, C, m.finalNorm.eps) and
+            sessionMatmulQ4(be, hNormF, m.lmHead.residentW, hLogits, 1) and
+            sessionArgmaxTokenEnc(be, hLogits, gPipe.ring, m.lmHead.outF, (gPipe.step + 1) mod DecodeRing)):
+      raise newException(CatchableError, "[GPU_SAMPLE] final norm / lm_head / argmax failed")
+    ok = sessionEndAsync(be)
+  except CatchableError as e:
+    stderr.writeLine "[GPU_SAMPLE] " & e.msg
+  if not ok:
+    discard sessionEnd(be)
+    for h in pending.mitems: sessionFree(be, h)
+    return false
+  gPipe.inflight.add(pending)
+  cache.seqLen += 1
+  inc gPipe.step
+  true
+
+proc decodePipeNext*(ctx: Backend): int =
+  ## Waits for the oldest enqueued step and returns the token it chose; -1 if it failed.
+  let be = ctx.kind.toByby()
+  if gPipe.inflight.len == 0: return -1
+  let ok = sessionWaitOldest(be)
+  var buffers = gPipe.inflight[0]
+  gPipe.inflight.delete(0)
+  for h in buffers.mitems: sessionFree(be, h)
+  if not ok:
+    stderr.writeLine "[GPU_SAMPLE] decode step failed: " & sessionGetLastError(be)
+    return -1
+  result = sessionTokenRingGet(be, gPipe.ring, (gPipe.done + 1) mod DecodeRing)
+  inc gPipe.done
+
+proc decodePipeFinish*(ctx: Backend, cache: var KVCacheL, seqLen: int) =
+  ## Waits for every step still in flight and rewinds the cache to seqLen positions
+  ## (steps enqueued past the last wanted token only wrote KV beyond it).
+  let be = ctx.kind.toByby()
+  while gPipe.inflight.len > 0:
+    discard sessionWaitOldest(be)
+    var buffers = gPipe.inflight[0]
+    gPipe.inflight.delete(0)
+    for h in buffers.mitems: sessionFree(be, h)
+  cache.seqLen = seqLen
+  for l in 0 ..< cache.layers.len:
+    cache.layers[l].filled = seqLen
 
 ## ---- Flash prefill: every layer of a prompt on the GPU, attention included ----
 ## The old prefill (forwardPrefill + fusedResidualNormFFN) reads Q/K/V back to the
