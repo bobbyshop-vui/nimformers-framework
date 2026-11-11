@@ -390,3 +390,17 @@ other/formers.n/firlift/firlift --trace /tmp/tl.fprobe --config models/tinyllama
 other/formers.n/formers-cli --models models/tinyllama -m models/tinyllama/model.safetensors \
   --fir /tmp/tl/model.fir --raw -p "The capital of France is" -n 14 --temp 0 --backend metal
 ```
+
+### Kernels that follow the Metal ones
+
+The lifter emits, for decode, kernels built the way the Metal ones are: the Q4 GEMV is one
+simdgroup per four rows with `simd_sum` (`genMatmulQ4Simd`), RMSNorm and add+RMSNorm are one
+threadgroup per row (`genRmsnormPar`, `genAddRmsnormPar`), and decode attention is one
+threadgroup per query head with the scores in threadgroup memory (`genAttentionDecodePar`).
+`FIRLIFT_GENERIC=1` selects the lane-per-output kernels that also run on the CPU VM.
+The lifted TinyLlama graph is in `models/tinyllama/lifted/`:
+
+```sh
+other/formers.n/formers-cli_arm64 --models models/tinyllama -m models/tinyllama/model.safetensors \
+  --fir models/tinyllama/lifted/model.fir --raw -p "The capital of France is" -n 64 --temp 0 --backend metal
+```

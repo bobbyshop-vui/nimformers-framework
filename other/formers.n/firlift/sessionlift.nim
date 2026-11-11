@@ -314,6 +314,11 @@ proc ropeKernel(l: SessionLift; rows, hn, d: int; outScale: float): Gen =
   result = if rows == 1: genRopePos(hn, d, ratio, posScale, outScale)
        else: genRopePosRows(rows, hn, d, ratio, posScale, outScale)
 
+proc genericKernels(): bool =
+  ## FIRLIFT_GENERIC=1: lane-per-output kernels that every VM backend can run. The default kernels
+  ## follow the Metal ones (threadgroups, simdgroups) and need simd ops.
+  getEnv("FIRLIFT_GENERIC").len > 0
+
 proc lowerRope(l: SessionLift; op: Op; outScale = 1.0) =
   let x = op.ins.port("x")
   let hn = op.attrInt("Hn")
@@ -384,7 +389,8 @@ proc lowerAttentionDecode(l: SessionLift; op: Op) =
   let kAll = l.stateBuf(op.ins.port("kAll"), cache)
   let vAll = l.stateBuf(op.ins.port("vAll"), cache)
   let o = l.wr(op, op.outs.port("o"))
-  l.addKernelNode(op, "attention", genAttentionDecode(h, hkv, d, l.positions, true),
+  l.addKernelNode(op, "attention", (if not genericKernels(): genAttentionDecodePar(h, hkv, d, l.positions)
+                                    else: genAttentionDecode(h, hkv, d, l.positions, true)),
     @[q, kAll, vAll, l.positionBuf()], @[o])
 
 proc lowerCopyGroup(l: SessionLift; ops: seq[Op]; first, last: int) =
@@ -462,7 +468,7 @@ proc lowerMatmulQ4(l: SessionLift; op: Op) =
   let c = l.wr(op, op.outs.port("c"))
   # Decode (M=1) is the structure of the Metal matmul_q4_simd kernel (simdgroup per rows, simd_sum);
   # FIRLIFT_GENERIC=1 keeps the lane-per-column kernels, which every VM backend can run.
-  let gen = (if m == 1 and getEnv("FIRLIFT_GENERIC").len == 0:
+  let gen = (if m == 1 and not genericKernels():
                genMatmulQ4Simd(k, n, group, op.attrInt("groupsPerRow"))
              else: genMatmulQ4Par(m, k, n, group, op.attrInt("groupsPerRow"), parLanes()))
   l.addKernelNode(op, "matmul_q4", gen, @[a, wn], @[c])
@@ -560,7 +566,8 @@ proc lowerOp(l: SessionLift; op: Op) =
     let x = l.rd(op.ins.port("x"))
     let gamma = l.rdWeight(op.ins.port("gamma"), "f32")
     let y = l.wr(op, op.outs.port("y"))
-    l.addKernelNode(op, "rmsnorm", genRmsnorm(op.attrInt("rows"), op.attrInt("cols"), op.attrFloat("eps")),
+    l.addKernelNode(op, "rmsnorm", (if genericKernels(): genRmsnorm(op.attrInt("rows"), op.attrInt("cols"), op.attrFloat("eps"))
+                       else: genRmsnormPar(op.attrInt("rows"), op.attrInt("cols"), op.attrFloat("eps"))),
       @[x, gamma], @[y])
   of "sessionLayernormEnc":
     let hasBeta = op.ins.len >= 3
@@ -838,7 +845,8 @@ proc tryFuse(l: SessionLift; ops: seq[Op]; i: int; consumed: var HashSet[int]): 
     let gamma = l.rdWeight(nm.ins.port("gamma"), "f32")
     let sum = l.wr(op, c)
     let y = l.wr(nm, nm.outs.port("y"))
-    l.addKernelNode(op, "add_rmsnorm", genAddRmsnorm(nm.attrInt("cols"), nm.attrFloat("eps")),
+    l.addKernelNode(op, "add_rmsnorm", (if genericKernels(): genAddRmsnorm(nm.attrInt("cols"), nm.attrFloat("eps"))
+                          else: genAddRmsnormPar(nm.attrInt("cols"), nm.attrFloat("eps"))),
       @[an, bn, gamma], @[sum, y])
     consumed.incl j1
     return 1
@@ -1166,7 +1174,7 @@ proc liftSessionFiles*(trace: Trace; configText, modelName, embeddingName: strin
         l.addBuf(outName, tr.n)
         if tr.n != l.hidden: fail("host round trip result has " & $tr.n & " elements, hidden is " & $l.hidden)
         l.cur[tr.dst.key] = outName
-        l.addKernelNode(op, "rmsnorm", genRmsnorm(1, l.hidden, l.eps), @[lastCleanRead, gamma], @[outName])
+        l.addKernelNode(op, "rmsnorm", (if genericKernels(): genRmsnorm(1, l.hidden, l.eps) else: genRmsnormPar(1, l.hidden, l.eps)), @[lastCleanRead, gamma], @[outName])
         afterTaintedRead = false
       elif not embedded and trace.stepToken >= 0:
         embedded = true

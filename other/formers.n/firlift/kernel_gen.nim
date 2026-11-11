@@ -1242,6 +1242,215 @@ proc genMatmulQ4Simd*(K, N, groupSize, nGroups: int; rows = 4; sg = 2): Gen =
   result = Gen(body: k.text, threads: ((N div rows + sg - 1) div sg) * sg * 32, ins: 2, outs: 1,
     tg: sg * 32, tgBytes: 16)
 
+proc tgReduceAt(k: KB; lf, acc, T, off: int; isMax: bool) =
+  ## Like tgSum, but over threadgroup slots [off, off+T) and optionally a maximum. The result is
+  ## left in slot `off`; every lane must call it.
+  k.e("tgstoref32", acc, lf, off)
+  k.e("barriertg")
+  let lim = k.r()
+  let idx = k.r()
+  let c = k.r()
+  let x = k.r()
+  let y = k.r()
+  var step = T div 2
+  while step >= 1:
+    let st = step
+    k.e("loadconstf32", lim, st)
+    k.e("cmplt", c, lf, lim)
+    k.cond(c, proc() =
+      k.e("addconst", idx, lf, st)
+      k.e("tgloadf32", x, idx, off)
+      k.e("tgloadf32", y, lf, off)
+      if isMax:
+        k.e("cmplt", c, y, x)
+        k.cond(c, proc() = k.cp(y, x))
+      else:
+        k.e("add", y, y, x)
+      k.e("tgstoref32", y, lf, off))
+    k.e("barriertg")
+    step = step div 2
+  k.fr(lim, idx, c, x, y)
+
+proc pow2Ceil(n: int): int =
+  result = 1
+  while result < n: result *= 2
+
+proc genNormPar(rows, cols: int; eps: float; addInput: bool; T = 256): Gen =
+  ## RMSNorm with one threadgroup of T lanes per row (the structure of the Metal rmsnorm kernels):
+  ## lanes stride over the row, the sum of squares is reduced through threadgroup memory.
+  ## addInput: ports in0=a in1=b in2=gamma, out0=a+b, out1=norm(a+b)*gamma (rows must be 1).
+  ## otherwise: in0=x in1=gamma out0=y.
+  let iters = pow2Ceil((cols + T - 1) div T)       # surplus steps are skipped by the i < cols guard
+  let k = newKB()
+  let row = k.u()
+  let lane = k.u()
+  let base = k.u()
+  let i = k.u()
+  let a = k.u()
+  let lf = k.r()
+  let v = k.r()
+  let w = k.r()
+  let sq = k.cf(0)
+  let c = k.r()
+  let jf = k.r()
+  let lim = k.cf(float(cols))
+  k.e("utgid", row)
+  k.e("ulid", lane)
+  k.e("loadlid", lf)
+  k.e("umulk", base, row, cols)
+  proc pass(body: proc()) =
+    k.e("uaddk", i, lane, 0)
+    k.forN(iters, proc() =
+      k.e("utor", jf, i)
+      k.e("cmplt", c, jf, lim)
+      k.cond(c, proc() =
+        k.e("uadd", a, base, i)
+        body())
+      k.e("uaddk", i, i, T))
+  pass(proc() =
+    if addInput:
+      k.e("uloadf32", v, a, "@in0")
+      k.e("uloadf32", w, a, "@in1")
+      k.e("add", v, v, w)
+      k.e("ustoref32", v, a, "@out0")
+    else:
+      k.e("uloadf32", v, a, "@in0")
+    k.e("mul", v, v, v)
+    k.e("add", sq, sq, v))
+  k.tgSum(lf, sq, T)
+  let inv = k.r()
+  let z = k.cf(0)
+  k.e("tgloadf32", inv, z, 0)
+  k.e("mulconst", inv, inv, fnum(1.0 / float(cols)))
+  k.e("addconst", inv, inv, fnum(eps))
+  k.e("rsqrt", inv, inv)
+  pass(proc() =
+    k.e("uloadf32", v, a, (if addInput: "@out0" else: "@in0"))
+    k.e("mul", v, v, inv)
+    k.e("uloadf32", w, i, (if addInput: "@in2" else: "@in1"))
+    k.e("mul", v, v, w)
+    k.e("ustoref32", v, a, (if addInput: "@out1" else: "@out0")))
+  result = Gen(body: k.text, threads: rows * T, ins: (if addInput: 3 else: 2), outs: (if addInput: 2 else: 1),
+    tg: T, tgBytes: max(16, T * 4))
+
+proc genRmsnormPar*(rows, cols: int; eps: float): Gen = genNormPar(rows, cols, eps, false)
+proc genAddRmsnormPar*(cols: int; eps: float): Gen = genNormPar(1, cols, eps, true)
+
+proc genAttentionDecodePar*(H, HKV, D, maxSeqLen: int; T = 128): Gen =
+  ## Decode attention with one threadgroup of T lanes per query head, as the Metal decode kernels
+  ## do: lanes take the keys s = lane, lane+T, ... (score = q . K[s], kept in threadgroup memory),
+  ## the max and the sum of exp are reduced across the group, then lane d < D accumulates
+  ## sum_s p[s] * V[s][d]. Ports as genAttentionDecode with countFromPosition (in3 = position).
+  let nRep = if HKV > 0: H div HKV else: 0
+  if HKV <= 0 or H mod HKV != 0 or (nRep and (nRep - 1)) != 0 or D > T or
+     (maxSeqLen + T) * 4 > 24000:
+    return genAttentionDecode(H, HKV, D, maxSeqLen, true)
+  var nShift = 0
+  while (1 shl nShift) < nRep: inc nShift
+  var tShift = 0
+  while (1 shl tShift) < T: inc tShift
+  let k = newKB()
+  let h = k.u()
+  let kvh = k.u()
+  let lane = k.u()
+  let qb = k.u()
+  let kvb = k.u()
+  let sU = k.u()
+  let ki = k.u()
+  let qi = k.u()
+  let stepsU = k.u()
+  let tmp = k.u()
+  let lf = k.r()
+  let sCnt = k.r()
+  let sF = k.r()
+  let m = k.r()
+  let l = k.r()
+  let dot = k.r()
+  let qv = k.r()
+  let kv = k.r()
+  let c = k.r()
+  let itf = k.r()
+  let gm = k.r()
+  let gl = k.r()
+  let z = k.cf(0)
+  let one = k.cf(1)
+  let negl = k.cf(NegLarge)
+  let zeroU = k.cu(0)
+  k.e("utgid", h)
+  k.e("ulid", lane)
+  k.e("loadlid", lf)
+  k.e("uloadf32", sCnt, zeroU, "@in3")
+  k.e("addconst", sCnt, sCnt, 1)
+  k.e("ushrk", kvh, h, nShift)
+  k.e("umulk", qb, h, D)
+  k.e("umulk", kvb, kvh, maxSeqLen * D)
+  k.e("rtou", stepsU, sCnt)
+  k.e("uaddk", stepsU, stepsU, T - 1)
+  k.e("ushrk", stepsU, stepsU, tShift)
+  k.e("utor", itf, stepsU)
+  var iters = 1                                        # compile-time bound for the pow2 loop trip
+  while iters < (maxSeqLen + T - 1) div T: iters *= 2
+  k.cp(m, negl)
+  k.e("loadconstf32", l, 0)
+  # phase 1: scores
+  k.e("uaddk", sU, lane, 0)
+  k.e("loadconstf32", sF, 0)
+  k.forN(iters, proc() =
+    k.e("utor", sF, sU)
+    k.e("cmplt", c, sF, sCnt)
+    k.cond(c, proc() =
+      k.e("umulk", ki, sU, D)
+      k.e("uadd", ki, ki, kvb)
+      k.e("uaddk", qi, qb, 0)
+      k.e("loadconstf32", dot, 0)
+      k.forN(D, proc() =
+        k.e("uloadf32", qv, qi, "@in0")
+        k.e("uloadf32", kv, ki, "@in1")
+        k.e("mul", qv, qv, kv)
+        k.e("add", dot, dot, qv)
+        k.e("uaddk", qi, qi, 1)
+        k.e("uaddk", ki, ki, 1))
+      k.e("tgstoref32", dot, sF, 0)
+      k.e("cmplt", c, m, dot)
+      k.cond(c, proc() = k.cp(m, dot)))
+    k.e("uaddk", sU, sU, T))
+  k.tgReduceAt(lf, m, T, maxSeqLen, true)
+  k.e("tgloadf32", gm, z, maxSeqLen)
+  k.e("barriertg")
+  # phase 2: p = exp(score - max), sum
+  k.e("uaddk", sU, lane, 0)
+  k.forN(iters, proc() =
+    k.e("utor", sF, sU)
+    k.e("cmplt", c, sF, sCnt)
+    k.cond(c, proc() =
+      k.e("tgloadf32", dot, sF, 0)
+      k.e("sub", dot, dot, gm)
+      k.e("exp", dot, dot)
+      k.e("tgstoref32", dot, sF, 0)
+      k.e("add", l, l, dot))
+    k.e("uaddk", sU, sU, T))
+  k.tgReduceAt(lf, l, T, maxSeqLen, false)
+  k.e("tgloadf32", gl, z, maxSeqLen)
+  k.e("barriertg")
+  # phase 3: o[d] = sum_s p[s] * V[s][d] / sum
+  let dLim = k.cf(float(D))
+  k.e("cmplt", c, lf, dLim)
+  k.cond(c, proc() =
+    k.e("loadconstf32", dot, 0)
+    k.e("loadconstf32", sF, 0)
+    k.e("uaddk", ki, kvb, 0)
+    k.e("uadd", ki, ki, lane)
+    k.forR(sCnt, proc() =
+      k.e("tgloadf32", qv, sF, 0)
+      k.e("uloadf32", kv, ki, "@in2")
+      k.e("fma", dot, qv, kv, dot)
+      k.e("addconst", sF, sF, 1)
+      k.e("uaddk", ki, ki, D))
+    k.e("div", dot, dot, gl)
+    k.e("uadd", tmp, qb, lane)
+    k.e("ustoref32", dot, tmp, "@out0"))
+  result = Gen(body: k.text, threads: H * T, ins: 4, outs: 1, tg: T, tgBytes: (maxSeqLen + T) * 4)
+
 proc genArgmax*(outer, dimSize, inner: int): Gen =
   ## sessionArgmaxIndexEnc(x, val, idx, outer, dimSize, inner): first maximum along dim.
   ## ports in0=x out0=val [outer*inner] out1=idx [outer*inner] (index as float); lane = outer row.
