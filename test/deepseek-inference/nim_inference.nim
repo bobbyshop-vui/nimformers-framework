@@ -2737,7 +2737,11 @@ proc encodePrefillLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMS
   step(sessionKvScatterEnc(be, hV, cache.layers[layerIdx].vResidentCombined, T, HKV, D, pos,
                            cache.maxSeqLen), "V cache scatter failed")
   prof("kv scatter")
-  for h in 0 ..< HKV:
+  # The per-head copies only serve the unfused attention fallback (decode on Metal reads the
+  # combined buffers and never refreshes them either), so Metal skips them:
+  # 2 x HKV dispatches fewer per layer. BYBY_PREFILL_HEAD_COPIES=1 keeps them.
+  let headCopies = be != gbMetal or getEnv("BYBY_PREFILL_HEAD_COPIES", "0") == "1"
+  for h in 0 ..< (if headCopies: HKV else: 0):
     let off = h * cache.maxSeqLen * D + pos * D
     step(sessionCopyInto(be, cache.layers[layerIdx].kResidentCombined,
                          cache.layers[layerIdx].kResident[h], off, pos * D, T * D),
@@ -2820,6 +2824,7 @@ proc prefillFlashChunk(m: LlamaModelL, xData: seq[float32], T, pos: int, ctx: Ba
       cosSlice[t * halfD + i] = m.rope.cosT[p * halfD + i]
       sinSlice[t * halfD + i] = m.rope.sinT[p * halfD + i]
 
+  let prefillLayersPerCb = if paced: 0 else: envNum("BYBY_PREFILL_LAYERS_PER_CB", 4)
   var keep: seq[SessionHandle]       # live across command buffers
   var pending: seq[SessionHandle]    # freed after the command buffer that used them
   var hX: SessionHandle
@@ -2838,12 +2843,17 @@ proc prefillFlashChunk(m: LlamaModelL, xData: seq[float32], T, pos: int, ctx: Ba
       if not sessionBegin(be):
         raise newException(CatchableError, "[FLASH_PREFILL] sessionBegin failed")
       open = true
+      let firstIdx = idx
       if idx == 0:
         hX = sessionUpload(be, xData)
         keep.add sessionUpload(be, cosSlice)
         keep.add sessionUpload(be, sinSlice)
       let stop = idx + nLayers
       while idx < stop:
+        # Apple Silicon: hand the GPU the first layers while the CPU still encodes the rest.
+        if prefillLayersPerCb > 0 and idx > firstIdx and (idx - firstIdx) mod prefillLayersPerCb == 0 and
+           not sessionCommitContinue(be):
+          raise newException(CatchableError, "[FLASH_PREFILL] sessionCommitContinue failed")
         let blk = m.blocks[idx]
         let hNext = encodePrefillLayerIntoOpenSession(blk.attn, blk.inputNorm, blk.postAttnNorm,
           blk.ff, hX, keep[0], keep[1], be, cache, idx, T, pos, pending)
