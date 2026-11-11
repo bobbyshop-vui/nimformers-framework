@@ -460,8 +460,12 @@ proc lowerMatmulQ4(l: SessionLift; op: Op) =
   if dims != @[n, k]: fail("Q4 weight " & rec.name & " has shape " & $dims & ", the op is [" & $n & "," & $k & "]")
   let wn = l.weightName(rec, (if group == 32: "q4b" else: "q4b" & $group), dims)
   let c = l.wr(op, op.outs.port("c"))
-  l.addKernelNode(op, "matmul_q4", genMatmulQ4Par(m, k, n, group, op.attrInt("groupsPerRow"), parLanes()),
-    @[a, wn], @[c])
+  # Decode (M=1) is the structure of the Metal matmul_q4_simd kernel (simdgroup per rows, simd_sum);
+  # FIRLIFT_GENERIC=1 keeps the lane-per-column kernels, which every VM backend can run.
+  let gen = (if m == 1 and getEnv("FIRLIFT_GENERIC").len == 0:
+               genMatmulQ4Simd(k, n, group, op.attrInt("groupsPerRow"))
+             else: genMatmulQ4Par(m, k, n, group, op.attrInt("groupsPerRow"), parLanes()))
+  l.addKernelNode(op, "matmul_q4", gen, @[a, wn], @[c])
 
 proc lowerMatmulNT(l: SessionLift; op: Op; bPort = "b") =
   let m = op.attrInt("M")

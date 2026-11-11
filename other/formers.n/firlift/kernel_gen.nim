@@ -1127,6 +1127,121 @@ proc genMatmulQ4Par*(M, K, N, groupSize, nGroups: int; T = 32): Gen =
     )
   result = Gen(body: k.text, threads: N * t, ins: 2, outs: 1, tg: t, tgBytes: max(16, t * 4))
 
+proc genMatmulQ4Simd*(K, N, groupSize, nGroups: int; rows = 4; sg = 2): Gen =
+  ## Decode (M=1) Q4 GEMV built the way the Metal kernel matmul_q4_simd is: one simdgroup per
+  ## `rows` output rows, a lane takes 8 weights (one aligned 4-byte pack) per step and the lanes
+  ## stride over K, the dot is the same fma chain, the group is corrected once per step with
+  ##   sum = fma(scale, dot - zero * sum(a), sum)
+  ## and the lanes are combined with simd_sum. Same ports as genMatmulQ4Par (packed q4b layout).
+  ## Needs K % 8 == 0, a power-of-two group that divides K, and N % rows == 0.
+  let gs = if groupSize > 0: groupSize else: K
+  if K mod 8 != 0 or K mod gs != 0 or (gs and (gs - 1)) != 0 or N mod rows != 0 or gs < 8:
+    return genMatmulQ4Par(1, K, N, groupSize, nGroups)
+  var gShift = 0
+  while (1 shl gShift) < gs: inc gShift
+  let rowBytes = K div 2
+  let wqF = (N * rowBytes + 3) div 4
+  let scalesAddr = "@in1+" & $wqF
+  let zerosAddr = "@in1+" & $(wqF + N * nGroups)
+  let stepsK = (K + 127) div 128            # at least 16 lanes x 8 weights per step (width is read at run time)
+  # The step count is rounded up to a power of two: the surplus steps are skipped by the k < K guard.
+  # On Intel Iris (Metal) a non-power-of-two trip count made this loop return wrong sums.
+  var pow2Steps = 1
+  while pow2Steps < stepsK: pow2Steps *= 2
+  let k = newKB()
+  let tg = k.u()
+  let lane = k.u()
+  let sid = k.u()
+  let sw = k.u()
+  let stepU = k.u()
+  let row0 = k.u()
+  let kk = k.u()
+  let wqb = k.u()
+  let ad = k.u()
+  let pk = k.u()
+  let tmp = k.u()
+  let gi = k.u()
+  let nr = k.u()
+  let kh = k.u()
+  let gb = k.u()
+  k.e("utgid", tg)
+  k.e("simdlane", lane)
+  k.e("simdw", sw)
+  k.e("simdgid", sid)                 # grid-wide simdgroup index, whatever the simdgroup width is
+  k.e("umulk", row0, sid, rows)
+  k.e("umulk", stepU, sw, 8)
+  k.e("uconst", wqb, "@in1")
+  k.e("umulk", wqb, wqb, 4)
+  k.e("umulk", kk, lane, 8)
+  let sums = newSeq[int](rows)
+  var sumR = sums
+  for r in 0 ..< rows: sumR[r] = k.cf(0)
+  let acts = newSeq[int](8)
+  var a = acts
+  for j in 0 ..< 8: a[j] = k.r()
+  let asum = k.r()
+  let t0 = k.r()
+  let t1 = k.r()
+  let d = k.r()
+  let q = k.r()
+  let sc = k.r()
+  let zp = k.r()
+  let c = k.r()
+  let kf = k.r()
+  let kLimit = k.cf(float(K))
+  let rowf = k.r()
+  let nLimit = k.cf(float(N))
+  let one = k.cf(1)
+  k.e("utor", rowf, row0)
+  k.e("cmplt", c, rowf, nLimit)
+  k.cond(c, proc() =
+    k.forN(pow2Steps, proc() =
+      k.e("utor", kf, kk)
+      k.e("cmplt", c, kf, kLimit)
+      k.cond(c, proc() =
+        for j in 0 ..< 8:
+          k.e("uloadf32", a[j], kk, "@in0+" & $j)
+        # act.sum = ((x0 + x1) + (x2 + x3)) + ((x4 + x5) + (x6 + x7))
+        k.e("add", t0, a[0], a[1])
+        k.e("add", t1, a[2], a[3])
+        k.e("add", t0, t0, t1)
+        k.e("add", t1, a[4], a[5])
+        k.e("add", d, a[6], a[7])
+        k.e("add", t1, t1, d)
+        k.e("add", asum, t0, t1)
+        k.e("ushrk", gb, kk, gShift)
+        k.e("ushrk", kh, kk, 1)
+        for r in 0 ..< rows:
+          k.e("uaddk", nr, row0, r)
+          k.e("umulk", ad, nr, rowBytes)
+          k.e("uadd", ad, ad, wqb)
+          k.e("uadd", ad, ad, kh)
+          k.e("uloadu32", pk, ad, 0)
+          # d = fma(a0,q0, fma(a1,q1, ... fma(a6,q6, a7*q7)))
+          for j in countdown(7, 0):
+            k.e("ushrk", tmp, pk, 4 * j)
+            if j < 7: k.e("uandk", tmp, tmp, 15)
+            k.e("utor", q, tmp)
+            if j == 7: k.e("mul", d, a[7], q)
+            else: k.e("fma", d, a[j], q, d)
+          k.e("umulk", gi, nr, nGroups)
+          k.e("uadd", gi, gi, gb)
+          k.e("uloadf32", sc, gi, scalesAddr)
+          k.e("uloadf32", zp, gi, zerosAddr)
+          k.e("mul", zp, zp, asum)
+          k.e("sub", d, d, zp)
+          k.e("fma", sumR[r], sc, d, sumR[r]))
+      k.e("uadd", kk, kk, stepU))
+    k.e("utor", kf, lane)
+    k.e("cmplt", c, kf, one)
+    for r in 0 ..< rows:
+      k.e("simdsum", d, sumR[r])
+      k.cond(c, proc() =
+        k.e("uaddk", nr, row0, r)
+        k.e("ustoref32", d, nr, "@out0")))
+  result = Gen(body: k.text, threads: ((N div rows + sg - 1) div sg) * sg * 32, ins: 2, outs: 1,
+    tg: sg * 32, tgBytes: 16)
+
 proc genArgmax*(outer, dimSize, inner: int): Gen =
   ## sessionArgmaxIndexEnc(x, val, idx, outer, dimSize, inner): first maximum along dim.
   ## ports in0=x out0=val [outer*inner] out1=idx [outer*inner] (index as float); lane = outer row.

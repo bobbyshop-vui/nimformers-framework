@@ -68,6 +68,11 @@ const
   OpGridEpilogue* = 0x9C'u32
   OpULoadU32* = 0x9D'u32
   OpULoadIn4* = 0x9E'u32
+  OpSimdSum* = 0xA0'u32
+  OpSimdLane* = 0xA1'u32
+  OpSimdId* = 0xA2'u32
+  OpSimdW* = 0xA3'u32
+  OpSimdGid* = 0xA4'u32
 
 type
   LiftPort* = object
@@ -169,6 +174,11 @@ proc disassemble*(words: openArray[uint32]; ports: seq[LiftPort]): string =
     of OpLoadTgid: mnemonic = "loadtgid"; pushU a
     of OpUTgid: mnemonic = "utgid"; pushU a
     of OpULid: mnemonic = "ulid"; pushU a
+    of OpSimdLane: mnemonic = "simdlane"; pushU a
+    of OpSimdId: mnemonic = "simdid"; pushU a
+    of OpSimdW: mnemonic = "simdw"; pushU a
+    of OpSimdGid: mnemonic = "simdgid"; pushU a
+    of OpSimdSum: mnemonic = "simdsum"; pushU a; pushU b
     of OpUAdd: mnemonic = "uadd"; pushU a; pushU b; pushU c
     of OpUMul: mnemonic = "umul"; pushU a; pushU b; pushU c
     of OpUShr: mnemonic = "ushr"; pushU a; pushU b; pushU c

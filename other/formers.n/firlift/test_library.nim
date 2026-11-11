@@ -321,6 +321,32 @@ proc sessionTests2() =
     chk("matmul_q4_par M" & $M & " K" & $K & " gs" & $gs & " tg" & $g.tg, g,
         @[a, bytesAsFloats(bytes) & scales & zeros], want, 1e-3'f32)
 
+  # simdgroup Q4 GEMV (the Metal matmul_q4_simd structure): lanes stride over K, simd_sum combines
+  for (K, N, gs, rows, sg) in [(256, 8, 128, 4, 2), (512, 4, 32, 4, 1), (128, 6, 64, 2, 2), (768, 4, 128, 4, 1), (3072, 4, 128, 4, 1)]:
+    let nG = K div gs
+    let bpr = K div 2
+    var q = newSeq[int](N*K)
+    var bytes = newSeq[uint8](N*bpr)
+    for i in 0 ..< N*K: q[i] = (i*5 + 3) mod 16
+    for n in 0 ..< N:
+      for kk in 0 ..< K:
+        let b = n*bpr + kk div 2
+        bytes[b] = bytes[b] or uint8(q[n*K + kk] shl (if kk mod 2 == 0: 0 else: 4))
+    let scales = fill(N*nG, 0.4, 0.3)
+    let zeros = fill(N*nG, 1.1, 2.0)
+    let a = fill(K, 0.8)
+    var want = newSeq[float32](N)
+    for n in 0 ..< N:
+      var s = 0.0'f32
+      for kk in 0 ..< K:
+        let gi = n*nG + kk div gs
+        s += a[kk] * ((float32(q[n*K + kk]) - zeros[gi]) * scales[gi])
+      want[n] = s
+    let g = genMatmulQ4Simd(K, N, gs, nG, rows, sg)
+    doAssert g.tg == sg * 32, "simd variant not selected"
+    chk("matmul_q4_simd K" & $K & " gs" & $gs & " rows" & $rows & " sg" & $sg, g,
+        @[a, bytesAsFloats(bytes) & scales & zeros], want, 1e-3'f32)
+
   # argmax keeps the first maximum
   block:
     let outer = 2

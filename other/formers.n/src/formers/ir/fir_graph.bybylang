@@ -1078,12 +1078,12 @@ function fgEncodeGraph(model: var FirGraph, token: int, phase: string)
                 for i in index ..< stop:
                     let node = model.graph.nodes[i]
                     if not fgEncodeNode(model, node, layer, token):
-                        raise newException(ValueError, "FIR graph resident encode failed: " & node.name)
+                        raise newException(ValueError, "FIR graph resident encode failed: " & node.name & (if cpu_backend.cpuLastErrorMessage().len > 0: " (" & cpu_backend.cpuLastErrorMessage() & ")" else: ""))
             index = stop
         else:
             let node = model.graph.nodes[index]
             if not fgEncodeNode(model, node, 0, token):
-                raise newException(ValueError, "FIR graph resident encode failed: " & node.name)
+                raise newException(ValueError, "FIR graph resident encode failed: " & node.name & (if cpu_backend.cpuLastErrorMessage().len > 0: " (" & cpu_backend.cpuLastErrorMessage() & ")" else: ""))
             inc index
 
 function firGraphStep(model: var FirGraph, token: int, stepKind = "decode"): seq[float32]
