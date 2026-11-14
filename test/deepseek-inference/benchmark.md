@@ -72,10 +72,13 @@ lower median for that matrix shape. Set
 
 ## MacBook Pro (Intel Iris Plus 640)
 
-| Backend | Prefill | Decode, 127 tokens |
+Latest paired native result (106-token prompt, warm GPU, measured before the
+runtime Q4 QKV autotuner):
+
+| Backend | Prefill throughput | Decode throughput (11 tokens) |
 | --- | ---: | ---: |
-| Metal (86 tokens) | 10.157 s · **8.47 tok/s** | 42.273 s · **3.00 tok/s** · 332.9 ms/token |
-| Vulkan (MoltenVK, 80 tokens) | 21.873 s · 3.66 tok/s | 92.290 s · 1.38 tok/s · 726.7 ms/token |
+| Metal | 9.74–10.94 tok/s | 2.93–3.16 tok/s |
+| Vulkan (MoltenVK) | **8.08–8.14 tok/s** | **1.95–2.19 tok/s** |
 
 Metal prefill uses the tiled Q4 GEMM (64x128 tiles) and the flash attention
 kernel. Long GPU work is split into command buffers of about 300 ms so the
@@ -100,10 +103,14 @@ BOS, greedy, `-c 512`, `-n 12` (106 prompt tokens, 11 decode tokens measured).
 
 Across these two paired runs Vulkan reached 74–84% of Metal prefill throughput
 and 67–69% of Metal decode throughput. The visible greedy continuation matched
-between backends. The earlier 0.58 tok/s Vulkan run ended with
-`CPU_Speed_Limit = 30`; the older 1.38 tok/s entry above used an 80-token
-prompt. Neither is a controlled comparison with these 106-token, warm-cache
-runs.
+between backends. The old 80-token Vulkan run measured 3.66 tok/s prefill and
+1.38 tok/s decode; it is retained as a short-prompt historical result. The
+earlier 0.58 tok/s Vulkan run ended with `CPU_Speed_Limit = 30`. Neither is a
+controlled comparison with these 106-token, warm-cache runs.
+
+The fused-versus-split QKV autotuner was added after these Iris measurements.
+The new code selects a route on the active Vulkan device; no post-autotune Iris
+throughput result has been recorded yet.
 
 ### Vulkan decode stage profile
 
