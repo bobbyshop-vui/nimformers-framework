@@ -54,9 +54,10 @@ Both runs completed all 254 MODE3 attempts with no fallback. The decode gain
 tracks the lower GPU-wait time; host encode and other host work barely changed.
 The prefill path does not use this decode QKV selection, so the 3.2% prefill
 difference is run-to-run variation, not an effect attributed to this change.
-This is one A/B pair, not a multi-run median. The pasted stdout/stderr are
-interleaved, so they do not establish exact generated-text parity. The runtime
-now selects split Q/K/V automatically on a device named Tesla T4; set
+This is one A/B pair, not a multi-run median. After stripping the interleaved
+diagnostic lines, the visible generated text matches between the two Vulkan
+runs. The log has no Metal run, so it does not establish Vulkan-to-Metal text
+parity. The runtime now selects split Q/K/V automatically on Tesla T4; set
 `BYBY_VULKAN_Q4_SPLIT_QKV=0` to force fused QKV or `=1` to force split on other
 Vulkan GPUs.
 
