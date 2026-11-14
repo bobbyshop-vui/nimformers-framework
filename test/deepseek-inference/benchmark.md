@@ -33,6 +33,33 @@ Prefill GEMMs at M=64 run on the tensor cores (tiled, split-K over the 40 SMs):
 | 4096x11008 | 172 x split-K 1 | 2.154 ms |
 | 11008x4096 | 64 x split-K 4 | 2.077 ms |
 
+### Tesla T4 Q4 QKV path A/B (Colab, 2026-11-14)
+
+The supplied Colab log compares the default fused QKV path against
+`BYBY_VULKAN_Q4_SPLIT_QKV=1`. Both runs used the same 309-token prompt and
+generated 254 tokens; the T4 reported cache hits for its Q4 plans. The split
+path uses the autotuned M=1 Q4 GEMV for Q, K, and V instead of the fixed fused
+QKV shader.
+
+| Measurement | Fused QKV | Split Q/K/V | Change |
+| --- | ---: | ---: | ---: |
+| Prefill | 213.86 tok/s | 207.00 tok/s | -3.2% |
+| Decode | 26.08 tok/s · 38.4 ms/token | **29.98 tok/s · 33.4 ms/token** | **+15.0% throughput** |
+| Decode elapsed | 9.741 s | 8.471 s | -1.270 s |
+| Host encode | 1.96 ms/token | 1.91 ms/token | -0.05 ms/token |
+| Wait for GPU | 35.46 ms/token | 30.55 ms/token | -4.91 ms/token |
+| Other host work | 0.93 ms/token | 0.89 ms/token | -0.04 ms/token |
+
+Both runs completed all 254 MODE3 attempts with no fallback. The decode gain
+tracks the lower GPU-wait time; host encode and other host work barely changed.
+The prefill path does not use this decode QKV selection, so the 3.2% prefill
+difference is run-to-run variation, not an effect attributed to this change.
+This is one A/B pair, not a multi-run median. The pasted stdout/stderr are
+interleaved, so they do not establish exact generated-text parity. The runtime
+now selects split Q/K/V automatically on a device named Tesla T4; set
+`BYBY_VULKAN_Q4_SPLIT_QKV=0` to force fused QKV or `=1` to force split on other
+Vulkan GPUs.
+
 ## MacBook Pro (Intel Iris Plus 640)
 
 | Backend | Prefill | Decode, 127 tokens |
