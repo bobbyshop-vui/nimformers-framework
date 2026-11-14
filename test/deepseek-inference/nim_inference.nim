@@ -2,12 +2,10 @@
 ## A SINGLE file: nimformer_llama (RoPE + RMSNorm + SwiGLU + GQA + paged KV cache)
 ## + a pure-Nim HF tokenizer + the text generation loop.
 
-import std/[math, random, sequtils, tables, algorithm, os, strformat, strutils, times, json, sets, heapqueue, terminal]
+import std/[math, random, sequtils, tables, algorithm, os, strformat, strutils, times, monotimes, json, sets, heapqueue, terminal]
 when defined(posix): import std/posix
 import nimformers  # Tensor, Linear, newLinear, flatten2D, transpose, Embedding, addT...
 import native_hf_tokenizer
-import vendor/bybylang/backends/vulkan/vulkan_driver as vkDriver
-import vendor/bybylang/backends/vulkan/vulkan_caps as vkCaps
 from probe import firProbeOn, probeStepBegin, probeStepEnd
 export native_hf_tokenizer
 
@@ -2020,10 +2018,106 @@ proc ensureRopeTables*(be: GpuBackend, rope: RoPEL) =
   gRopeTabsLen = rope.cosT.len
 
 var gVulkanQ4SplitQkvLogged = false
+var gVulkanQ4QkvTuneKey = ""
+var gVulkanQ4QkvSplitSelected = false
+
+proc q4QkvRouteSample(attn: GQAAttention, normQKV: RMSNormL, xData: seq[float32],
+                      be: GpuBackend, fused: bool, repetitions: int): float =
+  ## Time the actual fused or split Q4 QKV sequence in an isolated session.
+  ## Repeat dispatches in one command buffer so queue/fence overhead is amortized.
+  result = high(float)
+  if repetitions <= 0 or not sessionBegin(be): return
+  var sessionOpen = true
+  var pending = newSeq[SessionHandle]()
+  try:
+    let t0 = getMonoTime()
+    var hX = sessionUpload(be, xData); pending.add(hX)
+    var hGamma: SessionHandle
+    if normQKV.residentGammaReady:
+      hGamma = normQKV.residentGamma
+    else:
+      hGamma = sessionUpload(be, normQKV.weight.data); pending.add(hGamma)
+    var hNorm = sessionAllocScratch(be, attn.qProj.inF); pending.add(hNorm)
+    var hQ = sessionAllocScratch(be, attn.qProj.outF); pending.add(hQ)
+    var hK = sessionAllocScratch(be, attn.kProj.outF); pending.add(hK)
+    var hV = sessionAllocScratch(be, attn.vProj.outF); pending.add(hV)
+    var encoded = true
+    for _ in 0 ..< repetitions:
+      if fused:
+        if not sessionMatmulQ4Fused(be, 0, hX,
+            [attn.qProj.residentW, attn.kProj.residentW, attn.vProj.residentW],
+            [hQ, hK, hV], SessionHandle(), false, hGamma, normQKV.eps, true):
+          encoded = sessionRmsnormEnc(be, hX, hGamma, hNorm, 1,
+            attn.qProj.inF, normQKV.eps) and
+            sessionMatmulQ4Fused(be, 0, hNorm,
+              [attn.qProj.residentW, attn.kProj.residentW, attn.vProj.residentW],
+              [hQ, hK, hV], SessionHandle(), false)
+      else:
+        encoded = sessionRmsnormEnc(be, hX, hGamma, hNorm, 1,
+          attn.qProj.inF, normQKV.eps) and
+          sessionMatmulQ4(be, hNorm, attn.qProj.residentW, hQ, 1) and
+          sessionMatmulQ4(be, hNorm, attn.kProj.residentW, hK, 1) and
+          sessionMatmulQ4(be, hNorm, attn.vProj.residentW, hV, 1)
+      if not encoded: break
+    let sessionOk = sessionEnd(be)
+    sessionOpen = false
+    let elapsedNs = (getMonoTime() - t0).inNanoseconds
+    if encoded and sessionOk:
+      result = float(elapsedNs) / 1e9 / float(repetitions)
+  except CatchableError:
+    result = high(float)
+  finally:
+    if sessionOpen: discard sessionEnd(be)
+    for h in pending.mitems: sessionFree(be, h)
+
+proc median3(a, b, c: float): float =
+  var values = @[a, b, c]
+  values.sort()
+  values[1]
+
+proc qkvTuneTime(value: float): string =
+  if value >= high(float) / 2: "unsupported"
+  else: formatFloat(value * 1000.0, ffDecimal, 3) & " ms/op"
+
+proc selectVulkanQ4QkvSplit(attn: GQAAttention, normQKV: RMSNormL,
+                            xData: seq[float32], be: GpuBackend): bool =
+  ## Benchmark both real QKV routes once per device/shape and retain the faster.
+  ## BYBY_VULKAN_Q4_SPLIT_QKV=0/1 remains an explicit fused/split override.
+  if be != gbVulkan or not attn.qProj.residentReady: return false
+  let setting = getEnv("BYBY_VULKAN_Q4_SPLIT_QKV", "auto").toLowerAscii()
+  if setting == "0": return false
+  if setting == "1": return true
+  let C = attn.qProj.inF
+  if xData.len < C or firProbeOn: return false
+  let key = $C & "x" & $attn.qProj.outF & "/" & $attn.kProj.outF & "/" & $attn.vProj.outF &
+    "_g" & $attn.qProj.residentW.groupSize & "/" & $attn.kProj.residentW.groupSize &
+    "/" & $attn.vProj.residentW.groupSize
+  if gVulkanQ4QkvTuneKey != key:
+    gVulkanQ4QkvTuneKey = key
+    gVulkanQ4QkvSplitSelected = false
+    # Compile and warm both candidates before collecting timings.
+    discard q4QkvRouteSample(attn, normQKV, xData, be, true, 2)
+    discard q4QkvRouteSample(attn, normQKV, xData, be, false, 2)
+    var fusedTimes, splitTimes: seq[float]
+    for round in 0 ..< 3:
+      if round mod 2 == 0:
+        fusedTimes.add q4QkvRouteSample(attn, normQKV, xData, be, true, 6)
+        splitTimes.add q4QkvRouteSample(attn, normQKV, xData, be, false, 6)
+      else:
+        splitTimes.add q4QkvRouteSample(attn, normQKV, xData, be, false, 6)
+        fusedTimes.add q4QkvRouteSample(attn, normQKV, xData, be, true, 6)
+    let fusedSec = median3(fusedTimes[0], fusedTimes[1], fusedTimes[2])
+    let splitSec = median3(splitTimes[0], splitTimes[1], splitTimes[2])
+    gVulkanQ4QkvSplitSelected = splitSec < fusedSec
+    stderr.writeLine "[vulkan] Q4 QKV autotune: fused=" & qkvTuneTime(fusedSec) &
+      " split=" & qkvTuneTime(splitSec) & " -> " &
+      (if gVulkanQ4QkvSplitSelected: "split" else: "fused")
+  gVulkanQ4QkvSplitSelected
 
 proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSNormL,
     ff: SwiGLUL, hXIn: SessionHandle, rope: RoPEL, be: GpuBackend, cache: var KVCacheL,
-    layerIdx: int, pending: var seq[SessionHandle]): SessionHandle =
+    layerIdx: int, splitVulkanQ4Qkv: bool,
+    pending: var seq[SessionHandle]): SessionHandle =
   ## THE SHARED CORE of Mode 2 (forwardDecodeFullMergeSingleSession, 1 session per
   ## layer) AND Mode 3 (forwardDecodeAllLayersMergedSession, 1 session for the WHOLE
   ## model). Unlike the original (before the split): (1) it takes an EXISTING SessionHandle
@@ -2056,19 +2150,9 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
   let oProjQ4 = attn.oProj.residentReady
   let gateUpQ4 = ff.gateProj.residentReady
   let downQ4 = ff.downProj.residentReady
-  # The fixed Vulkan fused QKV shader does not use the per-shape M=1 Q4
-  # autotuned GEMV plans. Colab T4 A/B showed the split GEMVs are faster;
-  # auto-select them only on that device. Explicit 1/0 overrides remain useful
-  # for other Vulkan GPUs and controlled comparisons. Metal stays fused.
-  let qkvSplitSetting = getEnv("BYBY_VULKAN_Q4_SPLIT_QKV", "auto").toLowerAscii()
-  var vulkanTeslaT4 = false
-  if qkvQ4 and be == gbVulkan and qkvSplitSetting == "auto":
-    vulkanTeslaT4 = vkCaps.deviceName(vkDriver.vulkanDeviceCaps()).toLowerAscii().contains("tesla t4")
-  let splitVulkanQ4Qkv = qkvQ4 and be == gbVulkan and
-    (qkvSplitSetting == "1" or (qkvSplitSetting == "auto" and vulkanTeslaT4))
-  if splitVulkanQ4Qkv and layerIdx == 0 and not gVulkanQ4SplitQkvLogged:
+  if splitVulkanQ4Qkv and qkvQ4 and layerIdx == 0 and not gVulkanQ4SplitQkvLogged:
     gVulkanQ4SplitQkvLogged = true
-    stderr.writeLine "[vulkan] Q4 QKV path=split M=1 autotuned GEMVs"
+    stderr.writeLine "[vulkan] Q4 QKV selected=split M=1 autotuned GEMVs"
 
   template step(cond: bool, msg: string) =
     if not cond:
@@ -2310,13 +2394,14 @@ proc forwardDecodeFullMergeSingleSession(attn: GQAAttention, normQKV, normFFN: R
 
   var failMsg: string
   chk(precheckLayerResident(attn, ff, layerIdx, failMsg), failMsg)
+  let splitQkv = selectVulkanQ4QkvSplit(attn, normQKV, x.data, be)
   chk(sessionBegin(be), "sessionBegin failed")
   var pending = newSeq[SessionHandle]()
   var failed = false
   try:
     let hXIn = sessionUpload(be, x.data); pending.add(hXIn)
     let hFinal = encodeDecodeLayerIntoOpenSession(attn, normQKV, normFFN, ff, hXIn, rope, be,
-                                                    cache, layerIdx, pending)
+                                                    cache, layerIdx, splitQkv, pending)
     let sessionOk = sessionEnd(be)
     chk(sessionOk, "sessionEnd failed: " & sessionGetLastError(be))
     result = newTensor(x.shape)
@@ -2552,6 +2637,11 @@ proc forwardDecodeAllLayersMergedSession(m: LlamaModelL, xData: seq[float32], ct
     if not precheckLayerResident(m.blocks[idx].attn, m.blocks[idx].ff, idx, failMsg):
       raise newException(CatchableError, "[MODE3] " & failMsg)
 
+  let splitQkv = if m.blocks.len > 0:
+    selectVulkanQ4QkvSplit(m.blocks[0].attn, m.blocks[0].inputNorm, xData, be)
+  else:
+    false
+
   # A command buffer that runs for seconds is killed by the macOS GPU watchdog
   # (and every later submission is then ignored): on a slow iGPU, or when the
   # weights are paged out, one token of 32 layers can take that long. The token
@@ -2574,7 +2664,8 @@ proc forwardDecodeAllLayersMergedSession(m: LlamaModelL, xData: seq[float32], ct
       if decodeCommitBefore(idx, layersPerCb) and not sessionCommitContinue(be):
         raise newException(CatchableError, "[MODE3] sessionCommitContinue failed")
       hX = encodeDecodeLayerIntoOpenSession(m.blocks[idx].attn, m.blocks[idx].inputNorm,
-             m.blocks[idx].postAttnNorm, m.blocks[idx].ff, hX, m.rope, be, cache, idx, pending)
+             m.blocks[idx].postAttnNorm, m.blocks[idx].ff, hX, m.rope, be, cache, idx,
+             splitQkv, pending)
       # NOTE: do NOT sessionFree the previous layer's hX here - the session is still
       # open, every encoded handle must live until sessionEnd (see the full explanation
       # in encodeDecodeLayerIntoOpenSession). The previous layer's hX is already
@@ -2730,7 +2821,8 @@ proc decodePipeEnqueue*(m: LlamaModelL, ctx: Backend, cache: var KVCacheL): bool
         if not recording and decodeCommitBefore(idx, layersPerCb) and not sessionCommitContinue(be):
           raise newException(CatchableError, "[GPU_SAMPLE] sessionCommitContinue failed")
         hX = encodeDecodeLayerIntoOpenSession(m.blocks[idx].attn, m.blocks[idx].inputNorm,
-               m.blocks[idx].postAttnNorm, m.blocks[idx].ff, hX, m.rope, be, cache, idx, pending)
+               m.blocks[idx].postAttnNorm, m.blocks[idx].ff, hX, m.rope, be, cache, idx,
+               false, pending)
       var hNormF = sessionAllocScratch(be, C); pending.add(hNormF)
       var hLogits = sessionAllocScratch(be, m.lmHead.outF); pending.add(hLogits)
       if not (sessionRmsnormEnc(be, hX, m.finalNorm.residentGamma, hNormF, 1, C, m.finalNorm.eps) and
