@@ -6,6 +6,8 @@ import std/[math, random, sequtils, tables, algorithm, os, strformat, strutils, 
 when defined(posix): import std/posix
 import nimformers  # Tensor, Linear, newLinear, flatten2D, transpose, Embedding, addT...
 import native_hf_tokenizer
+import vendor/bybylang/backends/vulkan/vulkan_driver as vkDriver
+import vendor/bybylang/backends/vulkan/vulkan_caps as vkCaps
 from probe import firProbeOn, probeStepBegin, probeStepEnd
 export native_hf_tokenizer
 
@@ -2055,13 +2057,18 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
   let gateUpQ4 = ff.gateProj.residentReady
   let downQ4 = ff.downProj.residentReady
   # The fixed Vulkan fused QKV shader does not use the per-shape M=1 Q4
-  # autotuned GEMV plans. Keep this opt-in switch for a controlled T4 A/B:
-  # splitting Q/K/V uses those tuned plans; Metal and the default stay fused.
+  # autotuned GEMV plans. Colab T4 A/B showed the split GEMVs are faster;
+  # auto-select them only on that device. Explicit 1/0 overrides remain useful
+  # for other Vulkan GPUs and controlled comparisons. Metal stays fused.
+  let qkvSplitSetting = getEnv("BYBY_VULKAN_Q4_SPLIT_QKV", "auto").toLowerAscii()
+  var vulkanTeslaT4 = false
+  if qkvQ4 and be == gbVulkan and qkvSplitSetting == "auto":
+    vulkanTeslaT4 = vkCaps.deviceName(vkDriver.vulkanDeviceCaps()).toLowerAscii().contains("tesla t4")
   let splitVulkanQ4Qkv = qkvQ4 and be == gbVulkan and
-    getEnv("BYBY_VULKAN_Q4_SPLIT_QKV", "0") == "1"
+    (qkvSplitSetting == "1" or (qkvSplitSetting == "auto" and vulkanTeslaT4))
   if splitVulkanQ4Qkv and layerIdx == 0 and not gVulkanQ4SplitQkvLogged:
     gVulkanQ4SplitQkvLogged = true
-    stderr.writeLine "[vulkan] Q4 QKV path=split M=1 autotuned GEMVs (A/B override)"
+    stderr.writeLine "[vulkan] Q4 QKV path=split M=1 autotuned GEMVs"
 
   template step(cond: bool, msg: string) =
     if not cond:
