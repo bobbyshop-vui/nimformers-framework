@@ -57,9 +57,10 @@ difference is run-to-run variation, not an effect attributed to this change.
 This is one A/B pair, not a multi-run median. After stripping the interleaved
 diagnostic lines, the visible generated text matches between the two Vulkan
 runs. The log has no Metal run, so it does not establish Vulkan-to-Metal text
-parity. The runtime now selects split Q/K/V automatically on Tesla T4; set
-`BYBY_VULKAN_Q4_SPLIT_QKV=0` to force fused QKV or `=1` to force split on other
-Vulkan GPUs.
+parity. On first decode, the runtime now times both QKV routes on the active
+Vulkan device (three samples, six repeated ops per sample) and selects the
+lower median for that matrix shape. Set
+`BYBY_VULKAN_Q4_SPLIT_QKV=0` to force fused QKV or `=1` to force split.
 
 ## MacBook Pro (Intel Iris Plus 640)
 
