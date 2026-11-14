@@ -7,9 +7,17 @@ flash prefill: every layer of the prompt on the GPU, attention included.
 
 ## Tesla T4 (Vulkan, Colab)
 
-| Prefill, 86 tokens | Decode, 255 tokens |
+Latest supplied T4 run (309 prompt tokens, 254 generated tokens):
+
+| Prefill | Decode |
 | ---: | ---: |
-| 1.011 s · **85.03 tok/s** | 10.278 s · **24.81 tok/s** · 40.3 ms/token |
+| **≈210 tok/s** (207–214 tok/s across the A/B pair) | **≈30 tok/s** (29.98 tok/s) |
+
+Prefill throughput depends on prompt length. With a sufficiently long prompt,
+the measured tok/s can rise as setup and dispatch costs are amortized and the
+GPU processes fuller batches, until throughput saturates. An earlier 86-token
+prompt measured 85.03 tok/s prefill and 24.81 tok/s decode; it is retained as a
+short-prompt result, not the current T4 headline.
 
 Prefill attention runs the tensor-core flash kernel (`KHR_cooperative_matrix`
 FP16/FP32, lazy rescale), checked against a reference when it loads.
