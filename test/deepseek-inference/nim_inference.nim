@@ -1973,7 +1973,9 @@ proc precheckLayerResident(attn: GQAAttention, ff: SwiGLUL, layerIdx: int,
 
 ## BYBY_DECODE_PROFILE=<layer>: that layer's decode ops each run in their own
 ## command buffer and their GPU time is summed per op (decodeProfileReport).
+## BYBY_DECODE_PROFILE=-2 profiles every layer and reports per-step totals.
 let gDecodeProfileLayer = (try: parseInt(getEnv("BYBY_DECODE_PROFILE", "-1")) except ValueError: -1)
+let gDecodeProfileAllLayers = gDecodeProfileLayer == -2
 var gDecodeProfileNames: seq[string]
 var gDecodeProfileSec: seq[float]
 var gDecodeProfileTokens = 0
@@ -1995,7 +1997,8 @@ proc decodeProfileReport*(): string =
     let ms = gDecodeProfileSec[i] * 1000.0 / float(gDecodeProfileTokens)
     total += ms
     result.add(" " & gDecodeProfileNames[i] & " " & formatFloat(ms, ffDecimal, 3))
-  result = "layer " & $gDecodeProfileLayer & " ms/tok:" & result & " | sum " & formatFloat(total, ffDecimal, 3)
+  result = (if gDecodeProfileAllLayers: "all layers" else: "layer " & $gDecodeProfileLayer) &
+    " ms/tok:" & result & " | sum " & formatFloat(total, ffDecimal, 3)
   gDecodeProfileNames.setLen(0)
   gDecodeProfileSec.setLen(0)
   gDecodeProfileTokens = 0
@@ -2005,7 +2008,8 @@ var gRopeTabsLen = 0                      ## cosT.len of the uploaded tables (0:
 
 proc ensureRopeTables*(be: GpuBackend, rope: RoPEL) =
   ## Uploads the cos/sin tables once (outside any session).
-  if gRopeTabsLen == rope.cosT.len or rope.cosT.len == 0 or be != gbMetal: return
+  if gRopeTabsLen == rope.cosT.len or rope.cosT.len == 0 or
+      (be != gbMetal and be != gbVulkan): return
   if gRopeTabsLen > 0:
     sessionFree(be, gRopeCos)
     sessionFree(be, gRopeSin)
@@ -2053,7 +2057,7 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
     if not cond:
       raise newException(CatchableError, "[MERGED_SESSION] " & msg & " (layer " & $layerIdx & ")")
 
-  let profiled = layerIdx == gDecodeProfileLayer
+  let profiled = gDecodeProfileAllLayers or layerIdx == gDecodeProfileLayer
   var profLast = 0.0
   template mark(name: string) =
     # Closes the command buffer here so the GPU time since the last mark is this op's.
@@ -2064,7 +2068,8 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
       profLast = now
       step(sessionBegin(be), "profile sessionBegin failed")
   mark("")
-  if profiled: inc gDecodeProfileTokens
+  if profiled and (not gDecodeProfileAllLayers or layerIdx == 0):
+    inc gDecodeProfileTokens
 
   # ---- RMSNorm (input) + QKV matmul ----
   let hX = hXIn
@@ -2809,13 +2814,17 @@ proc encodePrefillLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMS
   var failMsg: string
   if not precheckLayerResident(attn, ff, layerIdx, failMsg):
     raise newException(CatchableError, "[FLASH_PREFILL] " & failMsg)
+  var prefillProfileLast = if gPrefillProfileLayer == layerIdx: sessionGpuSeconds(be) else: 0.0
   template step(cond: bool, msg: string) =
     if not cond:
       raise newException(CatchableError, "[FLASH_PREFILL] " & msg & " (layer " & $layerIdx & ")")
   template prof(label: string) =
     if gPrefillProfileLayer == layerIdx:
-      stderr.writeLine "[op] " & label & ":"
       if not sessionEnd(be): raise newException(CatchableError, "[FLASH_PREFILL] profile sessionEnd failed")
+      let gpuNow = sessionGpuSeconds(be)
+      stderr.writeLine "[prefill-profile] rows=" & $T & " layer=" & $layerIdx & " op=" & label &
+        " gpu=" & formatFloat((gpuNow - prefillProfileLast) * 1000.0, ffDecimal, 3) & " ms"
+      prefillProfileLast = gpuNow
       if not sessionBegin(be): raise newException(CatchableError, "[FLASH_PREFILL] profile sessionBegin failed")
   template linear(l: Linear, a: SessionHandle, rows: int, what: string): SessionHandle =
     var c = sessionAllocScratch(be, rows * l.outF)
@@ -3044,8 +3053,8 @@ proc forwardPrefillFlash(m: LlamaModelL, xData: seq[float32], T: int, ctx: Backe
   while start < T:
     # Rows per chunk: one 64-row GEMM tile until the speed is known, then what
     # one layer runs in the time budget (whole tiles, 16 .. BYBY_PREFILL_MAX_ROWS).
-    # Apple Silicon (no pacing) splits the prompt into micro-batches of BYBY_UBATCH rows
-    # (default 512, like llama.cpp's n_ubatch); 0 takes the whole prompt in one chunk.
+    # BYBY_UBATCH caps prefill micro-batches on every backend (default 512).
+    # On paced devices it caps the time-based chunk too; 0 leaves the scheduler uncapped.
     var rows = T
     let ubatch = envNum("BYBY_UBATCH", 512)
     if ubatch > 0 and not sessionPacesCommandBuffers(be): rows = ubatch
@@ -3054,6 +3063,7 @@ proc forwardPrefillFlash(m: LlamaModelL, xData: seq[float32], T: int, ctx: Backe
       if gPrefillMsPerLayerRow > 0:
         let fit = int(gPrefillCbMs / gPrefillMsPerLayerRow)
         rows = clamp(if fit >= 64: fit div 64 * 64 else: fit div 16 * 16, 16, gPrefillMaxRows)
+    if ubatch > 0: rows = min(rows, ubatch)
     rows = min(rows, T - start)
     result = prefillFlashChunk(m, xData[start * C ..< (start + rows) * C], rows, pos + start, ctx, cache, logits,
                               start + rows >= T)
@@ -3442,7 +3452,14 @@ proc uploadAllResidentWeights*(m: var LlamaModelL, ctx: Backend) =
     stderr.writeLine "[lm_head] fp32 -> grouped Q4 (" & $m.lmHead.outF & "x" & $m.lmHead.inF &
       ") in " & formatFloat(epochTime() - t0, ffDecimal, 2) & " s; BYBY_LM_HEAD=fp32 keeps fp32"
   uploadResident(m.lmHead, ctx)  # no-op for tied embeddings (useQuant=false)
-  tune(m.lmHead)
+  if ctx.kind.toByby() == gbVulkan and m.lmHead.residentReady:
+    # This inference path computes logits only for the last prompt row and
+    # one decode row, so the Q4 lm_head is always GEMV. M>1 autotuning at
+    # vocab=32256 does multi-billion element work on an iGPU, then never uses
+    # the selected plan. Keep the M=1 plan and skip those Vulkan-only trials.
+    discard residentPrepareQ4(m.lmHead.residentW, 1)
+  else:
+    tune(m.lmHead)
   var zeroCopy, residentQ4 = 0
   proc count(lin: Linear) =
     if lin.residentReady or lin.residentFp32Ready:
@@ -3668,6 +3685,7 @@ proc generate*(m: LlamaModelL, tok: HFTokenizer, ctx: Backend, promptIds: seq[in
   var allIds = promptIds
   allIds.add(nextId)
   var generated = 1
+  sessionTimingReset(ctx.kind.toByby())
   var decodeStart = epochTime()   # measured from AFTER prefill, excluding the first token (generated during prefill)
 
   # Native byte streaming consumes each token once and holds incomplete UTF-8.
@@ -3711,6 +3729,15 @@ proc generate*(m: LlamaModelL, tok: HFTokenizer, ctx: Backend, promptIds: seq[in
   if verbose:
     stderr.write(&"KV_RESIDENT_ALLOC: {gKvAllocCount} allocations in total " &
       &"(correct if == the layer count = {m.config.nLayers}, LEAK if > {m.config.nLayers})\n")
+    let cpuProfile = decodeCpuReport(decodeTime)
+    if cpuProfile.len > 0:
+      stderr.writeLine "[decode-profile] host: " & cpuProfile
+    let opProfile = decodeProfileReport()
+    if opProfile.len > 0:
+      stderr.writeLine "[decode-profile] device: " & opProfile
+    let driverProfile = sessionTimingReport(ctx.kind.toByby(), decodedCount)
+    if driverProfile.len > 0:
+      stderr.writeLine "[decode-profile] Vulkan driver: " & driverProfile
     stderr.write(&"Decode - attn (QKV+RoPE+attention+oProj): {gAttnTime:.3f}s | FFN: {gFfnTime:.3f}s | " &
                  &"both parts: {(gAttnTime+gFfnTime):.3f}s\n")
   if verbose and gMergeAllLayersSession:
