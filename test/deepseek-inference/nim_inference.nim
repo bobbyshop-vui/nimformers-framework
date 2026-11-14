@@ -2017,6 +2017,8 @@ proc ensureRopeTables*(be: GpuBackend, rope: RoPEL) =
   gRopeSin = sessionUpload(be, rope.sinT)
   gRopeTabsLen = rope.cosT.len
 
+var gVulkanQ4SplitQkvLogged = false
+
 proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSNormL,
     ff: SwiGLUL, hXIn: SessionHandle, rope: RoPEL, be: GpuBackend, cache: var KVCacheL,
     layerIdx: int, pending: var seq[SessionHandle]): SessionHandle =
@@ -2052,6 +2054,14 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
   let oProjQ4 = attn.oProj.residentReady
   let gateUpQ4 = ff.gateProj.residentReady
   let downQ4 = ff.downProj.residentReady
+  # The fixed Vulkan fused QKV shader does not use the per-shape M=1 Q4
+  # autotuned GEMV plans. Keep this opt-in switch for a controlled T4 A/B:
+  # splitting Q/K/V uses those tuned plans; Metal and the default stay fused.
+  let splitVulkanQ4Qkv = qkvQ4 and be == gbVulkan and
+    getEnv("BYBY_VULKAN_Q4_SPLIT_QKV", "0") == "1"
+  if splitVulkanQ4Qkv and layerIdx == 0 and not gVulkanQ4SplitQkvLogged:
+    gVulkanQ4SplitQkvLogged = true
+    stderr.writeLine "[vulkan] Q4 QKV path=split M=1 autotuned GEMVs (A/B override)"
 
   template step(cond: bool, msg: string) =
     if not cond:
@@ -2080,7 +2090,7 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
   var hV = sessionAllocScratch(be, HKV * D); pending.add(hV)
   var qkvFused = false
   var hNormed = hX
-  if qkvQ4:   # RMSNorm folded into the fused QKV kernel
+  if qkvQ4 and not splitVulkanQ4Qkv:   # RMSNorm folded into the fused QKV kernel
     qkvFused = sessionMatmulQ4Fused(be, 0, hX,
       [attn.qProj.residentW, attn.kProj.residentW, attn.vProj.residentW], [hQ, hK, hV],
       SessionHandle(), false, hGamma, normQKV.eps, true)
@@ -2088,7 +2098,7 @@ proc encodeDecodeLayerIntoOpenSession(attn: GQAAttention, normQKV, normFFN: RMSN
     hNormed = sessionAllocScratch(be, C); pending.add(hNormed)
     step(sessionRmsnormEnc(be, hX, hGamma, hNormed, 1, C, normQKV.eps), "RMSNorm input failed")
   mark("norm1")
-  if qkvQ4 and not qkvFused:
+  if qkvQ4 and not qkvFused and not splitVulkanQ4Qkv:
     qkvFused = sessionMatmulQ4Fused(be, 0, hNormed,
       [attn.qProj.residentW, attn.kProj.residentW, attn.vProj.residentW], [hQ, hK, hV],
       SessionHandle(), false)
