@@ -19,6 +19,7 @@ import ./firlift
 import ./firvm
 import ./kernel_gen
 import ./fuse
+from ./steps import isRopeTableUpload, isUploadedRopeTable
 import micro_kernel/slot_layout
 import probe_weights
 
@@ -333,7 +334,11 @@ proc lowerRope(l: SessionLift; op: Op; outScale = 1.0) =
   let x = op.ins.port("x")
   let hn = op.attrInt("Hn")
   let d = op.attrInt("D")
-  let tabled = l.cur.getOrDefault(op.ins.port("cosT").key, "") != "ropetable"
+  let uploadedCos = l.raw and l.trace.isUploadedRopeTable(op, "cosT")
+  let uploadedSin = l.raw and l.trace.isUploadedRopeTable(op, "sinT")
+  if uploadedCos != uploadedSin:
+    fail("RoPE cos/sin inputs mix uploaded and graph-computed tables")
+  let tabled = not uploadedCos and l.cur.getOrDefault(op.ins.port("cosT").key, "") != "ropetable"
   let rows = op.attrInt("T")
   if tabled:
     # Tables that the graph itself computed: the table-driven kernel.
@@ -989,6 +994,15 @@ proc prepareRaw(l: SessionLift; ops: seq[Op]; weightsPaths: seq[string]) =
         perStep[tr.dst.buffer] = tr
       for op in ops:
         if op.id == tr.op and op.implName in UploadOps: perStep[tr.dst.buffer] = tr
+  # A RoPE table can contain exactly hidden_size floats. Its semantic input
+  # port, not its size, distinguishes it from token rows. Key this by upload
+  # operation so allocator reuse does not give a buffer a permanent role.
+  var ropeTableUploads = initHashSet[int]()
+  for op in l.trace.ops:
+    if op.implName notin UploadOps: continue
+    let ti = l.trace.transferOf(op)
+    if ti >= 0 and l.trace.isRopeTableUpload(op, l.trace.transfers[ti].dst.buffer):
+      ropeTableUploads.incl op.id
   var embeddings: seq[int]
   var zeroUploads = initHashSet[int]()
   var embeddingPhase = initTable[int, int]()
@@ -997,7 +1011,7 @@ proc prepareRaw(l: SessionLift; ops: seq[Op]; weightsPaths: seq[string]) =
     if not l.coverage and l.captureAllZero(tr): zeroUploads.incl id
   for id, tr in perStep:
     if not l.coverage and sizes.hasKey(id) and id notin zeroUploads and l.hidden > 0 and
-        tr.n >= l.hidden and tr.n mod l.hidden == 0:
+        tr.n >= l.hidden and tr.n mod l.hidden == 0 and tr.op notin ropeTableUploads:
       embeddings.add id
       phaseCount.inc min(1, firstPhase.getOrDefault(id))
   if phaseCount.getOrDefault(0) > 1:
@@ -1051,7 +1065,8 @@ proc prepareRaw(l: SessionLift; ops: seq[Op]; weightsPaths: seq[string]) =
     if found:
       let match = if index.len > 0 and b.rawWeight:
           matchProbeTensor(index, primary, upload.dst.bytes, upload.fingerprint) else: -1
-      if perStep.hasKey(id) and l.trace.selectionSession > 0 and id notin zeroUploads:
+      if perStep.hasKey(id) and l.trace.selectionSession > 0 and id notin zeroUploads and
+          perStep[id].op notin ropeTableUploads:
         var constantWeight = match >= 0 and upload.fingerprint.len > 0
         for transfer in l.trace.transfers:
           if transfer.kind == "upload" and transfer.dst.buffer == id and transfer.fingerprint.len > 0 and
