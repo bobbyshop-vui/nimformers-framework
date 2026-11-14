@@ -72,7 +72,7 @@ export backend.sessionBegin, backend.sessionUpload, backend.sessionUploadIndices
        backend.sessionAttentionDecodeGqaEnc, backend.cpuAttentionDecodeGqa,
        backend.gpuGather, backend.gpuArgmaxIndex, backend.gpuCompare,
        backend.gpuDropoutMask, backend.gpuPermute, backend.gpuSplitSlice,
-       backend.gpuConcat
+       backend.gpuConcat, backend.sessionTimingReset, backend.sessionTimingReport
 
 # ── micro-VM / JIT (vendor/bybylang/micro_kernel) ──────────────────────────
 # session_vm + session_vm_dispatch + jit_vm moved from the root into

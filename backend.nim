@@ -18,6 +18,7 @@ export byby.GpuBackend, byby.SessionHandle, byby.sessionBegin, byby.sessionUploa
        byby.gpuPermute, byby.gpuSplitSlice, byby.gpuConcat, byby.sessionGetLastError, byby.sessionGpuSeconds, byby.sessionEndAsync, byby.sessionWaitOldest, byby.sessionTokenRingGet, byby.sessionTokenRingSet,
        byby.sessionEmbedTokenEnc, byby.sessionArgmaxTokenEnc,
        byby.sessionAttentionDecodeAllHeadsEnc, byby.sessionRecoverQueue, byby.sessionCommitContinue,
+       byby.sessionTimingReset, byby.sessionTimingReport,
        byby.sessionFlashAttentionPrepare, byby.sessionFlashAttentionPrefillEnc, byby.sessionKvScatterEnc,
        byby.sessionPacesCommandBuffers
 
