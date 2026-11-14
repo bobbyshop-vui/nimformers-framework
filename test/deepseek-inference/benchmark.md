@@ -44,6 +44,95 @@ Metal prefill uses the tiled Q4 GEMM (64x128 tiles) and the flash attention
 kernel. Long GPU work is split into command buffers of about 300 ms so the
 macOS GPU watchdog does not kill it.
 
+### Warm, same-prompt native re-test (2026-11-14)
+
+The sandbox did not expose the native GPU/thermal state reliably, so these
+measurements were repeated with native GPU access. `pmset -g therm` reported
+`CPU_Speed_Limit = 100` immediately before each measured leg. One Vulkan run
+with the exact prompt was used to warm JIT before measuring; each pair was run
+Metal then Vulkan. Prompt: eight copies of `The quick brown fox jumps over the
+lazy dog.` followed by `The quick brown fox jumps over the`, raw input with
+BOS, greedy, `-c 512`, `-n 12` (106 prompt tokens, 11 decode tokens measured).
+
+| Pair | Backend | Prefill, 106 tokens | Decode, 11 tokens |
+| --- | --- | ---: | ---: |
+| 1 | Metal | 9.74 tok/s | 3.16 tok/s · 316.3 ms/token |
+| 1 | Vulkan | 8.14 tok/s | 2.19 tok/s · 457.7 ms/token |
+| 2 | Metal | 10.94 tok/s | 2.93 tok/s · 341.4 ms/token |
+| 2 | Vulkan | 8.08 tok/s | 1.95 tok/s · 514.0 ms/token |
+
+Across these two paired runs Vulkan reached 74–84% of Metal prefill throughput
+and 67–69% of Metal decode throughput. The visible greedy continuation matched
+between backends. The earlier 0.58 tok/s Vulkan run ended with
+`CPU_Speed_Limit = 30`; the older 1.38 tok/s entry above used an 80-token
+prompt. Neither is a controlled comparison with these 106-token, warm-cache
+runs.
+
+### Vulkan decode stage profile
+
+One decode step was profiled on all 32 layers with
+`BYBY_DECODE_PROFILE=-2`, `BYBY_VULKAN_PROFILE=1`, and
+`BYBY_VULKAN_TIMESTAMPS=1`. The operation profiler intentionally split the
+step into 321 command-buffer sessions; use these device timings for stage
+attribution, not as the normal decode throughput. The measured GPU timestamp
+was 365.30 ms/token, and the labeled stages summed to 361.83 ms/token.
+
+| Stage | GPU time per decode step |
+| --- | ---: |
+| RMSNorm + fused Q/K/V | 88.66 ms |
+| RoPE + Q scale + KV append | 0.61 ms |
+| Attention | 7.84 ms |
+| oProj | 27.11 ms |
+| FFN RMSNorm | 1.40 ms |
+| Gate + up / SwiGLU | 139.44 ms |
+| Down projection + residual | 96.78 ms |
+| **Labeled stages** | **361.83 ms** |
+
+The unlabelled 3.47 ms to the full GPU timestamp is the final-step tail outside
+those layer marks (including logits/head work); it was not separately timed in
+this profile. Vulkan recorded 418 dispatches, 418 barriers, and zero decode
+copies. The all-layer trace therefore puts most device time in the Q4
+projection/FFN stages, not RoPE, attention, or KV copies. Barriers were counted
+but not timed separately. A separate one-session driver profile measured
+417.30 ms GPU time, 3.74 ms queue-submit, and 427.15 ms fence-wait per token;
+these overlap and are from a different run. The final unprofiled Vulkan pair
+measured 514.0 ms/token end-to-end, with host encode 27.79 ms, GPU wait
+473.80 ms, and other host work 12.37 ms.
+
+### Vulkan Q4 startup cache
+
+The Vulkan tuner now persists its selected Q4 plans by device, driver, shader
+source, and tuning settings, and the Vulkan JIT/pipeline cache is persistent.
+Warm runs reported cache hits for the Q4 shapes and the M=1 `lm_head` plan.
+Only M=1 is tuned for Vulkan `lm_head`; this inference route uses one row for
+logits, so its M=64 plan was unused. On the re-tests, converting
+`lm_head` fp32 to grouped Q4 took 0.99–1.21 s, compared with 25.14 s in the
+earlier cold run. The old ten-minute startup was not captured with a complete
+stage-by-stage startup trace, so its full time cannot be assigned to one cause.
+
+### Vulkan `BYBY_UBATCH` and Tesla T4
+
+The Vulkan path is paced for every Vulkan device, including discrete GPUs.
+Prefill first selects rows from the `BYBY_PREFILL_CB_MS` time target, then caps
+that chunk with `BYBY_UBATCH`; the default cap is 512 rows. Thus the T4 uses
+the same ubatch scheduler. The T4 also selects cooperative-matrix/tensor-core
+prefill kernels when the device exposes `KHR_cooperative_matrix` and a
+candidate passes parity. The Iris Plus re-test cannot validate T4 hardware;
+the existing Colab T4 measurements above are the device evidence.
+
+### Lifted FIR graph (Metal)
+
+The graph lifted from the native run
+(`models/deepseek-coder-6.7b/lifted/model_intel.fir`, 512-token context, the
+224 Q4 matrices resident outside the arena) against the native runtime, same
+106-token prompt, raw prompt with BOS, greedy, context 512. Both print the same
+text.
+
+| Runtime | Prefill, 106 tokens | Decode, 11 tokens |
+| --- | ---: | ---: |
+| FIR graph | 15.956 s · **6.64 tok/s** | 6.449 s · **1.71 tok/s** · 586.3 ms/token |
+| Native | 20.369 s · 5.20 tok/s | 7.678 s · 1.43 tok/s · 698.0 ms/token |
+
 ## Test machines
 
 Tesla T4 (Google Colab):
@@ -67,9 +156,14 @@ Tesla T4, cell 7 of `notebooks/deepseek_colab_vulkan.ipynb` (256 new tokens):
 
 ```sh
 BYBY_MODEL_MMAP=1 BYBY_VULKAN_DEVICE_LOCAL=auto BYBY_VULKAN_TENSOR_CORES=1 \
+  BYBY_UBATCH=512 BYBY_PREFILL_CB_MS=300 \
   ./nim_inference --no-progress "$MODELS" "$MODELS/model.nimq" vulkan \
   "Write a Python function to return the n-th Fibonacci number." 256 0.0 0.9
 ```
+
+The explicit `BYBY_UBATCH=512` keeps the prefill micro-batch cap enabled in
+this T4 command; `BYBY_PREFILL_CB_MS=300` also keeps the time-based command
+buffer target enabled.
 
 MacBook, Metal through formers.n (127 new tokens):
 
@@ -78,10 +172,33 @@ other/formers.n/formers-cli --models test/deepseek-inference/models -cnv --temp 
   <<< $'Write a Python function to return the n-th Fibonacci number.\n/exit'
 ```
 
+MacBook, lifted FIR graph and native on the same prompt (`$PROMPT` is "The
+quick brown fox jumps over the lazy dog." eight times, then "The quick brown
+fox jumps over the"); drop `--fir …` for the native run:
+
+```sh
+other/formers.n/formers-cli --models test/deepseek-inference/models \
+  --fir models/deepseek-coder-6.7b/lifted/model_intel.fir \
+  --raw --add-special-tokens -p "$PROMPT" -n 12 --temp 0 --backend metal --no-progress -c 512
+```
+
 MacBook, Vulkan (128 new tokens):
 
 ```sh
 ./nim_inference test/deepseek-inference/models \
   test/deepseek-inference/models/model.nimq vulkan \
   "Write a Python function to return the n-th Fibonacci number." 128 0 0.9
+```
+
+MacBook, exact 106-token native re-test prompt (warm Vulkan once with `-n 2`,
+then measure with `-n 12`; check `pmset -g therm` before every measured run):
+
+```sh
+PROMPT='The quick brown fox jumps over the lazy dog.'
+for i in 1 2 3 4 5 6 7; do PROMPT="$PROMPT The quick brown fox jumps over the lazy dog."; done
+PROMPT="$PROMPT The quick brown fox jumps over the"
+BYBY_UBATCH=512 BYBY_PREFILL_CB_MS=300 \
+  other/formers.n/formers-cli --models test/deepseek-inference/models \
+  --raw --add-special-tokens -p "$PROMPT" -n 12 --temp 0 \
+  --backend vulkan --no-progress -c 512 --verbose
 ```
