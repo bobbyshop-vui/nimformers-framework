@@ -70,6 +70,39 @@ proc opName(op: Op): string =
 
 proc isUpload(op: Op): bool = op.opName.startsWith("sessionUpload")
 
+proc isRopeTableUpload*(t: Trace; upload: Op; buffer: int): bool =
+  ## RoPE tables can be exactly one hidden vector in size. They are persistent inputs,
+  ## not token-row embeddings, even when the same buffer ID is reused as decode scratch later.
+  var afterUpload = false
+  for candidate in t.ops:
+    if not afterUpload:
+      if candidate.id == upload.id: afterUpload = true
+      continue
+    for p in candidate.ins:
+      if p.buffer == buffer:
+        return candidate.opName in ["sessionRope", "sessionRopeKvEnc"] and
+          p.name in ["cosT", "sinT"]
+    # A later upload/free/write starts another lifetime of this buffer. Do not infer
+    # the old upload's role from a consumer of the replacement contents.
+    for p in candidate.outs:
+      if p.buffer == buffer: return false
+  false
+
+proc isUploadedRopeTable*(t: Trace; consumer: Op; portName: string): bool =
+  ## Resolve the producer at this use, rather than assigning a permanent role to a
+  ## buffer ID that the allocator may reuse for computed tables or token rows.
+  var buffer = -1
+  for p in consumer.ins:
+    if p.name == portName: buffer = p.buffer
+  if buffer < 0: return false
+  for i in countdown(t.ops.high, 0):
+    let producer = t.ops[i]
+    if producer.order >= consumer.order: continue
+    for p in producer.outs:
+      if p.buffer == buffer:
+        return producer.isUpload and t.isRopeTableUpload(producer, buffer)
+  false
+
 proc accessOf(op: Op; t: Trace; reads, writes: var seq[int]) =
   ## Buffers an op reads and writes, from named ports or from the bytecode's domain access.
   if op.impl == "raw:dispatch":
