@@ -587,7 +587,7 @@ proc q4MatrixGemm(m, k, n, group, nGroups: int): tuple[gen: Gen, rowBlock, rowTg
   if result.gen.tg != result.rowTg: result.rowBlock = 0
 
 proc q4TensorCoreGemm(m, k, n, group, nGroups: int): tuple[gen: Gen, rowBlock, rowTg: int] =
-  result.rowBlock = 16
+  result.rowBlock = q4CoopRowTile(m, n)
   result.rowTg = ((n + 63) div 64) * 128
   result.gen = genMatmulQ4TensorCore(m, k, n, group, nGroups)
   if result.gen.tg != 128: result.rowBlock = 0

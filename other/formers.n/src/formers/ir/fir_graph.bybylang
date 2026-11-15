@@ -602,6 +602,9 @@ function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): 
                 elif be == gbVulkan:
                     prepared.name = kernelNameFor(jit, kernel.program, node.op)
                     prepared.source = glslSourceFor(jit, kernel.program, node.op)
+                    # Subgroup kernels (FIRLIFT_Q4_GEMV=simd) size their grid for 32-lane subgroups.
+                    if prepared.source.contains("GL_KHR_shader_subgroup_arithmetic") and gpuFixedSubgroupWidth(be) != 32:
+                        raise newException(ValueError, "FIR kernel " & node.op & " reduces across 32-lane subgroups, which this Vulkan device does not guarantee; re-lift with FIRLIFT_Q4_GEMV=word_parallel and FIRLIFT_SIMD=0")
                     jobs.add((prepared.name, prepared.source))
                 elif be == gbCpu and cpuJitEnabled() and not kernel.slotLayout and staged.len == 0:
                     # Compile the micro-kernel to native code; unsupported programs keep the interpreter.

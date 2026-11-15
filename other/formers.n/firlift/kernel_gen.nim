@@ -11,6 +11,7 @@
 ## optimization layered on the same ports.
 
 import std/[strutils, math]
+from session_vm import q4CoopRowTile
 
 const RegLimit* = 256   ## register index limit of the VM encoding; a kernel declares only what it uses
 
@@ -2190,10 +2191,11 @@ proc genMatmulQ4TensorCore*(M, K, N, groupSize, nGroups: int): Gen =
       groupSize mod 2 != 0 or K mod groupSize != 0 or nGroups != K div groupSize:
     raise newException(GenError, "Q4 Tensor Core micro-kernel requires M>0, N>=16, K divisible by 64 and an even group size dividing K")
   let cols = (N + 63) div 64
-  let rows = (M + 15) div 16
+  let bm = q4CoopRowTile(M, N)
+  let rows = (M + bm - 1) div bm
   result = Gen(body: "q4coop " & $M & " " & $K & " " & $N & " " & $groupSize & " " & $nGroups,
     threads: rows * cols * 128, ins: 2, outs: 1, tg: 128,
-    tgBytes: (16 * 72 + 64 * 72) * 2 + 4 * 256 * 4)
+    tgBytes: (bm * 72 + 64 * 72) * 2 + 4 * 256 * 4)
   genHiR = 0
   genHiU = 0
 
