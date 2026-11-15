@@ -23,6 +23,9 @@ type
     ins, outs: seq[string]
     memory: Table[string, int]
     where: string
+    reloc: bool                 ## relocatable scan: a port address evaluates to relocBase and is noted in refs
+    relocBase: float
+    refs: seq[string]
 
 function fkFail(s: FkScan, message: string)
     raise newException(ValueError, "FIR kernel " & s.where & ": " & message & " in '" & s.text & "'")
@@ -33,6 +36,10 @@ function fkIdentChar(c: char): bool
 function fkAddress(s: var FkScan, name: string): float
     # @in0, @out0 or any buffer name that has a memory binding.
     var buffer = name
+    if s.reloc:
+        let isPort = (name.len == 3 and name.startsWith("in") and name[2].isDigit()) or (name.len == 4 and name.startsWith("out") and name[3].isDigit())
+        s.refs.add(if isPort: name else: "?" & name)
+        return s.relocBase
     if name.len == 3 and name.startsWith("in") and name[2].isDigit() and int(name[2]) - int('0') < s.ins.len:
         buffer = s.ins[int(name[2]) - int('0')]
     elif name.len == 4 and name.startsWith("out") and name[3].isDigit() and int(name[3]) - int('0') < s.outs.len:
@@ -136,7 +143,7 @@ function fkF32(s: var FkScan, text: string): float32
     float32(fkEval(s, text))
 
 function fkSignature(mnemonic: string): string
-    # r = register (0..31), k = integer immediate or address offset, f = float constant.
+    # r = register (0..FkMaxRegister), k = integer immediate or address offset, f = float constant.
     case mnemonic
     of "nop", "forend", "ifend", "barriertg": ""
     of "forbegin", "ifbegin", "loadlid", "loadtgid", "utgid", "ulid", "simdlane", "simdid", "simdw", "simdgid", "mmzero": "r"
@@ -210,7 +217,26 @@ function fkEmit(p: var VmProgram, mnemonic: string, a: seq[uint32], f: float32)
     of "loadconstf32": p.emitLoadConstF32(a[0], f)
     else: discard
 
-const FkMaxRegister = 31'u32
+const FkMaxRegister = 255'u32   # 8-bit register fields (session_vm.VmMaxRegisters - 1)
+
+function fkPortOf(s: var FkScan, text: string): tuple[port: string, value: float, ok: bool]
+    ## An argument in relocatable mode: the port its address refers to ("" when it names none) and
+    ## its constant part. ok is false when the expression is not `one port + constant`.
+    s.reloc = true
+    s.refs = @[]
+    s.relocBase = 0.0
+    let low = fkEval(s, text)
+    let first = s.refs
+    s.refs = @[]
+    s.relocBase = 4096.0
+    let high = fkEval(s, text)
+    s.reloc = false
+    s.refs = @[]
+    if first.len == 0:
+        return ("", low, true)
+    if first.len != 1 or first[0].startsWith("?") or high-low != 4096.0 or low < 0 or low != floor(low) or low > 4294967295.0:
+        return ("", 0.0, false)
+    return (first[0], low, true)
 
 function firAssembleKernel(def: FirKernelDef, model: FirProgram, node: FirNode, memory: Table[string, int]): FirKernel
     let ins = node.inputs.splitWhitespace()
@@ -327,15 +353,25 @@ function firAssembleKernel(def: FirKernelDef, model: FirProgram, node: FirNode, 
             if parts.len != 2 or parts[0] notin domains or parts[0] in bound:
                 raise newException(ValueError, "FIR invalid or duplicate slot: " & slot)
             let port = parts[1]
-            if not port.startsWith("in") or port.len < 3:
-                raise newException(ValueError, "FIR slot needs an input port: " & slot)
-            let index = parseInt(port[2 .. ^1])
-            if index < 0 or index >= ins.len:
-                raise newException(ValueError, "FIR slot input outside kernel arity: " & slot)
+            var boundBuffer = ""
+            if port.startsWith("in") and port.len > 2:
+                let index = parseInt(port[2 .. ^1])
+                if index < 0 or index >= ins.len:
+                    raise newException(ValueError, "FIR slot input outside kernel arity: " & slot)
+                boundBuffer = ins[index]
+            elif port.startsWith("out") and port.len > 3:
+                if model.scriptAbi < FirScriptResidentQ4Abi or "resident_q4" notin model.requiredFeatures:
+                    raise newException(ValueError, "FIR output slots require script_abi 2 and feature resident_q4")
+                let index = parseInt(port[3 .. ^1])
+                if index < 0 or index >= outs.len:
+                    raise newException(ValueError, "FIR slot output outside kernel arity: " & slot)
+                boundBuffer = outs[index]
+            else:
+                raise newException(ValueError, "FIR slot needs an input or output port: " & slot)
             let domain = domains.find(parts[0])
             result.slotOffsets[domain] = 0
-            result.slotSizes[domain] = model.buffers[ins[index]].elements
-            result.slotBuffers[domain] = ins[index]
+            result.slotSizes[domain] = model.buffers[boundBuffer].elements
+            result.slotBuffers[domain] = boundBuffer
             bound.incl(parts[0])
         for i in 0 .. 4:
             result.slotAnchor[i] = if i < 4 and anchored[i]: anchor[i] else: -1
@@ -371,9 +407,9 @@ function firAssembleKernel(def: FirKernelDef, model: FirProgram, node: FirNode, 
             else:
                 a.add(fkU32(s, line.args[i]))
                 if kind == 'r' and a[^1] > FkMaxRegister:
-                    raise newException(ValueError, "FIR kernel " & def.name & " line " & $line.line & ": register out of range (0..31)")
-        if model.layout == "script" and model.scriptAbi == FirScriptAbi:
-            # ABI 1 uses the common domain of the existing CPU/JIT instructions.
+                    raise newException(ValueError, "FIR kernel " & def.name & " line " & $line.line & ": register out of range (0.." & $FkMaxRegister & ")")
+        if model.layout == "script" and model.scriptAbi in [FirScriptAbi, FirScriptResidentQ4Abi]:
+            # Both script ABIs use the common domain of the existing CPU/JIT instructions.
             if line.mnemonic in ["ushrk", "ushlk"] and a[2] > 31:
                 raise newException(ValueError, "FIR kernel " & s.where & ": script shift count must be in 0..31")
             let writesFloat = line.mnemonic in ["loadconstf32", "add", "sub", "mul", "div", "fma", "neg", "exp", "rsqrt", "sigmoid", "softplus", "addconst", "mulconst", "cmplt", "loadlid", "loadtgid", "utor", "loadf32", "uloadf32", "tgloadf32"]
@@ -401,3 +437,93 @@ function firAssembleKernel(def: FirKernelDef, model: FirProgram, node: FirNode, 
     result.tgSize = int(fkEval(s, def.tg))
     result.tgBytes = int(fkEval(s, def.tgBytes))
     result.tag = def.tag
+
+function firAssembleRelocatable(def: FirKernelDef, model: FirProgram, node: FirNode, memory: Table[string, int]): FirKernel
+    ## The same kernel as firAssembleKernel, but position independent: the program holds no buffer
+    ## address. It starts by reading the arena address of every port it names from a small table
+    ## (two floats per port, high and low 12 bits, in the input domain) and adds that base to each
+    ## access. Every node that uses the kernel then shares one program, so the backend compiles one
+    ## pipeline per kernel instead of one per node. `relocBuffers` lists the table's buffers in
+    ## order; it stays empty when the body cannot be relocated (the absolute program is returned).
+    result = firAssembleKernel(def, model, node, memory)
+    if def.layout == "slots":
+        return
+    let ins = node.inputs.splitWhitespace()
+    let outs = node.outputs.splitWhitespace()
+    var s = FkScan(ins: ins, outs: outs, memory: memory, where: def.name & " (node " & node.name & ")")
+    s.syms = initTable[string, float]()
+    for name, value in model.symbols:
+        s.syms[name] = float(value)
+    s.syms["eps"] = float(model.epsilon)
+    s.syms["pi"] = PI
+    for i, name in ins:
+        s.syms["in" & $i & ".size"] = float(model.buffers[name].elements)
+    for i, name in outs:
+        s.syms["out" & $i & ".size"] = float(model.buffers[name].elements)
+    var top = 0'u32
+    var ports: seq[string]
+    for line in def.body:
+        let sig = fkSignature(line.mnemonic)
+        for i, kind in sig:
+            let arg = fkPortOf(s, line.args[i])
+            if not arg.ok:
+                return
+            if arg.port.len > 0:
+                let supported = (line.mnemonic in ["uloadf32", "ustoref32", "uatomicadd"] and i == 2) or (line.mnemonic == "uconst" and i == 1)
+                if not supported:
+                    return
+                if arg.port notin ports:
+                    ports.add(arg.port)
+            elif kind == 'r':
+                top = max(top, uint32(arg.value))
+    if ports.len == 0:
+        return
+    let firstPort = top+1
+    let tmp = firstPort+uint32(ports.len)
+    let high = top+1
+    let low = top+2
+    if tmp > FkMaxRegister:
+        return
+    var p: VmProgram
+    for i, port in ports:
+        let reg = firstPort+uint32(i)
+        p.emitUConst(tmp, 0)
+        p.emitULoadIn(high, tmp, uint32(2*i))
+        p.emitULoadIn(low, tmp, uint32(2*i+1))
+        p.emitRToU(reg, high)
+        p.emitUMulK(reg, reg, 4096)
+        p.emitRToU(tmp, low)
+        p.emitUAdd(reg, reg, tmp)
+    for line in def.body:
+        s.where = def.name & " line " & $line.line
+        let sig = fkSignature(line.mnemonic)
+        var a: seq[uint32]
+        var f = 0'f32
+        var portReg = 0'u32
+        var hasPort = false
+        for i, kind in sig:
+            let arg = fkPortOf(s, line.args[i])
+            if kind == 'f':
+                f = float32(arg.value)
+                continue
+            if arg.value < 0 or arg.value > 4294967295.0 or arg.value != floor(arg.value):
+                s.fkFail("expected a non-negative integer")
+            a.add(uint32(arg.value))
+            if arg.port.len > 0:
+                hasPort = true
+                portReg = firstPort+uint32(ports.find(arg.port))
+        if not hasPort:
+            fkEmit(p, line.mnemonic, a, f)
+        elif line.mnemonic == "uconst":
+            p.emitUAddK(a[0], portReg, a[1])
+        else:
+            p.emitUAdd(tmp, a[1], portReg)
+            fkEmit(p, line.mnemonic, @[a[0], tmp, a[2]], f)
+    p.emitHalt()
+    result.program = p
+    for port in ports:
+        if port.startsWith("in"):
+            result.relocBuffers.add(ins[int(port[2]) - int('0')])
+        else:
+            result.relocBuffers.add(outs[int(port[3]) - int('0')])
+

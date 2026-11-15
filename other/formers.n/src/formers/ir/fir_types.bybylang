@@ -32,6 +32,7 @@ type
     line*: int
     layout*: string
     slots*: seq[string]
+    rowBlock*, rowThreads*: int     ## `rows=B:T`: threads are ordered by row, every B rows take T threads (0: not declared)
   FirProgram* = object
     kernels*: Table[string, FirKernelDef]
     model*, configPath*, sourcePath*, runtime*: string
@@ -46,6 +47,8 @@ type
     phases*: Table[string, int]     ## named multi-row phase -> tokens it consumes per run
     phaseOrder*: seq[string]
     phaseLogits*: Table[string, string]  ## phase -> buffer holding rows*vocab output floats
+    phasePartial*: seq[string]           ## phases that may run over fewer rows than declared (`partial`)
+    phaseLast*: Table[string, string]    ## phase -> buffer holding the vocab logits after its last row (`last=`)
     rebaseOff*: Table[string, int]       ## buffer -> float offset inside its allocation (filled by the graph runner)
     rebaseUnit*: Table[string, string]   ## buffer -> allocation that holds it (arena root or weight pool)
   FirBindings* = object
@@ -65,6 +68,7 @@ type
     slotOffsets*, slotSizes*: array[5, int]
     slotBuffers*: array[5, string]
     slotAnchor*: array[5, int]      ## float offset the domain is bound at; -1 = the buffer's own offset
+    relocBuffers*: seq[string]      ## position-independent program: buffers whose arena addresses it reads from its table
   FirMicroBuilder* = proc(model: FirProgram, node: FirNode, bindings: FirBindings): FirKernel {.closure.}
   FirExtArgs* = object
     backend*: Backend
@@ -83,7 +87,8 @@ type
     external*: Table[string, FirExtBinding]
 
 const FirScriptAbi* = 1
-const FirScriptFeatures* = ["weights_bf16", "weights_f16"]
+const FirScriptResidentQ4Abi* = 2
+const FirScriptFeatures* = ["weights_bf16", "weights_f16", "resident_q4"]
 
 function firResidentRaw(model: FirProgram, name: string): bool
     # Raw weights consumed exclusively through slot kernels need no arena copy.
@@ -100,14 +105,21 @@ function firResidentRaw(model: FirProgram, name: string): bool
     return true
 
 function firQ4bGroup(dtype: string): int
-    # q4b is group 32; q4b<N> selects group N (script layout, packed Q4 in the arena). 0: not q4b.
-    if dtype == "q4b":
+    # q4b stores packed Q4 in the arena; q4r stores the same bytes in a resident buffer.
+    # Both default to group 32 and allow an explicit group size suffix.
+    if dtype in ["q4b", "q4r"]:
         return 32
-    if dtype.startsWith("q4b") and dtype.len > 3:
-        let tail = dtype[3 .. ^1]
-        if tail.allCharsInSet({'0'..'9'}):
-            return parseInt(tail)
+    for prefix in ["q4b", "q4r"]:
+        if dtype.startsWith(prefix) and dtype.len > prefix.len:
+            let tail = dtype[prefix.len .. ^1]
+            if tail.allCharsInSet({'0'..'9'}):
+                return parseInt(tail)
     return 0
+
+function firResidentQ4(model: FirProgram, name: string): bool
+    if not model.buffers.hasKey(name):
+        return false
+    model.buffers[name].kind == "weight" and model.buffers[name].dtype.startsWith("q4r") and firQ4bGroup(model.buffers[name].dtype) > 0
 
 function firFp4kmWords(n: int, k: int): int
     # fp4km weight blob in the arena: nibble bytes [n*k/2], scale bytes [n*k/32] (padded to words),
@@ -123,8 +135,14 @@ function firCheckScriptContract(model: FirProgram)
             if def.tag.len > 0:
                 raise newException(ValueError, "FIR kernel " & name & ": tag needs 'layout script'")
         return
-    if model.scriptAbi notin [0, FirScriptAbi]:
-        raise newException(ValueError, "FIR unsupported script_abi " & $model.scriptAbi & "; runner supports 1")
+    if model.scriptAbi notin [0, FirScriptAbi, FirScriptResidentQ4Abi]:
+        raise newException(ValueError, "FIR unsupported script_abi " & $model.scriptAbi & "; runner supports 1 and 2")
     for feature in model.requiredFeatures:
         if feature notin FirScriptFeatures:
             raise newException(ValueError, "FIR unsupported required feature: " & feature)
+    if "resident_q4" in model.requiredFeatures and model.scriptAbi < FirScriptResidentQ4Abi:
+        raise newException(ValueError, "FIR feature resident_q4 requires script_abi 2")
+    for name, buffer in model.buffers:
+        if buffer.dtype.startsWith("q4r") and
+            (model.scriptAbi < FirScriptResidentQ4Abi or "resident_q4" notin model.requiredFeatures):
+            raise newException(ValueError, "FIR resident Q4 weight " & name & " requires script_abi 2 and feature resident_q4")

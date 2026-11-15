@@ -59,6 +59,28 @@ type
 var gM3Runtime*:M3Runtime
 var gM3ProgramProvider*:M3ProgramProvider
 
+type M3Graph = object
+  ## Decode graph (the DeepSeek approach): one token's dispatches are recorded once into an indirect
+  ## command buffer and replayed for every following token, so the CPU stops encoding them.
+  ## The token comes from a one-slot ring that the host sets, a micro-VM kernel gathers its
+  ## embedding row, and the logits land in their own buffer.
+  tried,valid,failed:bool
+  ring,table,logits:SessionHandle
+  embed:Kernel
+  rows:int
+
+var gM3Graph:M3Graph
+
+proc releaseM3Graph*() =
+  if gM3Graph.ring.metalHandle!=nil or gM3Graph.valid:
+    let be=gM3Runtime.be
+    if gM3Graph.valid:sessionGraphReset(be)
+    if gM3Graph.ring.metalHandle!=nil:sessionFree(be,gM3Graph.ring)
+    if gM3Graph.table.metalHandle!=nil:sessionFree(be,gM3Graph.table)
+    if gM3Graph.logits.metalHandle!=nil:sessionFree(be,gM3Graph.logits)
+  gM3Graph=default(M3Graph)
+
+
 proc setM3ProgramProvider*(provider:M3ProgramProvider) =
   # Cached programs must be rebuilt when the source of their bytecode changes.
   gM3Runtime.programs.clear()
@@ -70,6 +92,56 @@ proc require(ok:bool;message:string)=
 proc compile(p:VmProgram;tag:string;threads,tg:int;bytes=1024;be=gbMetal):Kernel =
   Kernel(name:vmKernelForBe(p,tag,be),threads:threads,tg:tg,bytes:bytes)
 
+proc m3ProfileOn():bool =
+  ## BYBY_M3_PROFILE=1 prints, for every decode step, the host time spent encoding the step, waiting
+  ## for the GPU (commit + wait) and reading the logits back.
+  getEnv("BYBY_M3_PROFILE","")=="1"
+
+proc m3ProfileLine(kind:string;tA,tB,tC,tD:int64) =
+  proc ms(a,b:int64):string = formatFloat(float64(b-a)/1e6,ffDecimal,2)
+  echo "[m3-profile] ",kind," encode ",ms(tA,tB)," ms, gpu wait ",ms(tB,tC)," ms, read ",ms(tC,tD)," ms"
+
+# Prefill scheduler (the DeepSeek prefill approach): the prompt goes through in micro-batches of rows,
+# and a micro-batch goes through in command buffers sized by the measured speed where the OS limits
+# how long one command buffer may run (Intel/AMD Macs, Vulkan), or in one command buffer committed
+# early every few layers where it does not (Apple GPUs), so the GPU starts on the first layers while
+# the host still encodes the rest.
+proc m3EnvInt(name:string;dflt:int):int =
+  let raw=getEnv(name,"")
+  if raw.len==0:return dflt
+  try:result=parseInt(raw.strip())
+  except ValueError:
+    stderr.writeLine "[m3] " & name & "='" & raw & "' is not an integer - using " & $dflt
+    result=dflt
+
+proc m3EnvFloat(name:string;dflt:float64):float64 =
+  let raw=getEnv(name,"")
+  if raw.len==0:return dflt
+  try:result=parseFloat(raw.strip())
+  except ValueError:
+    stderr.writeLine "[m3] " & name & "='" & raw & "' is not a number - using " & $dflt
+    result=dflt
+
+proc m3UbatchRows():int =
+  ## BYBY_UBATCH: rows per prefill micro-batch (llama.cpp's n_ubatch). 0 or unset keeps the arena
+  ## capacity (MAMBA3_PREFILL_CHUNK, 128 rows); a larger value grows the arena to hold it.
+  max(0,m3EnvInt("BYBY_UBATCH",0))
+
+proc m3PrefillCbMs():float64 =
+  ## BYBY_PREFILL_CB_MS: GPU time aimed at per prefill command buffer where command buffers are paced
+  ## (default 300 ms, as DeepSeek); 0 puts the whole micro-batch into one command buffer.
+  max(0.0,m3EnvFloat("BYBY_PREFILL_CB_MS",300.0))
+
+proc m3PrefillLayersPerCb():int =
+  ## BYBY_PREFILL_LAYERS_PER_CB: where command buffers are not paced, commit (without waiting) after
+  ## this many layers so the GPU can start early; 0 keeps one commit per micro-batch.
+  max(0,m3EnvInt("BYBY_PREFILL_LAYERS_PER_CB",4))
+
+var gM3PrefillMsPerLayerRow:float64 ## smoothed ms of one layer on one (tile-rounded) row; 0 = not measured yet
+var gM3PrefillLogged:bool
+
+proc m3Tile(rows:int):int = (rows+7) div 8*8 ## the FP4 prefill GEMM works in 8-row tiles
+
 proc encode(k:Kernel;st:M3Runtime;constant:SessionHandle)=
   encodeVmKernel(k.name,k.threads,k.tg,k.bytes,st.arena,0,
     gDummyFor(st.be),constant,st.arena,0)
@@ -80,6 +152,7 @@ proc encode(k:Kernel;st:M3Runtime;constant,offsets:SessionHandle)=
 
 proc releaseM3Runtime*() =
   if gM3Runtime.ready:
+    releaseM3Graph()
     release(gM3Runtime.od,gM3Runtime.be)
     sessionFree(gM3Runtime.be,gM3Runtime.arena)
     sessionFree(gM3Runtime.be,gM3Runtime.constants)
@@ -96,8 +169,9 @@ proc prepareM3Runtime*(m:var NimformerModelJamba;ctx:Backend)=
   let mr=m.blocks[0].mambaReal
   var rank=1
   for _,ad in gLoraGpu:rank=max(rank,ad.r)
-  let capacity=max(4,parseInt(getEnv("MAMBA3_PREFILL_CHUNK","128")))
-  require(capacity<=2048,"MAMBA3_PREFILL_CHUNK must be <=2048")
+  let capacity=max(max(4,parseInt(getEnv("MAMBA3_PREFILL_CHUNK","128"))),m3UbatchRows())
+  require(capacity<=2048,"MAMBA3_PREFILL_CHUNK and BYBY_UBATCH must be <=2048")
+  gM3PrefillMsPerLayerRow=0
   st.a=arenaLayout(m.embedDim,mr.intermediateSize,mr.numHeads,mr.dState,m.vocab,((capacity+7) div 8)*8,rank)
   st.stateStart=st.a.total
   var endState=st.stateStart
@@ -273,6 +347,184 @@ proc encodeLinear(st:M3Runtime;pr:RuntimePrograms;name:string;input,output,T:int
     let k=pr.bias[name]
     encodeVmKernel(k.name,k.threads,k.tg,k.bytes,st.arena,output,gDummyFor(st.be),lin.biasH,st.arena,0)
 
+proc encodeStack(m:NimformerModelJamba;pr:RuntimePrograms;T:int;hTrace:var SessionHandle;trace:bool;
+    firstLayer=0;lastLayer=high(int);commitEvery=0)=
+  ## Blocks firstLayer ..< lastLayer of the stack for T rows, into the open session (or the decode graph
+  ## being recorded). With commitEvery>0 the session is committed without waiting after every
+  ## commitEvery blocks, so the GPU starts on the first blocks while the host still encodes the rest.
+  let a=gM3Runtime.a;let be=gM3Runtime.be
+  for i in firstLayer..<min(lastLayer,m.blocks.len):
+    let blk=m.blocks[i]
+    if commitEvery>0 and i>firstLayer and (i-firstLayer) mod commitEvery==0:
+      require(sessionCommitContinue(be),"commit continue")
+    let lp=pr.layers[i]
+    let offsets=gM3Runtime.layerOffsets[i]
+    let root="block" & $i
+    if trace:require(sessionCopyInto(be,gM3Runtime.arena,hTrace,a.x,(i*4)*a.hidden,a.hidden),"trace input")
+    encode(lp.norm,gM3Runtime,gM3Runtime.constants,offsets)
+    encodeLinear(gM3Runtime,pr,root & ".mambaReal.inProj.weight",a.norm,a.proj,T)
+    encode(lp.prepare,gM3Runtime,gM3Runtime.constants,offsets)
+    encode(lp.scan,gM3Runtime,gM3Runtime.constants,offsets)
+    encode(lp.carry,gM3Runtime,gM3Runtime.constants,offsets)
+    encodeLinear(gM3Runtime,pr,root & ".mambaReal.outProj.weight",a.inner,a.mix,T)
+    if trace:require(sessionCopyInto(be,gM3Runtime.arena,hTrace,a.mix,(i*4+1)*a.hidden,a.hidden),"trace mixer")
+    if blk.kind!=bkMambaReal and not gM3Runtime.skipAttn:
+      encodeLinear(gM3Runtime,pr,root & ".attn.qkvProj.weight",a.norm,a.attnProj,T)
+      encode(lp.lp,gM3Runtime,gM3Runtime.constants,offsets)
+      encode(lp.lpCarry,gM3Runtime,gM3Runtime.constants,offsets)
+      encodeLinear(gM3Runtime,pr,root & ".attn.outProj.weight",a.attnInner,a.attnOut,T)
+      if trace:require(sessionCopyInto(be,gM3Runtime.arena,hTrace,a.attnOut,(i*4+2)*a.hidden,a.hidden),"trace sidecar")
+      if blk.kind==bkMambaRealGated:
+        encode(lp.gateIn,gM3Runtime,gM3Runtime.constants,offsets)
+        encodeLinear(gM3Runtime,pr,root & ".fuseGate.weight",a.gateIn,a.gate,T)
+        encode(lp.gate,gM3Runtime,gM3Runtime.constants,offsets)
+      else:encode(lp.mix,gM3Runtime,gM3Runtime.constants,offsets)
+    encode(lp.residual,gM3Runtime,gM3Runtime.constants,offsets)
+    encode(lp.norm2,gM3Runtime,gM3Runtime.constants,offsets)
+    encodeLinear(gM3Runtime,pr,root & ".mambaReal.mlpFc1.weight",a.norm,a.mlp,T)
+    encode(lp.mlp,gM3Runtime,gM3Runtime.constants,offsets)
+    encodeLinear(gM3Runtime,pr,root & ".mambaReal.mlpFc2.weight",a.gated,a.mix,T)
+    encode(lp.residual,gM3Runtime,gM3Runtime.constants,offsets)
+    if trace:require(sessionCopyInto(be,gM3Runtime.arena,hTrace,a.x,(i*4+3)*a.hidden,a.hidden),"trace output")
+
+proc m3GraphWanted(be:GpuBackend):bool =
+  ## Opt-in (BYBY_GRAPH=1). The replayed graph gives the same text as the ordinary decode (checked on
+  ## Intel Iris Plus 640), but there it is slower than encoding directly, so it is not the default.
+  ## DeepSeek turns its graph on where command buffers are not paced (Apple GPUs); that default is
+  ## left off here until a run on an Apple GPU has been checked.
+  be==gbMetal and getEnv("BYBY_GRAPH","")=="1"
+
+proc embedGatherProgram(a:M3Arena;tg:int):VmProgram =
+  ## mem[a.x + g] = table[ring[0] * hidden + g] for g in 0 ..< hidden.
+  var p:VmProgram
+  p.emitUTgid(0);p.emitULid(1)
+  p.emitUMulK(2,0,uint32(tg));p.emitUAdd(2,2,1)
+  p.emitUConst(3,0);p.emitULoadU32(4,3,0)     # token id from the ring (read as bytes)
+  p.emitUMulK(4,4,uint32(a.hidden));p.emitUAdd(4,4,2)
+  p.emitULoadIn(1,4,0)
+  p.emitUStoreF32(1,2,uint32(a.x))
+  p.emitHalt();p
+
+proc m3GraphStep(m:var NimformerModelJamba;token:int;pr:RuntimePrograms;logits:var seq[float32]):bool =
+  ## One decode token through the recorded graph; false when the graph cannot be used (the caller
+  ## runs the ordinary path, nothing has executed on the GPU in that case).
+  if gM3Graph.failed:return false
+  let be=gM3Runtime.be;let a=gM3Runtime.a
+  let prof=m3ProfileOn()
+  if not gM3Graph.tried:
+    let initStart=getMonoTime().ticks
+    gM3Graph.tried=true
+    var tg=0
+    for cand in [256,128,64,32]:
+      if a.hidden mod cand==0:
+        tg=cand;break
+    let n=m.vocab*a.hidden
+    if tg==0 or m.embed.weight.floatValues.len<n:
+      gM3Graph.failed=true;return false
+    gM3Graph.table=sessionUploadPrivate(be,m.embed.weight.floatValues.toOpenArray(0,n-1))
+    gM3Graph.ring=sessionAllocScratch(be,8)
+    gM3Graph.logits=sessionAllocScratch(be,m.vocab)
+    gM3Graph.embed=compile(embedGatherProgram(a,tg),"m3_embed_gather_" & $a.hidden,a.hidden,tg,16,be)
+    gM3Graph.rows=a.hidden
+    gM3Runtime.kernelSetupSeconds+=float64(getMonoTime().ticks-initStart)/1e9
+  sessionTokenRingSet(be,gM3Graph.ring,0,token)
+  var opened=false
+  var tA,tB,tC:int64
+  var recorded=false
+  try:
+    tA=getMonoTime().ticks
+    require(sessionBegin(be),"sessionBegin")
+    opened=true
+    if not gM3Graph.valid:
+      if not sessionGraphBegin(be,1):
+        discard sessionEnd(be);opened=false
+        gM3Graph.failed=true;return false
+      let k=gM3Graph.embed
+      encodeVmKernel(k.name,k.threads,k.tg,k.bytes,gM3Runtime.arena,0,
+        gM3Graph.ring,gDummyFor(be),gM3Graph.table,0)
+      var noTrace:SessionHandle
+      encodeStack(m,pr,1,noTrace,false)
+      encode(pr.finalNorm,gM3Runtime,gM3Runtime.constants)
+      let lin=gLinCache["outProj.weight"]
+      encodeLin(lin,gM3Runtime.arena,a.norm,gM3Graph.logits,0)
+      if not sessionGraphEnd(be):
+        # Nothing was executed (the commands were only recorded): close the session untouched.
+        discard sessionEnd(be);opened=false
+        gM3Graph.failed=true;return false
+      gM3Graph.valid=true
+      recorded=true
+    require(sessionGraphRun(be,0,1,0,0),"graph replay")
+    tB=getMonoTime().ticks
+    let ok=sessionEnd(be);opened=false
+    tC=getMonoTime().ticks
+    # The call that records the graph is setup, not decode speed: it encodes the whole stack, builds
+    # the indirect-command pipelines, and its first replay waits for the driver to finish them
+    # (about 2.3 s on Intel Iris Plus 640). The token it computes costs ~20 ms by comparison.
+    if recorded:gM3Runtime.kernelSetupSeconds+=float64(tC-tA)/1e9
+    require(ok,"sessionEnd: " & sessionGetLastError(be))
+    logits=sessionRead(be,gM3Graph.logits,m.vocab)
+    result=true
+    if prof:m3ProfileLine(if recorded:"graph+record" else:"graph",tA,tB,tC,getMonoTime().ticks)
+  except CatchableError:
+    if opened:
+      discard sessionEnd(be)
+      discard sessionRecoverQueue(be)
+    gM3Runtime.poisoned=true
+    raise
+
+proc m3PrefillPaced(be:GpuBackend):bool =
+  ## Command buffers are bounded by measured time where the OS limits how long one may run.
+  sessionPacesCommandBuffers(be) and m3PrefillCbMs()>0
+
+proc m3PrefillSplit(be:GpuBackend;T:int;produceLogits,trace,useOd:bool):bool =
+  ## A prefill micro-batch (several rows, no logits) goes through the scheduler unless both of its
+  ## controls are off, which keeps the plain one-command-buffer path.
+  T>1 and not produceLogits and not trace and not useOd and
+    (m3PrefillPaced(be) or m3PrefillLayersPerCb()>0)
+
+proc runPrefillStack(m:var NimformerModelJamba;pr:RuntimePrograms;T:int;hInput:SessionHandle) =
+  ## All blocks for the T rows of one micro-batch, starting from the embeddings in hInput.
+  let be=gM3Runtime.be;let a=gM3Runtime.a;let layers=m.blocks.len
+  let paced=m3PrefillPaced(be);let cbMs=m3PrefillCbMs()
+  let commitEvery=if paced:0 else:m3PrefillLayersPerCb()
+  if not gM3PrefillLogged:
+    gM3PrefillLogged=true
+    stderr.writeLine "[prefill] micro-batches of up to " & $a.capacity & " rows, " &
+      (if paced:"command buffers of ~" & $int(cbMs) & " ms" else:"commit every " & $commitEvery & " layers")
+  var noTrace:SessionHandle
+  var opened=false
+  var layer=0
+  try:
+    while layer<layers:
+      var count=layers-layer
+      if paced:
+        # Unknown speed: one layer, then as many layers as fit the time budget.
+        count=if gM3PrefillMsPerLayerRow<=0:1
+              else:clamp(int(min(cbMs/(gM3PrefillMsPerLayerRow*float64(m3Tile(T))),float64(layers))),1,layers-layer)
+      let t0=getMonoTime().ticks
+      require(sessionBegin(be),"sessionBegin")
+      opened=true
+      if layer==0:require(sessionCopyInto(be,hInput,gM3Runtime.arena,0,a.x,T*a.hidden),"input upload")
+      encodeStack(m,pr,T,noTrace,false,layer,layer+count,commitEvery)
+      let ok=sessionEnd(be);opened=false
+      require(ok,"sessionEnd: " & sessionGetLastError(be))
+      if existsEnv("BYBY_PREFILL_LOG") or existsEnv("BYBY_SESSION_LOG"):
+        stderr.writeLine "[prefill] rows " & $T & ", layers " & $count & ", encode+gpu " &
+          formatFloat(float64(getMonoTime().ticks-t0)/1e6,ffDecimal,2) & " ms"
+      if paced:
+        let per=float64(getMonoTime().ticks-t0)/1e6/float64(count*m3Tile(T))
+        # Follow a faster measurement at once (the first command buffer also pays warm-up costs),
+        # a slower one gradually.
+        gM3PrefillMsPerLayerRow=if gM3PrefillMsPerLayerRow<=0 or per<gM3PrefillMsPerLayerRow:per
+                                else:0.5*gM3PrefillMsPerLayerRow+0.5*per
+      layer+=count
+  except CatchableError:
+    if opened:
+      discard sessionEnd(be)
+      discard sessionRecoverQueue(be)
+    gM3Runtime.poisoned=true
+    raise
+
 proc runM3Resident*(m:var NimformerModelJamba;ids:seq[int];ctx:Backend;produceLogits=true;trace=false):Tensor =
   require(gM3Runtime.ready and not gM3Runtime.poisoned,"state unavailable; reset after a failed command buffer")
   require(ids.len>0 and ids.len<=gM3Runtime.a.capacity,"invalid chunk length")
@@ -293,6 +545,14 @@ proc runM3Resident*(m:var NimformerModelJamba;ids:seq[int];ctx:Backend;produceLo
     else:
       gM3Runtime.od=prepareOneDispatch(m,ctx,a,gM3Runtime.states,gM3Runtime.params,gM3Runtime.paramData)
   gM3Runtime.kernelSetupSeconds+=float64(getMonoTime().ticks-setupStart)/1e9
+  # Greedy-friendly decode through the recorded graph (DeepSeek-style): the embedding gather and the
+  # whole stack replay without the CPU encoding them again.
+  if T==1 and produceLogits and not trace and not useOd and gM3ProgramProvider.isNil and
+     not gM3Runtime.skipAttn and m3GraphWanted(be):
+    var gl:seq[float32]
+    if m3GraphStep(m,ids[0],pr,gl):
+      gM3Runtime.tokens+=1;inc gM3Runtime.decodeCalls
+      return Tensor(shape: @[1,1,m.vocab],data:gl)
   # Embedding lookup is the only host activation; the entire stack and state
   # remain resident after this bounded input upload, as in Codestral.
   let input=m.embed.lookupBatch(@[ids],ctx)
@@ -300,6 +560,8 @@ proc runM3Resident*(m:var NimformerModelJamba;ids:seq[int];ctx:Backend;produceLo
   var hTrace:SessionHandle
   if trace:hTrace=sessionUpload(be,newSeq[float32](4*m.blocks.len*a.hidden))
   var opened=false
+  let prof=T==1 and produceLogits and not trace and m3ProfileOn()
+  var tA,tB,tC:int64
   defer:
     if trace:sessionFree(be,hTrace)
     if opened:
@@ -307,49 +569,27 @@ proc runM3Resident*(m:var NimformerModelJamba;ids:seq[int];ctx:Backend;produceLo
       discard sessionRecoverQueue(be)
     sessionFree(be,hInput)
   try:
+    if m3PrefillSplit(be,T,produceLogits,trace,useOd):
+      runPrefillStack(m,pr,T,hInput)
+      gM3Runtime.tokens+=T;inc gM3Runtime.prefillCalls
+      return newTensor(@[1,1,0])
+    tA=getMonoTime().ticks
     require(sessionBegin(be),"sessionBegin")
     opened=true
     require(sessionCopyInto(be,hInput,gM3Runtime.arena,0,a.x,T*a.hidden),"input upload")
     if useOd:
       encodeOneDispatch(gM3Runtime.od,gM3Runtime.arena)
     else:
-      for i,blk in m.blocks:
-        let lp=pr.layers[i]
-        let offsets=gM3Runtime.layerOffsets[i]
-        let root="block" & $i
-        if trace:require(sessionCopyInto(be,gM3Runtime.arena,hTrace,a.x,(i*4)*a.hidden,a.hidden),"trace input")
-        encode(lp.norm,gM3Runtime,gM3Runtime.constants,offsets)
-        encodeLinear(gM3Runtime,pr,root & ".mambaReal.inProj.weight",a.norm,a.proj,T)
-        encode(lp.prepare,gM3Runtime,gM3Runtime.constants,offsets)
-        encode(lp.scan,gM3Runtime,gM3Runtime.constants,offsets)
-        encode(lp.carry,gM3Runtime,gM3Runtime.constants,offsets)
-        encodeLinear(gM3Runtime,pr,root & ".mambaReal.outProj.weight",a.inner,a.mix,T)
-        if trace:require(sessionCopyInto(be,gM3Runtime.arena,hTrace,a.mix,(i*4+1)*a.hidden,a.hidden),"trace mixer")
-        if blk.kind!=bkMambaReal and not gM3Runtime.skipAttn:
-          encodeLinear(gM3Runtime,pr,root & ".attn.qkvProj.weight",a.norm,a.attnProj,T)
-          encode(lp.lp,gM3Runtime,gM3Runtime.constants,offsets)
-          encode(lp.lpCarry,gM3Runtime,gM3Runtime.constants,offsets)
-          encodeLinear(gM3Runtime,pr,root & ".attn.outProj.weight",a.attnInner,a.attnOut,T)
-          if trace:require(sessionCopyInto(be,gM3Runtime.arena,hTrace,a.attnOut,(i*4+2)*a.hidden,a.hidden),"trace sidecar")
-          if blk.kind==bkMambaRealGated:
-            encode(lp.gateIn,gM3Runtime,gM3Runtime.constants,offsets)
-            encodeLinear(gM3Runtime,pr,root & ".fuseGate.weight",a.gateIn,a.gate,T)
-            encode(lp.gate,gM3Runtime,gM3Runtime.constants,offsets)
-          else:encode(lp.mix,gM3Runtime,gM3Runtime.constants,offsets)
-        encode(lp.residual,gM3Runtime,gM3Runtime.constants,offsets)
-        encode(lp.norm2,gM3Runtime,gM3Runtime.constants,offsets)
-        encodeLinear(gM3Runtime,pr,root & ".mambaReal.mlpFc1.weight",a.norm,a.mlp,T)
-        encode(lp.mlp,gM3Runtime,gM3Runtime.constants,offsets)
-        encodeLinear(gM3Runtime,pr,root & ".mambaReal.mlpFc2.weight",a.gated,a.mix,T)
-        encode(lp.residual,gM3Runtime,gM3Runtime.constants,offsets)
-        if trace:require(sessionCopyInto(be,gM3Runtime.arena,hTrace,a.x,(i*4+3)*a.hidden,a.hidden),"trace output")
+      encodeStack(m,pr,T,hTrace,trace)
     if produceLogits:
       encode(pr.finalNorm,gM3Runtime,gM3Runtime.constants)
       encodeLinear(gM3Runtime,pr,"outProj.weight",a.norm+(T-1)*a.hidden,a.logits,1)
     if produceLogits:
       require(sessionCopyInto(be,gM3Runtime.arena,gM3Runtime.readback,a.logits,0,m.vocab),"logits copy")
       if useOd:require(sessionCopyInto(be,gM3Runtime.arena,gM3Runtime.readback,0,m.vocab,4),"OD status copy")
+    tB=getMonoTime().ticks
     let ok=sessionEnd(be);opened=false
+    tC=getMonoTime().ticks
     require(ok,"sessionEnd: " & sessionGetLastError(be))
     if trace:
       let values=sessionRead(be,hTrace,4*m.blocks.len*a.hidden)
@@ -378,17 +618,75 @@ proc runM3Resident*(m:var NimformerModelJamba;ids:seq[int];ctx:Backend;produceLo
       let raw=sessionRead(be,gM3Runtime.readback,m.vocab+(if useOd:4 else:0))
       if useOd:require(cast[uint32](raw[m.vocab+3])==0,"persistent grid barrier failed; reset state")
       result=Tensor(shape: @[1,1,m.vocab],data:raw[0..<m.vocab])
+      if prof:m3ProfileLine("eager",tA,tB,tC,getMonoTime().ticks)
     else:result=newTensor(@[1,1,0])
   except CatchableError:
     gM3Runtime.poisoned=true
     raise
 
+proc m3PrefillTop():int =
+  ## Rows of the largest prefill micro-batch: BYBY_UBATCH, at most the arena capacity.
+  let cap=gM3Runtime.a.capacity
+  let ubatch=m3UbatchRows()
+  if ubatch>0:min(ubatch,cap) else:cap
+
+proc m3PrefillBuckets*(top:int):seq[int] =
+  ## Chunk lengths of a bucketed prefill, largest first: the micro-batch size, then a quarter of it, and so
+  ## on down to 8 rows. The kernels that scan a chunk are specialized per chunk length, so a conversation
+  ## that only ever feeds these lengths compiles each set once, which a warm-up can do before the first prompt.
+  var s=max(top,1)
+  result.add s
+  while s>=32:
+    s=(s div 4+7) div 8*8
+    result.add s
+  if result[^1]>8:result.add 8
+
 proc prefillM3Resident*(m:var NimformerModelJamba;ids:seq[int];ctx:Backend)=
+  ## The prompt in micro-batches (BYBY_UBATCH rows, at most the arena capacity). Where command buffers
+  ## are paced, a micro-batch shrinks (halving, never below 8 rows) until one layer of it fits the time
+  ## budget, so a slow device or a big model never needs a command buffer longer than that.
+  let top=m3PrefillTop()
+  let paced=m3PrefillPaced(gM3Runtime.be)
+  let cbMs=m3PrefillCbMs()
   var offset=0
   while offset<ids.len:
-    let count=min(ids.len-offset,gM3Runtime.a.capacity)
+    var rows=top
+    if paced and gM3PrefillMsPerLayerRow>0:
+      while rows>8 and gM3PrefillMsPerLayerRow*float64(m3Tile(rows))>cbMs:rows=max(8,rows div 2)
+    let count=min(ids.len-offset,rows)
     discard runM3Resident(m,ids[offset..<offset+count],ctx,produceLogits=false)
     offset+=count
+
+proc prefillM3Bucketed*(m:var NimformerModelJamba;ids:seq[int];ctx:Backend):int =
+  ## Like prefillM3Resident, but every chunk has a length from m3PrefillBuckets, so no kernel set is
+  ## compiled once those lengths are warm (warmM3Resident). Returns how many leading ids it fed; fewer
+  ## than the smallest bucket are left for the caller to feed as decode steps.
+  let buckets=m3PrefillBuckets(m3PrefillTop())
+  let paced=m3PrefillPaced(gM3Runtime.be)
+  let cbMs=m3PrefillCbMs()
+  while ids.len-result>=buckets[^1]:
+    var rows=buckets[^1]
+    for b in buckets:
+      if b>ids.len-result:continue
+      # Paced devices skip a bucket whose single layer would not fit the command buffer budget.
+      if paced and b>buckets[^1] and gM3PrefillMsPerLayerRow>0 and
+         gM3PrefillMsPerLayerRow*float64(m3Tile(b))>cbMs:continue
+      rows=b
+      break
+    discard runM3Resident(m,ids[result..<result+rows],ctx,produceLogits=false)
+    result+=rows
+
+proc warmM3Resident*(m:var NimformerModelJamba;ctx:Backend;prefill=true):seq[int] =
+  ## Before the first prompt of a conversation: runs every bucketed prefill length (unless prefill is
+  ## false) and the decode step once, so their kernel sets are compiled and the prefill speed is
+  ## measured. Returns the chunk lengths it ran. The recurrent state is dirty afterwards, so the caller
+  ## resets it.
+  if prefill:
+    for rows in m3PrefillBuckets(m3PrefillTop()):
+      discard runM3Resident(m,newSeq[int](rows),ctx,produceLogits=false)
+      result.add rows
+  for _ in 0..<3:
+    discard runM3Resident(m,@[0],ctx)
 
 proc invalidateM3OneDispatch*() =
   if gM3Runtime.ready:release(gM3Runtime.od,gM3Runtime.be)

@@ -32,6 +32,11 @@ builds every micro program without loading weights. Details: [`docs/fir.md`](../
 and [`models/FIR.md`](../../models/FIR.md). Tests: `make fir-test` (or `make formers-fir-test` at
 the repository root).
 
+A native run can also be recorded (`BYBY_FIR_PROBE`) and lifted by `firlift` into a standalone
+`model.fir` that `--fir --raw` runs without the model's own code, Mamba-3 with a merged LoRA
+included (prompt phases, state clears and single-token units are described there). See
+[`docs/fir-script-lift.md`](../../docs/fir-script-lift.md); tests: `make fir-lift-test`.
+
 ## Layout
 
 ```
@@ -206,6 +211,16 @@ carrying the chat state in. The warmup runs one 16-token prefill, so these kerne
 compile before `ready` too: only the 128- and 16-token lengths ever compile. With
 `BYBY_ONE_DISPATCH=1` the decode state lives apart from the prefill's, so later turns
 decode instead.
+
+Mamba-3 chat feeds each turn through the prefill scheduler of `test/mamba3`: every token
+but the last in chunks of 128, 32 and 8 tokens, the fewer than 8 left over as decode steps,
+and the last token as a decode step with logits. Only those chunk lengths exist, so
+`ready: warmup N s (prefill chunks of 128/32/8 tok, decode)` compiles all their kernels
+before the `> ` prompt, the prompt-eval and eval speeds printed for the turns contain no
+kernel setup/JIT, and `--no-warmup` skips it (the first turn then pays the JIT).
+`BYBY_CHAT_PREFILL=0` feeds every token as a decode step instead. The scheduler's own
+variables (`BYBY_UBATCH`, `BYBY_PREFILL_CB_MS`, `BYBY_PREFILL_LAYERS_PER_CB`) are described
+in [`test/mamba3/README.md`](../../test/mamba3/README.md).
 
 ### Logs
 

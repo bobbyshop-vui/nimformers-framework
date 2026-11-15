@@ -1,6 +1,7 @@
 # Synthetic checkpoint and instruction-contract fixtures; no model weights.
 import nim "std/[os, tables, json, math, strutils]"
 import nim "backend"
+import nim "quant"
 import nim "session_vm"
 import nim "vm_interp"
 import nim "vendor/bybylang/backends/cpu/cpu_backend"
@@ -8,6 +9,7 @@ import "../src/formers/ir/fir_parse.bybylang"
 import "../src/formers/ir/fir_exec.bybylang"
 import "../src/formers/ir/fir_kernel.bybylang"
 import "../src/formers/ir/fir_graph.bybylang"
+import "../src/formers/ir/fir_data.bybylang"
 import "../src/formers/io/safetensors.bybylang"
 import "../src/formers/arch/detect.bybylang"
 
@@ -56,9 +58,9 @@ function checkPhases(root: string)
     doAssert graph.nodes[0].phase == "" and graph.nodes[1].phase == "warm" and graph.nodes[2].phase == "score" and graph.nodes[3].phase == ""
     let scored = parseSource(root, head & "phase score rows=4 logits=b\nnode n1 ext fir.embedding a b -> b\n")
     doAssert scored.phaseLogits["score"] == "b" and scored.phases["score"] == 4
-    parseError(root, head & "phase score rows=4 extra=b\n", "expected 'phase NAME rows=N [logits=BUFFER]'")
+    parseError(root, head & "phase score rows=4 extra=b\n", "expected 'phase NAME rows=N [logits=BUFFER] [last=BUFFER] [partial]'")
     parseError(root, head & "phase warm rows=1\n", "rows must be at least 2")
-    parseError(root, head & "phase warm\n", "expected 'phase NAME rows=N [logits=BUFFER]'")
+    parseError(root, head & "phase warm\n", "expected 'phase NAME rows=N [logits=BUFFER] [last=BUFFER] [partial]'")
     parseError(root, head & "phase warm rows=2\nphase warm rows=4\n", "duplicate phase warm")
     echo "PASS multi-row phases: arbitrary names and row counts, decode switch, malformed headers"
 
@@ -66,11 +68,11 @@ function checkGates(root: string)
     let graph = parseSource(root, "script_abi 1\nrequire feature weights_bf16\nrequire feature weights_f16\nlayout script\n")
     doAssert graph.scriptAbi == 1 and graph.requiredFeatures == @["weights_bf16", "weights_f16"]
     doAssert parseSource(root, "layout script\n").scriptAbi == 0
-    for value in ["0", "2", "-1", "bogus"]:
+    for value in ["0", "3", "-1", "bogus"]:
         parseError(root, "script_abi " & value & "\nlayout script\n", "unsupported script_abi " & value)
-    parseError(root, "layout script\nscript_abi\n", "expected one 'script_abi 1'")
-    parseError(root, "layout script\nscript_abi 1 extra\n", "expected one 'script_abi 1'")
-    parseError(root, "layout script\nscript_abi 1\nscript_abi 1\n", "expected one 'script_abi 1'")
+    parseError(root, "layout script\nscript_abi\n", "expected one 'script_abi 1|2'")
+    parseError(root, "layout script\nscript_abi 1 extra\n", "expected one 'script_abi 1|2'")
+    parseError(root, "layout script\nscript_abi 1\nscript_abi 1\n", "expected one 'script_abi 1|2'")
     parseError(root, "require feature future\nlayout script\n", "unsupported required feature: future")
     parseError(root, "layout script\nrequire feature\n", "expected 'require feature NAME'")
     parseError(root, "layout script\nrequire feature weights_f16 extra\n", "expected 'require feature NAME'")
@@ -93,6 +95,106 @@ function checkGates(root: string)
             actual = e.msg
         doAssert actual.contains(if defect == "abi": "unsupported script_abi" else: "unsupported required feature")
     echo "PASS script gates: late layout, legacy script, ABI/feature errors, classic errors and negotiation before checkpoint/backend access"
+
+function checkResidentQ4(root: string)
+    var p: VmProgram
+    p.emitULid(0)
+    p.emitULoadU8(1, 0, 0)
+    p.emitULoadConstF(2, 0, 0)
+    p.emitULoadIn(3, 0, 0)
+    p.emitAdd(4, 2, 3)
+    p.emitUStoreF32(4, 0, 0)
+    p.emitHalt()
+    var words = "words"
+    for word in p.words:
+        words.add " " & toHex(word, 8).toLowerAscii
+    var source = "runtime graph\nlayout script\nscript_abi 2\nrequire feature resident_q4\n"
+    source &= "sym layers = 1\nsym positions = 1\nsym vocab = 1\n"
+    source &= "buf token f32 1 input:token\nbuf position f32 1 input:position\nbuf logits f32 1 output:logits\n"
+    source &= "buf x f32 4\nweight w q4r tensor tensor [1,4]\n"
+    source &= "kernel resident in=2 out=1 threads=1 tg=1 tgbytes=16 layout=slots slots=mem:out0,u8:in1,lut:in1,input:in0\n"
+    source &= words & "\nendkernel\nnode q4 micro resident x w -> logits\n"
+    let graph = parseSource(root, source)
+    doAssert graph.scriptAbi == 2 and graph.buffers["w"].elements == 3
+    let bindings = firGraphBindings(graph)
+    doAssert bindings.memory["w"] == 0 and bindings.memoryFloats < 256
+    let kernel = firMicroKernel(graph.nodes[0], graph, firDefaultRegistry(), bindings)
+    doAssert kernel.slotLayout
+    doAssert kernel.slotBuffers[0] == "logits" and kernel.slotBuffers[1] == "w"
+    doAssert kernel.slotBuffers[2] == "w" and kernel.slotBuffers[3] == "x"
+    parseError(root, "layout script\nscript_abi 1\nweight w q4r tensor tensor [1,4]\n", "requires script_abi 2 and feature resident_q4")
+    parseError(root, "layout script\nscript_abi 2\nweight w q4r tensor tensor [1,4]\n", "requires script_abi 2 and feature resident_q4")
+    echo "PASS resident Q4 ABI 2: separate weight allocation, shared byte/LUT bindings and direct output slot"
+
+    # Run it: an arena kernel fills the activation, the slot kernel reads it through the input
+    # domain, reads the weight bytes and scales from the resident buffer and writes the arena.
+    var q: VmProgram
+    q.emitUConst(0, 0)
+    q.emitULoadU8(1, 0, 1)
+    q.emitUToR(5, 1)
+    q.emitULoadConstF(2, 0, 1)
+    q.emitULoadIn(3, 0, 2)
+    q.emitAdd(4, 2, 3)
+    q.emitAdd(4, 4, 5)
+    q.emitUStoreF32(4, 0, 1)
+    q.emitHalt()
+    var runWords = "words"
+    for word in q.words:
+        runWords.add " " & toHex(word, 8).toLowerAscii
+    var run = "runtime graph\nlayout script\nscript_abi 2\nrequire feature resident_q4\n"
+    run &= "sym layers = 1\nsym positions = 4\nsym vocab = 3\n"
+    run &= "buf token f32 1 input:token\nbuf position f32 1 input:position\nbuf pad f32 70\nbuf x f32 4\nbuf logits f32 3 output:logits\n"
+    run &= "weight w q4r tensor tensor [1,4]\n"
+    run &= "kernel fill in=1 out=1 threads=1 tg=1 tgbytes=16\nuconst 0 0\nuloadf32 1 0 @in0\naddconst 1 1 0.5\nustoref32 1 0 @out0+2\nendkernel\n"
+    run &= "kernel resident in=2 out=1 threads=1 tg=1 tgbytes=16 layout=slots slots=mem:out0,u8:in1,lut:in1,input:in0\n"
+    run &= runWords & "\nendkernel\nnode fill micro fill token -> x\nnode q4 micro resident x w -> logits\n"
+    let runGraph = parseSource(root, run)
+    doAssert not firDataGraph(runGraph)
+    let values = @[-1.5'f32, 0.25, 2.0, 3.75]
+    let packed = quantizeInt4AsymmetricGrouped(values, @[1, 4], 32)
+    var weights = initTable[string, seq[float32]]()
+    weights["tensor"] = values
+    var model = firNewGraph(runGraph, weights, newBackend("cpu"), firDefaultRegistry())
+    defer: firFreeGraph(model)
+    doAssert not model.useHandles and model.handles.len == 1 and model.arena.cpuData.len == model.bindings.memoryFloats
+    for token in [2, 0, 1]:
+        let logits = firGraphStep(model, token)
+        doAssert logits[1] == (packed.scale[0] + (float32(token) + 0.5'f32)) + float32(packed.data[1]), "resident Q4 run, token " & $token
+        doAssert logits[0] == 0 and logits[2] == 0
+    echo "PASS resident Q4 run: arena kernel and slot kernel share the arena, weight bytes and scales read from the resident buffer, three steps exact"
+
+    # Handle graph (a recorded lift: a buffer with initial data gives every buffer its own
+    # allocation). Weights that kernels read from memory become buffers of their own in the arena
+    # encoding: the arena-layout kernel stages the f32a matrix, the packed q4b128 weight and the
+    # initialized buffer, the slot kernel binds the q4r weight directly.
+    var handle = "runtime graph\nlayout script\nscript_abi 2\nrequire feature resident_q4\n"
+    handle &= "sym layers = 1\nsym positions = 4\nsym vocab = 3\n"
+    handle &= "buf token f32 1 input:token\nbuf position f32 1 input:position\nbuf x f32 4\nbuf logits f32 3 output:logits\n"
+    handle &= "buf bias f32 4\ninitwords bias 3f800000 40000000 40400000 40800000\n"
+    handle &= "weight wa f32a matrix tensor [1,4]\nweight wq q4b128 packed tensor [1,4]\nweight w q4r tensor tensor [1,4]\n"
+    handle &= "kernel mix in=4 out=1 threads=1 tg=1 tgbytes=16\nuconst 0 0\nuloadf32 1 0 @in0\nuloadf32 2 0 @in1+1\nadd 1 1 2\n"
+    handle &= "uloadf32 2 0 @in2+1\nadd 1 1 2\nuconst 3 @in2\numulk 3 3 4\nuloadu8 4 3 1\nutor 2 4\nadd 1 1 2\n"
+    handle &= "uloadf32 2 0 @in3+2\nadd 1 1 2\nustoref32 1 0 @out0+2\nendkernel\n"
+    handle &= "kernel resident in=2 out=1 threads=1 tg=1 tgbytes=16 layout=slots slots=mem:out0,u8:in1,lut:in1,input:in0\n"
+    handle &= runWords & "\nendkernel\nnode mix micro mix token wa wq bias -> x\nnode q4 micro resident x w -> logits\n"
+    let handleGraph = parseSource(root, handle)
+    doAssert firDataGraph(handleGraph)
+    let matrix = @[0.5'f32, -2.25, 1.0, 4.0]
+    let grouped = @[-3.0'f32, 1.5, 0.75, 2.5]
+    let packedGroup = quantizeInt4AsymmetricGrouped(grouped, @[1, 4], 128)
+    var handleWeights = initTable[string, seq[float32]]()
+    handleWeights["tensor"] = values
+    handleWeights["matrix"] = matrix
+    handleWeights["packed"] = grouped
+    var handleModel = firNewGraph(handleGraph, handleWeights, newBackend("cpu"), firDefaultRegistry())
+    defer: firFreeGraph(handleModel)
+    doAssert handleModel.useHandles and handleModel.arena.cpuData.len == 0
+    for token in [2, 0, 1]:
+        let mixed = (((float32(token) + matrix[1]) + packedGroup.scale[0]) + float32(packedGroup.data[1])) + 3.0'f32
+        let logits = firGraphStep(handleModel, token)
+        doAssert logits[1] == (packed.scale[0] + mixed) + float32(packed.data[1]), "handle graph Q4 run, token " & $token
+        doAssert logits[0] == 0 and logits[2] == 0
+    echo "PASS handle graph weights: f32a, packed q4b128 and resident q4r weights each in a buffer of their own next to an initialized buffer, staged and slot kernels, three steps exact"
 
 function appendWord(data: var string, word: uint32, width: int)
     for i in 0 ..< width:
@@ -327,5 +429,6 @@ function main()
     checkWireConversions(root)
     checkCheckpoint(root)
     checkInstructions(root)
+    checkResidentQ4(root)
 
 main()

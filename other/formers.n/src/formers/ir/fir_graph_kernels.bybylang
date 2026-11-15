@@ -20,6 +20,9 @@ function firGraphBindings(model: FirProgram, separateRawWeights: bool = false): 
         if separateRawWeights and firResidentRaw(model, name):
             result.memory[name] = 0
             continue
+        if firResidentQ4(model, name):
+            result.memory[name] = 0
+            continue
         if buffer.kind != "weight" or buffer.dims.len == 1:
             names.add(name)
         elif model.layout == "script" and buffer.dtype == "f32" and buffer.dims.len != 2:

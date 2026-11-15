@@ -17,7 +17,9 @@ import "fir_graph_kernels.bybylang"
 import "fir_data.bybylang"
 import "../io/safetensors.bybylang"
 import nim "vendor/bybylang/probe_weights"
+import nim "vendor/bybylang/mapped_file as firMappedFile"
 import nim "std/os"
+import nim "std/times"
 
 type
   FgStagePort* = object
@@ -29,6 +31,7 @@ type
     name*, source*: string
     cpuFn*: pointer                 ## compiled CPU function (nil = interpret the bytecode)
     stage*: seq[FgStagePort]        ## arena-layout kernel in a handle graph: ports staged contiguously
+    metaOffset*: int                ## position-independent kernel: float offset of this node's address table in the arena (-1: none)
   FirGraph* = object
     graph*: FirProgram
     registry*: FirRegistry
@@ -38,6 +41,8 @@ type
     handles*: seq[SessionHandle]
     handleIndex*: Table[string, int]
     useHandles*: bool
+    nativeQ4*: bool                 ## BYBY_FIR_Q4_BACKEND=native: resident Q4 nodes dispatch through sessionMatmulQ4 instead of their lifted kernel (a diagnostic switch).
+    checkpointMap*: firMappedFile.MappedReadOnlyFile ## Keeps mapped Q4 checkpoint bytes alive.
     fp32*: Table[string, SessionHandle]
     rawWeights*: Table[string, SessionHandle]
     rawPools*: seq[SessionHandle]       # GPU backends: raw weights packed into a few large buffers
@@ -51,12 +56,24 @@ type
     checkpoint*: string
     initialState*: seq[tuple[offset: int, name: string]]
     chunk*: seq[int]                ## token ids of the multi-row phase being encoded
+    activeRows*: int                ## > 0: a partial phase run over this many rows (fewer than declared)
+    metaWrites*: seq[tuple[offset: int, value: float32]]   ## address tables of the position-independent kernels
     phaseReadback*: SessionHandle
     stage*: SessionHandle
     stageFloats*: int
+    profTime*: Table[string, float]     ## BYBY_FIR_PROFILE=2: wall seconds per "phase kernel"
+    profCount*: Table[string, int]
+    stepEncodeSeconds*, stepWaitSeconds*, stepReadSeconds*: float   ## BYBY_FIR_PROFILE=1: decode step totals
+    stepSeconds*: float                       ## measured at warm-up: one decode step
+    phaseBlockSeconds*: Table[string, float]  ## measured at warm-up: one row block of a partial phase
+    phaseBlockRows*: Table[string, int]       ## rows one block of that phase covers (largest rows=B of its kernels)
+    stepProfiled*: int
 
 function fgTensorName(buffer: FirBuffer, layer: int): string
     buffer.tensorName.replace("{i}", $layer)
+
+function fgResidentQ4HandleKey(name: string, layer: int): string
+    "@resident_q4/" & name & "/" & $layer
 
 function fgNodeKey(node: FirNode, layer: int): string
     node.name & ":" & $(if node.perLayer: layer else: -1)
@@ -111,10 +128,34 @@ function fgNodeTag(model: FirGraph, node: FirNode, layer: int): string
         of "fir.embedding": return "aten::embedding"
         of "fir.linear", "fir.linear_t": return "aten::linear"
         else: return "fir::" & node.op
-    let k = model.programs[fgNodeKey(node, layer)].kernel
-    if k.tag.len > 0:
-        return k.tag
+    if model.programs.hasKey(fgNodeKey(node, layer)):
+        let tag = model.programs[fgNodeKey(node, layer)].kernel.tag
+        if tag.len > 0:
+            return tag
+    if model.graph.kernels.hasKey(node.op) and model.graph.kernels[node.op].tag.len > 0:
+        return model.graph.kernels[node.op].tag
     return fgKernelTag(node.op)
+
+function fgNativeQ4Weight(graph: FirProgram, node: FirNode): string
+    ## A q4r weight is consumed by a generated slot kernel. With the native
+    ## runner selector, the same node can use the backend's resident Q4 plan.
+    if node.kind != "micro" or not graph.kernels.hasKey(node.op) or graph.kernels[node.op].layout != "slots":
+        return ""
+    for name in node.inputs.splitWhitespace():
+        if graph.buffers.hasKey(name) and firResidentQ4(graph, name):
+            return name
+    return ""
+
+function fgNativeQ4Tensor(graph: FirProgram, name: string): bool
+    for node in graph.nodes:
+        if fgNativeQ4Weight(graph, node) == name:
+            return true
+
+function fgTuneNativeQ4(model: FirGraph, weight: ResidentWeightHandle)
+    if model.nativeQ4:
+        discard residentPrepareQ4(weight, 1)
+        discard residentPrepareQ4(weight, 8)
+        discard residentPrepareQ4(weight, 256)
 
 function fgProbeTensor(model: FirGraph, name: string, layer: int): string
     ## Buffer reference of one node port: resident weight, arena weight or arena
@@ -126,6 +167,14 @@ function fgProbeTensor(model: FirGraph, name: string, layer: int): string
         return probeHandleRef(model.rawWeights[base], packed + buffer.viewOffset, buffer.elements)
     if model.handleIndex.hasKey(base):
         return probeHandleRef(model.handles[model.handleIndex[base]], buffer.viewOffset, buffer.elements)
+    if firResidentQ4(model.graph, base):
+        let tensor = fgTensorName(buffer, layer)
+        if model.nativeQ4 and model.q4.hasKey(tensor):
+            return probeWeightRef(model.q4[tensor])
+        let key = fgResidentQ4HandleKey(base, layer)
+        if not model.handleIndex.hasKey(key):
+            raise newException(ValueError, "FIR resident Q4 tensor handle is missing: " & name)
+        return probeHandleRef(model.handles[model.handleIndex[key]], 0, buffer.elements)
     let bindings = fgLayerBindings(model, layer)
     if buffer.kind == "weight":
         let tensor = fgTensorName(buffer, layer)
@@ -174,6 +223,11 @@ function firFreeGraph(model: var FirGraph)
     sessionFree(be, model.scratchA)
     sessionFree(be, model.scratchB)
     sessionFree(be, model.scratchC)
+    if model.checkpointMap.data != nil:
+        try:
+            firMappedFile.unmapReadOnlyFile(model.checkpointMap)
+        except CatchableError:
+            discard
     model.q4.clear()
     model.fp32.clear()
     model.rawWeights.clear()
@@ -183,6 +237,59 @@ function firFreeGraph(model: var FirGraph)
     model.handleIndex.clear()
     model.failed = true
 
+function fgPackedQ4Words(values: seq[float32], n: int, k: int, group: int): seq[float32]
+    ## Packed asymmetric Q4 [out,in] as float words: the nibble bytes (4 per word), then the group
+    ## scales, then the group zero points. Group size from the dtype (q4b/q4r: 32, q4b128: 128).
+    let groups = (k+group-1) div group
+    let packed = quantizeInt4AsymmetricGrouped(values, @[n, k], group)
+    let words = (packed.data.len+3) div 4
+    result = newSeq[float32](words+2*n*groups)
+    for w in 0 ..< words:
+        var bits = 0'u32
+        for b in 0 ..< 4:
+            let idx = w*4+b
+            if idx < packed.data.len:
+                bits = bits or (uint32(packed.data[idx]) shl uint32(8*b))
+        result[w] = cast[float32](bits)
+    for i in 0 ..< n*groups:
+        result[words+i] = packed.scale[i]
+        result[words+n*groups+i] = packed.zero_point[i]
+
+function fgMemoryWeight(model: FirGraph, buffer: FirBuffer, values: seq[float32], words: var seq[float32]): bool
+    ## The float words of a weight that micro kernels read from memory: a span of the arena, or a
+    ## buffer of its own in a handle graph. False: the weight is resident in the backend instead
+    ## (sessionMatmul / sessionMatmulQ4 operands).
+    if buffer.dtype == "f32a":
+        # Matrix kept in memory so micro kernels can read it.
+        words = values
+    elif buffer.dtype == "fp4km":
+        # FP4-KM (group 32): the quantizer's byte block, then the decode table.
+        let qt = quantizeFp4KM(values, @[buffer.dims[0], buffer.dims[1]])
+        let count = (qt.data.len+3) div 4
+        words = newSeq[float32](count+272)
+        for w in 0 ..< count:
+            var bits = 0'u32
+            for b in 0 ..< 4:
+                let idx = w*4+b
+                if idx < qt.data.len:
+                    bits = bits or (uint32(qt.data[idx]) shl uint32(8*b))
+            words[w] = cast[float32](bits)
+        let lut = fp4kmDecodeLut()
+        for i in 0 ..< 16:
+            words[count+i] = lut[i]
+        let e4m3 = buildDecodeLUT(FP8_E4M3)
+        for i in 0 ..< 256:
+            words[count+16+i] = e4m3[i] * qt.scale[0]
+    elif firQ4bGroup(buffer.dtype) > 0:
+        words = fgPackedQ4Words(values, buffer.dims[0], buffer.dims[1], firQ4bGroup(buffer.dtype))
+    elif buffer.dims.len == 1:
+        words = values
+    elif model.graph.layout == "script" and buffer.dtype == "f32" and buffer.dims.len != 2 and not model.useHandles:
+        words = values
+    else:
+        return false
+    return true
+
 function fgUploadWeight(model: var FirGraph, name: string, buffer: FirBuffer, layer: int, values: seq[float32], memory: var seq[float32])
     let tensor = fgTensorName(buffer, layer)
     var expected = 1
@@ -190,70 +297,38 @@ function fgUploadWeight(model: var FirGraph, name: string, buffer: FirBuffer, la
         expected *= d
     if values.len != expected:
         raise newException(ValueError, "FIR graph invalid weight element count: " & tensor)
-    if model.useHandles:
-        let be = model.backend.kind.toByby()
-        if buffer.dtype == "f32" and buffer.dims.len >= 2:
-            model.fp32[tensor] = beResidentUploadFp32(model.backend, values)
-        elif buffer.dtype == "f32":
-            model.handleIndex[name] = model.handles.len
-            model.handles.add(sessionUpload(be, values))
-        else:
-            raise newException(ValueError, "FIR handle runner does not support weight dtype " & buffer.dtype & ": " & tensor)
-        return
-    if buffer.dtype == "f32a":
-        # Matrix kept in the arena so micro kernels can read it.
-        let offset = fgLayerBindings(model, layer).memory[name]
-        for i, value in values:
-            memory[offset+i] = value
-    elif buffer.dtype == "fp4km":
-        # FP4-KM (group 32) in the arena: the quantizer's byte block, then the decode table.
-        let n = buffer.dims[0]
-        let k = buffer.dims[1]
-        let qt = quantizeFp4KM(values, @[n, k])
-        let offset = fgLayerBindings(model, layer).memory[name]
-        let words = (qt.data.len+3) div 4
-        for w in 0 ..< words:
-            var bits = 0'u32
-            for b in 0 ..< 4:
-                let idx = w*4+b
-                if idx < qt.data.len:
-                    bits = bits or (uint32(qt.data[idx]) shl uint32(8*b))
-            memory[offset+w] = cast[float32](bits)
-        let lut = fp4kmDecodeLut()
-        for i in 0 ..< 16:
-            memory[offset+words+i] = lut[i]
-        let e4m3 = buildDecodeLUT(FP8_E4M3)
-        for i in 0 ..< 256:
-            memory[offset+words+16+i] = e4m3[i] * qt.scale[0]
-    elif firQ4bGroup(buffer.dtype) > 0:
-        # Packed asymmetric Q4 [out,in] in the arena: nibble bytes (4 per float word), then the
-        # group scales, then the group zero points. Group size from the dtype (q4b: 32, q4b128: 128).
+    let be = model.backend.kind.toByby()
+    if firResidentQ4(model.graph, name):
         let n = buffer.dims[0]
         let k = buffer.dims[1]
         let group = firQ4bGroup(buffer.dtype)
-        let groups = (k+group-1) div group
-        let packed = quantizeInt4AsymmetricGrouped(values, @[n, k], group)
-        let offset = fgLayerBindings(model, layer).memory[name]
-        let words = (packed.data.len+3) div 4
-        for w in 0 ..< words:
-            var bits = 0'u32
-            for b in 0 ..< 4:
-                let idx = w*4+b
-                if idx < packed.data.len:
-                    bits = bits or (uint32(packed.data[idx]) shl uint32(8*b))
-            memory[offset+w] = cast[float32](bits)
-        for i in 0 ..< n*groups:
-            memory[offset+words+i] = packed.scale[i]
-            memory[offset+words+n*groups+i] = packed.zero_point[i]
-    elif buffer.dims.len == 1:
-        let offset = fgLayerBindings(model, layer).memory[name]
-        for i, value in values:
-            memory[offset+i] = value
-    elif model.graph.layout == "script" and buffer.dtype == "f32" and buffer.dims.len != 2:
-        let offset = fgLayerBindings(model, layer).memory[name]
-        for i, value in values:
-            memory[offset+i] = value
-    elif buffer.dtype in ["q4", "q4t"]:
+        if model.nativeQ4 and fgNativeQ4Tensor(model.graph, name):
+            let packed = quantizeInt4AsymmetricGrouped(values, @[n, k], group)
+            model.q4[tensor] = beResidentUploadQ4(model.backend, packed.data, packed.scale, packed.zero_point, k, n, packed.groupSize, (k+group-1) div group)
+            fgTuneNativeQ4(model, model.q4[tensor])
+            probeName(model.q4[tensor], tensor, buffer.dtype, buffer.dims)
+            return
+        let key = fgResidentQ4HandleKey(name, layer)
+        if model.handleIndex.hasKey(key):
+            raise newException(ValueError, "FIR resident Q4 tensor was uploaded twice: " & tensor)
+        model.handleIndex[key] = model.handles.len
+        model.handles.add(sessionUpload(be, fgPackedQ4Words(values, n, k, group)))
+        return
+    var words: seq[float32]
+    if fgMemoryWeight(model, buffer, values, words):
+        if model.useHandles:
+            # Handle graph: the weight is a buffer of its own in the layout the arena would hold, so
+            # slot kernels bind it and arena-layout kernels stage it like any other port.
+            if model.handleIndex.hasKey(name):
+                raise newException(ValueError, "FIR handle graph weight was uploaded twice (per-layer weights need an arena graph): " & tensor)
+            model.handleIndex[name] = model.handles.len
+            model.handles.add(sessionUpload(be, words))
+        else:
+            let offset = fgLayerBindings(model, layer).memory[name]
+            for i, value in words:
+                memory[offset+i] = value
+        return
+    if buffer.dtype in ["q4", "q4t"]:
         # q4: checkpoint [in,out] -> resident [out,in] (transpose first).
         # q4t: checkpoint is already [out,in], quantize in place.
         let k = if buffer.dtype == "q4t": buffer.dims[1] else: buffer.dims[0]
@@ -272,6 +347,63 @@ function fgUploadWeight(model: var FirGraph, name: string, buffer: FirBuffer, la
         # lm_head share a single [vocab,hidden] allocation, consumed with NT.
         model.fp32[tensor] = beResidentUploadFp32(model.backend, values)
         probeName(model.fp32[tensor], tensor, buffer.dtype, buffer.dims)
+
+function fgUploadNativeQ4(model: var FirGraph, name: string, buffer: FirBuffer, layer: int, f: var File, tensor: ProbeTensor): bool
+    let group = firQ4bGroup(buffer.dtype)
+    if group <= 0 or tensor.kind != int(qkInt4Asymmetric) or tensor.groupSize != group or tensor.shape != buffer.dims:
+        if model.nativeQ4 and getEnv("BYBY_FIR_Q4_MAP_LOG", "0") == "1":
+            stderr.writeLine("[fir] resident Q4 fallback " & tensor.name & " dtype=" & buffer.dtype & " kind=" & $tensor.kind & "/" & $int(qkInt4Asymmetric) & " group=" & $tensor.groupSize & "/" & $group & " shapeMatch=" & $(tensor.shape == buffer.dims))
+        return false
+    let rows = buffer.dims[0]
+    let cols = buffer.dims[1]
+    let groups = (cols+group-1) div group
+    let bytes = rows*((cols+1) div 2)
+    if tensor.bytes != bytes or tensor.scales != rows*groups:
+        raise newException(ValueError, "FIR graph packed resident Q4 layout mismatch: " & fgTensorName(buffer, layer))
+    let words = (bytes+3) div 4
+    if model.nativeQ4 and fgNativeQ4Tensor(model.graph, name):
+        var scales = newSeq[float32](rows*groups)
+        var zeros = newSeq[float32](rows*groups)
+        f.setFilePos(tensor.scaleOffset)
+        let scaleBytes = rows*groups*4
+        if f.readBuffer(addr scales[0], scaleBytes) != scaleBytes or f.readBuffer(addr zeros[0], scaleBytes) != scaleBytes:
+            raise newException(IOError, "FIR truncated native Q4 metadata: " & tensor.name)
+        let key = fgTensorName(buffer, layer)
+        var zeroCopy = false
+        if model.checkpointMap.data != nil:
+            let wq = cast[pointer](cast[uint](model.checkpointMap.data) + uint(tensor.offset))
+            let uploaded = beResidentUploadQ4Mapped(model.backend, wq, bytes, scales, zeros, cols, rows, group, groups)
+            model.q4[key] = uploaded.w
+            zeroCopy = uploaded.zeroCopy
+        else:
+            var packed = newSeq[uint8](bytes)
+            f.setFilePos(tensor.offset)
+            if bytes > 0 and f.readBuffer(addr packed[0], bytes) != bytes:
+                raise newException(IOError, "FIR truncated native tensor: " & tensor.name)
+            model.q4[key] = beResidentUploadQ4(model.backend, packed, scales, zeros, cols, rows, group, groups)
+        if getEnv("BYBY_FIR_Q4_MAP_LOG", "0") == "1":
+            stderr.writeLine("[fir] resident Q4 " & tensor.name & (if zeroCopy: " mapped zero-copy" else: " uploaded copy"))
+        fgTuneNativeQ4(model, model.q4[key])
+        probeName(model.q4[key], tensor.name, buffer.dtype, buffer.dims)
+        return true
+    var encoded = newSeq[float32](words+2*rows*groups)
+    f.setFilePos(tensor.offset)
+    # The native checkpoint and supported GPU hosts are little-endian, so the
+    # packed byte stream can be read straight into its float-word slot.
+    if bytes > 0 and f.readBuffer(addr encoded[0], bytes) != bytes:
+        raise newException(IOError, "FIR truncated native tensor: " & tensor.name)
+    f.setFilePos(tensor.scaleOffset)
+    let scaleBytes = rows*groups*4
+    if f.readBuffer(addr encoded[words], scaleBytes) != scaleBytes:
+        raise newException(IOError, "FIR truncated native scales: " & tensor.name)
+    if f.readBuffer(addr encoded[words+rows*groups], scaleBytes) != scaleBytes:
+        raise newException(IOError, "FIR truncated native zero points: " & tensor.name)
+    let key = fgResidentQ4HandleKey(name, layer)
+    if model.handleIndex.hasKey(key):
+        raise newException(ValueError, "FIR resident Q4 tensor was uploaded twice: " & tensor.name)
+    model.handleIndex[key] = model.handles.len
+    model.handles.add(sessionUpload(model.backend.kind.toByby(), encoded))
+    return true
 
 function fgSlotGlsl(kernel: FirKernel, name: string): string
     # Keep descriptor offsets aligned at zero. Apply byte/float view bases to
@@ -382,6 +514,10 @@ function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): 
     result.registry = registry
     result.bindings = firGraphBindings(graph, true)
     result.useHandles = firDataGraph(graph)
+    let q4Backend = getEnv("BYBY_FIR_Q4_BACKEND", "micro").toLowerAscii()
+    if q4Backend notin ["micro", "native"]:
+        raise newException(ValueError, "BYBY_FIR_Q4_BACKEND must be micro or native")
+    result.nativeQ4 = q4Backend == "native"
     result.backend = backend
     firValidate(graph, registry, result.bindings)
     if backend.kind.toByby() != gbCpu:
@@ -398,8 +534,11 @@ function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): 
     var jobs: seq[tuple[name, source: string]]
     var cpuUnits: seq[CpuJitUnit]
     var cpuSeen = initTable[string, bool]()
+    var metaFloats = 0
     for node in graph.nodes:
         if node.kind == "micro":
+            if result.nativeQ4 and fgNativeQ4Weight(graph, node).len > 0:
+                continue
             for layer in 0 ..< (if node.perLayer: graph.symbols["layers"] else: 1):
                 var nodeBindings = fgLayerBindings(result, layer)
                 var staged: seq[FgStagePort]
@@ -423,8 +562,19 @@ function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): 
                         nodeBindings.memory[name] = cursor
                         cursor += elements
                     result.stageFloats = max(result.stageFloats, cursor)
-                let kernel = firMicroKernel(node, result.graph, registry, nodeBindings)
-                var prepared = FgResidentProgram(kernel: kernel, stage: staged)
+                # Metal, arena layout: position-independent programs, so every node of a kernel shares one
+                # compiled pipeline (a graph has a thousand nodes and a few dozen kernels). BYBY_FIR_RELOC=0
+                # keeps one program per node.
+                let relocatable = be == gbMetal and not result.useHandles and not isSlots and getEnv("BYBY_FIR_RELOC", "1") != "0"
+                let kernel = firMicroKernel(node, result.graph, registry, nodeBindings, relocatable)
+                var prepared = FgResidentProgram(kernel: kernel, stage: staged, metaOffset: -1)
+                if kernel.relocBuffers.len > 0:
+                    prepared.metaOffset = result.bindings.memoryFloats + metaFloats
+                    for i, name in kernel.relocBuffers:
+                        let address = nodeBindings.memory[name]
+                        result.metaWrites.add((prepared.metaOffset + 2*i, float32(address div 4096)))
+                        result.metaWrites.add((prepared.metaOffset + 2*i + 1, float32(address mod 4096)))
+                    metaFloats += ((2*kernel.relocBuffers.len + 3) div 4)*4
                 if be == gbMetal:
                     prepared.name = dispatchProgramNoSession(jit, kernel.program, node.op)
                     if prepared.name == "micro_vm_kernel":
@@ -447,6 +597,8 @@ function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): 
                 result.programs[fgNodeKey(node, layer)] = prepared
         elif node.kind notin ["ext", "session"]:
             raise newException(ValueError, "FIR graph executor supports micro, ext and session nodes: " & node.name)
+    # The address tables sit after everything else in the arena.
+    result.bindings.memoryFloats += metaFloats
     sessionJitPrewarm(be, jobs)
     if cpuUnits.len > 0:
         let compiled = cpuJitBuild(cpuUnits)
@@ -465,25 +617,43 @@ function fgPortBase(model: FirGraph, name: string): string
         result = model.graph.buffers[name].viewOf
     return result
 
-function fgPortOffset(model: FirGraph, name: string): int
+function fgPortOffset(model: FirGraph, name: string, layer: int = 0): int
     result = 0
     if model.graph.buffers.hasKey(name):
         result = model.graph.buffers[name].viewOffset
     let base = fgPortBase(model, name)
+    if firResidentQ4(model.graph, base):
+        return 0
+    if not model.useHandles and model.bindings.memory.hasKey(name):
+        # Arena graph: the float offset of the buffer (or view) inside the arena.
+        result = model.bindings.memory[name]
+        if model.graph.buffers[name].perLayer or model.graph.buffers[name].tensorName.contains("{i}"):
+            result += layer*model.graph.buffers[name].elements
+        return result
+    if model.graph.buffers.hasKey(name) and
+        (model.graph.buffers[name].perLayer or model.graph.buffers[name].tensorName.contains("{i}")):
+        result += layer*model.graph.buffers[name].elements
     if model.rawBase.hasKey(base):
         result += model.rawBase[base]
     return result
 
-function fgPortHandleIndex(model: FirGraph, name: string): int
+function fgPortHandleIndex(model: FirGraph, name: string, layer: int = 0): int
     let base = fgPortBase(model, name)
+    if firResidentQ4(model.graph, base):
+        return model.handleIndex.getOrDefault(fgResidentQ4HandleKey(base, layer), -1)
     if model.handleIndex.hasKey(base):
         return model.handleIndex[base]
     return -1
 
-function fgPortHandle(model: FirGraph, name: string): SessionHandle
+function fgPortHandle(model: FirGraph, name: string, layer: int = 0): SessionHandle
     let base = fgPortBase(model, name)
     if model.rawWeights.hasKey(base):
         return model.rawWeights[base]
+    if firResidentQ4(model.graph, base):
+        let key = fgResidentQ4HandleKey(base, layer)
+        if model.handleIndex.hasKey(key):
+            return model.handles[model.handleIndex[key]]
+        raise newException(ValueError, "FIR resident Q4 tensor handle is missing: " & name)
     if model.handleIndex.hasKey(base):
         return model.handles[model.handleIndex[base]]
     return model.arena
@@ -503,6 +673,11 @@ function fgInitValues(model: FirGraph, buffer: FirBuffer): seq[float32]
         finally:
             f.close()
 
+function fgWriteMeta(model: FirGraph, memory: var seq[float32])
+    ## Fills the address tables of the position-independent kernels (before the arena is uploaded).
+    for item in model.metaWrites:
+        memory[item.offset] = item.value
+
 function fgAllocate(model: var FirGraph, memory: seq[float32])
     let be = model.backend.kind.toByby()
     if model.useHandles:
@@ -511,9 +686,12 @@ function fgAllocate(model: var FirGraph, memory: seq[float32])
                 continue
             if firResidentRaw(model.graph, name):
                 continue
+            if firResidentQ4(model.graph, name):
+                continue
             if model.handleIndex.hasKey(name):
                 continue
-            if buffer.kind == "weight" and buffer.dtype == "f32" and buffer.dims.len >= 2:
+            if buffer.kind == "weight" and buffer.dtype != "raw":
+                # Uploaded by fgUploadWeight: a buffer of its own above, or resident in the backend.
                 continue
             let values = fgInitValues(model, buffer)
             model.handleIndex[name] = model.handles.len
@@ -522,12 +700,16 @@ function fgAllocate(model: var FirGraph, memory: seq[float32])
                 model.initialState.add((0, name))
     else:
         model.arena = sessionUpload(be, memory)
+        if be == gbMetal and model.arena.metalHandle.isNil:
+            # Activations, state (the KV caches grow with the context) and small weights share
+            # this one buffer; the device limits how large a single buffer may be.
+            raise newException(ValueError, "FIR graph arena of " & $(memory.len div 262144) & " MiB does not fit one device buffer; lift and run with a smaller context")
         for name, buffer in model.graph.buffers:
             if buffer.kind != "weight" and (buffer.initFile.len > 0 or buffer.initialWords.len > 0):
                 model.initialState.add((model.bindings.memory[name], name))
     if not model.useHandles and unlikely(firProbeOn):
         for name, buffer in model.graph.buffers:
-            if firResidentRaw(model.graph, name):
+            if firResidentRaw(model.graph, name) or firResidentQ4(model.graph, name):
                 continue
             if model.bindings.memory.hasKey(name):
                 for layer in 0 ..< (if buffer.tensorName.contains("{i}"): model.graph.symbols["layers"] else: 1):
@@ -537,14 +719,17 @@ function fgAllocate(model: var FirGraph, memory: seq[float32])
                     elif buffer.role.len > 0:
                         probeRole(model.arena, buffer.role, offset, buffer.elements*4)
     var largest = model.graph.symbols["vocab"]
-    if not model.useHandles:
-        for name, buffer in model.graph.buffers:
-            if buffer.kind != "weight" and not buffer.perLayer:
-                largest = max(largest, buffer.elements)
+    for name, buffer in model.graph.buffers:
+        if buffer.kind != "weight" and not buffer.perLayer:
+            largest = max(largest, buffer.elements)
     model.linearInput = sessionAllocScratch(be, largest)
     model.linearOutput = sessionAllocScratch(be, largest)
     model.logitsReadback = sessionAllocScratch(be, model.graph.symbols["vocab"])
     var phaseFloats = 1
+    for name, buffer in model.graph.phaseLast:
+        if not model.graph.buffers.hasKey(buffer) or model.graph.buffers[buffer].elements != model.graph.symbols["vocab"]:
+            raise newException(ValueError, "FIR phase " & name & ": last= buffer must hold vocab floats")
+        phaseFloats = max(phaseFloats, model.graph.buffers[buffer].elements)
     for name, buffer in model.graph.phaseLogits:
         if not model.graph.buffers.hasKey(buffer) or model.graph.buffers[buffer].elements != model.graph.phases[name]*model.graph.symbols["vocab"]:
             raise newException(ValueError, "FIR phase " & name & ": logits buffer must hold rows*vocab floats")
@@ -602,6 +787,75 @@ function firNewGraph(graph: FirProgram, weights: Table[string, seq[float32]], ba
         fgLoadRawWeights(result, "")
         if not result.useHandles:
             firInitializeData(graph, "", memory, result.bindings)
+        fgWriteMeta(result, memory)
+        fgAllocate(result, memory)
+    except:
+        firFreeGraph(result)
+        raise
+
+function fgLoadNative(graph: FirProgram, path: string, backend: Backend): FirGraph
+    ## Weights from a native .nimq checkpoint. A packed asymmetric Q4 tensor whose group size and
+    ## shape match a q4b weight is copied as stored (nibble bytes, then scales, then zero points):
+    ## no dequantize/requantize pass at load, and the graph computes with the very values the
+    ## native runtime uses. Every other tensor is dequantized to f32 and takes the usual path.
+    firCheckDataWeights(graph, path)
+    let index = probeTensorIndex(path)
+    result = fgPrepare(graph, backend, firDefaultRegistry())
+    result.checkpoint = path
+    if result.nativeQ4:
+        try:
+            result.checkpointMap = firMappedFile.openReadOnlyMapping(path)
+        except CatchableError:
+            discard
+    try:
+        var memory = if result.useHandles: newSeq[float32]() else: newSeq[float32](result.bindings.memoryFloats)
+        var f = open(path, fmRead)
+        try:
+            for name, buffer in graph.buffers:
+                if buffer.kind != "weight":
+                    continue
+                for layer in 0 ..< (if buffer.tensorName.contains("{i}"): graph.symbols["layers"] else: 1):
+                    let tensorName = fgTensorName(buffer, layer)
+                    var found = -1
+                    for i, tensor in index:
+                        if tensor.name == tensorName:
+                            found = i
+                    if found < 0:
+                        for prefix in graph.prefixes:
+                            for i, tensor in index:
+                                if tensor.name == prefix & tensorName:
+                                    found = i
+                    if found < 0:
+                        raise newException(ValueError, "FIR graph checkpoint lacks tensor: " & tensorName)
+                    let tensor = index[found]
+                    if firResidentQ4(graph, name):
+                        if not fgUploadNativeQ4(result, name, buffer, layer, f, tensor):
+                            fgUploadWeight(result, name, buffer, layer, firReadNativeF32(path, tensor), memory)
+                        continue
+                    let group = firQ4bGroup(buffer.dtype)
+                    if group > 0 and tensor.kind == int(qkInt4Asymmetric) and tensor.groupSize == group and tensor.shape == buffer.dims:
+                        let rows = buffer.dims[0]
+                        let groups = (buffer.dims[1]+group-1) div group
+                        let bytes = rows*((buffer.dims[1]+1) div 2)
+                        if tensor.bytes != bytes or tensor.scales != rows*groups:
+                            raise newException(ValueError, "FIR graph packed Q4 layout mismatch: " & tensorName)
+                        let offset = fgLayerBindings(result, layer).memory[name]
+                        let words = (bytes+3) div 4
+                        f.setFilePos(tensor.offset)
+                        if f.readBuffer(addr memory[offset], bytes) != bytes:
+                            raise newException(IOError, "FIR truncated native tensor: " & tensorName)
+                        # The file keeps the scales, then the zero points, right after the tensor header.
+                        f.setFilePos(tensor.scaleOffset)
+                        if f.readBuffer(addr memory[offset+words], rows*groups*8) != rows*groups*8:
+                            raise newException(IOError, "FIR truncated native scales: " & tensorName)
+                    else:
+                        fgUploadWeight(result, name, buffer, layer, firReadNativeF32(path, tensor), memory)
+        finally:
+            f.close()
+        fgLoadRawWeights(result, path)
+        if not result.useHandles:
+            firInitializeData(graph, path, memory, result.bindings)
+        fgWriteMeta(result, memory)
         fgAllocate(result, memory)
     except:
         firFreeGraph(result)
@@ -625,9 +879,21 @@ function firLoadGraph(graph: FirProgram, path: string, backend: Backend): FirGra
                     continue
                 var values: seq[float32]
                 if native:
+                    var packed = false
                     for tensor in index:
                         if tensor.name == buffer.tensorName:
-                            values = firReadNativeF32(path, tensor)
+                            if firResidentQ4(graph, name):
+                                # Copy the packed Q4 bytes as stored: the graph then computes with
+                                # the very values the native runtime uses.
+                                var f = open(path, fmRead)
+                                try:
+                                    packed = fgUploadNativeQ4(result, name, buffer, 0, f, tensor)
+                                finally:
+                                    f.close()
+                            if not packed:
+                                values = firReadNativeF32(path, tensor)
+                    if packed:
+                        continue
                 else:
                     let source = fmResolveTensor(header, graph.prefixes, buffer.tensorName)
                     values = fmLoadSafeF32(path, header, source, buffer.dims, true)
@@ -635,11 +901,14 @@ function firLoadGraph(graph: FirProgram, path: string, backend: Backend): FirGra
             fgLoadRawWeights(result, path)
             if not result.useHandles:
                 firInitializeData(graph, path, memory, result.bindings)
+            fgWriteMeta(result, memory)
             fgAllocate(result, memory)
         except:
             firFreeGraph(result)
             raise
         return result
+    if path.endsWith(".nimq"):
+        return fgLoadNative(graph, path, backend)
     let header = fmReadSafeHeader(path)
     if graph.layout == "script":
         # Check every selected layer before backend preparation or weight upload.
@@ -667,33 +936,48 @@ function firLoadGraph(graph: FirProgram, path: string, backend: Backend): FirGra
                     raise newException(ValueError, "FIR graph checkpoint lacks tensor: " & tensor)
                 let values = fmLoadSafeF32(path, header, source, buffer.dims, graph.layout == "script")
                 fgUploadWeight(result, name, buffer, layer, values, memory)
+        fgWriteMeta(result, memory)
         fgAllocate(result, memory)
     except:
         firFreeGraph(result)
         raise
 
-function fgDispatchArena(model: var FirGraph, prepared: FgResidentProgram, target: SessionHandle): bool
-    var arena = target
+function fgDispatchArena(model: var FirGraph, prepared: FgResidentProgram, staged: bool, threads: int): bool
+    ## Runs an arena-layout kernel over the arena, or over the staging arena of a handle graph.
     let be = model.backend.kind.toByby()
     let k = prepared.kernel
     if be == gbCpu:
-        # Production framework VM, in place; vm_interp is used only in tests.
-        return cpu_backend.vmRun(k.program.words, arena.cpuData, newSeq[float32](), k.threads, max(4, k.tgBytes div 4), k.tgSize)
+        # Production framework VM, in place (a copy of the handle would copy the CPU buffer and
+        # the VM would write the copy); vm_interp is used only in tests.
+        if staged:
+            return cpu_backend.vmRun(k.program.words, model.stage.cpuData, newSeq[float32](), threads, max(4, k.tgBytes div 4), k.tgSize)
+        return cpu_backend.vmRun(k.program.words, model.arena.cpuData, newSeq[float32](), threads, max(4, k.tgBytes div 4), k.tgSize)
+    var arena = if staged: model.stage else: model.arena
     if be == gbVulkan:
-        result = sessionJitMicroVmEnc(be, prepared.name, prepared.source, arena, k.threads, k.tgSize, max(4, k.tgBytes div 4))
+        result = sessionJitMicroVmEnc(be, prepared.name, prepared.source, arena, threads, k.tgSize, max(4, k.tgBytes div 4))
         if result and unlikely(firProbeOn):
-            probeGpuDispatch(probeProgram(k.program.words), prepared.name, k.threads, k.tgSize, k.tgBytes)
+            probeGpuDispatch(probeProgram(k.program.words), prepared.name, threads, k.tgSize, k.tgBytes)
         return
     # Compiled MSL ignores the bytecode binding. All arithmetic is already in
     # the prepared pipeline, and all addresses refer to the resident arena.
-    result = sessionPipeline(prepared.name) and sessionBindBuffer(0, arena.metalHandle) and sessionBindBuffer(1, arena.metalHandle) and sessionBindBuffer(2, arena.metalHandle) and sessionBindBuffer(3, arena.metalHandle) and sessionSetThreadgroupBytes(0, max(16, k.tgBytes)) and sessionDispatch(k.threads, k.tgSize)
+    if prepared.metaOffset >= 0 and not sessionPipeline(prepared.name):
+        return false
+    if prepared.metaOffset >= 0 and not sessionBindBuffer(4, arena.metalHandle, prepared.metaOffset*4):
+        return false
+    result = sessionPipeline(prepared.name) and sessionBindBuffer(0, arena.metalHandle) and sessionBindBuffer(1, arena.metalHandle) and sessionBindBuffer(2, arena.metalHandle) and sessionBindBuffer(3, arena.metalHandle) and sessionSetThreadgroupBytes(0, max(16, k.tgBytes)) and sessionDispatch(threads, k.tgSize)
     if result and unlikely(firProbeOn):
-        probeGpuDispatch(probeProgram(k.program.words), prepared.name, k.threads, k.tgSize, k.tgBytes)
+        probeGpuDispatch(probeProgram(k.program.words), prepared.name, threads, k.tgSize, k.tgBytes)
 
 function fgEncodeMicroBody(model: var FirGraph, prepared: FgResidentProgram, node: FirNode, layer: int): bool
     let be = model.backend.kind.toByby()
     let k = prepared.kernel
     inc model.dispatched
+    # A partial phase run launches only the threads of its first rows (kernels that declare rows=B:T).
+    var threads = k.threads
+    if model.activeRows > 0 and model.graph.kernels.hasKey(node.op):
+        let def = model.graph.kernels[node.op]
+        if def.rowBlock > 0:
+            threads = min(threads, ((model.activeRows + def.rowBlock - 1) div def.rowBlock) * def.rowThreads)
     if k.slotLayout:
         if be == gbCpu:
             var views: array[5, CpuVmView]
@@ -702,19 +986,22 @@ function fgEncodeMicroBody(model: var FirGraph, prepared: FgResidentProgram, nod
                 if k.slotBuffers[i].len == 0:
                     continue
                 let name = k.slotBuffers[i]
-                let offset = fgPortOffset(model, name)
-                let index = fgPortHandleIndex(model, name)
+                let offset = fgPortOffset(model, name, layer)
+                let index = fgPortHandleIndex(model, name, layer)
                 if index >= 0:
                     views[i] = CpuVmView(base: cast[ptr float32](addr model.handles[index].cpuData[0]), offset: offset, elements: k.slotSizes[i], allocationElements: model.handles[index].cpuData.len)
                 else:
                     let base = fgPortBase(model, name)
-                    if not model.rawWeights.hasKey(base):
+                    if model.rawWeights.hasKey(base):
+                        held[i] = model.rawWeights[base]
+                        views[i] = CpuVmView(base: cast[ptr float32](addr held[i].cpuData[0]), offset: offset, elements: k.slotSizes[i], allocationElements: held[i].cpuData.len)
+                    elif model.arena.cpuData.len > 0:
+                        views[i] = CpuVmView(base: cast[ptr float32](addr model.arena.cpuData[0]), offset: offset, elements: k.slotSizes[i], allocationElements: model.arena.cpuData.len)
+                    else:
                         return false
-                    held[i] = model.rawWeights[base]
-                    views[i] = CpuVmView(base: cast[ptr float32](addr held[i].cpuData[0]), offset: offset, elements: k.slotSizes[i], allocationElements: held[i].cpuData.len)
             if views[0].base == nil:
                 return false
-            return cpu_backend.vmRunBound(k.program.words, views, k.threads, (k.tgBytes+3) div 4, k.tgSize)
+            return cpu_backend.vmRunBound(k.program.words, views, threads, (k.tgBytes+3) div 4, k.tgSize)
         let vk = be == gbVulkan
         if not sessionEncPipeline(vk, prepared.name, prepared.source):
             return false
@@ -722,30 +1009,27 @@ function fgEncodeMicroBody(model: var FirGraph, prepared: FgResidentProgram, nod
             if k.slotBuffers[i].len == 0:
                 continue
             let slot = if vk: i else: i+1
-            let handle = fgPortHandle(model, k.slotBuffers[i])
-            let offset = if k.slotAnchor[i] >= 0: k.slotAnchor[i] else: fgPortOffset(model, k.slotBuffers[i])
+            let handle = fgPortHandle(model, k.slotBuffers[i], layer)
+            let offset = if k.slotAnchor[i] >= 0: k.slotAnchor[i] else: fgPortOffset(model, k.slotBuffers[i], layer)
             if not sessionEncBindVkOrMetal(vk, slot, handle.metalHandle, handle.vulkanHandle, offset):
                 return false
         if not sessionEncTgBytes(vk, 0, k.tgBytes):
             return false
-        return sessionEncDispatch(vk, k.threads, k.tgSize, k.tgBytes)
-    if be == gbCpu and prepared.cpuFn != nil and not model.useHandles and cpuJitRun(prepared.cpuFn, model.arena.cpuData, k.threads, k.tgSize):
+        return sessionEncDispatch(vk, threads, k.tgSize, k.tgBytes)
+    if be == gbCpu and prepared.cpuFn != nil and not model.useHandles and cpuJitRun(prepared.cpuFn, model.arena.cpuData, threads, k.tgSize):
         return true
-    if be == gbCpu and prepared.stage.len == 0:
-        # `var arena = model.arena` would copy the CPU buffer and the VM would write the copy.
-        return cpu_backend.vmRun(k.program.words, model.arena.cpuData, newSeq[float32](), k.threads, max(4, k.tgBytes div 4), k.tgSize)
-    var arena = model.arena
-    if prepared.stage.len > 0:
-        arena = model.stage
-        for port in prepared.stage:
-            if port.reads and not sessionCopyInto(be, fgPortHandle(model, port.name), arena, fgPortOffset(model, port.name), port.offset, port.elements):
-                return false
-    result = fgDispatchArena(model, prepared, arena)
-    if result and prepared.stage.len > 0:
+    if prepared.stage.len == 0:
+        return fgDispatchArena(model, prepared, false, threads)
+    # Handle graph: copy the ports into the staging arena, run the kernel there, copy the outputs back.
+    for port in prepared.stage:
+        if port.reads and not sessionCopyInto(be, fgPortHandle(model, port.name), model.stage, fgPortOffset(model, port.name), port.offset, port.elements):
+            return false
+    result = fgDispatchArena(model, prepared, true, threads)
+    if result:
         for port in prepared.stage:
             if port.writes:
                 let index = fgPortHandleIndex(model, port.name)
-                if index < 0 or not sessionCopyInto(be, arena, model.handles[index], port.offset, fgPortOffset(model, port.name), port.elements):
+                if index < 0 or not sessionCopyInto(be, model.stage, model.handles[index], port.offset, fgPortOffset(model, port.name), port.elements):
                     return false
 
 function fgEncodeMicro(model: var FirGraph, prepared: FgResidentProgram, node: FirNode, layer: int): bool
@@ -770,6 +1054,67 @@ function fgAttrBits(table: Table[string, string], key: string, fallback: float32
     if value.len == 9 and value[0] == 'h':
         return cast[float32](uint32(parseHexInt(value[1 .. ^1])))
     float32(parseFloat(value))
+
+function fgCopySourceOffset(model: FirGraph, attrs: Table[string, string], n: int): int
+    ## srcOff of a replayed copy. lastRowOf=R: the source holds R rows of n floats and the copy
+    ## takes the last one, or the last row a partial phase run really computed.
+    result = fgAttrInt(attrs, "srcOff", 0)
+    let rows = fgAttrInt(attrs, "lastRowOf", 0)
+    if rows > 0:
+        let active = if model.activeRows > 0: min(rows, model.activeRows) else: rows
+        result += (active-1)*n
+
+function fgEncodeNativeQ4(model: var FirGraph, node: FirNode, layer: int): bool
+    let weightName = fgNativeQ4Weight(model.graph, node)
+    if weightName.len == 0:
+        return false
+    let ins = node.inputs.splitWhitespace()
+    let outs = node.outputs.splitWhitespace()
+    if ins.len != 2 or outs.len != 1:
+        raise newException(ValueError, "FIR native Q4 kernel needs one activation, one weight and one output: " & node.name)
+    let inputName = if ins[0] == weightName: ins[1] else: ins[0]
+    let outputName = outs[0]
+    let weight = model.graph.buffers[weightName]
+    let input = model.graph.buffers[inputName]
+    let output = model.graph.buffers[outputName]
+    let tensor = fgTensorName(weight, layer)
+    if not model.q4.hasKey(tensor):
+        raise newException(ValueError, "FIR native Q4 weight was not loaded: " & tensor)
+    let q4 = model.q4[tensor]
+    if q4.k <= 0 or input.elements mod q4.k != 0:
+        raise newException(ValueError, "FIR native Q4 input shape mismatch: " & node.name)
+    let fullRows = input.elements div q4.k
+    let rows = if model.activeRows > 0: min(fullRows, model.activeRows) else: fullRows
+    let count = rows*q4.n
+    if rows <= 0 or count > output.elements:
+        raise newException(ValueError, "FIR native Q4 output shape mismatch: " & node.name)
+
+    let be = model.backend.kind.toByby()
+    let source = fgPortHandle(model, inputName, layer)
+    let sourceOffset = fgPortOffset(model, inputName, layer)
+    let sourceIndex = fgPortHandleIndex(model, inputName, layer)
+    let targetIndex = fgPortHandleIndex(model, outputName, layer)
+    let targetOffset = fgPortOffset(model, outputName, layer)
+    # In data graphs, activations already have one handle each. Dispatch straight
+    # into the output handle, exactly as the native runner does, when the ports
+    # are whole buffers and do not alias.
+    if sourceIndex >= 0 and targetIndex >= 0 and sourceIndex != targetIndex and
+        sourceOffset == 0 and targetOffset == 0:
+        var target = model.handles[targetIndex]
+        if not sessionMatmulQ4(be, source, q4, target, rows):
+            return false
+        model.handles[targetIndex] = target
+        return true
+
+    if not sessionCopyInto(be, source, model.linearInput, sourceOffset, 0, rows*q4.k):
+        return false
+    var target = model.linearOutput
+    if not sessionMatmulQ4(be, model.linearInput, q4, target, rows):
+        return false
+    model.linearOutput = target
+    if targetIndex >= 0:
+        return sessionCopyInto(be, target, model.handles[targetIndex], 0, targetOffset, count)
+    sessionCopyInto(be, target, model.arena, 0, model.bindings.memory[outputName], count)
 
 function fgEncodeSessionHandles(model: var FirGraph, node: FirNode, layer: int): bool
     let be = model.backend.kind.toByby()
@@ -847,7 +1192,7 @@ function fgEncodeSessionHandles(model: var FirGraph, node: FirNode, layer: int):
         if n <= 0:
             return false
         let source = fgPortHandle(model, ins[0])
-        let sourceOffset = fgPortOffset(model, ins[0]) + fgAttrInt(attrs, "srcOff", 0)
+        let sourceOffset = fgPortOffset(model, ins[0]) + fgCopySourceOffset(model, attrs, n)
         let targetIndex = fgPortHandleIndex(model, outs[0])
         let targetOffset = fgPortOffset(model, outs[0]) + fgAttrInt(attrs, "dstOff", 0)
         if targetIndex < 0:
@@ -913,7 +1258,7 @@ function fgEncodeSession(model: var FirGraph, node: FirNode, layer: int): bool
         let n = fgAttrInt(attrs, "n", 0)
         if n <= 0:
             return false
-        let srcOffset = memory[ins[0]] + fgAttrInt(attrs, "srcOff", 0)
+        let srcOffset = memory[ins[0]] + fgCopySourceOffset(model, attrs, n)
         let dstOffset = memory[outs[0]] + fgAttrInt(attrs, "dstOff", 0)
         var dst = model.arena
         return sessionCopyInto(be, model.arena, dst, srcOffset, dstOffset, n)
@@ -921,6 +1266,8 @@ function fgEncodeSession(model: var FirGraph, node: FirNode, layer: int): bool
 
 function fgEncodeNodeBody(model: var FirGraph, node: FirNode, layer, token: int): bool
     if node.kind == "micro":
+        if model.nativeQ4 and fgNativeQ4Weight(model.graph, node).len > 0:
+            return fgEncodeNativeQ4(model, node, layer)
         return fgEncodeMicro(model, model.programs[fgNodeKey(node, layer)], node, layer)
     if node.kind == "session":
         return fgEncodeSession(model, node, layer)
@@ -939,8 +1286,9 @@ function fgEncodeNodeBody(model: var FirGraph, node: FirNode, layer, token: int)
         let rows = n div width
         if rows < 1 or rows*width != n:
             raise newException(ValueError, "FIR graph embedding output is not a whole number of rows: " & output)
-        if rows > 1 and (role != "token" or model.chunk.len != rows):
-            raise newException(ValueError, "FIR graph multi-row embedding needs a token chunk of " & $rows)
+        let filled = if model.activeRows > 0: min(rows, model.activeRows) else: rows
+        if rows > 1 and (role != "token" or model.chunk.len != filled):
+            raise newException(ValueError, "FIR graph multi-row embedding needs a token chunk of " & $filled)
         var targetIndex = 0
         var targetOffset = bindings.memory[output]
         if model.useHandles:
@@ -948,7 +1296,7 @@ function fgEncodeNodeBody(model: var FirGraph, node: FirNode, layer, token: int)
             targetOffset = fgPortOffset(model, output)
         if targetIndex < 0:
             return false
-        for row in 0 ..< rows:
+        for row in 0 ..< filled:
             var index = token
             if rows > 1:
                 index = model.chunk[row]
@@ -1021,10 +1369,14 @@ function fgEncodeNode(model: var FirGraph, node: FirNode, layer, token: int): bo
     var prog = "none"
     var impl = "ext:" & node.op
     if node.kind == "micro":
-        let prepared = model.programs[fgNodeKey(node, layer)].kernel
-        attrs = attrs & ",threads=" & $prepared.threads & ",tg=" & $prepared.tgSize & ",tgbytes=" & $prepared.tgBytes
-        prog = probeProgram(prepared.program.words)
-        impl = probeProgramImpl(prog)
+        if model.nativeQ4 and fgNativeQ4Weight(model.graph, node).len > 0:
+            impl = "backend.sessionMatmulQ4"
+            attrs = attrs & ",q4_backend=native"
+        else:
+            let prepared = model.programs[fgNodeKey(node, layer)].kernel
+            attrs = attrs & ",threads=" & $prepared.threads & ",tg=" & $prepared.tgSize & ",tgbytes=" & $prepared.tgBytes
+            prog = probeProgram(prepared.program.words)
+            impl = probeProgramImpl(prog)
     let context = probeOpStart("fgEncodeNode", tag, ins, attrs, impl, prog)
     try:
         result = fgEncodeNodeBody(model, node, layer, token)
@@ -1063,8 +1415,43 @@ function firGraphReset(model: var FirGraph)
             discard sessionEnd(be)
     model.position = 0
 
+const FgCommitRowNodes = 512              # row-nodes per command buffer inside a multi-row phase
+
+function fgProfileNodes(): bool
+    ## BYBY_FIR_PROFILE=2 ends the GPU session after every node and adds the wall time to a
+    ## per-kernel total (firGraphProfileReport). The extra waits slow the run; use it only to
+    ## see which kernels a phase spends its time in.
+    var state {.global.}: int
+    if state == 0:
+        state = if getEnv("BYBY_FIR_PROFILE", "0") == "2": 2 else: 1
+    result = state == 2
+
+function fgProfileNode(model: var FirGraph, node: FirNode, phase: string, startedAt: float)
+    let be = model.backend.kind.toByby()
+    if not sessionEnd(be) or not sessionBegin(be):
+        raise newException(ValueError, "FIR graph profile session failed")
+    let colon = node.op.find(':')
+    let key = (if phase.len > 0: phase else: "decode") & " " & (if colon >= 0: node.op[0 ..< colon] else: node.op)
+    model.profTime[key] = model.profTime.getOrDefault(key, 0.0) + epochTime()-startedAt
+    model.profCount[key] = model.profCount.getOrDefault(key, 0) + 1
+
+function firGraphProfileReport(model: FirGraph): seq[string]
+    ## One line per (phase, kernel): runs, total and mean wall time, from BYBY_FIR_PROFILE=2.
+    for key, seconds in model.profTime:
+        let runs = model.profCount[key]
+        result.add(key & ": " & $runs & " runs, " & formatFloat(seconds*1000, ffDecimal, 1) & " ms total, " & formatFloat(seconds*1000/float(runs), ffDecimal, 3) & " ms each")
+    result.sort()
+
 function fgEncodeGraph(model: var FirGraph, token: int, phase: string)
     # Encode every node of one phase ("" = decode step, else a named multi-row phase) in file order.
+    let profileNodes = fgProfileNodes()
+    # A multi-row phase is too long for one command buffer on GPUs that pace them (the driver
+    # cancels a buffer that runs for seconds): commit and keep encoding, without waiting, every
+    # FgCommitRowNodes row-nodes (nodes times the rows this run covers), like the native prefill.
+    let be = model.backend.kind.toByby()
+    let paced = phase.len > 0 and sessionPacesCommandBuffers(be)
+    let runRows = if model.activeRows > 0: model.activeRows elif phase.len > 0: model.graph.phases[phase] else: 1
+    var pendingRows = 0
     var index = 0
     while index < model.graph.nodes.len:
         if model.graph.nodes[index].phase != phase:
@@ -1077,14 +1464,40 @@ function fgEncodeGraph(model: var FirGraph, token: int, phase: string)
             for layer in 0 ..< model.graph.symbols["layers"]:
                 for i in index ..< stop:
                     let node = model.graph.nodes[i]
+                    let nodeStart = if profileNodes: epochTime() else: 0.0
                     if not fgEncodeNode(model, node, layer, token):
                         raise newException(ValueError, "FIR graph resident encode failed: " & node.name & (if cpu_backend.cpuLastErrorMessage().len > 0: " (" & cpu_backend.cpuLastErrorMessage() & ")" else: ""))
+                    if profileNodes:
+                        fgProfileNode(model, node, phase, nodeStart)
+                    elif paced:
+                        pendingRows += runRows
+                        if pendingRows >= FgCommitRowNodes:
+                            if not sessionCommitContinue(be):
+                                raise newException(ValueError, "FIR graph commit failed in phase " & phase)
+                            pendingRows = 0
             index = stop
         else:
             let node = model.graph.nodes[index]
+            let nodeStart = if profileNodes: epochTime() else: 0.0
             if not fgEncodeNode(model, node, 0, token):
                 raise newException(ValueError, "FIR graph resident encode failed: " & node.name & (if cpu_backend.cpuLastErrorMessage().len > 0: " (" & cpu_backend.cpuLastErrorMessage() & ")" else: ""))
+            if profileNodes:
+                fgProfileNode(model, node, phase, nodeStart)
+            elif paced:
+                pendingRows += runRows
+                if pendingRows >= FgCommitRowNodes:
+                    if not sessionCommitContinue(be):
+                        raise newException(ValueError, "FIR graph commit failed in phase " & phase)
+                    pendingRows = 0
             inc index
+
+function fgProfileOn(): bool
+    ## BYBY_FIR_PROFILE=1 adds up, per decode step, the host encode time, the GPU wait and the
+    ## logits read, to tell GPU-bound steps from host-bound ones (the BYBY_M3_PROFILE split).
+    var state {.global.}: int
+    if state == 0:
+        state = if getEnv("BYBY_FIR_PROFILE", "0") == "1": 2 else: 1
+    result = state == 2
 
 function firGraphStep(model: var FirGraph, token: int, stepKind = "decode"): seq[float32]
     if model.failed:
@@ -1099,6 +1512,10 @@ function firGraphStep(model: var FirGraph, token: int, stepKind = "decode"): seq
     defer:
         if unlikely(firProbeOn):
             probeStepEnd()
+    let profile = fgProfileOn()
+    let startedAt = if profile: epochTime() else: 0.0
+    var encodedAt = 0.0
+    var waitedAt = 0.0
     # Two scalar inputs are the only per-token host upload. All weights,
     # scratch, activations and KV remain allocated across sessions.
     var scalars = sessionUpload(be, @[float32(token), float32(model.position)])
@@ -1136,12 +1553,22 @@ function firGraphStep(model: var FirGraph, token: int, stepKind = "decode"): seq
                 raise newException(ValueError, "FIR graph logits encode failed")
         elif not sessionCopyInto(be, model.arena, model.logitsReadback, model.bindings.memory[logitsName], 0, model.graph.symbols["vocab"]):
             raise newException(ValueError, "FIR graph logits encode failed")
+        if profile:
+            encodedAt = epochTime()
         ended = true
         if not sessionEnd(be):
             raise newException(ValueError, "FIR graph sessionEnd failed")
+        if profile:
+            waitedAt = epochTime()
         result = sessionRead(be, model.logitsReadback, model.graph.symbols["vocab"])
         if result.len != model.graph.symbols["vocab"]:
             raise newException(ValueError, "FIR graph logits read length mismatch")
+        if profile:
+            let doneAt = epochTime()
+            model.stepEncodeSeconds += encodedAt-startedAt
+            model.stepWaitSeconds += waitedAt-encodedAt
+            model.stepReadSeconds += doneAt-waitedAt
+            inc model.stepProfiled
         inc model.logitsReads
         inc model.position
     except:
@@ -1155,9 +1582,11 @@ function firGraphStep(model: var FirGraph, token: int, stepKind = "decode"): seq
 function firGraphPhase(model: var FirGraph, phase: string, tokens: seq[int]): seq[float32]
     # Run one named multi-row phase over `rows` tokens. It updates model state; a phase that
     # declares `logits=BUFFER` also returns rows*vocab floats, otherwise the result is empty.
+    # A phase declared `partial` also takes fewer tokens (the tail of a prompt): only the threads
+    # of those rows are launched.
     if model.failed:
         raise newException(ValueError, "FIR graph model is closed or a prior session failed")
-    if not model.graph.phases.hasKey(phase) or tokens.len != model.graph.phases[phase]:
+    if not model.graph.phases.hasKey(phase) or tokens.len < 1 or tokens.len > model.graph.phases[phase] or (tokens.len < model.graph.phases[phase] and phase notin model.graph.phasePartial):
         raise newException(ValueError, "FIR graph phase " & phase & " does not take " & $tokens.len & " rows")
     for token in tokens:
         if token < 0 or token >= model.graph.symbols["vocab"]:
@@ -1184,11 +1613,15 @@ function firGraphPhase(model: var FirGraph, phase: string, tokens: seq[int]): se
         elif not sessionCopyInto(be, scalars, model.arena, 0, model.bindings.memory[tokenName], 1) or not sessionCopyInto(be, scalars, model.arena, 1, model.bindings.memory[positionName], 1):
             raise newException(ValueError, "FIR graph scalar input encode failed")
         model.chunk = tokens
-        fgEncodeGraph(model, tokens[0], phase)
-        model.chunk = @[]
+        model.activeRows = if tokens.len < model.graph.phases[phase]: tokens.len else: 0
+        try:
+            fgEncodeGraph(model, tokens[0], phase)
+        finally:
+            model.chunk = @[]
+            model.activeRows = 0
         var count = 0
-        if model.graph.phaseLogits.hasKey(phase):
-            let name = model.graph.phaseLogits[phase]
+        if model.graph.phaseLogits.hasKey(phase) or model.graph.phaseLast.hasKey(phase):
+            let name = if model.graph.phaseLogits.hasKey(phase): model.graph.phaseLogits[phase] else: model.graph.phaseLast[phase]
             count = model.graph.buffers[name].elements
             var copied = false
             if model.useHandles:

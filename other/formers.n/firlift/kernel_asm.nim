@@ -63,11 +63,20 @@ type
     inBase, outBase: seq[int]
     inSize, outSize: seq[int]
     syms: Syms
+    slotLayout: bool
 
 proc portOffset(l: Layout; port: string; extra: string): uint32 =
   var base = 0
   var size = 0
-  if port.startsWith("in"):
+  if l.slotLayout:
+    base = 0
+    if port.startsWith("in"):
+      let i = parseInt(port[2 .. ^1])
+      size = l.inSize[i]
+    else:
+      let i = parseInt(port[3 .. ^1])
+      size = l.outSize[i]
+  elif port.startsWith("in"):
     let i = parseInt(port[2 .. ^1])
     base = l.inBase[i]; size = l.inSize[i]
   else:
@@ -87,12 +96,12 @@ proc resolveAddress(arg: string; l: Layout): uint32 =
   let extra = if i < arg.len: arg[i .. ^1] else: ""
   portOffset(l, port, extra)
 
-proc assemble*(body: string; ins, outs: int; inSize, outSize: seq[int]; eps: float32): VmProgram =
+proc assemble*(body: string; ins, outs: int; inSize, outSize: seq[int]; eps: float32; slotLayout = false): VmProgram =
   var syms = initTable[string, float64]()
   for i, n in inSize: syms["in" & $i & ".size"] = float64(n)
   for i, n in outSize: syms["out" & $i & ".size"] = float64(n)
   syms["eps"] = float64(eps)
-  var l = Layout(syms: syms, inSize: inSize, outSize: outSize)
+  var l = Layout(syms: syms, inSize: inSize, outSize: outSize, slotLayout: slotLayout)
   var base = 0
   for n in inSize:
     l.inBase.add base
@@ -110,6 +119,8 @@ proc assemble*(body: string; ins, outs: int; inSize, outSize: seq[int]; eps: flo
     of "rtou": result.emitRToU(parseInt(a[0]).uint32, parseInt(a[1]).uint32)
     of "utor": result.emitUToR(parseInt(a[0]).uint32, parseInt(a[1]).uint32)
     of "uloadf32": result.emitULoadF32(parseInt(a[0]).uint32, parseInt(a[1]).uint32, resolveAddress(a[2], l))
+    of "uloadconstf": result.emitULoadConstF(parseInt(a[0]).uint32, parseInt(a[1]).uint32, resolveAddress(a[2], l))
+    of "uloadin": result.emitULoadIn(parseInt(a[0]).uint32, parseInt(a[1]).uint32, resolveAddress(a[2], l))
     of "ustoref32": result.emitUStoreF32(parseInt(a[0]).uint32, parseInt(a[1]).uint32, resolveAddress(a[2], l))
     of "uconst": result.emitUConst(parseInt(a[0]).uint32, resolveAddress(a[1], l))
     of "uadd": result.emitUAdd(parseInt(a[0]).uint32, parseInt(a[1]).uint32, parseInt(a[2]).uint32)
