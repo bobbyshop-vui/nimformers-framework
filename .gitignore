@@ -97,3 +97,9 @@ models/**/*.fprobe
 models/**/*.fprobe.data
 other/formers.n/formers-cli_arm64
 other/formers.n/build-arm64/
+# Build outputs: never commit executables
+other/formers.n/firlift/builder_test
+other/formers.n/firlift/firlift
+other/formers.n/firlift/test_fuse
+other/formers.n/firlift/test_library
+other/formers.n/firlift/test_session_gpu
