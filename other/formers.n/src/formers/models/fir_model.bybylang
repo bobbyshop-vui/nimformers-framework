@@ -189,6 +189,7 @@ function fmRunFir(det: FmDetection, cliOpts: FmOptions): bool
     let ctx = newBackend(opts.backend)
     var model = firLoadGraph(graph, det.files.nimqPath, ctx)
     defer: firFreeGraph(model)
+    firGraphTuneGemv(model)
     var sampler = fmNewSampler(opts, graph.symbols["vocab"])
     if not useIds:
         for probe in ["\n", "\n\n", " ", "  ", "    ", "\t", "\n    ", "\n\t", "\r\n"]:
@@ -226,6 +227,7 @@ function fmRunFir(det: FmDetection, cliOpts: FmOptions): bool
             # Other graphs: load a fresh one (the compiled pipelines stay cached in the process).
             firFreeGraph(model)
             model = firLoadGraph(graph, det.files.nimqPath, ctx)
+            firGraphTuneGemv(model)
             model.stepSeconds = measuredStep
             model.phaseBlockSeconds = measuredBlocks
             model.phaseBlockRows = measuredRows
