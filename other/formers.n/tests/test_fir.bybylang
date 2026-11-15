@@ -378,3 +378,23 @@ function checkLayouts()
     echo "PASS FIR layouts: default/explicit classic offsets unchanged; script F32 rank-3/rank-4 and per-layer row-major copies; matrices/Q4 excluded; invalid layouts rejected"
 
 checkLayouts()
+
+function checkRawConfigKeys()
+    # A Mamba-3 config (ssm_cfg) keeps every positive integer key as a symbol, so a lifted
+    # file can alias raw keys (`sym hidden = d_model`); the derived symbols still win.
+    let root = getTempDir() / ("fir_rawkeys_" & $getCurrentProcessId())
+    createDir(root)
+    defer: removeDir(root)
+    let raw = %*{"d_model": 32, "d_intermediate": 16, "n_layer": 3, "vocab_size": 64, "pad_vocab_size_multiple": 16, "inter": 7, "rms_norm": true, "ssm_cfg": {"expand": 2, "headdim": 8, "d_state": 16, "ngroups": 1, "rope_fraction": 0.5}}
+    writeFile(root / "config.json", $raw)
+    let path = root / "model.fir"
+    writeFile(path, "fir 1\nmodel raw_keys\nruntime graph\nsym hidden = d_model\nsym layers = n_layer\nsym vocab = vocab_size\nbuf activation f32 hidden\n")
+    let lifted = firParse(path)
+    doAssert lifted.symbols["d_model"] == 32 and lifted.symbols["n_layer"] == 3 and lifted.symbols["vocab_size"] == 64
+    doAssert lifted.symbols["pad_vocab_size_multiple"] == 16 and not lifted.symbols.hasKey("rms_norm")
+    doAssert lifted.symbols["hidden"] == 32 and lifted.symbols["layers"] == 3 and lifted.symbols["vocab"] == 64
+    doAssert lifted.symbols["inter"] == 16 and lifted.symbols["nheads"] == 2 and lifted.symbols["dstate"] == 16 and lifted.symbols["rope"] == 4
+    doAssert lifted.buffers["activation"].elements == 32
+    echo "PASS Mamba-3 config: positive integer keys are symbols; sym aliases to raw keys parse; derived symbols win over a raw key of the same name"
+
+checkRawConfigKeys()

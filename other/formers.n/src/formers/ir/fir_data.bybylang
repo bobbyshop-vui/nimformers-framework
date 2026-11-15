@@ -7,11 +7,20 @@ import nim "customfloat"
 import "fir_types.bybylang"
 
 function firDataGraph(graph: FirProgram): bool
-    for name, kernel in graph.kernels:
-        if kernel.layout == "slots":
-            return true
+    ## True when every buffer gets an allocation of its own (recorded graphs: raw weights, buffers
+    ## with initial data, recorded slot kernels). A graph whose slot kernels exist to reach resident
+    ## Q4 weights keeps one arena for its activations and state: its other kernels then run in
+    ## place, and only the Q4 weights live outside the arena.
+    var residentQ4 = false
     for name, buffer in graph.buffers:
         if buffer.dtype == "raw" or buffer.initFile.len > 0 or buffer.initialWords.len > 0:
+            return true
+        if firResidentQ4(graph, name):
+            residentQ4 = true
+    if residentQ4:
+        return false
+    for name, kernel in graph.kernels:
+        if kernel.layout == "slots":
             return true
 
 function firInitPath(graph: FirProgram, buffer: FirBuffer, checkpoint: string): string
@@ -37,6 +46,27 @@ function firCheckDataWeights(graph: FirProgram, checkpoint: string)
                     found = true
             if buffer.dtype == "raw" or not found:
                 raise newException(ValueError, "FIR missing checkpoint tensor or raw initializer: " & buffer.tensorName)
+
+function firCheckNativeWeights(graph: FirProgram, checkpoint: string)
+    ## Every weight of the graph must be a tensor of the native checkpoint (.nimq) with the declared
+    ## shape; the name may carry one of the graph's prefixes.
+    let index = probeTensorIndex(checkpoint)
+    for name, buffer in graph.buffers:
+        if buffer.kind != "weight":
+            continue
+        for layer in 0 ..< (if buffer.tensorName.contains("{i}"): graph.symbols["layers"] else: 1):
+            let tensor = buffer.tensorName.replace("{i}", $layer)
+            var found = false
+            for item in index:
+                if item.shape != buffer.dims:
+                    continue
+                if item.name == tensor:
+                    found = true
+                for prefix in graph.prefixes:
+                    if item.name == prefix & tensor:
+                        found = true
+            if not found:
+                raise newException(ValueError, "FIR graph checkpoint lacks tensor: " & tensor)
 
 function firReadNativeF32(path: string, tensor: ProbeTensor): seq[float32]
     if tensor.kind < 0 or tensor.kind > int(high(QuantKind)):

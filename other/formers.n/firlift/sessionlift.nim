@@ -18,8 +18,11 @@ import std/[strutils, tables, json, sets, math, os, algorithm]
 import ./firlift
 import ./firvm
 import ./kernel_gen
+import ./kernel_asm
+import session_vm
 import ./fuse
-from ./steps import isRopeTableUpload, isUploadedRopeTable
+import ./sidecar
+from ./steps import withoutSingleRowUnits, isRopeTableUpload, isUploadedRopeTable
 import micro_kernel/slot_layout
 import probe_weights
 
@@ -43,6 +46,8 @@ type
     sizes: seq[int]
     slots: string
     raw: bool
+    rowBlock, rowThreads, rows: int   ## row-major launch: every `rowBlock` rows take `rowThreads` threads (0: unknown)
+    hiR, hiU: int                     ## highest float / integer register the body uses
 
   SNode = object
     kind, op, name: string
@@ -75,6 +80,7 @@ type
     raw: bool
     phaseRows: Table[int, int]           ## phase number -> token rows that phase consumes per run
     phaseLogits: Table[int, (string, int)] ## phase number -> (buffer, rows) of vocabulary-sized output rows
+    phaseLast: Table[int, string]          ## phase number -> buffer with the logits after the phase's last row
 
 const Bookkeeping = [
   "sessionBegin", "sessionEnd", "sessionFree", "sessionAllocScratch", "sessionAllocHeap",
@@ -216,6 +222,7 @@ proc weightName(l: SessionLift; n: NameRec; dtype: string; dims: seq[int]): stri
   if l.weightIdx.hasKey(key): return l.weights[l.weightIdx[key]].name
   var name = sanitize(n.name)
   if dtype.startsWith("q4b"): name.add "_q"
+  elif dtype.startsWith("q4r"): name.add "_qr"
   elif dtype == "f32" and dims.len == 2: name.add "_emb"
   var unique = name
   var i = 2
@@ -228,11 +235,12 @@ proc weightName(l: SessionLift; n: NameRec; dtype: string; dims: seq[int]): stri
   unique
 
 proc q4Group(dtype: string): int =
-  ## q4b is group 32; q4b<N> is group N.
-  if dtype == "q4b": 32 else: parseInt(dtype[3 .. ^1])
+  ## q4b/q4r default to group 32; the suffix selects the group size.
+  let prefix = if dtype.startsWith("q4r"): "q4r" else: "q4b"
+  if dtype == prefix: 32 else: parseInt(dtype[prefix.len .. ^1])
 
 proc elementsOf(w: SWeight): int =
-  if w.dtype.startsWith("q4b"):
+  if w.dtype.startsWith("q4b") or w.dtype.startsWith("q4r"):
     return q4Elements(w.dims[0], w.dims[1], q4Group(w.dtype))
   result = 1
   for d in w.dims: result *= d
@@ -267,14 +275,39 @@ proc groupSize(threads: int): int =
   1
 
 proc addKernelNode(l: SessionLift; op: Op; hint: string; g: Gen; ins, outs: seq[string];
-                   writtenIns: seq[int] = @[]; tgBytes = 16) =
+                   writtenIns: seq[int] = @[]; tgBytes = 16; rowBlock = 0; rows = 0; residentQ4 = false) =
   ## Register the generated kernel (deduplicated by text and port sizes) and append its node.
+  ## rowBlock/rows: the kernel works on `rows` rows and its threads are ordered by row, `rowBlock`
+  ## rows at a time, each thread touching only its own rows (and state of earlier rows). The runner
+  ## may then launch only the threads of the first rows of a phase (`rows=B:T` on the kernel line).
+  var rb = 0
+  var rt = 0
+  if rowBlock > 0 and rows > 0:
+    let blocks = (rows + rowBlock - 1) div rowBlock
+    let tgSize = (if g.tg > 0: g.tg else: groupSize(g.threads))
+    if g.threads mod blocks == 0 and (g.threads div blocks) mod tgSize == 0:
+      rb = rowBlock
+      rt = g.threads div blocks
   var outAll = outs
   for i in writtenIns: outAll.add ins[i]
   var sizes: seq[int]
   for n in ins & outAll: sizes.add l.sizeOfBuf(n)
+  var body = g.body
+  var slots = ""
+  if residentQ4:
+    if ins.len != 2 or outAll.len != 1:
+      fail("resident Q4 kernel needs activation, weight and one output")
+    var inSizes, outSizes: seq[int]
+    for name in ins: inSizes.add l.sizeOfBuf(name)
+    for name in outAll: outSizes.add l.sizeOfBuf(name)
+    let program = assemble(g.body, ins.len, outAll.len,
+      inSizes, outSizes, l.eps.float32, slotLayout = true)
+    body = "words"
+    for word in program.words: body.add " " & toHex(word, 8).toLowerAscii
+    slots = "mem:out0,u8:in1,lut:in1,input:in0"
   let tag = if op.tag.len > 0 and not op.tag.startsWith("fir::"): op.tag else: ""
-  let sig = g.body & "\n" & $g.threads & "|" & $ins.len & "|" & $outAll.len & "|" & sizes.join(",")
+  let sig = body & "\n" & slots & "|" & $g.threads & "|" & $ins.len & "|" & $outAll.len & "|" & sizes.join(",") &
+    "|" & $rb & ":" & $rt & ":" & $rows
   var idx: int
   if l.kernelIdx.hasKey(sig):
     idx = l.kernelIdx[sig]
@@ -284,14 +317,21 @@ proc addKernelNode(l: SessionLift; op: Op; hint: string; g: Gen; ins, outs: seq[
     idx = l.kernels.len
     l.kernelIdx[sig] = idx
     l.kernels.add SKern(name: "s." & hint & (if count > 1: "_" & $count else: ""),
-      body: g.body, tag: tag, threads: g.threads,
+      body: body, tag: tag, threads: g.threads,
       tg: (if g.tg > 0: g.tg else: groupSize(g.threads)),
       tgBytes: (if g.tgBytes > 0: g.tgBytes else: tgBytes),
-      ins: ins.len, outs: outAll.len, sizes: sizes)
+      ins: ins.len, outs: outAll.len, sizes: sizes, rowBlock: rb, rowThreads: rt,
+      slots: slots, raw: residentQ4, rows: (if rb > 0: rows else: 0), hiR: kernel_gen.genHiR, hiU: kernel_gen.genHiU)
   l.nodes.add SNode(kind: "micro", op: l.kernels[idx].name, name: l.nodeName(hint),
     ins: ins, outs: outAll)
 
 # ── op lowering ─────────────────────────────────────────────────────
+
+proc unitRows(l: SessionLift; op: Op; n: int): int =
+  ## Token rows of the unit `op` belongs to when its `n` elements split evenly over them (else 0):
+  ## an elementwise kernel over n elements is then row-major with n / rows threads per row.
+  let rows = (if op.phase > 0: l.phaseRows.getOrDefault(op.phase, 0) else: 1)
+  if rows > 0 and n mod rows == 0: rows else: 0
 
 proc positionBuf(l: SessionLift): string =
   l.usedPosition = true
@@ -315,7 +355,7 @@ proc ropeKernel(l: SessionLift; rows, hn, d: int; outScale: float): Gen =
       fail("rope_scaling type " & kind & " has no generated kernel")
   let ratio = pow(theta, -1.0 / float(d div 2))
   let half = d div 2
-  result = if not genericKernels() and half >= 2 and (half and (half - 1)) == 0 and rows * hn * half <= 65536:
+  result = if not genericKernels() and half >= 2 and (half and (half - 1)) == 0 and rows * hn * half <= (1 shl 20):   # thread ids stay exact in float
              genRopePosPar(rows, hn, d, ratio, posScale, outScale)
            elif rows == 1: genRopePos(hn, d, ratio, posScale, outScale)
            else: genRopePosRows(rows, hn, d, ratio, posScale, outScale)
@@ -329,6 +369,16 @@ proc genericKernels(): bool =
   ## FIRLIFT_GENERIC=1: lane-per-output kernels that every VM backend can run. The default kernels
   ## follow the Metal ones (threadgroups, simdgroups) and need simd ops.
   getEnv("FIRLIFT_GENERIC").len > 0
+
+proc simdKernels(l: SessionLift): bool =
+  ## Whether the decode matmuls may reduce with simdgroup ops. Those kernels follow Metal: a
+  ## simdgroup is a contiguous run of at least 16 threads of the grid. Vulkan promises neither for
+  ## its subgroups (the width is the driver's choice, down to 1), and on MoltenVK the simdgroup Q4
+  ## GEMV returned wrong sums, so a graph lifted from a Vulkan run reduces through threadgroup
+  ## memory instead. FIRLIFT_SIMD=0|1 overrides.
+  let v = getEnv("FIRLIFT_SIMD")
+  if v.len > 0: return v != "0"
+  not genericKernels() and l.trace.backend != "vulkan"
 
 proc lowerRope(l: SessionLift; op: Op; outScale = 1.0) =
   let x = op.ins.port("x")
@@ -355,7 +405,9 @@ proc lowerRope(l: SessionLift; op: Op; outScale = 1.0) =
   if x.bytes div 4 != rows*hn*d: fail("RoPE port size does not match T*Hn*D")
   let g = l.ropeKernel(rows, hn, d, outScale)
   let xn = l.rd(x)
-  l.addKernelNode(op, "rope", g, @[xn, l.positionBuf()], @[xn])
+  # one thread per (row, head, frequency) is row-major; the lane-per-head kernels are not
+  l.addKernelNode(op, "rope", g, @[xn, l.positionBuf()], @[xn],
+    rowBlock = (if g.threads == rows * hn * (d div 2): 1 else: 0), rows = rows)
 
 proc kvScatterKernel(t, hkv, d, positions: int): Gen =
   if genericKernels(): genKvScatter(t, hkv, d, positions)
@@ -460,6 +512,14 @@ proc lowerCopyGroup(l: SessionLift; ops: seq[Op]; first, last: int) =
         let src = l.rd(c.op.ins.port("src"))
         let dstPort = c.op.outs.port("dst")
         let dst = l.stateBuf(dstPort, dstPort.bytes div 4)
+        let rows = (if c.op.phase > 0: l.phaseRows.getOrDefault(c.op.phase, 0) else: 0)
+        if rows > 1 and c.dstOff == 0 and c.srcOff == (rows - 1) * c.n and l.sizeOfBuf(src) == rows * c.n and
+            l.sizeOfBuf(dst) == c.n:
+          # The last row of a multi-row unit (what the head reads): the runner takes the last row it
+          # really ran, so the unit also works over fewer rows.
+          l.nodes.add SNode(kind: "session", name: l.nodeName("last_row"), ins: @[src], outs: @[dst],
+            op: "sessionCopyInto:srcOff=0,dstOff=0,n=" & $c.n & ",lastRowOf=" & $rows)
+          continue
         l.addKernelNode(c.op, "copy", genCopyOffset(c.n, c.srcOff, c.dstOff), @[src], @[dst])
         l.nodes[^1].rmw = true
 
@@ -479,6 +539,63 @@ proc tunerKnob(name: string; default: int; allowed: openArray[int]): int =
   result = parseInt(v)
   if result notin allowed: fail(name & "=" & v & " is not one of " & $allowed)
 
+proc gemmTile(): (int, int, int, int) =
+  ## Tile of the tiled Q4 prefill GEMM, set per device when lifting: the output tile of a
+  ## threadgroup (FIRLIFT_GEMM_TILE=32x64|64x64|32x128|64x128, default 64x128) and the register tile
+  ## of a thread (FIRLIFT_GEMM_REG=4x4|8x4|4x8|8x8, default 8x8). A threadgroup has
+  ## rows/regRows * columns/regColumns threads. The Metal variants are 32x64 with 4x4, 64x64 with
+  ## 8x4, 32x128 with 4x8 and 64x128 with 8x8 (128 threads each). The defaults match native Metal's
+  ## variant 3; the environment variables remain available for device-specific tuning.
+  let tile = getEnv("FIRLIFT_GEMM_TILE", "64x128").split('x')
+  let reg = getEnv("FIRLIFT_GEMM_REG", "8x8").split('x')
+  if tile.len != 2 or tile[0] notin ["32", "64"] or tile[1] notin ["64", "128"]:
+    fail("FIRLIFT_GEMM_TILE is not one of 32x64, 64x64, 32x128, 64x128")
+  if reg.len != 2 or reg[0] notin ["4", "8"] or reg[1] notin ["4", "8"]:
+    fail("FIRLIFT_GEMM_REG is not one of 4x4, 8x4, 4x8, 8x8")
+  (parseInt(tile[0]), parseInt(tile[1]), parseInt(reg[0]), parseInt(reg[1]))
+
+proc q4Choice(name, fallback: string; allowed: openArray[string]): string =
+  result = getEnv(name, fallback).toLowerAscii()
+  if result notin allowed:
+    fail(name & "=" & result & " is not one of " & allowed.join(", "))
+
+proc q4ParallelLanes(): int =
+  let value = getEnv("FIRLIFT_Q4_LANES", getEnv("FIRLIFT_TG", "32"))
+  result = parseInt(value)
+  if result notin [16, 32, 64]:
+    fail("FIRLIFT_Q4_LANES must be 16, 32, or 64")
+
+proc q4GemmFma(m, k, n, group, nGroups: int): tuple[gen: Gen, rowBlock, rowTg: int] =
+  let tile = gemmTile()
+  result.rowBlock = tile[0]
+  result.rowTg = (tile[0] div tile[2]) * (tile[1] div tile[3])
+  result.gen = genMatmulQ4Gemm(m, k, n, group, nGroups, tile[0], tile[1], tile[2], tile[3], true)
+  if result.gen.tg != result.rowTg: result.rowBlock = 0
+
+proc q4MatrixGemm(m, k, n, group, nGroups: int): tuple[gen: Gen, rowBlock, rowTg: int] =
+  result.rowBlock = 32
+  result.rowTg = 128
+  result.gen = genMatmulQ4Mm(m, k, n, group, nGroups, true)
+  if result.gen.tg != result.rowTg: result.rowBlock = 0
+
+proc q4SimdGemv(k, n, group, nGroups: int): tuple[gen: Gen, variant: string] =
+  let rows = tunerKnob("FIRLIFT_Q4_ROWS", 4, [1, 2, 4, 8])
+  let sg = tunerKnob("FIRLIFT_Q4_SG", 2, [1, 2, 4, 8])
+  let packs = tunerKnob("FIRLIFT_Q4_PACKS", 1, [1, 2])
+  result.gen = genMatmulQ4Simd(k, n, group, nGroups, rows, sg, packs, true)
+  let gs = if group > 0: group else: k
+  let supported = k mod (8 * packs) == 0 and k mod gs == 0 and (gs and (gs - 1)) == 0 and
+    n mod rows == 0 and gs >= 8 * packs
+  result.variant = if supported: "simd"
+    elif result.gen.tg == 0: "scalar"
+    else: "parallel"
+
+proc q4ParallelVariant(gen: Gen; useFma: bool): string =
+  if gen.tg == 0:
+    if useFma: "scalar_fma" else: "scalar"
+  elif useFma: "parallel_fma"
+  else: "parallel"
+
 proc lowerMatmulQ4(l: SessionLift; op: Op) =
   let m = op.attrInt("M")
   let k = op.attrInt("k")
@@ -491,17 +608,80 @@ proc lowerMatmulQ4(l: SessionLift; op: Op) =
              else: findName(l.trace, w))
   let dims = shapeOf(rec)
   if dims != @[n, k]: fail("Q4 weight " & rec.name & " has shape " & $dims & ", the op is [" & $n & "," & $k & "]")
-  let wn = l.weightName(rec, (if group == 32: "q4b" else: "q4b" & $group), dims)
+  let wn = l.weightName(rec, (if group == 32: "q4r" else: "q4r" & $group), dims)
   let c = l.wr(op, op.outs.port("c"))
-  # Decode (M=1) is the structure of the Metal matmul_q4_simd kernel (simdgroup per rows, simd_sum);
-  # FIRLIFT_GENERIC=1 keeps the lane-per-column kernels, which every VM backend can run.
-  let gen = (if m == 1 and not genericKernels():
-               genMatmulQ4Simd(k, n, group, op.attrInt("groupsPerRow"), tunerKnob("FIRLIFT_Q4_ROWS", 4, [1, 2, 4, 8]),
-                               tunerKnob("FIRLIFT_Q4_SG", 2, [1, 2, 4, 8]), tunerKnob("FIRLIFT_Q4_PACKS", 1, [1, 2]))
-             elif m > 1 and appleTarget():
-               genMatmulQ4Mm(m, k, n, group, op.attrInt("groupsPerRow"))
-             else: genMatmulQ4Par(m, k, n, group, op.attrInt("groupsPerRow"), parLanes()))
-  l.addKernelNode(op, "matmul_q4", gen, @[a, wn], @[c])
+  var rowBlock = 0
+  var rowTg = 0
+  let nGroups = op.attrInt("groupsPerRow")
+  var gen: Gen
+  var variant = ""
+  if m == 1:
+    let choice = q4Choice("FIRLIFT_Q4_GEMV", "auto", ["auto", "scalar", "scalar_fma", "fma", "parallel", "parallel_fma", "simd"])
+    case choice
+    of "scalar":
+      gen = genMatmulQ4(m, k, n, group, nGroups, 0, true, false, true)
+      variant = "scalar"
+    of "scalar_fma", "fma":
+      gen = genMatmulQ4(m, k, n, group, nGroups, 0, true, true, true)
+      variant = "scalar_fma"
+    of "parallel":
+      gen = genMatmulQ4Par(m, k, n, group, nGroups, q4ParallelLanes(), false, true)
+      variant = q4ParallelVariant(gen, false)
+    of "parallel_fma":
+      gen = genMatmulQ4Par(m, k, n, group, nGroups, q4ParallelLanes(), true, true)
+      variant = q4ParallelVariant(gen, true)
+    of "simd":
+      let simd = q4SimdGemv(k, n, group, nGroups)
+      gen = simd.gen; variant = simd.variant
+    else:
+      if genericKernels():
+        gen = genMatmulQ4Par(m, k, n, group, nGroups, parLanes(), false, true)
+        variant = q4ParallelVariant(gen, false)
+      elif l.simdKernels():
+        let simd = q4SimdGemv(k, n, group, nGroups)
+        gen = simd.gen; variant = simd.variant
+      else:
+        gen = genMatmulQ4Par(m, k, n, group, nGroups, q4ParallelLanes(), false, true)
+        variant = q4ParallelVariant(gen, false)
+  else:
+    let choice = q4Choice("FIRLIFT_Q4_GEMM", "auto", ["auto", "scalar", "scalar_fma", "parallel", "parallel_fma", "fma", "tiled", "tiled_fma", "matrix", "mm"])
+    case choice
+    of "scalar":
+      gen = genMatmulQ4(m, k, n, group, nGroups, 0, true, false, true)
+      variant = "scalar"
+    of "scalar_fma":
+      gen = genMatmulQ4(m, k, n, group, nGroups, 0, true, true, true)
+      variant = "scalar_fma"
+    of "parallel":
+      gen = genMatmulQ4Par(m, k, n, group, nGroups, q4ParallelLanes(), false, true)
+      variant = q4ParallelVariant(gen, false)
+    of "parallel_fma":
+      gen = genMatmulQ4Par(m, k, n, group, nGroups, q4ParallelLanes(), true, true)
+      variant = q4ParallelVariant(gen, true)
+    of "fma", "tiled", "tiled_fma":
+      let tiled = q4GemmFma(m, k, n, group, nGroups)
+      gen = tiled.gen; rowBlock = tiled.rowBlock; rowTg = tiled.rowTg
+      variant = (if gen.tg == 128: "tiled_fma" else: q4ParallelVariant(gen, true))
+    of "matrix", "mm":
+      if not appleTarget():
+        fail("FIRLIFT_Q4_GEMM=matrix requires FIRLIFT_TARGET=apple with FIRLIFT_GENERIC unset (simdgroup_matrix is Metal-only)")
+      let matrix = q4MatrixGemm(m, k, n, group, nGroups)
+      gen = matrix.gen; rowBlock = matrix.rowBlock; rowTg = matrix.rowTg
+      variant = (if gen.tg == 128: "matrix" else: q4ParallelVariant(gen, false))
+    else:
+      if appleTarget():
+        let matrix = q4MatrixGemm(m, k, n, group, nGroups)
+        gen = matrix.gen; rowBlock = matrix.rowBlock; rowTg = matrix.rowTg
+        variant = (if gen.tg == 128: "matrix" else: q4ParallelVariant(gen, false))
+      elif m >= 16 and not genericKernels():
+        let tiled = q4GemmFma(m, k, n, group, nGroups)
+        gen = tiled.gen; rowBlock = tiled.rowBlock; rowTg = tiled.rowTg
+        variant = (if gen.tg == 128: "tiled_fma" else: q4ParallelVariant(gen, true))
+      else:
+        gen = genMatmulQ4Par(m, k, n, group, nGroups, parLanes(), false, true)
+        variant = q4ParallelVariant(gen, false)
+  if gen.tg != rowTg: rowBlock = 0   # a fallback uses no row-tile launch metadata
+  l.addKernelNode(op, "matmul_q4_" & variant, gen, @[a, wn], @[c], rowBlock = rowBlock, rows = m, residentQ4 = true)
 
 proc lowerMatmulNT(l: SessionLift; op: Op; bPort = "b") =
   let m = op.attrInt("M")
@@ -517,7 +697,7 @@ proc lowerMatmulNT(l: SessionLift; op: Op; bPort = "b") =
   let g =
     if off != 0: genMatmulNT(m, k, n, off)
     elif genericKernels(): genMatmulNTPar(m, k, n, parLanes())
-    elif m == 1: genMatmulNTSimd(k, n)
+    elif m == 1 and l.simdKernels(): genMatmulNTSimd(k, n)
     elif appleTarget(): genMatmulNTMm(m, k, n)
     else: genMatmulNTPar(m, k, n, parLanes())
   l.addKernelNode(op, "matmul_nt", g, @[a, bn], @[c])
@@ -603,7 +783,7 @@ proc lowerOp(l: SessionLift; op: Op) =
     let y = l.wr(op, op.outs.port("y"))
     l.addKernelNode(op, "rmsnorm", (if genericKernels(): genRmsnorm(op.attrInt("rows"), op.attrInt("cols"), op.attrFloat("eps"))
                        else: genRmsnormPar(op.attrInt("rows"), op.attrInt("cols"), op.attrFloat("eps"))),
-      @[x, gamma], @[y])
+      @[x, gamma], @[y], rowBlock = 1, rows = op.attrInt("rows"))
   of "sessionLayernormEnc":
     let hasBeta = op.ins.len >= 3
     let x = l.rd(op.ins.port("x"))
@@ -629,16 +809,19 @@ proc lowerOp(l: SessionLift; op: Op) =
     let b = l.rd(op.ins.port("b"))
     let c = l.wr(op, op.outs.port("c"))
     let kind = op.attrStr("op")
-    l.addKernelNode(op, "vec_" & kind, genVecOp(kind, op.attrInt("n")), @[a, b], @[c])
+    l.addKernelNode(op, "vec_" & kind, genVecOp(kind, op.attrInt("n")), @[a, b], @[c],
+      rowBlock = 1, rows = l.unitRows(op, op.attrInt("n")))
   of "sessionActivation":
     let x = l.rd(op.ins.port("x"))
     let y = l.wr(op, op.outs.port("y"))
     let kind = op.attrStr("op")
     let p = (if op.attrs.hasKey("p"): op.attrFloat("p") else: 0.0)
-    l.addKernelNode(op, "act_" & kind, genActivation(kind, op.attrInt("n"), p), @[x], @[y])
+    l.addKernelNode(op, "act_" & kind, genActivation(kind, op.attrInt("n"), p), @[x], @[y],
+      rowBlock = 1, rows = l.unitRows(op, op.attrInt("n")))
   of "sessionScale":
     let x = l.rd(op.ins.port("x"))
-    l.addKernelNode(op, "scale", genScale(op.attrInt("n"), op.attrFloat("scalar")), @[x], @[x])
+    l.addKernelNode(op, "scale", genScale(op.attrInt("n"), op.attrFloat("scalar")), @[x], @[x],
+      rowBlock = 1, rows = l.unitRows(op, op.attrInt("n")))
   of "sessionRope":
     l.lowerRope(op)
   of "sessionKvAppendEnc":
@@ -655,8 +838,10 @@ proc lowerOp(l: SessionLift; op: Op) =
     let d = op.attrInt("D")
     let src = l.rd(op.ins.port("src"))
     let dst = l.stateBuf(op.outs.port("dst"), hkv*l.positions*d)
-    l.addKernelNode(op, "kv_scatter", kvScatterKernel(op.attrInt("T"), hkv, d, l.positions),
-      @[src, l.positionBuf(), dst], @[], @[2])
+    let scatter = kvScatterKernel(op.attrInt("T"), hkv, d, l.positions)
+    # one thread per element is row-major; the lane-per-head kernel is not
+    l.addKernelNode(op, "kv_scatter", scatter, @[src, l.positionBuf(), dst], @[], @[2],
+      rowBlock = (if scatter.threads == op.attrInt("T") * hkv * d: 1 else: 0), rows = op.attrInt("T"))
   of "sessionFlashAttentionPrefillEnc":
     let hkv = op.attrInt("HKV")
     let d = op.attrInt("D")
@@ -665,8 +850,18 @@ proc lowerOp(l: SessionLift; op: Op) =
     let vAll = l.stateBuf(op.ins.port("vAll"), hkv*l.positions*d)
     let o = l.wr(op, op.outs.port("o"))
     let flash = (if genericKernels(): genFlashPrefill(op.attrInt("T"), op.attrInt("H"), hkv, d, l.positions, op.attrFloat("scale"))
-                 else: genAttentionDecodePar(op.attrInt("H"), hkv, d, l.positions, 128, op.attrInt("T"), op.attrFloat("scale")))
-    l.addKernelNode(op, "flash_prefill", flash, @[q, kAll, vAll, l.positionBuf()], @[o])
+                 elif getEnv("FIRLIFT_FLASH") == "row":
+                   genAttentionDecodePar(op.attrInt("H"), hkv, d, l.positions, 128, op.attrInt("T"), op.attrFloat("scale"))
+                 else: genFlashPrefillTiled(op.attrInt("T"), op.attrInt("H"), hkv, d, l.positions, op.attrFloat("scale")))
+    # threadgroups ordered by row (one per (row, head)) or by 16-row tile (one per (tile, head)) are
+    # row-major and causal: row t reads keys 0 .. position + t
+    let flashRows = op.attrInt("T")
+    let flashBlock = (if flash.tg <= 0: 0
+                      elif flash.threads == flashRows * op.attrInt("H") * flash.tg: 1
+                      elif flash.threads == ((flashRows + 15) div 16) * op.attrInt("H") * flash.tg: 16
+                      else: 0)
+    l.addKernelNode(op, "flash_prefill", flash, @[q, kAll, vAll, l.positionBuf()], @[o],
+      rowBlock = flashBlock, rows = flashRows)
   of "sessionSoftmax":
     let x = l.rd(op.ins.port("x"))
     let y = l.wr(op, op.outs.port("y"))
@@ -863,7 +1058,8 @@ proc tryFuse(l: SessionLift; ops: seq[Op]; i: int; consumed: var HashSet[int]): 
     let xn = l.rd(x)
     let un = l.rd(m2.ins.port("b"))
     let c = l.wr(m2, m2.outs.port("c"))
-    l.addKernelNode(op, "silu_mul", genSiluMul(op.attrInt("n")), @[xn, un], @[c])
+    l.addKernelNode(op, "silu_mul", genSiluMul(op.attrInt("n")), @[xn, un], @[c],
+      rowBlock = 1, rows = l.unitRows(op, op.attrInt("n")))
     consumed.incl j1
     consumed.incl j2
     return 2
@@ -908,20 +1104,10 @@ proc tryFuse(l: SessionLift; ops: seq[Op]; i: int; consumed: var HashSet[int]): 
 proc captureAllZero(l: SessionLift; tr: TransferRec): bool =
   ## True when the recorded upload bytes are present and all zero (a host-cleared scratch).
   if tr.captureOffset < 0 or tr.captureBytes <= 0 or tr.captureBytes != tr.dst.bytes: return false
-  let path = l.trace.sourcePath & ".data"
-  if l.trace.sourcePath.len == 0 or not fileExists(path): return false
-  let f = open(path, fmRead)
-  defer: f.close()
-  f.setFilePos(tr.captureOffset)
-  var buffer = newString(min(tr.captureBytes, 1 shl 20))
-  var left = tr.captureBytes
-  while left > 0:
-    let n = min(buffer.len, left)
-    if f.readBuffer(addr buffer[0], n) != n: return false
-    for c in buffer.toOpenArray(0, n-1):
-      if c != '\0': return false
-    left -= n
-  true
+  sidecarAllZero(l.trace.sourcePath, tr.captureOffset, tr.captureBytes)
+
+var droppedSingleRowUnits* = 0   ## single-token units left out of the last lift
+var reusedBuffers* = 0           ## temporaries of the last lift that took over an earlier buffer
 
 proc prepareRaw(l: SessionLift; ops: seq[Op]; weightsPaths: seq[string]) =
   var sizes = initTable[int, int]()
@@ -1007,15 +1193,20 @@ proc prepareRaw(l: SessionLift; ops: seq[Op]; weightsPaths: seq[string]) =
   var zeroUploads = initHashSet[int]()
   var embeddingPhase = initTable[int, int]()
   var phaseCount = initCountTable[int]()
+  var embeddingCandidates: seq[string]
   for id, tr in perStep:
     if not l.coverage and l.captureAllZero(tr): zeroUploads.incl id
   for id, tr in perStep:
     if not l.coverage and sizes.hasKey(id) and id notin zeroUploads and l.hidden > 0 and
-        tr.n >= l.hidden and tr.n mod l.hidden == 0 and tr.op notin ropeTableUploads:
+        tr.n >= l.hidden and tr.n mod l.hidden == 0 and
+        tr.op notin ropeTableUploads:
       embeddings.add id
-      phaseCount.inc min(1, firstPhase.getOrDefault(id))
+      let phase = min(1, firstPhase.getOrDefault(id))
+      phaseCount.inc phase
+      embeddingCandidates.add "b" & $id & " n=" & $tr.n & " phase=" & $phase
   if phaseCount.getOrDefault(0) > 1:
-    fail("several per-step token-row uploads in the selected unit; choose a slice with one embedding input")
+    fail("several per-step token-row uploads in the selected unit (" & embeddingCandidates.join("; ") &
+      "); choose a slice with one embedding input")
   # Every token-row upload of the replayed ops starts a unit of its own (any row count, any
   # number of units). Ops before the first upload belong to the first unit.
   var starts: seq[(int, int)]
@@ -1085,8 +1276,8 @@ proc prepareRaw(l: SessionLift; ops: seq[Op]; weightsPaths: seq[string]) =
         l.trace.names.add NameRec(buffer: id, bytes: bytes, name: index[match].name,
           shape: "(" & dims.join(" ") & ")", dtype: "raw")
       elif upload.captureOffset >= 0 and upload.captureBytes == upload.dst.bytes:
-        if l.trace.sourcePath.len == 0 or not fileExists(l.trace.sourcePath & ".data"):
-          fail("missing upload sidecar " & l.trace.sourcePath & ".data")
+        if not sidecarAvailable(l.trace.sourcePath):
+          fail("missing upload sidecar " & sidecarPath(l.trace.sourcePath))
         b.tensor = "capture." & upload.fingerprint
         b.initFile = "trace.data"; b.initOffset = upload.captureOffset; b.initBytes = upload.captureBytes
         b.fingerprint = upload.fingerprint
@@ -1182,6 +1373,7 @@ proc liftSessionFiles*(trace: Trace; configText, modelName, embeddingName: strin
     # Recurrent raw graphs need no context-sized allocation. This is an I/O
     # position counter limit; recorded buffer extents still constrain kernels.
     l.positions = int(high(int32))
+  if l.raw and not coverage: ops = withoutSingleRowUnits(trace, ops, l.hidden, droppedSingleRowUnits)
   if l.raw: l.prepareRaw(ops, weightsPaths)
   for k in ["rms_norm_eps", "layer_norm_epsilon", "layer_norm_eps", "norm_eps"]:
     if l.eps == 0.0 and l.config.hasKey(k) and l.config[k].kind in {JFloat, JInt}:
@@ -1236,6 +1428,12 @@ proc liftSessionFiles*(trace: Trace; configText, modelName, embeddingName: strin
         afterTaintedRead = false
       elif op.phase > 0 and trace.stepToken >= 0:
         # Token rows of the multi-row prefill phase: the embedding of `rows` tokens.
+        if l.phaseRows.hasKey(op.phase):
+          # A further token-row upload in the same recorded step (the runtime split the prompt into
+          # chunks): it starts a unit of its own, so every chunk size becomes its own phase.
+          for j in i ..< ops.len:
+            if ops[j].phase > 0: inc ops[j].phase
+          stampPhase = op.phase
         if l.hidden <= 0 or tr.n mod l.hidden != 0: fail("the prefill upload has " & $tr.n & " elements, hidden is " & $l.hidden)
         var emb = embeddingName
         if emb.len == 0:
@@ -1272,7 +1470,11 @@ proc liftSessionFiles*(trace: Trace; configText, modelName, embeddingName: strin
       inc i
       continue
     if name == "sessionRead" and op.phase > 0 and not l.raw:
-      inc i                      # the prefill phase only updates state; decode produces the logits
+      # A vocabulary-sized read ends the unit: the logits after its last row. Other reads are dropped.
+      let h = op.ins.port("h")
+      if l.vocab > 0 and op.attrInt("n") == l.vocab and l.cur.hasKey(h.key) and l.cur[h.key] notin l.tainted:
+        l.phaseLast[op.phase] = l.cur[h.key]
+      inc i
       continue
     if name == "sessionRead":
       let h = op.ins.port("h")
@@ -1286,7 +1488,16 @@ proc liftSessionFiles*(trace: Trace; configText, modelName, embeddingName: strin
       if src in l.tainted:
         afterTaintedRead = true
       elif l.raw and op.phase > 0 and l.vocab > 0 and n mod l.vocab == 0:
-        l.phaseLogits[op.phase] = (src, n div l.vocab)
+        let rows = n div l.vocab
+        if rows == 1:
+          # Native prefill usually reads back only the final row's logits, even when the
+          # recorded embedding/GEMM phase consumed a full micro-batch.
+          l.phaseLast[op.phase] = src
+        elif rows == l.phaseRows.getOrDefault(op.phase):
+          l.phaseLogits[op.phase] = (src, rows)
+        else:
+          fail("prefill read back " & $rows & " logits rows for phase " & $op.phase &
+            ", expected one final row or the full " & $l.phaseRows.getOrDefault(op.phase) & " rows")
       elif l.vocab > 0 and n == l.vocab:
         logits = src
       else:
@@ -1344,6 +1555,7 @@ proc liftSessionFiles*(trace: Trace; configText, modelName, embeddingName: strin
   # Dead-node elimination from the logits backwards.
   var live = initHashSet[string]()
   live.incl logits
+  for phase, name in l.phaseLast: live.incl name
   var keep = newSeq[bool](l.nodes.len)
   for idx in countdown(l.nodes.high, 0):
     let n = l.nodes[idx]
@@ -1358,6 +1570,72 @@ proc liftSessionFiles*(trace: Trace; configText, modelName, embeddingName: strin
   var nodes: seq[SNode]
   for idx, n in l.nodes:
     if keep[idx]: nodes.add n
+  if not l.raw and not coverage and getEnv("FIRLIFT_NOSIDE").len == 0:
+    # Side-by-side fusion: consecutive decode kernels that do not depend on each other (no one reads
+    # or writes a buffer another one writes) and share a threadgroup size become one launch, each
+    # kernel on its own thread range. Every dispatch has a fixed cost, so fewer launches per token
+    # is what the fused native kernels buy.
+    var kernelOf = initTable[string, int]()
+    for idx, k in l.kernels: kernelOf[k.name] = idx
+    var sideIdx = initTable[string, int]()
+    proc fusable(n: SNode): bool =
+      n.kind == "micro" and n.phase == 0 and kernelOf.hasKey(n.op) and not l.kernels[kernelOf[n.op]].raw and
+        not l.kernels[kernelOf[n.op]].name.startsWith("s.side")
+    proc independent(group: seq[SNode]; n: SNode): bool =
+      for g in group:
+        for o in g.outs:
+          if o in n.ins or o in n.outs: return false
+        for o in n.outs:
+          if o in g.ins or o in g.outs: return false
+      true
+    var merged: seq[SNode]
+    var group: seq[SNode]
+    proc settle() =
+      if group.len >= 2:
+        var bodies: seq[string]
+        var threads, ins, outs, hiR, hiU, inSizes, outSizes: seq[int]
+        var allIns, allOuts: seq[string]
+        var tgBytes = 16
+        let tg = l.kernels[kernelOf[group[0].op]].tg
+        for n in group:
+          let k = l.kernels[kernelOf[n.op]]
+          bodies.add k.body
+          threads.add k.threads
+          ins.add k.ins
+          outs.add k.outs
+          hiR.add k.hiR
+          hiU.add k.hiU
+          tgBytes = max(tgBytes, k.tgBytes)
+          inSizes.add k.sizes[0 ..< k.ins]
+          outSizes.add k.sizes[k.ins ..< k.ins + k.outs]
+          allIns.add n.ins
+          allOuts.add n.outs
+        let body = fuseSideBySide(bodies, threads, ins, outs, hiR, hiU, tg)
+        if body.len > 0:
+          let sizes = inSizes & outSizes
+          let sig = body & "\n" & sizes.join(",")
+          if not sideIdx.hasKey(sig):
+            sideIdx[sig] = l.kernels.len
+            l.kernels.add SKern(name: "s.side" & (if sideIdx.len > 1: "_" & $sideIdx.len else: ""), body: body,
+              threads: sum(threads), tg: tg, tgBytes: tgBytes, ins: allIns.len, outs: allOuts.len, sizes: sizes)
+            kernelOf[l.kernels[^1].name] = l.kernels.high
+          merged.add SNode(kind: "micro", op: l.kernels[sideIdx[sig]].name, name: group[0].name & "_side",
+            ins: allIns, outs: allOuts)
+          group = @[]
+          return
+      for n in group: merged.add n
+      group = @[]
+    for n in nodes:
+      if not fusable(n):
+        settle()
+        merged.add n
+        continue
+      if group.len > 0 and (l.kernels[kernelOf[group[0].op]].tg != l.kernels[kernelOf[n.op]].tg or
+          not independent(group, n)):
+        settle()
+      group.add n
+    settle()
+    nodes = merged
   if fuseDispatches and l.raw:
     # Merge consecutive raw dispatches whose threadgroups are provably independent.
     var roots = initTable[string, string]()
@@ -1561,6 +1839,69 @@ proc liftSessionFiles*(trace: Trace; configText, modelName, embeddingName: strin
       run.add n
     settle()
     nodes = merged
+  if not l.raw and not coverage and getEnv("FIRLIFT_NOREUSE").len == 0:
+    # Buffer reuse. Every op output got a buffer of its own, so a graph holds one activation per
+    # op (GiBs for a large multi-row phase). A temporary only has to live from the node that
+    # writes it to the last node that reads it: later temporaries of the same size take over its
+    # buffer. Only buffers that one phase writes before it reads them qualify; state, inputs,
+    # outputs and anything two phases share keep their own buffer.
+    var persistent = initHashSet[string]()
+    persistent.incl logits
+    for phase, name in l.phaseLast: persistent.incl name
+    for phase, output in l.phaseLogits: persistent.incl output[0]
+    var phaseOf = initTable[string, int]()
+    var phaseList: seq[int]
+    for n in nodes:
+      if n.phase notin phaseList: phaseList.add n.phase
+      for b in n.ins & n.outs:
+        if not l.bufIdx.hasKey(b): continue          # a weight
+        let sb = l.bufs[l.bufIdx[b]]
+        if sb.role.len > 0 or sb.base.len > 0 or sb.initFile.len > 0 or sb.data.len > 0 or sb.rawWeight or
+            not b.startsWith("t"):
+          persistent.incl b
+        if phaseOf.hasKey(b) and phaseOf[b] != n.phase: persistent.incl b
+        phaseOf[b] = n.phase
+    proc temporary(b: string): bool = l.bufIdx.hasKey(b) and b notin persistent
+    # first writer and last user of every temporary, per phase
+    var firstAt = initTable[string, int]()
+    var lastAt = initTable[string, int]()
+    for idx, n in nodes:
+      for b in n.ins:
+        if not l.bufIdx.hasKey(b) or b in persistent: continue
+        if not firstAt.hasKey(b): persistent.incl b    # read before this phase wrote it
+        lastAt[b] = idx
+      for b in n.outs:
+        if not l.bufIdx.hasKey(b) or b in persistent: continue
+        if not firstAt.hasKey(b):
+          if n.rmw: persistent.incl b                  # updated in place: its old contents are read
+          else: firstAt[b] = idx
+        lastAt[b] = idx
+    var rename = initTable[string, string]()
+    var slots = 0
+    for phase in phaseList:
+      var free = initTable[int, seq[string]]()         # elements -> buffers free to take over
+      var live: seq[(int, string, int)]                # (last user, buffer, elements)
+      for idx, n in nodes:
+        if n.phase != phase: continue
+        var still: seq[(int, string, int)]
+        for item in live:
+          if item[0] < idx: free.mgetOrPut(item[2], @[]).add item[1]
+          else: still.add item
+        live = still
+        for b in n.outs:
+          if not temporary(b) or firstAt.getOrDefault(b, -1) != idx or rename.hasKey(b): continue
+          let size = l.bufs[l.bufIdx[b]].elements
+          var slot = b
+          if free.getOrDefault(size).len > 0: slot = free[size].pop()
+          else: inc slots
+          rename[b] = slot
+          live.add (lastAt[b], slot, size)
+    for n in nodes.mitems:
+      for b in n.ins.mitems:
+        if rename.hasKey(b): b = rename[b]
+      for b in n.outs.mitems:
+        if rename.hasKey(b): b = rename[b]
+    reusedBuffers = rename.len - slots
   # Emit.
   var usedBuf = initHashSet[string]()
   var usedWeight = initHashSet[string]()
@@ -1572,9 +1913,19 @@ proc liftSessionFiles*(trace: Trace; configText, modelName, embeddingName: strin
     if n.kind == "micro": usedKernel.incl n.op
   for phase, output in l.phaseLogits:
     usedBuf.incl output[0]
+  for phase, name in l.phaseLast: usedBuf.incl name
+  # The logits read may cover only part of its buffer (a scratch longer than the vocabulary): the
+  # role then sits on a view that no node names, which must still be emitted.
+  usedBuf.incl logits
   for b in l.bufs:
     if b.name in usedBuf and b.base.len > 0: usedBuf.incl b.base
-  var outText = "fir 1\nmodel " & modelName & "\nconfig config.json\nruntime graph\nlayout script\nscript_abi 1\n"
+  var hasResidentQ4 = false
+  for weight in l.weights:
+    if weight.dtype.startsWith("q4r"):
+      hasResidentQ4 = true
+  var outText = "fir 1\nmodel " & modelName & "\nconfig config.json\nruntime graph\nlayout script\nscript_abi " &
+    (if hasResidentQ4: "2" else: "1") & "\n"
+  if hasResidentQ4: outText.add "require feature resident_q4\n"
   let epsKey = l.config.cfgKey(["rms_norm_eps", "layer_norm_epsilon", "layer_norm_eps", "norm_eps"])
   if epsKey.len > 0: outText.add "epsilon " & epsKey & "\n"
   if l.config.hasKey("torch_dtype") and l.config["torch_dtype"].getStr("") in ["bfloat16", "float16"]:
@@ -1625,6 +1976,7 @@ proc liftSessionFiles*(trace: Trace; configText, modelName, embeddingName: strin
     outText.add "kernel " & k.name & " in=" & $k.ins & " out=" & $k.outs & " threads=" & $k.threads &
       " tg=" & $k.tg & " tgbytes=" & $k.tgBytes
     if expect.len > 0: outText.add " expect=" & expect.join(",")
+    if k.rowBlock > 0: outText.add " rows=" & $k.rowBlock & ":" & $k.rowThreads
     if k.raw:
       outText.add " layout=slots"
       if k.slots.len > 0: outText.add " slots=" & k.slots
@@ -1640,6 +1992,19 @@ proc liftSessionFiles*(trace: Trace; configText, modelName, embeddingName: strin
   let hasPrefill = ordered.len > 0
   for n in nodes:
     if n.phase == 0: ordered.add n
+  proc partialPhase(phase: int): bool =
+    ## Every node of the phase is an embedding or a row-major kernel over the phase rows: the
+    ## runner may then run the phase over fewer rows (the tail of a prompt).
+    var kernelOf = initTable[string, int]()
+    for idx, k in l.kernels: kernelOf[k.name] = idx
+    for n in nodes:
+      if n.phase != phase: continue
+      if n.kind == "ext" and n.op == "fir.embedding": continue
+      if n.kind == "session" and "lastRowOf=" in n.op: return true   # what follows works on that one row
+      if n.kind != "micro" or not kernelOf.hasKey(n.op): return false
+      let k = l.kernels[kernelOf[n.op]]
+      if k.rowBlock <= 0 or k.rows != l.phaseRows.getOrDefault(phase): return false
+    true
   var emittedPhase = -1
   for n in ordered:
     seen.inc n.name
@@ -1650,6 +2015,9 @@ proc liftSessionFiles*(trace: Trace; configText, modelName, embeddingName: strin
         if l.phaseRows.getOrDefault(n.phase) <= 0: fail("replayed unit " & $n.phase & " has no token-row embedding input")
         outText.add "phase chunk" & $n.phase & " rows=" & $l.phaseRows[n.phase]
         if l.phaseLogits.hasKey(n.phase): outText.add " logits=" & l.phaseLogits[n.phase][0]
+        else:
+          if l.phaseLast.hasKey(n.phase): outText.add " last=" & l.phaseLast[n.phase]
+          if partialPhase(n.phase): outText.add " partial"
         outText.add "\n"
       else:
         outText.add "phase decode\n"

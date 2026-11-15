@@ -27,6 +27,15 @@ A current Vulkan throughput result has not been recorded after the runtime Q4
 QKV autotuner was added. No earlier Iris throughput or profile results are
 listed here.
 
+## Lifted FIR graph (Metal)
+
+Same 106-token prompt and 11-token decode as the native paired benchmark:
+
+| Runtime | Prefill | Decode |
+| --- | ---: | ---: |
+| FIR graph | 15.956 s · 6.64 tok/s | 6.449 s · 1.71 tok/s |
+| Native | 20.369 s · 5.20 tok/s | 7.678 s · 1.43 tok/s |
+
 ## Test machines
 
 Tesla T4 (Google Colab): Vulkan discrete GPU; cooperative matrix available.

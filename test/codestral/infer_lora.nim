@@ -730,24 +730,33 @@ proc sampleToken(logits: seq[float32], vocab: int, cfg: SamplerCfg,
   var nBad = 0
   var adj = newSeq[float32](vocab)
   for i in 0 ..< vocab:
-    var v = logits[i]
+    let v = logits[i]
     if v.classify in {fcNan, fcInf, fcNegInf}:
       adj[i] = NegInfF32
       inc nBad
-      continue
-    if cfg.repeatPenalty != 1.0'f32 and recent.len > 0:
-      if not (noPenalty.len == vocab and noPenalty[i]):
-        for rid in recent:
-          if rid == i:
-            if v > 0'f32: v = v / cfg.repeatPenalty
-            else: v = v * cfg.repeatPenalty
-            break
-    if banned.len == vocab and banned[i]:
+    elif banned.len == vocab and banned[i]:
       adj[i] = NegInfF32
-      continue
-    adj[i] = v
-    if v > maxL:
-      maxL = v
+    else:
+      adj[i] = v
+  # Repetition penalty: walk the recent window once (O(vocab + window)) instead of scanning
+  # the whole window for every vocab entry (O(vocab * window)). A token is penalized once even
+  # if it repeats in the window; banned/NaN tokens and `noPenalty` tokens are left alone.
+  if cfg.repeatPenalty != 1.0'f32 and recent.len > 0:
+    for k in 0 ..< recent.len:
+      let rid = recent[k]
+      if rid < 0 or rid >= vocab: continue
+      var repeated = false
+      for j in 0 ..< k:
+        if recent[j] == rid:
+          repeated = true
+          break
+      if repeated or adj[rid] <= NegInfF32: continue
+      if noPenalty.len == vocab and noPenalty[rid]: continue
+      if adj[rid] > 0'f32: adj[rid] = adj[rid] / cfg.repeatPenalty
+      else: adj[rid] = adj[rid] * cfg.repeatPenalty
+  for i in 0 ..< vocab:
+    if adj[i] > maxL:
+      maxL = adj[i]
       argMaxI = i
   if nBad > 0 and not gNanWarned:
     gNanWarned = true

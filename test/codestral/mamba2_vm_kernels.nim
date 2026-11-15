@@ -4,7 +4,7 @@
 ## (EXP, NEG, SIGMOID, RSQRT, LOAD/STORE_F32_IDX, IF_BEGIN/END, CMP_LT...).
 ## Dispatched through session_vm_dispatch.nim (real metal_enc_*, not emulated).
 
-import std/bitops
+import std/[bitops, os]
 import session_vm
 
 
@@ -15,9 +15,55 @@ import session_vm
 ## every thread in the threadgroup reaches it (no deadlock).
 ## Registers: rStride (changes), rCnt (CONSTANT in the loop: Metal rereads it each iteration),
 ## rTmp (cmp then addr), rA, rB. idxReg = index within the threadgroup.
+proc simdReduceEnabled(): bool =
+  ## Opt-in (BYBY_SIMD_REDUCE=1). Measured on Intel Iris Plus 640 it made Mamba-3 decode slower
+  ## (73 vs 54 ms/token), and it is not measured on Apple GPUs, so the barrier tree stays the default.
+  getEnv("BYBY_SIMD_REDUCE", "0") == "1"
+
+proc emitTgSimdReduce(p: var VmProgram; idxReg: uint32; n: int;
+                      rStride, rCnt, rTmp, rA, rB: uint32) =
+  ## Same contract as the tree reduction (sum of tgF32[0..n) left in tgF32[0], barrier at the
+  ## end) when the threadgroup has exactly n threads: simd_sum inside every simdgroup, one
+  ## partial per simdgroup in tgF32[simdgroup], then every lane adds the partials. The simdgroup
+  ## width is read at run time, so Intel (16) and Apple (32) share the program.
+  ## Integer registers: only U31, as a transient (the state/param loaders use it the same way).
+  ## The callers keep live offsets in the others - rmsRows holds its gamma offset in U30 across
+  ## the reduction, and an earlier version that used U28..U30 corrupted every norm.
+  p.emitTgLoadF32(rA, idxReg, 0)
+  p.emitSimdSum(rA, rA)
+  p.emitBarrierTg()                                   # every lane has read its own slot
+  p.emitSimdLane(31); p.emitUToR(rTmp, 31)
+  p.emitLoadConstF32(rStride, 1)
+  p.emitCmpLt(rTmp, rTmp, rStride)                    # simd lane == 0
+  sessionVmIfGpu(p, rTmp):
+    p.emitSimdId(31); p.emitUToR(rB, 31)
+    p.emitTgStoreF32(rA, rB, 0)
+  p.emitBarrierTg()
+  p.emitSimdW(31); p.emitUToR(rB, 31)
+  p.emitLoadConstF32(rStride, float32(n))
+  p.emitDiv(rStride, rStride, rB)                     # simdgroups per threadgroup
+  p.emitLoadConstF32(rA, 0)
+  p.emitLoadConstF32(rTmp, 0)
+  p.emitLoadConstF32(rCnt, float32(max(1, n div 8)))  # upper bound on the simdgroup count (width >= 8)
+  sessionVmForGpu(p, rCnt):
+    p.emitCmpLt(rB, rTmp, rStride)
+    sessionVmIfGpu(p, rB):
+      p.emitTgLoadF32(rB, rTmp, 0)
+      p.emitAdd(rA, rA, rB)
+    p.emitAddConst(rTmp, rTmp, 1'f32)
+  p.emitBarrierTg()                                   # all partials read before slot 0 is overwritten
+  p.emitLoadConstF32(rTmp, 1)
+  p.emitCmpLt(rTmp, idxReg, rTmp)                     # lane 0 stores the total
+  sessionVmIfGpu(p, rTmp):
+    p.emitTgStoreF32(rA, idxReg, 0)
+  p.emitBarrierTg()
+
 proc emitTgTreeReduce*(p: var VmProgram; idxReg: uint32; n: int;
                       rStride, rCnt, rTmp, rA, rB: uint32) =
   doAssert n >= 1 and (n and (n - 1)) == 0, "emitTgTreeReduce: n must be a power of 2"
+  if n >= 8 and simdReduceEnabled():
+    p.emitTgSimdReduce(idxReg, n, rStride, rCnt, rTmp, rA, rB)
+    return
   p.emitLoadConstF32(rCnt, float32(countTrailingZeroBits(n)))   # log2(n) steps
   p.emitLoadConstF32(rStride, float32(n div 2))
   sessionVmForGpu(p, rCnt):

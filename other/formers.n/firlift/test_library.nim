@@ -116,6 +116,21 @@ proc bytesAsFloats(b: seq[uint8]): seq[float32] =
   result = newSeq[float32]((b.len + 3) div 4)
   if b.len > 0: copyMem(addr result[0], unsafeAddr b[0], b.len)
 
+proc chkResidentQ4(name: string; g: Gen; a, packed, expected: seq[float32]; tol = 1e-3'f32) =
+  let program = assemble(g.body, 2, 1, @[a.len, packed.len], @[expected.len], 1e-5'f32, slotLayout = true)
+  var output = newSeq[float32](expected.len)
+  var views: array[5, cpu.CpuVmView]
+  views[0] = cpu.CpuVmView(base: cast[ptr float32](addr output[0]), elements: output.len, allocationElements: output.len)
+  views[1] = cpu.CpuVmView(base: cast[ptr float32](unsafeAddr packed[0]), elements: packed.len, allocationElements: packed.len)
+  views[2] = views[1]
+  views[3] = cpu.CpuVmView(base: cast[ptr float32](unsafeAddr a[0]), elements: a.len, allocationElements: a.len)
+  if not cpu.vmRunBound(program.words, views, g.threads, max(4, g.tgBytes div 4), max(1, g.tg)):
+    raise newException(ValueError, name & ": resident CPU VM rejected the program: " & cpu.cpuLastErrorMessage())
+  for i in 0 ..< expected.len:
+    if not near(output[i], expected[i], tol):
+      raise newException(ValueError, name & " resident mismatch at " & $i & ": got " & $output[i] & " want " & $expected[i])
+  echo "PASS resident Q4 kernel ", name
+
 proc sessionTests2() =
   block:
     let g = Gen(body: "uloadf32 1 2 @in1+4\nustoref32 1 2 @out0\nuloadf32 3 2 @in0\nuloadf32 4 2 @in1", threads: 1, ins: 2, outs: 1)
@@ -314,6 +329,8 @@ proc sessionTests2() =
         want[m*N + n] = s
     chk("matmul_q4.packed", genMatmulQ4(M, K, N, gs, nG, 0, true),
         @[a, bytesAsFloats(bytes) & scales & zeros], want, 1e-3'f32)
+    chkResidentQ4("scalar packed", genMatmulQ4(M, K, N, gs, nG, 0, true, false, true),
+        a, bytesAsFloats(bytes) & scales & zeros, want)
 
   # threadgroup-parallel Q4 matmul: same packed layout, T lanes per output column
   for (M, K, N, gs, T) in [(1, 128, 5, 32, 8), (2, 128, 3, 64, 32), (1, 256, 4, 128, 32), (3, 64, 2, 16, 4)]:
@@ -341,6 +358,9 @@ proc sessionTests2() =
     doAssert g.tg >= 2, "parallel variant not selected"
     chk("matmul_q4_par M" & $M & " K" & $K & " gs" & $gs & " tg" & $g.tg, g,
         @[a, bytesAsFloats(bytes) & scales & zeros], want, 1e-3'f32)
+    let resident = genMatmulQ4Par(M, K, N, gs, nG, T, false, true)
+    chkResidentQ4("parallel K" & $K & " tg" & $resident.tg, resident,
+        a, bytesAsFloats(bytes) & scales & zeros, want)
 
   # simdgroup Q4 GEMV (the Metal matmul_q4_simd structure): lanes stride over K, simd_sum combines
   for (K, N, gs, rows, sg) in [(256, 8, 128, 4, 2), (512, 4, 32, 4, 1), (128, 6, 64, 2, 2), (768, 4, 128, 4, 1), (3072, 4, 128, 4, 1)]:
@@ -369,6 +389,9 @@ proc sessionTests2() =
       doAssert g.tg == sg * 32, "simd variant not selected"
       chk("matmul_q4_simd K" & $K & " gs" & $gs & " rows" & $rows & " sg" & $sg & " packs" & $packs, g,
           @[a, bytesAsFloats(bytes) & scales & zeros], want, 1e-3'f32)
+      let resident = genMatmulQ4Simd(K, N, gs, nG, rows, sg, packs, true)
+      chkResidentQ4("simd K" & $K & " packs" & $packs, resident,
+          a, bytesAsFloats(bytes) & scales & zeros, want)
 
   # simdgroup_matrix Q4 GEMM (the Metal matmul_q4_mm_sg structure): full and partial tiles
   for (M, K, N, gs) in [(32, 64, 32, 32), (40, 64, 40, 32), (3, 96, 5, 32), (33, 128, 70, 128)]:
@@ -396,6 +419,40 @@ proc sessionTests2() =
     doAssert g.tg == 128, "mm variant not selected"
     chk("matmul_q4_mm M" & $M & " K" & $K & " N" & $N, g,
         @[a, bytesAsFloats(bytes) & scales & zeros], want, 1e-3'f32)
+    let resident = genMatmulQ4Mm(M, K, N, gs, nG, true)
+    chkResidentQ4("matrix M" & $M & " K" & $K, resident,
+        a, bytesAsFloats(bytes) & scales & zeros, want)
+
+  # tiled FP32 Q4 GEMM (the Metal matmul_q4_gemm_kernel structure): full and partial tiles
+  for (M, K, N, gs) in [(32, 64, 64, 32), (40, 64, 70, 32), (3, 96, 5, 32), (65, 128, 130, 128), (16, 64, 33, 64)]:
+    let nG = K div gs
+    let bpr = K div 2
+    var q = newSeq[int](N*K)
+    var bytes = newSeq[uint8](N*bpr)
+    for i in 0 ..< N*K: q[i] = (i*7 + 1) mod 16
+    for n in 0 ..< N:
+      for kk in 0 ..< K:
+        let b = n*bpr + kk div 2
+        bytes[b] = bytes[b] or uint8(q[n*K + kk] shl (if kk mod 2 == 0: 0 else: 4))
+    let scales = fill(N*nG, 0.4, 0.3)
+    let zeros = fill(N*nG, 1.1, 2.0)
+    let a = fill(M*K, 0.8)
+    var want = newSeq[float32](M*N)
+    for m in 0 ..< M:
+      for n in 0 ..< N:
+        var sum = 0.0'f32
+        for kk in 0 ..< K:
+          let gi = n*nG + kk div gs
+          sum += a[m*K + kk] * ((float32(q[n*K + kk]) - zeros[gi]) * scales[gi])
+        want[m*N + n] = sum
+    for (bm, bn, tm, tn) in [(32, 64, 4, 4), (64, 64, 8, 4), (32, 128, 4, 8), (64, 128, 8, 8), (64, 64, 4, 4)]:
+      let g = genMatmulQ4Gemm(M, K, N, gs, nG, bm, bn, tm, tn)
+      doAssert g.tg == (bm div tm) * (bn div tn), "gemm variant not selected"
+      chk("matmul_q4_gemm " & $bm & "x" & $bn & " reg " & $tm & "x" & $tn & " M" & $M & " K" & $K & " N" & $N, g,
+          @[a, bytesAsFloats(bytes) & scales & zeros], want, 1e-3'f32)
+      let resident = genMatmulQ4Gemm(M, K, N, gs, nG, bm, bn, tm, tn, true)
+      chkResidentQ4("tiled M" & $M & " K" & $K & " N" & $N & " tile " & $bm & "x" & $bn,
+          resident, a, bytesAsFloats(bytes) & scales & zeros, want)
 
   # argmax keeps the first maximum
   block:
@@ -657,6 +714,38 @@ proc sessionTests2() =
     chk("flash_prefill", genFlashPrefill(T, H, HKV, D, maxSeq, sc), @[q, kc, vc, @[float32(pos)]], o, 1e-3'f32)
     if (H and (H - 1)) == 0:
       chk("flash_prefill_par", genAttentionDecodePar(H, HKV, D, maxSeq, 32, T, sc), @[q, kc, vc, @[float32(pos)]], o, 1e-3'f32)
+
+  # tiled flash prefill: 16 query rows per threadgroup, keys streamed 16 at a time
+  for (T, H, HKV, D, maxSeq, pos) in [(3, 4, 2, 8, 24, 2), (16, 4, 2, 8, 40, 0), (20, 4, 4, 16, 64, 5),
+                                      (37, 6, 2, 8, 80, 30), (33, 2, 1, 24, 48, 15)]:
+    let sc = 0.35'f32
+    let q = fill(T*H*D, 0.3)
+    let kc = fill(HKV*maxSeq*D, 0.9)
+    let vc = fill(HKV*maxSeq*D, 1.6)
+    var o = newSeq[float32](T*H*D)
+    let rep = H div HKV
+    for t in 0 ..< T:
+      for h in 0 ..< H:
+        let base = (h div rep)*maxSeq*D
+        let n = pos + t + 1
+        var raw = newSeq[float32](n)
+        var mx = -1e30'f32
+        for key in 0 ..< n:
+          var s = 0.0'f32
+          for d in 0 ..< D: s += q[(t*H + h)*D + d]*kc[base + key*D + d]
+          raw[key] = s*sc
+          mx = max(mx, raw[key])
+        var tot = 0.0'f32
+        for key in 0 ..< n:
+          raw[key] = exp(raw[key] - mx)
+          tot += raw[key]
+        for d in 0 ..< D:
+          var a = 0.0'f32
+          for key in 0 ..< n: a += raw[key]*vc[base + key*D + d]
+          o[(t*H + h)*D + d] = a / tot
+    let g = genFlashPrefillTiled(T, H, HKV, D, maxSeq, sc)
+    doAssert g.tg == 128 and g.threads == ((T + 15) div 16)*H*128, "tiled flash prefill not selected"
+    chk("flash_prefill_tiled T" & $T & " H" & $H & " D" & $D & " pos" & $pos, g, @[q, kc, vc, @[float32(pos)]], o, 1e-3'f32)
 
   # Mamba-2 state-space scan
   for cont in 0 .. 1:
@@ -928,6 +1017,68 @@ proc sessionTests() =
           raise newException(ValueError, "kv_scatter mismatch at " & $i)
       echo "PASS session kernel kv_scatter"
 
+proc sideBySideTests() =
+  ## fuseSideBySide: the fused launch must write what the kernels write when launched one by one.
+  type Part = object
+    g: Gen
+    hiR, hiU: int
+    data: seq[seq[float32]]
+    outSizes: seq[int]
+  proc part(g: Gen; data: seq[seq[float32]]; outSizes: seq[int]): Part =
+    Part(g: g, hiR: genHiR, hiU: genHiU, data: data, outSizes: outSizes)
+  proc launch(body: string; ins, outs, threads, tg, tgBytes: int; data: seq[seq[float32]];
+              outSizes: seq[int]): seq[float32] =
+    var inSize: seq[int]
+    var mem: seq[float32]
+    for d in data:
+      inSize.add d.len
+      for v in d: mem.add v
+    let total = mem.len
+    mem.setLen(total + sum(outSizes))
+    let program = assemble(body, ins, outs, inSize, outSizes, 1e-5'f32)
+    if not cpu.vmRun(program.words, mem, newSeq[float32](), threads, max(4, tgBytes div 4), tg):
+      raise newException(ValueError, "side_by_side: CPU VM rejected the program: " & cpu.cpuLastErrorMessage())
+    mem[total .. ^1]
+  proc check(name: string; parts: seq[Part]; tg: int) =
+    var bodies: seq[string]
+    var threads, ins, outs, hiR, hiU, outSizes: seq[int]
+    var data: seq[seq[float32]]
+    var want: seq[float32]
+    var tgBytes = 16
+    for p in parts:
+      want.add launch(p.g.body, p.g.ins, p.g.outs, p.g.threads, tg, p.g.tgBytes, p.data, p.outSizes)
+      bodies.add p.g.body
+      threads.add p.g.threads
+      ins.add p.g.ins
+      outs.add p.g.outs
+      hiR.add p.hiR
+      hiU.add p.hiU
+      outSizes.add p.outSizes
+      data.add p.data
+      tgBytes = max(tgBytes, p.g.tgBytes)
+    let body = fuseSideBySide(bodies, threads, ins, outs, hiR, hiU, tg)
+    doAssert body.len > 0, name & ": the kernels were not fused"
+    let got = launch(body, sum(ins), sum(outs), sum(threads), tg, tgBytes, data, outSizes)
+    doAssert got.len == want.len
+    for i in 0 ..< want.len:
+      if not near(got[i], want[i]):
+        raise newException(ValueError, "side_by_side " & name & " mismatch at " & $i & ": got " & $got[i] & " want " & $want[i])
+    echo "PASS session kernel side_by_side ", name
+  check("vecop+activation", @[
+    part(genVecOp("add", 96), @[fill(96, 0.3), fill(96, 1.1)], @[96]),
+    part(genActivation("sigmoid", 64), @[fill(64, 0.7, 2.0)], @[64])], 32)
+  check("rmsnorm_par x2 (threadgroup ids)", @[
+    part(genRmsnormPar(2, 64, 1e-5), @[fill(128, 0.2, 2.0), fill(64, 0.9)], @[128]),
+    part(genRmsnormPar(2, 64, 1e-5), @[fill(128, 1.4, 0.5), fill(64, 0.1)], @[128])], 256)
+  block:
+    let a = genMatmulNTSimd(96, 8)
+    let pa = part(a, @[fill(96, 0.4), fill(8 * 96, 1.7)], @[8])
+    let b = genMatmulNTSimd(96, 16)
+    let pb = part(b, @[fill(96, 0.8), fill(16 * 96, 0.3)], @[16])
+    doAssert a.tg == b.tg and a.tg > 0
+    check("matmul_nt_simd x2 (simdgroup ids)", @[pa, pb], a.tg)
+
+sideBySideTests()
 sessionTests2()
 sessionTests()
 main()

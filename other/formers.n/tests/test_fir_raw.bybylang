@@ -1,10 +1,11 @@
 # Record real CPU VM launches through the core recorder, then lift and execute FIR.
-import nim "std/[os, tables, strutils]"
+import nim "std/[os, tables, strutils, math]"
 import nim "std/osproc"
 import nim "backend"
 import nim "quant"
 import nim "session_vm"
 import nim "vendor/bybylang/gpubackend"
+import nim "vendor/bybylang/probe"
 import nim "vendor/bybylang/backends/cpu/cpu_backend"
 import nim "../firlift/firlift"
 import nim "../firlift/steps"
@@ -177,6 +178,125 @@ function embeddingFixture(root: string)
         firFreeGraph(model)
     echo "PASS unmarked per-token embedding uploads: inferred arbitrary checkpoint name, native NIMQ loading, separate CPU input slot; bit-for-bit for three tokens"
 
+function shortLogitsFixture(root: string)
+    # The logits read covers only the first vocabulary-sized part of a longer scratch buffer, so the
+    # logits role sits on a view that no node names. The lifter must still emit that view.
+    let cfg = "{\"hidden_size\":4,\"num_hidden_layers\":1,\"vocab_size\":3,\"max_position_embeddings\":8}"
+    writeFile(root / "config.json", cfg)
+    let table = @[1'f32, 2'f32, 3'f32, 4'f32, 10'f32, 20'f32, 30'f32, 40'f32, -1'f32, -2'f32, -3'f32, -4'f32]
+    saveQuantStateDict(root / "model.nimq", [3, 4, 1, 1, 1], @[("arbitrary.table", quantizeRaw(table, @[3, 4]))])
+    firProbeStart(root / "short.fprobe")
+    var logits = sessionAllocScratch(gbCpu, 5)
+    var program: VmProgram
+    program.emitULid(0)
+    program.emitULoadIn(1, 0)
+    program.emitAddConst(2, 1, 1'f32)
+    program.emitUStoreF32(2, 0)
+    program.emitHalt()
+    var expected: seq[seq[float32]]
+    for token in 0 ..< 3:
+        var row = sessionUpload(gbCpu, table[token*4 ..< token*4+4])
+        doAssert sessionBegin(gbCpu)
+        doAssert cpu_backend.vmRun(program.words, logits.cpuData, row.cpuData, 3, 0, 3)
+        doAssert sessionEnd(gbCpu)
+        expected.add(sessionRead(gbCpu, logits, 3))
+        sessionFree(gbCpu, row)
+    firProbeStop()
+    var trace = parseTrace(readFile(root / "short.fprobe"))
+    trace.sourcePath = root / "short.fprobe"
+    let selected = selectStep(trace, 1)
+    let lifted = liftSession(selected.trace, cfg, "short_logits_fixture", "", false, root / "model.nimq")
+    var logitsViews = 0
+    for line in lifted.splitLines():
+        let words = line.splitWhitespace()
+        if words.len == 6 and words[0] == "view" and words[5] == "output:logits":
+            inc logitsViews
+            doAssert words[4] == "3", "the logits view must hold exactly the vocabulary: " & line
+    doAssert logitsViews == 1, "the lifted file must declare the logits view"
+    writeFile(root / "model.fir", lifted)
+    if lifted.contains(" trace.data "):
+        copyFile(root / "short.fprobe.data", root / "trace.data")
+    let graph = firParse(root / "model.fir")
+    let logitsName = firRoleBuffer(graph, "logits")
+    doAssert graph.buffers[logitsName].viewOf.len > 0 and graph.buffers[logitsName].elements == 3
+    var model = firLoadGraph(graph, root / "model.nimq", newBackend("cpu"))
+    try:
+        for token in 0 ..< 3:
+            bitsEqual(expected[token], firGraphStep(model, token))
+    finally:
+        firFreeGraph(model)
+    echo "PASS logits role on a view over a longer scratch buffer: the lifter emits the view, the runner reads the vocabulary through it; bit-for-bit for three tokens"
+
+function ropeUploadFixture(root: string)
+    # With D=4 and two rows, each cos/sin table has four elements: exactly hidden_size.
+    # This is the same size collision that produced two phantom one-row phases on T4.
+    let cfg = "{\"hidden_size\":4,\"num_hidden_layers\":1,\"vocab_size\":4,\"max_position_embeddings\":16,\"rope_theta\":10000}"
+    writeFile(root / "config.json", cfg)
+    let table = @[1'f32, 2'f32, 3'f32, 4'f32, 2'f32, 3'f32, 4'f32, 5'f32, 3'f32, 4'f32, 5'f32, 6'f32, 4'f32, 5'f32, 6'f32, 7'f32]
+    saveQuantStateDict(root / "model.nimq", [4, 4, 1, 1, 1], @[("model.embed_tokens.weight", quantizeRaw(table, @[4, 4]))])
+    firProbeStart(root / "rope.fprobe")
+    var logits = sessionAllocScratch(gbCpu, 4)
+    probeStepBegin("prefill", 0, 0, 0, 4)
+    for chunk in 0 ..< 2:
+        doAssert sessionBegin(gbCpu)
+        var x = sessionUpload(gbCpu, table[chunk*8 ..< chunk*8+8])
+        var cosine, sine: seq[float32]
+        for row in 0 ..< 2:
+            for pair in 0 ..< 2:
+                let angle = float32(chunk*2+row) / pow(10000'f32, float32(pair)/2'f32)
+                cosine.add(cos(angle))
+                sine.add(sin(angle))
+        var c = sessionUpload(gbCpu, cosine)
+        var s = sessionUpload(gbCpu, sine)
+        doAssert sessionRope(gbCpu, x, c, s, 2, 1, 4)
+        doAssert sessionCopyInto(gbCpu, x, logits, 4, 0, 4)
+        doAssert sessionEnd(gbCpu)
+        discard sessionRead(gbCpu, logits, 4)
+        sessionFree(gbCpu, x)
+        sessionFree(gbCpu, c)
+        sessionFree(gbCpu, s)
+    probeStepEnd()
+    probeStepBegin("decode", 4, 4, 0, 1)
+    doAssert sessionBegin(gbCpu)
+    var x = sessionUpload(gbCpu, table[0 ..< 4])
+    var c = sessionUpload(gbCpu, @[cos(4'f32), cos(0.04'f32)])
+    var s = sessionUpload(gbCpu, @[sin(4'f32), sin(0.04'f32)])
+    doAssert sessionRope(gbCpu, x, c, s, 1, 1, 4)
+    doAssert sessionCopyInto(gbCpu, x, logits, 0, 0, 4)
+    doAssert sessionEnd(gbCpu)
+    discard sessionRead(gbCpu, logits, 4)
+    probeStepEnd()
+    firProbeStop()
+    var trace = parseTrace(readFile(root / "rope.fprobe"))
+    trace.sourcePath = root / "rope.fprobe"
+    let lifted = liftSession(trace, cfg, "rope_fixture", "", false, root / "model.nimq")
+    doAssert not lifted.contains("rows=1\n"), "RoPE tables must not become singleton phases"
+    doAssert not lifted.contains("rope_table"), "host tables must become position-derived RoPE"
+    writeFile(root / "model.fir", lifted)
+    if lifted.contains(" trace.data "):
+        copyFile(root / "rope.fprobe.data", root / "trace.data")
+    let graph = firParse(root / "model.fir")
+    doAssert graph.phaseOrder.len == 2
+    for name in graph.phaseOrder:
+        doAssert graph.phases[name] == 2
+    var model = firLoadGraph(graph, root / "model.nimq", newBackend("cpu"))
+    try:
+        # Replay a recorded phase at both recorded and unrecorded positions. Frozen
+        # host cos/sin tables would pass at the original position and fail after it.
+        for pass in 0 ..< 3:
+            let position = pass*2+1
+            let actual = firGraphPhase(model, graph.phaseOrder[pass mod 2], @[0, 1])
+            doAssert actual.len == 4
+            for pair in 0 ..< 2:
+                let angle = float32(position) / pow(10000'f32, float32(pair)/2'f32)
+                let lo = table[4+pair]
+                let hi = table[6+pair]
+                doAssert abs(actual[pair] - (lo*cos(angle)-hi*sin(angle))) < 0.00001'f32
+                doAssert abs(actual[pair+2] - (hi*cos(angle)+lo*sin(angle))) < 0.00001'f32
+    finally:
+        firFreeGraph(model)
+    echo "PASS hidden-sized RoPE uploads: two real prefill phases, strict parser, position-derived replay at unseen positions"
+
 function selectionTest()
     var synthetic = "fprobe 2\nbackend cpu\n"
     var id = 0
@@ -224,6 +344,8 @@ createDir(root)
 try:
     fixture(root)
     embeddingFixture(root)
+    shortLogitsFixture(root)
+    ropeUploadFixture(root)
     selectionTest()
     tokenizerContract(root)
 finally:

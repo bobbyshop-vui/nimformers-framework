@@ -6,8 +6,8 @@ Chạy các lệnh bên dưới từ thư mục gốc repository.
 Kết quả benchmark được ghi riêng theo model tại
 [`benchmark.md`](benchmark.md): [187M](benchmark.md#mamba-3-siso-187m)
 và [1.5B](benchmark.md#mamba-3-siso-15b). Lượt 1.5B mới nhất trên Intel Iris Plus
-Graphics 640/Metal đạt prefill 9.88 tok/s và decode 4.89 tok/s; đo một lượt,
-không tính load model/merge LoRA và không gộp với kết quả 187M.
+Graphics 640/Metal đạt prefill 10.10 tok/s và decode 4.90 tok/s; đo một lượt,
+không tính setup/JIT kernel, load model hay merge LoRA và không gộp với kết quả 187M.
 
 ## Hai model và assets hiện có
 
@@ -188,8 +188,10 @@ dispatch trong một command buffer/token. `m3_onedispatch.nim` cung cấp đư�
 one-dispatch tùy chọn. Bounded GPU merge đã tích hợp và smoke mở rộng đã merge
 17/17 adapter; decode sau merge trên persistent stack khớp resident decode.
 
-Trên Metal, prefill và token đầu tiên bao gồm thời gian setup/JIT; thống kê tốc
-độ tách phần setup kernel nhưng vẫn giữ tổng wall time. Runtime truyền các
+Trên Metal, prefill và token đầu tiên có thời gian setup/JIT kernel một lần; tốc
+độ prefill và decode do `infer_lora_bin` in ra không tính phần setup này (nó được
+in riêng ở dòng `kernel setup/JIT`), còn dòng `Total` vẫn là wall time đã gồm
+setup. Runtime truyền các
 offset của address và gamma dưới dạng descriptor GPU `uint32` thô theo từng
 layer, nhờ đó helper có cùng shape/T có thể dùng lại một kernel qua cả 24 layer.
 Đây là cách truyền tham số mới, không đổi phép tính; đường static OD vẫn được
@@ -199,6 +201,90 @@ tăng theo số layer. Đặt
 `BYBY_METAL_JIT_LOG=0` để ẩn log thông tin `[metal_jit]` về kernel và archive;
 `BYBY_METAL_JIT_LOG=1` hoặc không đặt biến sẽ bật lại. Warning và error vẫn được
 in.
+
+### Decode graph, profiling and opt-in switches
+
+All of these are off by default. The default decode path is the resident
+multi-dispatch path with the LoRA adapters merged in place.
+
+- `BYBY_GRAPH=1` records one decode step into a Metal indirect command buffer
+  (ICB) and replays it for the following tokens. A pipeline used inside an ICB
+  must be created with `supportIndirectCommandBuffers`. JIT pipelines were
+  compiled without it, so on Intel the replay silently did nothing: the logits
+  stayed zero and every step sampled the same junk token (`!`). The runtime now
+  builds an ICB-capable variant of a JIT pipeline lazily, the first time a graph
+  records that kernel; `BYBY_JIT_ICB=0` restores the old behavior and exists
+  only to reproduce the failure. `test_m3_graph_vm.nim` checks this without a
+  model (build and run instructions are in its header; it fails with
+  `BYBY_JIT_ICB=0` and passes otherwise). With the fix, graph and eager decode
+  print identical text for the same prompt. On Intel Iris Plus 640 decode is
+  bound by GPU time, so the graph does not beat the default path, and its first
+  replay costs a few seconds while the driver finalizes the ICB pipelines
+  (reported as kernel setup/JIT, not as decode time). It stays opt-in until it
+  has been checked on an Apple GPU.
+- `BYBY_M3_PROFILE=1` prints one `[m3-profile]` line per decode step with the
+  host encode time, the GPU wait time and the logits read time, to tell
+  GPU-bound steps from host-bound ones.
+- `BYBY_SIMD_REDUCE=1` replaces the barrier-tree threadgroup reduction
+  (RMSNorm sums and similar) with a simdgroup reduction. It was slower on Intel
+  Iris Plus 640 and has not been measured on an Apple GPU, so the barrier tree
+  stays the default. `test/codestral/test_tg_simd_reduce.nim` compares both
+  variants numerically for every power-of-two threadgroup size and checks that
+  the caller's integer registers survive the reduction.
+- `BYBY_METAL_JIT_ARCHIVE_SAVE=0` skips saving the Metal JIT archive at exit.
+  On Intel the save can take minutes.
+
+The repetition penalty of `sampleToken` (Mamba-3 and Codestral inference) walks
+the recent window once instead of scanning it for every vocabulary entry, so
+sampling no longer adds a vocabulary-times-window loop to each decoded token;
+the adjusted logits and the chosen token are unchanged.
+
+### Prefill scheduler (micro-batches)
+
+The prompt goes through prefill the way the DeepSeek path (`nim_inference.nim`)
+does it: in micro-batches of rows, each micro-batch in command buffers that suit
+the device. `runPrefillStack` in `m3_gpu_runtime.nim` splits a micro-batch by
+layers.
+
+- Micro-batch size: the arena capacity, `MAMBA3_PREFILL_CHUNK` (128 rows by
+  default). `BYBY_UBATCH=N` sets it directly (llama.cpp's `n_ubatch`) and grows
+  the arena if N is larger (at most 2048).
+- Where the OS limits how long one command buffer may run (Intel/AMD Macs on
+  Metal, Vulkan: `sessionPacesCommandBuffers`), a micro-batch goes through in
+  command buffers of about `BYBY_PREFILL_CB_MS` of GPU time (default 300). The
+  first command buffer of a process is one layer; after that the layers per
+  command buffer follow the measured time per layer and row. If even one layer
+  of a micro-batch would not fit the budget, the micro-batch shrinks (halving,
+  never below 8 rows). `BYBY_PREFILL_CB_MS=0` turns the pacing off.
+- On Apple GPUs a micro-batch is one command buffer that is committed, without
+  waiting, after every `BYBY_PREFILL_LAYERS_PER_CB` layers (default 4), so the
+  GPU starts on the first layers while the host still encodes the rest; 0 keeps
+  one commit per micro-batch. This path has not been measured on an Apple GPU.
+- `BYBY_PREFILL_LOG=1` prints one line per prefill command buffer (rows, layers,
+  encode + GPU ms). `BYBY_PREFILL_BENCH=N` times the prompt's prefill N times
+  under each mode inside one process (one untimed warm-up round, modes
+  interleaved); results are in [`benchmark.md`](benchmark.md).
+
+The mode does not change the result: on Intel, a 176-token prompt gives the same
+step-0 logit fingerprint and the same text with the scheduler on and off. On the
+187M model and the Intel GPU the pacing is about 5-7% slower than one command
+buffer per micro-batch; it exists to keep command buffers short for larger models.
+
+The kernels that scan a chunk are specialized for the chunk length, so every new
+length compiles its own kernel set the first time it is used (0.5-1 s on Intel).
+That is the cold-start cost `infer_lora_bin` prints as `kernel setup/JIT`; the
+`Prefill` and `Decode` speeds it prints leave it out, and `Total` is wall time
+with it.
+
+`formers-cli -cnv` (`other/formers.n`) uses the same scheduler. A turn goes
+through `formersFeedChat`: all tokens but the last in chunks of 128, 32 and 8 rows
+(`m3PrefillBuckets`), the fewer than 8 left over as decode steps, and the last
+token as a decode step with logits. Only these chunk lengths exist, so
+`ready: warmup` (`formersWarmupChat`) compiles every kernel set before the first
+prompt and no turn pays for JIT; `--no-warmup` skips it. `BYBY_CHAT_PREFILL=0`
+feeds every chat token as a decode step instead, the reference the chunked feed
+was compared against: three turns at `--temp 0`, including a 179-token turn that
+uses all three chunk lengths, give the same text in both modes.
 
 Lượt kiểm tra ngày 2026-11-05 trên Intel Iris Plus 640/Metal, checkpoint 1.5B
 `runs/mamba3-1.5b/lora-g1.bin`, prompt
