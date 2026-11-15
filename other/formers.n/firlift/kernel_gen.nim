@@ -11,7 +11,7 @@
 ## optimization layered on the same ports.
 
 import std/[strutils, math]
-from session_vm import q4CoopRowTile
+from session_vm import q4CoopRowTile, q4GemvSupported, q4GemvThreadCount, Q4GemvDefaultRows, Q4GemvThreads
 
 const RegLimit* = 256   ## register index limit of the VM encoding; a kernel declares only what it uses
 
@@ -2199,6 +2199,20 @@ proc genMatmulQ4TensorCore*(M, K, N, groupSize, nGroups: int): Gen =
   result = Gen(body: "q4coop " & $M & " " & $K & " " & $N & " " & $groupSize & " " & $nGroups,
     threads: rows * cols * 128, ins: 2, outs: 1, tg: 128,
     tgBytes: (bm * 72 + 64 * 72) * 2 + 4 * 256 * 4)
+  genHiR = 0
+  genHiU = 0
+
+proc genMatmulQ4SubgroupMicro*(M, K, N, groupSize, nGroups: int): Gen =
+  ## Vulkan FIR micro-kernel for Q4 decode GEMV. The VM instruction carries the shape;
+  ## the Vulkan JIT lowers it into a dedicated shader with the algorithm of the native
+  ## decode kernel (coalesced uvec4 weight loads, scale/zero once per load unit,
+  ## subgroup or shared-memory sum). It is one ordinary custom FIR micro node.
+  if M <= 0 or N <= 0 or not q4GemvSupported(K, groupSize, nGroups):
+    raise newException(GenError, "Q4 subgroup GEMV micro-kernel requires K and the group size divisible by 8 and a group size dividing K")
+  # Default grid; the FIR runtime picks the rows per subgroup per device and sizes the grid itself.
+  result = Gen(body: "q4gemv " & $M & " " & $K & " " & $N & " " & $groupSize & " " & $nGroups,
+    threads: q4GemvThreadCount(M, N, Q4GemvDefaultRows), ins: 2, outs: 1, tg: Q4GemvThreads,
+    tgBytes: Q4GemvThreads * 4)
   genHiR = 0
   genHiU = 0
 

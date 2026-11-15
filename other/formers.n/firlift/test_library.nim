@@ -604,9 +604,10 @@ proc sessionTests2() =
       let weightFloats = if spacked > 0: spacked else: (sn * (sk div 2) + 3) div 4 + 2 * sn * sng
       let program = assemble(sg.body, 2, 1, @[sm * sk, weightFloats], @[sm * sn], 1e-5'f32, slotLayout = true)
       doAssert ("const uint BM = " & $q4CoopRowTile(sm, sn) & "u;") in lowerBytecodeToGlsl(program, "q4_tc_default")
-      for tile in Q4CoopRowTiles:
-        let shader = lowerQ4CoopGlsl(program, "q4_tensor_core_source_test", tile)
-        let tag = "M" & $sm & " K" & $sk & " N" & $sn & " tile " & $tile
+      for (tile, frags) in [(16, 1), (32, 1), (64, 1), (16, 2), (32, 2), (64, 2)]:
+        let shader = lowerQ4CoopGlsl(program, "q4_tensor_core_source_test", tile, frags)
+        let tag = "M" & $sm & " K" & $sk & " N" & $sn & " tile " & $tile & " fragments " & $frags
+        doAssert ("const uint FRAGS = " & $frags & "u;") in shader, tag
         doAssert "GL_KHR_cooperative_matrix" in shader
         doAssert "coopMatMulAdd" in shader
         doAssert "sessionMatmulQ4" notin shader
@@ -626,6 +627,75 @@ proc sessionTests2() =
           if compileCode != 0:
             raise newException(ValueError, "glslc rejected the Q4 Tensor Core micro shader " & tag & ": " & compileOutput)
           echo "PASS Q4 Tensor Core micro shader glslc compile ", tag
+
+  # Vulkan Q4 decode GEMV with the native decode algorithm is a shape-op micro-kernel too.
+  # The CPU VM runs the same instruction as a scalar reference; the Vulkan JIT lowers it to
+  # the subgroup or shared-memory shader the runtime picks per device.
+  block:
+    for (M, K, N, gs) in [(1, 64, 40, 32), (2, 72, 24, 8), (1, 128, 33, 64)]:
+      let nG = K div gs
+      let bpr = K div 2
+      var q = newSeq[int](N*K)
+      var bytes = newSeq[uint8](N*bpr)
+      for n in 0 ..< N:
+        for kk in 0 ..< K:
+          q[n*K + kk] = (n*7 + kk*5 + kk div 7 + 3) mod 16
+          let b = n*bpr + kk div 2
+          bytes[b] = bytes[b] or uint8(q[n*K + kk] shl (if kk mod 2 == 0: 0 else: 4))
+      let scales = fill(N*nG, 0.23, 0.05)
+      let zeros = fill(N*nG, 7.1, 1.9)
+      var a = newSeq[float32](M*K)
+      for i in 0 ..< a.len: a[i] = float32((i*11 mod 37) - 18) / 27
+      var want = newSeq[float32](M*N)
+      for m in 0 ..< M:
+        for n in 0 ..< N:
+          var sum = 0.0'f32
+          for kk in 0 ..< K:
+            let gi = n*nG + kk div gs
+            sum += a[m*K + kk] * ((float32(q[n*K + kk]) - zeros[gi]) * scales[gi])
+          want[m*N + n] = sum
+      let packed = bytesAsFloats(bytes) & scales & zeros
+      var g = genMatmulQ4SubgroupMicro(M, K, N, gs, nG)
+      let tag = "M" & $M & " K" & $K & " N" & $N & " group " & $gs
+      doAssert g.tg == 128 and "q4gemv " in g.body, tag
+      doAssert g.threads == q4GemvThreadCount(M, N, Q4GemvDefaultRows), tag
+      for rows in Q4GemvRowChoices:
+        g.threads = q4GemvThreadCount(M, N, rows)
+        chkResidentQ4("subgroup_micro GEMV " & tag & " grid for rows " & $rows, g, a, packed, want)
+    doAssert q4GemvRowsPerGroup(2) == 8
+    doAssert q4GemvThreadCount(1, 4096, 2) == 512 * 128
+    doAssert q4GemvThreadCount(1, 11008, 4) == 688 * 128
+    doAssert q4GemvThreadCount(3, 40, 1) == 3 * 10 * 128
+    doAssert not q4GemvSupported(130, 32, 5) and not q4GemvSupported(64, 4, 16)
+
+    let glslc = findExe("glslc")
+    for (sk, sn, sgs) in [(4096, 4096, 128), (11008, 4096, 128), (4096, 11008, 64), (4096, 32256, 32), (72, 24, 8)]:
+      let sng = sk div sgs
+      let sg = genMatmulQ4SubgroupMicro(1, sk, sn, sgs, sng)
+      let weightFloats = (sn * (sk div 2) + 3) div 4 + 2 * sn * sng
+      let program = assemble(sg.body, 2, 1, @[sk, weightFloats], @[sn], 1e-5'f32, slotLayout = true)
+      doAssert "#define SHARED_REDUCE 1" in lowerBytecodeToGlsl(program, "q4_gemv_default")
+      for rows in Q4GemvRowChoices:
+        for sharedReduce in [true, false]:
+          let shader = lowerQ4GemvGlsl(program, "q4_gemv_source_test", rows, sharedReduce)
+          let tag = "K" & $sk & " N" & $sn & " group " & $sgs & " rows " & $rows & (if sharedReduce: " shared" else: " subgroup")
+          doAssert ("#define ROWS " & $rows) in shader, tag
+          doAssert ("#define VEC " & (if sk mod 32 == 0 and sgs mod 32 == 0: "4" else: "1")) in shader, tag
+          doAssert "sessionMatmulQ4" notin shader
+          if glslc.len > 0:
+            let shaderPath = getTempDir() / ("fir_q4_gemv_" & $getCurrentProcessId() & ".comp")
+            let spvPath = shaderPath & ".spv"
+            writeFile(shaderPath, shader)
+            let compile = startProcess(glslc, args = ["--target-env=vulkan1.1", "-o", spvPath, shaderPath],
+              options = {poUsePath, poStdErrToStdOut})
+            let compileOutput = compile.outputStream.readAll()
+            let compileCode = compile.waitForExit()
+            compile.close()
+            if fileExists(shaderPath): removeFile(shaderPath)
+            if fileExists(spvPath): removeFile(spvPath)
+            if compileCode != 0:
+              raise newException(ValueError, "glslc rejected the Q4 GEMV micro shader " & tag & ": " & compileOutput)
+          echo "PASS Q4 subgroup GEMV micro shader ", tag
 
   # argmax keeps the first maximum
   block:

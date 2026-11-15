@@ -326,10 +326,12 @@ proc addKernelNode(l: SessionLift; op: Op; hint: string; g: Gen; ins, outs: seq[
     ins: ins, outs: outAll)
 
 proc q4TensorCoreKernel(k: SKern): bool =
+  ## A shape-op Q4 micro-kernel (Tensor Core GEMM or subgroup GEMV): one instruction the
+  ## Vulkan JIT lowers whole, so it is never merged into a chain of raw kernels.
   let words = k.body.splitWhitespace()
   if words.len < 2 or words[0] != "words": return false
   try:
-    result = (uint32(parseHexInt(words[1])) and 0xFF'u32) == OP_Q4_COOP_GEMM
+    result = (uint32(parseHexInt(words[1])) and 0xFF'u32) in [OP_Q4_COOP_GEMM, OP_Q4_GEMV]
   except ValueError:
     result = false
 
@@ -621,6 +623,15 @@ proc q4WordParallel(k, n, group, nGroups: int; maxK = high(int)): tuple[gen: Gen
     result.gen = genMatmulQ4Par(1, k, n, group, nGroups, q4ParallelLanes(), false, true)
     result.variant = q4ParallelVariant(result.gen, false)
 
+proc q4SubgroupGemv(l: SessionLift; m, k, n, group, nGroups: int): tuple[gen: Gen, variant: string] =
+  ## Vulkan decode GEMV with the native decode kernel's algorithm, as a FIR shape-op micro-kernel.
+  if l.trace.backend != "vulkan":
+    fail("FIRLIFT_Q4_GEMV=subgroup requires a Vulkan trace; this kernel is lowered by the Vulkan JIT")
+  if not q4GemvSupported(k, group, nGroups):
+    fail("FIRLIFT_Q4_GEMV=subgroup needs K and the group size divisible by 8 (K=" & $k & ", group=" & $group & ")")
+  result.gen = genMatmulQ4SubgroupMicro(m, k, n, group, nGroups)
+  result.variant = "subgroup_micro"
+
 proc q4WordAutoMaxK(): int =
   ## The word kernel wins on K=4096 on the tested Iris Vulkan device, but loses on K=11008.
   ## Keep auto conservative; a device can tune this threshold, or set it to 0 to disable it.
@@ -647,7 +658,7 @@ proc lowerMatmulQ4(l: SessionLift; op: Op) =
   var gen: Gen
   var variant = ""
   if m == 1:
-    let choice = q4Choice("FIRLIFT_Q4_GEMV", "auto", ["auto", "scalar", "scalar_fma", "fma", "parallel", "parallel_fma", "simd", "word_parallel"])
+    let choice = q4Choice("FIRLIFT_Q4_GEMV", "auto", ["auto", "scalar", "scalar_fma", "fma", "parallel", "parallel_fma", "simd", "word_parallel", "subgroup", "subgroup_micro"])
     case choice
     of "scalar":
       gen = genMatmulQ4(m, k, n, group, nGroups, 0, true, false, true)
@@ -667,6 +678,9 @@ proc lowerMatmulQ4(l: SessionLift; op: Op) =
     of "word_parallel":
       let word = q4WordParallel(k, n, group, nGroups)
       gen = word.gen; variant = word.variant
+    of "subgroup", "subgroup_micro":
+      let sg = l.q4SubgroupGemv(m, k, n, group, nGroups)
+      gen = sg.gen; variant = sg.variant
     else:
       if genericKernels():
         gen = genMatmulQ4Par(m, k, n, group, nGroups, parLanes(), false, true)
@@ -675,7 +689,11 @@ proc lowerMatmulQ4(l: SessionLift; op: Op) =
         let simd = q4SimdGemv(k, n, group, nGroups)
         gen = simd.gen; variant = simd.variant
       else:
-        if l.trace.backend == "vulkan":
+        if l.trace.backend == "vulkan" and q4GemvSupported(k, group, nGroups):
+          # The native decode algorithm as a FIR micro-kernel: the fastest Vulkan GEMV.
+          let sg = l.q4SubgroupGemv(m, k, n, group, nGroups)
+          gen = sg.gen; variant = sg.variant
+        elif l.trace.backend == "vulkan":
           let word = q4WordParallel(k, n, group, nGroups, q4WordAutoMaxK())
           gen = word.gen; variant = word.variant
         else:

@@ -34,6 +34,7 @@ type
     metaOffset*: int                ## position-independent kernel: float offset of this node's address table in the arena (-1: none)
     coopTiles*: seq[int]            ## Q4 Tensor Core micro-kernel: row tiles built for this node (chosen per dispatch)
     coopNames*, coopSources*: seq[string]
+    gemvRows*: int                  ## Q4 subgroup GEMV micro-kernel: output rows per 32 invocations (0: not one)
   FirGraph* = object
     graph*: FirProgram
     registry*: FirRegistry
@@ -73,6 +74,9 @@ type
     computeUnits*: int                        ## SM/CU count of the device (0: unknown); sizes Q4 Tensor Core tiles
     coopForcedRows*: int                      ## BYBY_FIR_Q4_COOP_ROWS: fixed Q4 Tensor Core row tile (0: per dispatch)
     coopPerUnit*: int                         ## BYBY_FIR_Q4_COOP_WG_PER_UNIT: workgroups each SM/CU should get
+    coopFragments*: int                       ## 16-column fragments per subgroup of the Q4 Tensor Core shader (1 with 32-wide subgroups)
+    gemvRows*: int                            ## BYBY_FIR_Q4_GEMV_ROWS: output rows per subgroup of the Q4 GEMV micro-kernel
+    gemvSubgroupSum*: bool                    ## Q4 GEMV micro-kernel sums with subgroupAdd (32-wide subgroups guaranteed)
 
 function fgTensorName(buffer: FirBuffer, layer: int): string
     buffer.tensorName.replace("{i}", $layer)
@@ -561,6 +565,24 @@ function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): 
         if result.coopForcedRows notin Q4CoopRowTiles:
             raise newException(ValueError, "BYBY_FIR_Q4_COOP_ROWS must be 16, 32 or 64")
     let coopVerbose = getEnv("BYBY_FIR_Q4_COOP_VERBOSE", "0") != "0"
+    var coopLogged = initTable[string, bool]()
+    # Q4 micro-kernels follow the device: subgroup sums and one Tensor Core fragment per
+    # subgroup need compute subgroups that are exactly 32 wide (NVIDIA guarantees it).
+    let fixedWidth = gpuFixedSubgroupWidth(be)
+    result.coopFragments = if fixedWidth == 32: 1 else: 2
+    result.gemvSubgroupSum = fixedWidth == 32
+    result.gemvRows = parseInt(getEnv("BYBY_FIR_Q4_GEMV_ROWS", $Q4GemvDefaultRows))
+    if result.gemvRows notin Q4GemvRowChoices:
+        raise newException(ValueError, "BYBY_FIR_Q4_GEMV_ROWS must be 1, 2 or 4")
+    let gemvReduce = getEnv("BYBY_FIR_Q4_GEMV_REDUCE", "auto").toLowerAscii()
+    if gemvReduce == "shared":
+        result.gemvSubgroupSum = false
+    elif gemvReduce == "subgroup":
+        if fixedWidth != 32:
+            raise newException(ValueError, "BYBY_FIR_Q4_GEMV_REDUCE=subgroup needs 32-wide compute subgroups; this Vulkan device does not guarantee them")
+        result.gemvSubgroupSum = true
+    elif gemvReduce != "auto":
+        raise newException(ValueError, "BYBY_FIR_Q4_GEMV_REDUCE must be auto, subgroup or shared")
     var cfg = defaultJitConfig()
     cfg.enableMetalJit = be == gbMetal
     cfg.hotThreshold = 1
@@ -609,6 +631,8 @@ function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): 
                             raise newException(ValueError, "FIR Q4 Tensor Core micro-kernel requires Vulkan KHR_cooperative_matrix support")
                     elif be != gbCpu:
                         raise newException(ValueError, "FIR Q4 Tensor Core micro-kernel is Vulkan-only")
+                if isQ4GemvProgram(kernel.program) and be notin [gbVulkan, gbCpu]:
+                    raise newException(ValueError, "FIR Q4 subgroup GEMV micro-kernel is Vulkan-only; re-lift with FIRLIFT_Q4_GEMV=simd or word_parallel")
                 var prepared = FgResidentProgram(kernel: kernel, stage: staged, metaOffset: -1)
                 if kernel.relocBuffers.len > 0:
                     prepared.metaOffset = result.bindings.memoryFloats + metaFloats
@@ -633,12 +657,23 @@ function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): 
                                 let tileName = prepared.name & "_r" & $tile
                                 prepared.coopTiles.add(tile)
                                 prepared.coopNames.add(tileName)
-                                prepared.coopSources.add(lowerQ4CoopGlsl(kernel.program, tileName, tile))
+                                prepared.coopSources.add(lowerQ4CoopGlsl(kernel.program, tileName, tile, result.coopFragments))
                                 jobs.add((tileName, prepared.coopSources[^1]))
                         prepared.source = prepared.coopSources[prepared.coopTiles.find(fgQ4CoopTile(result, shape.M, shape.N))]
-                        if coopVerbose and layer == 0:
+                        if coopVerbose and not coopLogged.hasKey(node.op):
+                            coopLogged[node.op] = true
                             let fullTile = fgQ4CoopTile(result, shape.M, shape.N)
-                            stderr.writeLine("[fir] Q4 Tensor Core " & node.op & " K=" & $shape.K & " N=" & $shape.N & " M=" & $shape.M & ": row tile " & $fullTile & " (tiles built " & $prepared.coopTiles & ", " & $result.computeUnits & " SM/CU)")
+                            stderr.writeLine("[fir] Q4 Tensor Core " & node.op & " K=" & $shape.K & " N=" & $shape.N & " M=" & $shape.M & ": row tile " & $fullTile & " (tiles built " & $prepared.coopTiles & ", " & $result.computeUnits & " SM/CU, " & $result.coopFragments & " fragment(s) per subgroup)")
+                    elif isQ4GemvProgram(kernel.program):
+                        # Rows per subgroup and the reduction follow the device; the grid follows from them.
+                        prepared.gemvRows = result.gemvRows
+                        prepared.name = prepared.name & "_r" & $result.gemvRows & (if result.gemvSubgroupSum: "_sg" else: "_shm")
+                        prepared.source = lowerQ4GemvGlsl(kernel.program, prepared.name, result.gemvRows, not result.gemvSubgroupSum, kernel.tgSize)
+                        jobs.add((prepared.name, prepared.source))
+                        if coopVerbose and not coopLogged.hasKey(node.op):
+                            coopLogged[node.op] = true
+                            let shape = q4GemvShape(kernel.program)
+                            stderr.writeLine("[fir] Q4 GEMV " & node.op & " K=" & $shape.K & " N=" & $shape.N & ": " & $result.gemvRows & " row(s) per subgroup, " & (if result.gemvSubgroupSum: "subgroupAdd" else: "shared-memory sum"))
                     else:
                         prepared.source = glslSourceFor(jit, kernel.program, node.op)
                         # Subgroup kernels (FIRLIFT_Q4_GEMV=simd) size their grid for 32-lane subgroups.
@@ -1078,6 +1113,11 @@ function fgEncodeMicroBody(model: var FirGraph, prepared: FgResidentProgram, nod
             pipelineName = prepared.coopNames[index]
             pipelineSource = prepared.coopSources[index]
             threads = ((rows + tile - 1) div tile) * ((shape.N + 63) div 64) * k.tgSize
+        elif vk and prepared.gemvRows > 0:
+            # Q4 subgroup GEMV micro-kernel: one workgroup per ROWS*tg/32 output rows of each activation row.
+            let shape = q4GemvShape(k.program)
+            let rows = if model.activeRows > 0: min(shape.M, model.activeRows) else: shape.M
+            threads = q4GemvThreadCount(rows, shape.N, prepared.gemvRows, k.tgSize)
         if not sessionEncPipeline(vk, pipelineName, pipelineSource):
             return false
         for i in 0 .. 4:
@@ -1086,6 +1126,9 @@ function fgEncodeMicroBody(model: var FirGraph, prepared: FgResidentProgram, nod
             let slot = if vk: i else: i+1
             let handle = fgPortHandle(model, k.slotBuffers[i], layer)
             let offset = if k.slotAnchor[i] >= 0: k.slotAnchor[i] else: fgPortOffset(model, k.slotBuffers[i], layer)
+            if vk and i in [1, 3] and offset mod 4 != 0 and (prepared.coopTiles.len > 0 or prepared.gemvRows > 0):
+                # These shaders read the weights as uvec4 and the activations as vec4.
+                raise newException(ValueError, "FIR Q4 micro-kernel " & node.op & ": " & k.slotBuffers[i] & " starts at float " & $offset & ", not on a 16-byte boundary")
             if not sessionEncBindVkOrMetal(vk, slot, handle.metalHandle, handle.vulkanHandle, offset):
                 return false
         if not sessionEncTgBytes(vk, 0, k.tgBytes):
