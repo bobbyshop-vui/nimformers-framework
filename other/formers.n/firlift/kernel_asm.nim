@@ -138,6 +138,8 @@ proc assemble*(body: string; ins, outs: int; inSize, outSize: seq[int]; eps: flo
     of "mmloadt": result.emitMmLoad(parseInt(a[0]).uint32, parseInt(a[1]).uint32, 1, uint32(evalExpr(a[2], syms)))
     of "mmstoretg": result.emitMmStoreTg(parseInt(a[0]).uint32, parseInt(a[1]).uint32, uint32(evalExpr(a[2], syms)))
     of "mmstoremem": result.emitMmStoreMem(parseInt(a[0]).uint32, parseInt(a[1]).uint32, uint32(evalExpr(a[2], syms)))
+    of "q4coop": result.emitQ4CoopGemm(uint32(evalExpr(a[0], syms)), uint32(evalExpr(a[1], syms)),
+      uint32(evalExpr(a[2], syms)), uint32(evalExpr(a[3], syms)), uint32(evalExpr(a[4], syms)))
     of "simdw": result.emitSimdW(parseInt(a[0]).uint32)
     of "simdgid": result.emitSimdGid(parseInt(a[0]).uint32)
     of "simdsum": result.emitSimdSum(parseInt(a[0]).uint32, parseInt(a[1]).uint32)

@@ -3,8 +3,9 @@
 ## Each kernel body is assembled with the same mnemonic set the FIR kernel
 ## parser accepts and executed on the production CPU VM. A plain Nim loop is the
 ## independent reference; the tolerance is 1e-4.
-import std/[math, strutils, tables]
+import std/[math, strutils, tables, os, osproc, streams]
 import session_vm
+import jit_vm
 import backends/cpu/cpu_backend as cpu
 import ./kernel_library
 import ./kernel_gen
@@ -518,6 +519,62 @@ proc sessionTests2() =
       let resident = genMatmulQ4Gemm(M, K, N, gs, nG, bm, bn, tm, tn, true)
       chkResidentQ4("tiled M" & $M & " K" & $K & " N" & $N & " tile " & $bm & "x" & $bn,
           resident, a, bytesAsFloats(bytes) & scales & zeros, want)
+
+  # Vulkan cooperative-matrix Q4 GEMM is a custom micro-VM op. The production
+  # Vulkan JIT lowers it to KHR_cooperative_matrix; the CPU VM executes the
+  # same instruction as a scalar reference for bytecode/layout parity.
+  block:
+    let M = 16
+    let K = 64
+    let N = 64
+    let gs = 32
+    let nG = K div gs
+    let bpr = K div 2
+    var q = newSeq[int](N*K)
+    var bytes = newSeq[uint8](N*bpr)
+    for n in 0 ..< N:
+      for kk in 0 ..< K:
+        q[n*K + kk] = (n*11 + kk*7 + kk div 3 + 2) mod 16
+        let b = n*bpr + kk div 2
+        bytes[b] = bytes[b] or uint8(q[n*K + kk] shl (if kk mod 2 == 0: 0 else: 4))
+    let scales = fill(N*nG, 0.17, 0.11)
+    let zeros = fill(N*nG, 6.3, 2.7)
+    var a = newSeq[float32](M*K)
+    for i in 0 ..< a.len: a[i] = float32((i*13 mod 41) - 20) / 31
+    var want = newSeq[float32](M*N)
+    for m in 0 ..< M:
+      for n in 0 ..< N:
+        var sum = 0.0'f32
+        for kk in 0 ..< K:
+          let gi = n*nG + kk div gs
+          sum += a[m*K + kk] * ((float32(q[n*K + kk]) - zeros[gi]) * scales[gi])
+        want[m*N + n] = sum
+    let packed = bytesAsFloats(bytes) & scales & zeros
+    let g = genMatmulQ4TensorCore(M, K, N, gs, nG)
+    doAssert g.threads == 128 and g.tg == 128 and "q4coop " in g.body
+    chkResidentQ4("tensor_core_micro M16 K64 N64", g, a, packed, want)
+    let program = assemble(g.body, 2, 1, @[a.len, packed.len], @[want.len], 1e-5'f32, slotLayout = true)
+    let shader = lowerBytecodeToGlsl(program, "q4_tensor_core_source_test")
+    doAssert "GL_KHR_cooperative_matrix" in shader
+    doAssert "coopMatMulAdd" in shader
+    doAssert "sessionMatmulQ4" notin shader
+    echo "PASS Q4 Tensor Core micro shader lowering"
+    let glslc = findExe("glslc")
+    if glslc.len > 0:
+      let shaderPath = getTempDir() / ("fir_q4_tc_" & $getCurrentProcessId() & ".comp")
+      let spvPath = shaderPath & ".spv"
+      writeFile(shaderPath, shader)
+      defer:
+        if fileExists(shaderPath): removeFile(shaderPath)
+        if fileExists(spvPath): removeFile(spvPath)
+      let compile = startProcess(glslc, args = ["--target-env=vulkan1.3", "-o", spvPath, shaderPath],
+        options = {poUsePath, poStdErrToStdOut})
+      let compileOutput = compile.outputStream.readAll()
+      let compileCode = compile.waitForExit()
+      compile.close()
+      if compileCode != 0:
+        raise newException(ValueError, "glslc rejected the Q4 Tensor Core micro shader: " & compileOutput)
+      echo "PASS Q4 Tensor Core micro shader glslc compile"
 
   # argmax keeps the first maximum
   block:

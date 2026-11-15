@@ -314,6 +314,11 @@ Linear layers are Q4 resident by default (`--fir-f32` keeps them fp32 as the
 correctness reference). Tests run the file's kernels via `runGrid` and full tiny graphs
 through the production CPU backend (tolerance `1e-4`), and reject malformed kernel blocks.
 
+For a Vulkan dGPU that exposes `VK_KHR_cooperative_matrix`, lift Q4 prefill GEMMs
+as custom Tensor Core micro-kernels with `FIRLIFT_Q4_GEMM=tensor_core`. The FIR
+node's Vulkan JIT emits `coopMatMulAdd` directly; it remains on the FIR micro
+dispatch path. The mode requires `K` divisible by 64 and even Q4 groups.
+
 Without `--fir`, the model directory's `model.fir` is used. This is one-shot
 completion (`-cnv` chat uses the model's chat template); partial offload, unsupported config variants and context overflow
 are rejected. On Intel Iris Plus 640, chat decode runs at 8.57 tok/s (Metal) and 11.40 tok/s (Vulkan) with Q4,

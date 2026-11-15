@@ -2181,6 +2181,22 @@ proc genMatmulQ4Mm*(M, K, N, groupSize, nGroups: int; residentWeights = false): 
         k.e("ustoref32", sc, gk, "@out0")))
   result = Gen(body: k.text, threads: nTM * nTN * 128, ins: 2, outs: 1, tg: 128, tgBytes: 2 * WS * 4)
 
+proc genMatmulQ4TensorCore*(M, K, N, groupSize, nGroups: int): Gen =
+  ## Vulkan FIR micro-kernel using KHR_cooperative_matrix directly. The VM
+  ## instruction carries the shape; the Vulkan JIT lowers it into a dedicated
+  ## Q4 dequantize + FP16/FP32 Tensor Core shader. It is still one ordinary
+  ## custom FIR micro node and never calls the native Q4/session GEMM API.
+  if M <= 0 or N < 16 or K <= 0 or K mod 64 != 0 or groupSize < 2 or
+      groupSize mod 2 != 0 or K mod groupSize != 0 or nGroups != K div groupSize:
+    raise newException(GenError, "Q4 Tensor Core micro-kernel requires M>0, N>=16, K divisible by 64 and an even group size dividing K")
+  let cols = (N + 63) div 64
+  let rows = (M + 15) div 16
+  result = Gen(body: "q4coop " & $M & " " & $K & " " & $N & " " & $groupSize & " " & $nGroups,
+    threads: rows * cols * 128, ins: 2, outs: 1, tg: 128,
+    tgBytes: (16 * 72 + 64 * 72) * 2 + 4 * 256 * 4)
+  genHiR = 0
+  genHiU = 0
+
 proc genMatmulQ4Gemm*(M, K, N, groupSize, nGroups: int; BM = 32; BN = 64; TM = 4; TN = 4; residentWeights = false): Gen =
   ## Prefill Q4 GEMM built like the Metal kernels matmul_q4_gemm*_kernel (plain FP32 FMA, no
   ## simdgroup_matrix, so it also runs on Intel): a BM x BN output tile per threadgroup, each
