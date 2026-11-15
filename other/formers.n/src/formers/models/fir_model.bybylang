@@ -67,7 +67,7 @@ function fmFirFeedPrompt(model: var FirGraph, graph: FirProgram, ids: seq[int]):
     var finished = false
     var ubatch = 0
     try:
-        ubatch = max(0, parseInt(getEnv("BYBY_UBATCH", "0")))
+        ubatch = max(0, parseInt(getEnv("BYBY_UBATCH", "512")))
     except ValueError:
         ubatch = 0
     while not finished and next < ids.len:
@@ -141,7 +141,7 @@ function fmRunFir(det: FmDetection, cliOpts: FmOptions): bool
     var opts = cliOpts
     var ubatch = 0
     try:
-        ubatch = max(0, parseInt(getEnv("BYBY_UBATCH", "0")))
+        ubatch = max(0, parseInt(getEnv("BYBY_UBATCH", "512")))
     except ValueError:
         ubatch = 0
     let path = if opts.firFile.len > 0: opts.firFile else: opts.modelsDir / "model.fir"

@@ -58,6 +58,7 @@ type
     sourcePath*: string
     selectionSession*: int
     backend*: string
+    device*: string      ## device features of the recorded run ("coopmatrix", "plain"; "unspecified" for older traces)
     bufs*: seq[BufferRec]
     programs*: Table[string, seq[uint32]]
     ops*: seq[Op]
@@ -239,6 +240,8 @@ proc parseTrace*(text: string): Trace =
     if raw.startsWith("backend "):
       let w = raw.splitWhitespace()
       if w.len >= 2: result.backend = w[1]
+      for item in w:
+        if item.startsWith("device="): result.device = unquote(item[7 .. ^1])
     elif raw.startsWith("buf "):
       var b = BufferRec()
       for item in raw[4 .. ^1].splitWhitespace():

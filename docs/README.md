@@ -46,6 +46,7 @@ This directory is the user documentation for the public Nimformer APIs. Use the 
 - [BybyLang language reference](bybylang-language.md): the project-local bilingual edition of the vendored README, including syntax and hardware simulation.
 - [Codestral Low Memory](codestral-low-memory.md): mmap model/adapter loading, bounded merge, device workgroups, and Vulkan Tensor Cores.
 - [Vulkan Q4 Autotuner](vulkan-q4-autotune.md): tuning interface and environment controls for Q4 matmul.
+- [Runtime flags](runtime-flags.md): every environment flag of the Vulkan native, FIR graph and lift paths, with defaults.
 
 
 ## Reference by module

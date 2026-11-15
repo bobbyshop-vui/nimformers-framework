@@ -225,7 +225,7 @@ proc main() =
     var graphNodes = 0
     for op in trace.ops:
       if op.parent < 0 and op.attrs.hasKey("kind"): inc graphNodes
-    echo "trace: backend=", trace.backend, " buffers=", trace.bufs.len,
+    echo "trace: backend=", trace.backend, " device=", trace.device, " buffers=", trace.bufs.len,
       " programs=", trace.programs.len, " ops=", trace.ops.len,
       " graph_nodes=", graphNodes
     report(model)

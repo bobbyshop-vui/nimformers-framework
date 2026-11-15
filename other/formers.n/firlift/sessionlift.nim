@@ -735,6 +735,11 @@ proc lowerMatmulQ4(l: SessionLift; op: Op) =
         let matrix = q4MatrixGemm(m, k, n, group, nGroups)
         gen = matrix.gen; rowBlock = matrix.rowBlock; rowTg = matrix.rowTg
         variant = (if gen.tg == 128: "matrix" else: q4ParallelVariant(gen, false))
+      elif l.trace.backend == "vulkan" and l.trace.device == "coopmatrix" and not genericKernels():
+        # The recorded device has KHR_cooperative_matrix: the prefill GEMMs run on the Tensor Cores.
+        let tensorCore = q4TensorCoreGemm(m, k, n, group, nGroups)
+        gen = tensorCore.gen; rowBlock = tensorCore.rowBlock; rowTg = tensorCore.rowTg
+        variant = "tensor_core_micro"
       elif m >= 16 and not genericKernels():
         let tiled = q4GemmFma(m, k, n, group, nGroups)
         gen = tiled.gen; rowBlock = tiled.rowBlock; rowTg = tiled.rowTg
