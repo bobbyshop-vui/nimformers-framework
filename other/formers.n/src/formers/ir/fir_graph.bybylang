@@ -1534,6 +1534,16 @@ function firGraphReset(model: var FirGraph)
     model.position = 0
 
 const FgCommitRowNodes = 512              # row-nodes per command buffer inside a multi-row phase
+const FgDecodeFirstNodes = 16             # decode: nodes in the first command buffer, so the GPU starts early
+
+function fgDecodeCommitNodes(): int
+    ## BYBY_FIR_DECODE_CB_NODES: a decode step is submitted without waiting every this many
+    ## nodes (the first time after FgDecodeFirstNodes), so the GPU runs the layers already
+    ## encoded while the host encodes the rest. 0 keeps the whole step in one command buffer.
+    var state {.global.}: int
+    if state == 0:
+        state = 1 + max(0, parseInt(getEnv("BYBY_FIR_DECODE_CB_NODES", "64")))
+    result = state - 1
 
 function fgProfileNodes(): bool
     ## BYBY_FIR_PROFILE=2 ends the GPU session after every node and adds the wall time to a
@@ -1566,10 +1576,13 @@ function fgEncodeGraph(model: var FirGraph, token: int, phase: string)
     # A multi-row phase is too long for one command buffer on GPUs that pace them (the driver
     # cancels a buffer that runs for seconds): commit and keep encoding, without waiting, every
     # FgCommitRowNodes row-nodes (nodes times the rows this run covers), like the native prefill.
+    # A decode step is split the same way, every fgDecodeCommitNodes() nodes, so the GPU overlaps
+    # the host encode (the submissions do not wait; sessionEnd waits on all of them).
     let be = model.backend.kind.toByby()
-    let paced = phase.len > 0 and sessionPacesCommandBuffers(be)
+    let commitEvery = if phase.len > 0: FgCommitRowNodes else: fgDecodeCommitNodes()
+    let paced = commitEvery > 0 and sessionPacesCommandBuffers(be)
     let runRows = if model.activeRows > 0: model.activeRows elif phase.len > 0: model.graph.phases[phase] else: 1
-    var pendingRows = 0
+    var pendingRows = if phase.len == 0 and commitEvery > FgDecodeFirstNodes: commitEvery - FgDecodeFirstNodes else: 0
     var index = 0
     while index < model.graph.nodes.len:
         if model.graph.nodes[index].phase != phase:
@@ -1589,7 +1602,7 @@ function fgEncodeGraph(model: var FirGraph, token: int, phase: string)
                         fgProfileNode(model, node, phase, nodeStart)
                     elif paced:
                         pendingRows += runRows
-                        if pendingRows >= FgCommitRowNodes:
+                        if pendingRows >= commitEvery:
                             if not sessionCommitContinue(be):
                                 raise newException(ValueError, "FIR graph commit failed in phase " & phase)
                             pendingRows = 0
@@ -1603,7 +1616,7 @@ function fgEncodeGraph(model: var FirGraph, token: int, phase: string)
                 fgProfileNode(model, node, phase, nodeStart)
             elif paced:
                 pendingRows += runRows
-                if pendingRows >= FgCommitRowNodes:
+                if pendingRows >= commitEvery:
                     if not sessionCommitContinue(be):
                         raise newException(ValueError, "FIR graph commit failed in phase " & phase)
                     pendingRows = 0
