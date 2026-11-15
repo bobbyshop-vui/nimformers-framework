@@ -152,7 +152,7 @@ function fkSignature(mnemonic: string): string
     of "exp", "neg", "sigmoid", "softplus", "rsqrt", "rtou", "utor", "simdsum": "rr"
     of "mmmac": "rrr"
     of "uconst": "rk"
-    of "q4coop": "kkkkk"
+    of "q4coop", "q4gemv": "kkkkk"
     of "uaddk", "umulk", "uandk", "ushrk", "ushlk": "rrk"
     of "uloadf32", "ustoref32", "uatomicadd", "loadf32", "storef32", "tgloadf32", "tgstoref32", "uloadu8", "uloadu32", "mmload", "mmloadt", "mmstoretg", "mmstoremem": "rrk"
     of "addconst", "mulconst": "rrf"
@@ -183,6 +183,7 @@ function fkEmit(p: var VmProgram, mnemonic: string, a: seq[uint32], f: float32)
     of "mmstoretg": p.emitMmStoreTg(a[0], a[1], a[2])
     of "mmstoremem": p.emitMmStoreMem(a[0], a[1], a[2])
     of "q4coop": p.emitQ4CoopGemm(a[0], a[1], a[2], a[3], a[4])
+    of "q4gemv": p.emitQ4Gemv(a[0], a[1], a[2], a[3], a[4])
     of "add": p.emitAdd(a[0], a[1], a[2])
     of "sub": p.emitSub(a[0], a[1], a[2])
     of "mul": p.emitMul(a[0], a[1], a[2])

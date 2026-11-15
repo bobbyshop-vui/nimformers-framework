@@ -60,21 +60,29 @@ try:
   delEnv("FIRLIFT_Q4_WORD_MAX_K")
   delEnv("FIRLIFT_Q4_GEMM")
 
+  # Vulkan auto: the native decode algorithm as a shape-op micro-kernel.
   var fir = liftQ4("vulkan")
-  doAssert "kernel s.matmul_q4_word_parallel" in fir
+  doAssert "kernel s.matmul_q4_subgroup_micro" in fir
   doAssert " q4r model.layers.0.q_proj.weight tensor [4," in fir
 
   fir = liftQ4("vulkan", k = 11008, group = 128, nGroups = 86)
-  doAssert "kernel s.matmul_q4_parallel" in fir
+  doAssert "kernel s.matmul_q4_subgroup_micro" in fir
   doAssert "matmul_q4_word_parallel" notin fir
 
-  setEnv("FIRLIFT_Q4_WORD_MAX_K", "11008")
+  setEnv("FIRLIFT_Q4_GEMV", "subgroup")
+  fir = liftQ4("vulkan", k = 11008, group = 128, nGroups = 86)
+  doAssert "kernel s.matmul_q4_subgroup_micro" in fir
+  var refused = false
+  try:
+    discard liftQ4("metal")
+  except CatchableError:
+    refused = true
+  doAssert refused, "the subgroup GEMV micro-kernel is Vulkan-only"
+
+  setEnv("FIRLIFT_Q4_GEMV", "word_parallel")
   fir = liftQ4("vulkan", k = 11008, group = 128, nGroups = 86)
   doAssert "kernel s.matmul_q4_word_parallel" in fir
-
-  setEnv("FIRLIFT_Q4_WORD_MAX_K", "0")
-  fir = liftQ4("vulkan")
-  doAssert "kernel s.matmul_q4_parallel" in fir
+  delEnv("FIRLIFT_Q4_GEMV")
 
   setEnv("FIRLIFT_Q4_GEMV", "word_parallel")
   fir = liftQ4("vulkan")
@@ -122,4 +130,4 @@ finally:
   restoreEnv("FIRLIFT_Q4_WORD_MAX_K", saved[5])
   restoreEnv("FIRLIFT_Q4_GEMM", saved[6])
 
-echo "PASS Q4 GEMV and Tensor Core GEMM selection"
+echo "PASS Q4 GEMV (subgroup micro, word, simd) and Tensor Core GEMM selection"

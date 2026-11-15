@@ -318,6 +318,17 @@ For a Vulkan dGPU that exposes `VK_KHR_cooperative_matrix`, lift Q4 prefill GEMM
 as custom Tensor Core micro-kernels with `FIRLIFT_Q4_GEMM=tensor_core`. The FIR
 node's Vulkan JIT emits `coopMatMulAdd` directly; it remains on the FIR micro
 dispatch path. The mode requires `K` divisible by 64 and even Q4 groups.
+The runtime picks its row tile (16, 32 or 64) per dispatch from the GPU's SM/CU
+count; `BYBY_FIR_Q4_COOP_ROWS` fixes it and `BYBY_FIR_Q4_COOP_WG_PER_UNIT` sets the
+workgroups each SM/CU should get.
+
+Q4 decode GEMVs on Vulkan lift by default (`FIRLIFT_Q4_GEMV=subgroup`) to a custom
+micro-kernel with the native decode algorithm: coalesced `uvec4` weight loads, the
+group scale/zero applied once per load unit, and a `subgroupAdd` sum on GPUs whose
+compute subgroups are 32 wide (NVIDIA), a shared-memory sum elsewhere. It needs `K`
+and the Q4 group size divisible by 8. `BYBY_FIR_Q4_GEMV_ROWS` (1, 2, 4; default 2)
+sets the output rows per subgroup and `BYBY_FIR_Q4_GEMV_REDUCE` (auto, subgroup,
+shared) the sum; `BYBY_FIR_Q4_COOP_VERBOSE=1` prints the choices once per kernel.
 After updating the repository and submodules, rebuild `make formers-cli` as
 well as `firlift`: the AOT CLI contains its own VM opcode validator and JIT.
 The CLI build checks a tiny Tensor Core FIR fixture before installing the
