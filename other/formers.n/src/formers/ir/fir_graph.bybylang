@@ -35,6 +35,8 @@ type
     coopTiles*: seq[int]            ## Q4 Tensor Core micro-kernel: row tiles built for this node (chosen per dispatch)
     coopNames*, coopSources*: seq[string]
     gemvRows*: int                  ## Q4 subgroup GEMV micro-kernel: output rows per 32 invocations (0: not one)
+    gemvThreads*: int               ## Q4 subgroup GEMV micro-kernel: workgroup width
+    gemvVariants*: seq[tuple[rows, threads: int, name, source: string]]   ## shaders fgTuneGemv chooses from
   FirGraph* = object
     graph*: FirProgram
     registry*: FirRegistry
@@ -77,6 +79,8 @@ type
     coopFragments*: int                       ## 16-column fragments per subgroup of the Q4 Tensor Core shader (1 with 32-wide subgroups)
     gemvRows*: int                            ## BYBY_FIR_Q4_GEMV_ROWS: output rows per subgroup of the Q4 GEMV micro-kernel
     gemvSubgroupSum*: bool                    ## Q4 GEMV micro-kernel sums with subgroupAdd (32-wide subgroups guaranteed)
+    gemvThreads*: int                         ## BYBY_FIR_Q4_GEMV_THREADS: workgroup width of the Q4 GEMV micro-kernel (0: lifted width)
+    gemvTune*: bool                           ## time every rows/width pair per GEMV shape at load (fgTuneGemv)
 
 function fgTensorName(buffer: FirBuffer, layer: int): string
     buffer.tensorName.replace("{i}", $layer)
@@ -526,6 +530,36 @@ function fgQ4CoopTile(model: FirGraph, rows, n: int): int
         return model.coopForcedRows
     q4CoopRowTile(rows, n, model.computeUnits, model.coopPerUnit)
 
+const FgGemvThreadChoices = [128, 64, 256]   # Q4 GEMV workgroup widths fgTuneGemv may pick
+
+function fgGemvCandidates(model: FirGraph, liftedThreads: int): seq[tuple[rows, threads: int]]
+    ## The default pair first (BYBY_FIR_Q4_GEMV_ROWS / BYBY_FIR_Q4_GEMV_THREADS, else 2 rows and
+    ## the lifted width), then, when fgTuneGemv runs, every other pair it may pick.
+    let defaultThreads = if model.gemvThreads > 0: model.gemvThreads else: liftedThreads
+    result.add((rows: model.gemvRows, threads: defaultThreads))
+    if not model.gemvTune:
+        return result
+    let forcedRows = getEnv("BYBY_FIR_Q4_GEMV_ROWS", "").len > 0
+    for rows in Q4GemvRowChoices:
+        if forcedRows and rows != model.gemvRows:
+            continue
+        for threads in FgGemvThreadChoices:
+            if model.gemvThreads > 0 and threads != model.gemvThreads:
+                continue
+            var seen = false
+            for pair in result:
+                if pair.rows == rows and pair.threads == threads:
+                    seen = true
+            if not seen:
+                result.add((rows: rows, threads: threads))
+
+function fgUseGemvVariant(prepared: var FgResidentProgram, index: int)
+    let variant = prepared.gemvVariants[index]
+    prepared.gemvRows = variant.rows
+    prepared.gemvThreads = variant.threads
+    prepared.name = variant.name
+    prepared.source = variant.source
+
 function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): FirGraph
     if graph.runtime != "graph":
         raise newException(ValueError, "FIR graph executor requires 'runtime graph' in the model file")
@@ -571,9 +605,19 @@ function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): 
     let fixedWidth = gpuFixedSubgroupWidth(be)
     result.coopFragments = if fixedWidth == 32: 1 else: 2
     result.gemvSubgroupSum = fixedWidth == 32
-    result.gemvRows = parseInt(getEnv("BYBY_FIR_Q4_GEMV_ROWS", $Q4GemvDefaultRows))
+    let forcedGemvRows = getEnv("BYBY_FIR_Q4_GEMV_ROWS", "")
+    result.gemvRows = parseInt(if forcedGemvRows.len > 0: forcedGemvRows else: $Q4GemvDefaultRows)
     if result.gemvRows notin Q4GemvRowChoices:
         raise newException(ValueError, "BYBY_FIR_Q4_GEMV_ROWS must be 1, 2 or 4")
+    let forcedGemvThreads = getEnv("BYBY_FIR_Q4_GEMV_THREADS", "")
+    if forcedGemvThreads.len > 0:
+        result.gemvThreads = parseInt(forcedGemvThreads)
+        if result.gemvThreads notin FgGemvThreadChoices:
+            raise newException(ValueError, "BYBY_FIR_Q4_GEMV_THREADS must be 64, 128 or 256")
+    # Like the native Q4 autotune: unless both are fixed, every rows/width pair is built and
+    # fgTuneGemv keeps the fastest one per GEMV shape on this device.
+    let gemvFixed = forcedGemvRows.len > 0 and forcedGemvThreads.len > 0
+    result.gemvTune = be == gbVulkan and getEnv("BYBY_FIR_Q4_GEMV_TUNE", "1") != "0" and not gemvFixed
     let gemvReduce = getEnv("BYBY_FIR_Q4_GEMV_REDUCE", "auto").toLowerAscii()
     if gemvReduce == "shared":
         result.gemvSubgroupSum = false
@@ -665,15 +709,20 @@ function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): 
                             let fullTile = fgQ4CoopTile(result, shape.M, shape.N)
                             stderr.writeLine("[fir] Q4 Tensor Core " & node.op & " K=" & $shape.K & " N=" & $shape.N & " M=" & $shape.M & ": row tile " & $fullTile & " (tiles built " & $prepared.coopTiles & ", " & $result.computeUnits & " SM/CU, " & $result.coopFragments & " fragment(s) per subgroup)")
                     elif isQ4GemvProgram(kernel.program):
-                        # Rows per subgroup and the reduction follow the device; the grid follows from them.
-                        prepared.gemvRows = result.gemvRows
-                        prepared.name = prepared.name & "_r" & $result.gemvRows & (if result.gemvSubgroupSum: "_sg" else: "_shm")
-                        prepared.source = lowerQ4GemvGlsl(kernel.program, prepared.name, result.gemvRows, not result.gemvSubgroupSum, kernel.tgSize)
-                        jobs.add((prepared.name, prepared.source))
-                        if coopVerbose and not coopLogged.hasKey(node.op):
+                        # Rows per subgroup, workgroup width and the reduction follow the device; the
+                        # grid follows from them. The first variant is the default; fgTuneGemv times
+                        # the others once the weights are resident.
+                        let baseName = prepared.name
+                        for pair in fgGemvCandidates(result, kernel.tgSize):
+                            let variant = baseName & "_r" & $pair.rows & "_w" & $pair.threads & (if result.gemvSubgroupSum: "_sg" else: "_shm")
+                            let source = lowerQ4GemvGlsl(kernel.program, variant, pair.rows, not result.gemvSubgroupSum, pair.threads)
+                            prepared.gemvVariants.add((pair.rows, pair.threads, variant, source))
+                            jobs.add((variant, source))
+                        fgUseGemvVariant(prepared, 0)
+                        if coopVerbose and not coopLogged.hasKey(node.op) and not result.gemvTune:
                             coopLogged[node.op] = true
                             let shape = q4GemvShape(kernel.program)
-                            stderr.writeLine("[fir] Q4 GEMV " & node.op & " K=" & $shape.K & " N=" & $shape.N & ": " & $result.gemvRows & " row(s) per subgroup, " & (if result.gemvSubgroupSum: "subgroupAdd" else: "shared-memory sum"))
+                            stderr.writeLine("[fir] Q4 GEMV " & node.op & " K=" & $shape.K & " N=" & $shape.N & ": " & $prepared.gemvRows & " row(s) per subgroup, " & $prepared.gemvThreads & " threads, " & (if result.gemvSubgroupSum: "subgroupAdd" else: "shared-memory sum"))
                     else:
                         prepared.source = glslSourceFor(jit, kernel.program, node.op)
                         # Subgroup kernels (FIRLIFT_Q4_GEMV=simd) size their grid for 32-lane subgroups.
@@ -1100,6 +1149,7 @@ function fgEncodeMicroBody(model: var FirGraph, prepared: FgResidentProgram, nod
                 return false
             return cpu_backend.vmRunBound(k.program.words, views, threads, (k.tgBytes+3) div 4, k.tgSize)
         let vk = be == gbVulkan
+        var tgSize = k.tgSize
         var pipelineName = prepared.name
         var pipelineSource = prepared.source
         if vk and prepared.coopTiles.len > 0:
@@ -1117,7 +1167,8 @@ function fgEncodeMicroBody(model: var FirGraph, prepared: FgResidentProgram, nod
             # Q4 subgroup GEMV micro-kernel: one workgroup per ROWS*tg/32 output rows of each activation row.
             let shape = q4GemvShape(k.program)
             let rows = if model.activeRows > 0: min(shape.M, model.activeRows) else: shape.M
-            threads = q4GemvThreadCount(rows, shape.N, prepared.gemvRows, k.tgSize)
+            tgSize = prepared.gemvThreads
+            threads = q4GemvThreadCount(rows, shape.N, prepared.gemvRows, tgSize)
         if not sessionEncPipeline(vk, pipelineName, pipelineSource):
             return false
         for i in 0 .. 4:
@@ -1133,7 +1184,7 @@ function fgEncodeMicroBody(model: var FirGraph, prepared: FgResidentProgram, nod
                 return false
         if not sessionEncTgBytes(vk, 0, k.tgBytes):
             return false
-        return sessionEncDispatch(vk, threads, k.tgSize, k.tgBytes)
+        return sessionEncDispatch(vk, threads, tgSize, k.tgBytes)
     if be == gbCpu and prepared.cpuFn != nil and not model.useHandles and cpuJitRun(prepared.cpuFn, model.arena.cpuData, threads, k.tgSize):
         return true
     if prepared.stage.len == 0:
@@ -1152,6 +1203,84 @@ function fgEncodeMicroBody(model: var FirGraph, prepared: FgResidentProgram, nod
 
 function fgEncodeMicro(model: var FirGraph, prepared: FgResidentProgram, node: FirNode, layer: int): bool
     fgEncodeMicroBody(model, prepared, node, layer)
+
+const FgGemvTuneReps = 32                 # dispatches per timed command buffer of the Q4 GEMV tune
+
+function firGraphTuneGemv(model: var FirGraph)
+    ## The native Q4 autotune for the FIR Q4 GEMV micro-kernel: for each GEMV shape, time every
+    ## rows-per-subgroup / workgroup-width variant fgPrepare built on one of its nodes with its
+    ## resident weights (back-to-back dispatches with the barrier a graph puts between nodes,
+    ## the GPU wait of one command buffer, best of three), then give every node of that shape
+    ## the fastest. The writes land in activation buffers the run overwrites. Choices are kept
+    ## per process, so a graph loaded again reuses them. BYBY_FIR_Q4_GEMV_TUNE=0 skips it.
+    if not model.gemvTune or model.backend.kind.toByby() != gbVulkan:
+        return
+    var cache {.global.}: Table[string, int]
+    let be = gbVulkan
+    let verbose = getEnv("BYBY_FIR_Q4_COOP_VERBOSE", "0") != "0"
+    let savedDispatched = model.dispatched
+    let savedRows = model.activeRows
+    model.activeRows = 0
+    var chosen = initTable[string, int]()
+    for node in model.graph.nodes:
+        if node.kind != "micro":
+            continue
+        let key = fgNodeKey(node, 0)
+        if not model.programs.hasKey(key):
+            continue
+        let prepared = model.programs[key]
+        if prepared.gemvVariants.len < 2:
+            continue
+        let shape = q4GemvShape(prepared.kernel.program)
+        let shapeKey = $shape.M & "x" & $shape.K & "x" & $shape.N & "x" & $shape.groupSize
+        if chosen.hasKey(shapeKey):
+            continue
+        if cache.hasKey(shapeKey):
+            chosen[shapeKey] = cache[shapeKey]
+            continue
+        var seconds: seq[float]
+        var best = 0
+        for index in 0 ..< prepared.gemvVariants.len:
+            var trial = prepared
+            fgUseGemvVariant(trial, index)
+            var fastest = 1e30
+            for attempt in 0 ..< 4:
+                # Attempt 0 builds the pipeline and warms the caches; it is not timed.
+                if not sessionBegin(be):
+                    raise newException(ValueError, "FIR Q4 GEMV tune: sessionBegin failed")
+                for rep in 0 ..< (if attempt == 0: 2 else: FgGemvTuneReps):
+                    if not fgEncodeMicroBody(model, trial, node, 0):
+                        discard sessionEnd(be)
+                        raise newException(ValueError, "FIR Q4 GEMV tune: dispatch failed for " & trial.name)
+                let startedAt = epochTime()
+                if not sessionEnd(be):
+                    raise newException(ValueError, "FIR Q4 GEMV tune: sessionEnd failed for " & trial.name)
+                if attempt > 0:
+                    fastest = min(fastest, (epochTime()-startedAt) / float(FgGemvTuneReps))
+            seconds.add(fastest)
+            if fastest < seconds[best]:
+                best = index
+        chosen[shapeKey] = best
+        cache[shapeKey] = best
+        if verbose:
+            var line = "[fir] Q4 GEMV tune " & node.op & " K=" & $shape.K & " N=" & $shape.N & ":"
+            for index, variant in prepared.gemvVariants:
+                line = line & " r" & $variant.rows & "/w" & $variant.threads & "=" & formatFloat(seconds[index]*1e6, ffDecimal, 1) & "us"
+            let pick = prepared.gemvVariants[best]
+            stderr.writeLine(line & " -> " & $pick.rows & " row(s) per subgroup, " & $pick.threads & " threads, " & (if model.gemvSubgroupSum: "subgroupAdd" else: "shared-memory sum"))
+    var keys: seq[string]
+    for key, item in model.programs:
+        if item.gemvVariants.len > 1:
+            keys.add(key)
+    for key in keys:
+        var item = model.programs[key]
+        let shape = q4GemvShape(item.kernel.program)
+        let shapeKey = $shape.M & "x" & $shape.K & "x" & $shape.N & "x" & $shape.groupSize
+        if chosen.hasKey(shapeKey):
+            fgUseGemvVariant(item, chosen[shapeKey])
+            model.programs[key] = item
+    model.dispatched = savedDispatched
+    model.activeRows = savedRows
 
 function fgAttrTable(text: string): Table[string, string]
     result = initTable[string, string]()
