@@ -69,6 +69,8 @@ lượng tử hóa, backend, session và micro-VM.
 - [Codestral ít RAM](codestral-low-memory.vi.md): mmap model/adapter,
   merge có giới hạn, workgroup và Vulkan Tensor Cores.
 - [Autotune Q4 Vulkan](vulkan-q4-autotune.vi.md): API tuning và biến điều khiển Q4 matmul.
+- [Flag runtime](runtime-flags.vi.md): mọi biến môi trường của đường Vulkan native,
+  FIR graph và lift, kèm giá trị mặc định.
 
 
 ## Tra cứu theo module
