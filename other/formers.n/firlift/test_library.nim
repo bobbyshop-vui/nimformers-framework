@@ -362,6 +362,71 @@ proc sessionTests2() =
     chkResidentQ4("parallel K" & $K & " tg" & $resident.tg, resident,
         a, bytesAsFloats(bytes) & scales & zeros, want)
 
+  # word-parallel Q4 GEMV: one output per threadgroup, 8 nibbles per uloadu32.
+  # Use odd N and nonuniform activations / per-group quantization parameters so
+  # swapped nibble order, row stride, and group correction errors are visible.
+  for (K, gs, T) in [(256, 32, 16), (256, 64, 32), (256, 128, 64), (256, 256, 16),
+                     (384, 32, 32), (384, 64, 64), (384, 128, 16),
+                     (384, 32, 24),
+                     (4096, 32, 64), (4096, 64, 16), (4096, 128, 32), (4096, 256, 64),
+                     (11008, 128, 32)]:
+    let N = 5
+    let nG = (K + gs - 1) div gs
+    let bpr = (K + 1) div 2
+    var q = newSeq[int](N*K)
+    var bytes = newSeq[uint8](N*bpr)
+    for n in 0 ..< N:
+      for kk in 0 ..< K:
+        # Distinct neighboring low/high nibbles and rows.
+        q[n*K + kk] = (n*11 + kk*7 + kk div 3 + 2) mod 16
+        let b = n*bpr + kk div 2
+        bytes[b] = bytes[b] or uint8(q[n*K + kk] shl (if kk mod 2 == 0: 0 else: 4))
+    let scales = fill(N*nG, 0.17, 0.11)
+    let zeros = fill(N*nG, 6.3, 2.7)
+    let a = fill(K, 0.43, 1.2)
+    var want = newSeq[float32](N)
+    for n in 0 ..< N:
+      var sum = 0.0'f32
+      for kk in 0 ..< K:
+        let gi = n*nG + kk div gs
+        sum += a[kk] * ((float32(q[n*K + kk]) - zeros[gi]) * scales[gi])
+      want[n] = sum
+    let packed = bytesAsFloats(bytes) & scales & zeros
+    let g = genMatmulQ4WordPar(K, N, gs, nG, T)
+    doAssert g.tg >= 2 and (g.tg and (g.tg - 1)) == 0 and g.tg <= T,
+      "word-parallel Q4 threadgroup width is invalid for K=" & $K & " gs=" & $gs & " T=" & $T
+    doAssert "uloadu32 " in g.body, "word-parallel Q4 must load packed words"
+    doAssert "simd" notin g.body, "word-parallel Q4 must not use simd instructions"
+    chk("matmul_q4_wordpar.K" & $K & ".gs" & $gs & ".T" & $T, g, @[a, packed], want, 2e-3'f32)
+    # Exercise resident weight loads on representative partial and full groups.
+    if (K == 384 and gs == 256) or (K == 4096 and gs == 128):
+      let resident = genMatmulQ4WordPar(K, N, gs, nG, T, true)
+      chkResidentQ4("wordpar resident K" & $K & " gs" & $gs, resident, a, packed, want, 2e-3'f32)
+
+  # Unsupported word layouts must retain the generic correct path. These include
+  # a short odd-K tail and a group size that cannot be decomposed into 8-nibble words.
+  for (K, N, gs, T) in [(13, 3, 6, 16), (30, 3, 10, 32), (384, 3, 256, 32)]:
+    let nG = (K + gs - 1) div gs
+    let bpr = (K + 1) div 2
+    var q = newSeq[int](N*K)
+    var bytes = newSeq[uint8](N*bpr)
+    for n in 0 ..< N:
+      for kk in 0 ..< K:
+        q[n*K + kk] = (n*9 + kk*5 + 1) mod 16
+        let b = n*bpr + kk div 2
+        bytes[b] = bytes[b] or uint8(q[n*K + kk] shl (if kk mod 2 == 0: 0 else: 4))
+    let scales = fill(N*nG, 0.29, 0.13)
+    let zeros = fill(N*nG, 7.1, 1.8)
+    let a = fill(K, 0.91, 0.8)
+    var want = newSeq[float32](N)
+    for n in 0 ..< N:
+      for kk in 0 ..< K:
+        let gi = n*nG + kk div gs
+        want[n] += a[kk] * ((float32(q[n*K + kk]) - zeros[gi]) * scales[gi])
+    let g = genMatmulQ4WordPar(K, N, gs, nG, T)
+    chk("matmul_q4_wordpar_fallback.K" & $K & ".gs" & $gs, g,
+        @[a, bytesAsFloats(bytes) & scales & zeros], want, 2e-3'f32)
+
   # simdgroup Q4 GEMV (the Metal matmul_q4_simd structure): lanes stride over K, simd_sum combines
   for (K, N, gs, rows, sg) in [(256, 8, 128, 4, 2), (512, 4, 32, 4, 1), (128, 6, 64, 2, 2), (768, 4, 128, 4, 1), (3072, 4, 128, 4, 1)]:
     let nG = K div gs

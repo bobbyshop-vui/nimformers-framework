@@ -224,6 +224,12 @@ output too.
 Opt-in threadgroup-parallel variants `genMatmulQ4Par` / `genMatmulNTPar` split the K
 reduction over T lanes with a tree reduction (`FIRLIFT_TG=16|32|64`). On Intel Iris Plus
 640 they were slower per token than the lane-per-column kernels, so they are off by default.
+The Q4 GEMV `word_parallel` variant is subgroup-independent and loads packed weights as aligned
+32-bit words before reducing across the threadgroup. It supports K divisible by 8 and a power-of-two
+quantization group size of at least 8 that divides K, with `nGroups == K / groupSize` and a useful
+threadgroup width of at least two lanes for the selected lane limit. Other shapes retain the byte-load
+parallel kernel. Vulkan auto selection uses this variant when supported. No measured speedup is
+implied.
 
 `test_library` checks every generator on the CPU VM against a scalar reference.
 `test_session_gpu` runs each generated body on the GPU backend and compares it with
@@ -441,6 +447,7 @@ The lifter emits kernels built the way the Metal ones are:
 | Op | Generator | Structure |
 | --- | --- | --- |
 | Q4 GEMV (M = 1) | `genMatmulQ4Simd` | one simdgroup per 4 rows, `simd_sum` |
+| Q4 GEMV (M = 1, Vulkan auto / explicit) | `genMatmulQ4WordPar` | aligned 32-bit packed-weight loads and a threadgroup tree reduction; falls back to byte-load parallel for unsupported K/group shapes or a one-lane reduction |
 | Q4 scalar / parallel GEMM | `genMatmulQ4`, `genMatmulQ4Par` | one lane per output with serial K reduction, or a threadgroup split over K; each has separate multiply-add and fused FMA forms |
 | Q4 GEMM (M >= 16, Intel/AMD default) | `genMatmulQ4Gemm` | the `matmul_q4_gemm*_kernel` Metal kernels: an output tile per threadgroup, K step 32 through threadgroup memory, a register tile per thread; no `simdgroup_matrix`. `FIRLIFT_GEMM_TILE=32x64\|64x64\|32x128\|64x128` (default 64x128) picks the output tile and `FIRLIFT_GEMM_REG=4x4\|8x4\|4x8\|8x8` (default 8x8) the register tile, matching native Metal's default. A 64-row tile decodes each weight once per 64 rows; use the overrides to tune other devices |
 | Q4 GEMM (M > 1, `FIRLIFT_TARGET=apple`) | `genMatmulQ4Mm` | 32 x 32 tile, 4 simdgroups, 8 x 8 `simdgroup_matrix` (the `matmul_q4_mm_sg` kernel; Metal only) |
@@ -453,14 +460,22 @@ The lifter emits kernels built the way the Metal ones are:
 | f32 GEMM, `matmul_nt` (M > 1, `FIRLIFT_TARGET=apple`) | `genMatmulNTMm` | 32 x 32 tile, 4 simdgroups, 8 x 8 `simdgroup_matrix` |
 
 Choose the Q4 implementation at lift time. `FIRLIFT_Q4_GEMV` accepts `auto`, `scalar`, `scalar_fma`
-(`fma` is an alias), `parallel`, `parallel_fma` or `simd`. `FIRLIFT_Q4_GEMM` accepts `auto`, `scalar`,
+(`fma` is an alias), `parallel`, `parallel_fma`, `simd` or `word_parallel`. Vulkan `auto` uses
+`word_parallel` for supported shapes with K up to 4096 by default; larger shapes retain the byte-load
+kernel. The limit reflects local Iris measurements: word loads were 11–12% faster at K=4096 and 32%
+slower at K=11008. Set `FIRLIFT_Q4_WORD_MAX_K` to tune the auto limit per device (`0` disables the
+word kernel); explicit `word_parallel` ignores this limit and uses the same shape checks on any
+target. Metal keeps its SIMD path and generic kernels keep their existing selection.
+`FIRLIFT_Q4_GEMM` accepts `auto`, `scalar`,
 `scalar_fma`, `parallel`, `parallel_fma`, `tiled_fma` (`tiled` and `fma` are aliases), or `matrix`
 (`mm` is an alias). The scalar forms use one lane per output and serial K reduction; the parallel forms
 split K across lanes; tiled FMA uses the register-blocked Q4 GEMM; matrix uses `simdgroup_matrix`.
 `auto` keeps target-aware selection. The chosen form is written into the generated `.fir`; re-lift to
 change it. Kernel names include the selected form, such as `matmul_q4_tiled_fma` or
-`matmul_q4_parallel_fma`. If a tiled or matrix generator cannot handle the weight shape, it emits its
-lane-parallel fallback, and the kernel name records the fallback that was actually generated.
+`matmul_q4_parallel_fma` or `matmul_q4_word_parallel`. If a tiled or matrix generator cannot handle
+the weight shape, it emits its lane-parallel fallback, and the kernel name records the fallback that
+was actually generated. Unsupported `word_parallel` shapes use the byte-load generator and record its
+actual `parallel` or `scalar` variant.
 
 Use `FIRLIFT_Q4_LANES=16|32|64` (default 32) to select the threadgroup width for explicitly selected
 parallel forms; when unset it falls back to `FIRLIFT_TG`. The Q4 GEMV SIMD tuner remains available per
@@ -474,18 +489,35 @@ kernel selected and serialized by the lifter. Native mode loads the packed weigh
 points into separate resident Q4 buffers and skips JIT for only the Q4 slot nodes it replaces; the
 other FIR kernels remain unchanged. The same graph file works in either mode.
 
+To compare the previous byte-load parallel kernel, `word_parallel`, and native Q4 GEMV on Vulkan,
+run this benchmark from the repository root:
+
+```sh
+BACKEND=vulkan nim c -r -d:release --hints:off --path:vendor/bybylang \
+  --nimcache:/tmp/firlift-q4-bench-cache -o:/tmp/firlift-q4-bench \
+  other/formers.n/firlift/bench_q4_gemv.nim
+```
+
+It checks both generated kernels against native Q4 before reporting median dispatch times. Uploads and
+JIT warmup happen before samples; each timed sample includes `sessionBegin`/`sessionEnd` around four
+dispatches. The output reports timings and numerical error for the tested shapes; results depend on
+the Vulkan device and driver.
+
 `FIRLIFT_GENERIC=1` selects the lane-per-output kernels that also run on the CPU VM. Intel and AMD
 Metal devices cannot create `simdgroup_matrix` pipelines. `FIRLIFT_Q4_GEMM=matrix` therefore requires
 `FIRLIFT_TARGET=apple` with `FIRLIFT_GENERIC` unset; the Vulkan JIT rejects a FIR kernel containing
 those Metal-only instructions.
-Use `scalar`, `parallel`, `parallel_fma`, or `tiled_fma` for Vulkan and other targets.
+Use `scalar`, `parallel`, `parallel_fma`, `word_parallel` (Q4 GEMV), or `tiled_fma` for Vulkan and
+other targets.
 
 A graph lifted from a Vulkan run keeps the default kernels except the simdgroup decode matmuls
 (`genMatmulQ4Simd`, `genMatmulNTSimd`). Those follow Metal, where a simdgroup is a contiguous run of at
 least 16 threads of the grid; Vulkan leaves the subgroup width to the driver, and on MoltenVK the
-simdgroup Q4 GEMV returns wrong sums. For a Vulkan trace `auto` therefore picks the lane-parallel forms,
-which reduce through threadgroup memory. `FIRLIFT_SIMD=1` keeps the simdgroup kernels for a Vulkan trace
-and `FIRLIFT_SIMD=0` drops them for a Metal one.
+simdgroup Q4 GEMV returns wrong sums. For a Vulkan trace `auto` uses `word_parallel` for supported Q4
+GEMV shapes up to `FIRLIFT_Q4_WORD_MAX_K`, falling back to the byte-load reduction for larger or
+unsupported shapes; the f32 GEMV and other reductions continue to use threadgroup memory.
+`FIRLIFT_SIMD=1` explicitly requests simdgroup kernels for a Vulkan trace, and `FIRLIFT_SIMD=0`
+disables them on targets that otherwise select them.
 
 ### Registers
 

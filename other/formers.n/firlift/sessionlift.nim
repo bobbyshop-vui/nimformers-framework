@@ -596,6 +596,23 @@ proc q4ParallelVariant(gen: Gen; useFma: bool): string =
   elif useFma: "parallel_fma"
   else: "parallel"
 
+proc q4WordParallel(k, n, group, nGroups: int; maxK = high(int)): tuple[gen: Gen, variant: string] =
+  ## The word-load kernel needs whole 32-bit Q4 words within each quantization group.
+  ## Keep the established byte-load reduction for shapes it cannot represent.
+  let lanes = q4ParallelLanes()
+  if n > 0 and k <= maxK and supportsQ4WordPar(k, group, nGroups, lanes):
+    result.gen = genMatmulQ4WordPar(k, n, group, nGroups, lanes, true)
+    result.variant = "word_parallel"
+  else:
+    result.gen = genMatmulQ4Par(1, k, n, group, nGroups, q4ParallelLanes(), false, true)
+    result.variant = q4ParallelVariant(result.gen, false)
+
+proc q4WordAutoMaxK(): int =
+  ## The word kernel wins on K=4096 on the tested Iris Vulkan device, but loses on K=11008.
+  ## Keep auto conservative; a device can tune this threshold, or set it to 0 to disable it.
+  result = parseInt(getEnv("FIRLIFT_Q4_WORD_MAX_K", "4096"))
+  if result < 0: fail("FIRLIFT_Q4_WORD_MAX_K must be non-negative")
+
 proc lowerMatmulQ4(l: SessionLift; op: Op) =
   let m = op.attrInt("M")
   let k = op.attrInt("k")
@@ -616,7 +633,7 @@ proc lowerMatmulQ4(l: SessionLift; op: Op) =
   var gen: Gen
   var variant = ""
   if m == 1:
-    let choice = q4Choice("FIRLIFT_Q4_GEMV", "auto", ["auto", "scalar", "scalar_fma", "fma", "parallel", "parallel_fma", "simd"])
+    let choice = q4Choice("FIRLIFT_Q4_GEMV", "auto", ["auto", "scalar", "scalar_fma", "fma", "parallel", "parallel_fma", "simd", "word_parallel"])
     case choice
     of "scalar":
       gen = genMatmulQ4(m, k, n, group, nGroups, 0, true, false, true)
@@ -633,6 +650,9 @@ proc lowerMatmulQ4(l: SessionLift; op: Op) =
     of "simd":
       let simd = q4SimdGemv(k, n, group, nGroups)
       gen = simd.gen; variant = simd.variant
+    of "word_parallel":
+      let word = q4WordParallel(k, n, group, nGroups)
+      gen = word.gen; variant = word.variant
     else:
       if genericKernels():
         gen = genMatmulQ4Par(m, k, n, group, nGroups, parLanes(), false, true)
@@ -641,8 +661,12 @@ proc lowerMatmulQ4(l: SessionLift; op: Op) =
         let simd = q4SimdGemv(k, n, group, nGroups)
         gen = simd.gen; variant = simd.variant
       else:
-        gen = genMatmulQ4Par(m, k, n, group, nGroups, q4ParallelLanes(), false, true)
-        variant = q4ParallelVariant(gen, false)
+        if l.trace.backend == "vulkan":
+          let word = q4WordParallel(k, n, group, nGroups, q4WordAutoMaxK())
+          gen = word.gen; variant = word.variant
+        else:
+          gen = genMatmulQ4Par(m, k, n, group, nGroups, q4ParallelLanes(), false, true)
+          variant = q4ParallelVariant(gen, false)
   else:
     let choice = q4Choice("FIRLIFT_Q4_GEMM", "auto", ["auto", "scalar", "scalar_fma", "parallel", "parallel_fma", "fma", "tiled", "tiled_fma", "matrix", "mm"])
     case choice
