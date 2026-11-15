@@ -81,6 +81,11 @@ type
     gemvSubgroupSum*: bool                    ## Q4 GEMV micro-kernel sums with subgroupAdd (32-wide subgroups guaranteed)
     gemvThreads*: int                         ## BYBY_FIR_Q4_GEMV_THREADS: workgroup width of the Q4 GEMV micro-kernel (0: lifted width)
     gemvTune*: bool                           ## time every rows/width pair per GEMV shape at load (fgTuneGemv)
+    replayState*: int                         ## decode record/replay: 0 not tried yet, 1 recorded, -1 off
+    replayId*: int                            ## kept recording of the decode step, plus one (0: none)
+    replayScalars*, replayLogits*: SessionHandle   ## host-visible token/position input and logits output of the recording
+    replayDispatched*: int                    ## dispatches inside the recording (counted per replayed step)
+    replayEncoding*: bool                     ## encoding the recording: embedding rows are gathered on the GPU
 
 function fgTensorName(buffer: FirBuffer, layer: int): string
     buffer.tensorName.replace("{i}", $layer)
@@ -215,6 +220,12 @@ function fgProbeWeightAttrs(model: FirGraph, names: string, layer: int): string
 
 function firFreeGraph(model: var FirGraph)
     let be = model.backend.kind.toByby()
+    if model.replayId > 0:
+        sessionFreeRecording(be, model.replayId-1)
+        model.replayId = 0
+    model.replayState = 0
+    sessionFree(be, model.replayScalars)
+    sessionFree(be, model.replayLogits)
     for weight in model.q4.mvalues:
         beResidentFreeQ4(weight)
     for weight in model.fp32.mvalues:
@@ -1511,6 +1522,29 @@ function fgEncodeSession(model: var FirGraph, node: FirNode, layer: int): bool
         return sessionCopyInto(be, model.arena, dst, srcOffset, dstOffset, n)
     raise newException(ValueError, "FIR graph unsupported session replay: " & node.op)
 
+function fgEncodeGather(model: var FirGraph, table, dst, index: SessionHandle, dstOffset, indexOffset, width, tableRows: int): bool
+    ## Vulkan: dst[dstOffset + i] = table[row*width + i] with row = index[indexOffset], read on
+    ## the GPU (clamped to the table). The offsets are constants of the shader, so every binding
+    ## starts at 0.
+    let name = "fir_embed_gather_w" & $width & "_r" & $tableRows & "_d" & $dstOffset & "_i" & $indexOffset
+    var source = "#version 450\n"
+    source.add("layout(local_size_x_id = 0) in;\n")
+    source.add("layout(std430, set=0, binding=0) buffer DstBuf { float dst[]; };\n")
+    source.add("layout(std430, set=0, binding=1) readonly buffer TableBuf { float table[]; };\n")
+    source.add("layout(std430, set=0, binding=2) readonly buffer IndexBuf { float index[]; };\n")
+    source.add("void main() {\n")
+    source.add("    uint i = gl_GlobalInvocationID.x;\n")
+    source.add("    if (i >= " & $width & "u) return;\n")
+    source.add("    uint row = min(uint(max(index[" & $indexOffset & "u], 0.0)), " & $(tableRows-1) & "u);\n")
+    source.add("    dst[" & $dstOffset & "u + i] = table[row * " & $width & "u + i];\n")
+    source.add("}\n")
+    inc model.dispatched
+    if not sessionEncPipeline(true, name, source):
+        return false
+    if not sessionEncBindVkOrMetal(true, 0, dst.metalHandle, dst.vulkanHandle, 0) or not sessionEncBindVkOrMetal(true, 1, table.metalHandle, table.vulkanHandle, 0) or not sessionEncBindVkOrMetal(true, 2, index.metalHandle, index.vulkanHandle, 0):
+        return false
+    return sessionEncDispatch(true, width, 256)
+
 function fgEncodeNodeBody(model: var FirGraph, node: FirNode, layer, token: int): bool
     if node.kind == "micro":
         if model.nativeQ4 and fgNativeQ4Weight(model.graph, node).len > 0:
@@ -1543,6 +1577,14 @@ function fgEncodeNodeBody(model: var FirGraph, node: FirNode, layer, token: int)
             targetOffset = fgPortOffset(model, output)
         if targetIndex < 0:
             return false
+        if model.replayEncoding:
+            # A recorded decode step: the row index is read on the GPU from the token/position
+            # buffer the replay rewrites, not baked into a copy offset.
+            if rows != 1:
+                return false
+            if model.useHandles:
+                return fgEncodeGather(model, model.fp32[tensor], model.handles[targetIndex], fgPortHandle(model, ins[0]), targetOffset, fgPortOffset(model, ins[0]), width, weight.dims[0])
+            return fgEncodeGather(model, model.fp32[tensor], model.arena, model.arena, targetOffset, bindings.memory[ins[0]], width, weight.dims[0])
         for row in 0 ..< filled:
             var index = token
             if rows > 1:
@@ -1759,6 +1801,161 @@ function fgProfileOn(): bool
         state = if getEnv("BYBY_FIR_PROFILE", "0") == "1": 2 else: 1
     result = state == 2
 
+function fgEncodeScalarsIn(model: var FirGraph, scalars: SessionHandle)
+    ## Copies the token (float 0) and position (float 1) of `scalars` into the graph's inputs.
+    let be = model.backend.kind.toByby()
+    if model.useHandles:
+        let tokenName = firRoleBuffer(model.graph, "token")
+        let positionName = firRoleBuffer(model.graph, "position")
+        let tokenIndex = fgPortHandleIndex(model, tokenName)
+        let tokenOffset = fgPortOffset(model, tokenName)
+        let positionIndex = fgPortHandleIndex(model, positionName)
+        let positionOffset = fgPortOffset(model, positionName)
+        if tokenIndex < 0 or positionIndex < 0:
+            raise newException(ValueError, "FIR graph scalar input needs resident buffers")
+        if not sessionCopyInto(be, scalars, model.handles[tokenIndex], 0, tokenOffset, 1) or not sessionCopyInto(be, scalars, model.handles[positionIndex], 1, positionOffset, 1):
+            raise newException(ValueError, "FIR graph scalar input encode failed")
+    elif not sessionCopyInto(be, scalars, model.arena, 0, model.bindings.memory[firRoleBuffer(model.graph, "token")], 1) or not sessionCopyInto(be, scalars, model.arena, 1, model.bindings.memory[firRoleBuffer(model.graph, "position")], 1):
+        raise newException(ValueError, "FIR graph scalar input encode failed")
+
+function fgEncodeLogitsOut(model: var FirGraph, target: SessionHandle)
+    ## Copies the logits of the step into `target` (vocab floats from 0).
+    let be = model.backend.kind.toByby()
+    var dst = target
+    let logitsName = firRoleBuffer(model.graph, "logits")
+    if model.useHandles:
+        let logitsIndex = fgPortHandleIndex(model, logitsName)
+        let logitsOffset = fgPortOffset(model, logitsName)
+        if logitsIndex < 0:
+            raise newException(ValueError, "FIR graph logits needs a resident buffer")
+        if not sessionCopyInto(be, model.handles[logitsIndex], dst, logitsOffset, 0, model.graph.symbols["vocab"]):
+            raise newException(ValueError, "FIR graph logits encode failed")
+    elif not sessionCopyInto(be, model.arena, dst, model.bindings.memory[logitsName], 0, model.graph.symbols["vocab"]):
+        raise newException(ValueError, "FIR graph logits encode failed")
+
+function fgReplaySay(line: string)
+    ## Decode replay notes go to stderr with BYBY_FIR_PROFILE or BYBY_FIR_DECODE_REPLAY_VERBOSE set.
+    if getEnv("BYBY_FIR_PROFILE", "0") != "0" or getEnv("BYBY_FIR_DECODE_REPLAY_VERBOSE", "0") != "0":
+        stderr.writeLine(line)
+
+function fgReplayBlocker(model: FirGraph): string
+    ## Why the decode step cannot be recorded once and replayed (empty: it can). A replayed step
+    ## must not depend on host values other than the token and position it reads from buffers:
+    ## every decode node is a micro-kernel (fixed bindings and grid) or a one-row embedding
+    ## (gathered on the GPU).
+    let be = model.backend.kind.toByby()
+    if getEnv("BYBY_FIR_DECODE_REPLAY", "1") == "0":
+        return "BYBY_FIR_DECODE_REPLAY=0"
+    if be != gbVulkan or not sessionCanRecord(be):
+        return "backend cannot replay a recorded session"
+    if model.nativeQ4:
+        return "BYBY_FIR_Q4_BACKEND=native"
+    if firProbeOn:
+        return "probe active"
+    if fgProfileNodes():
+        return "BYBY_FIR_PROFILE=2"
+    for node in model.graph.nodes:
+        if node.phase != "":
+            continue
+        if node.kind == "micro":
+            let key = fgNodeKey(node, 0)
+            if not model.programs.hasKey(key):
+                return "node " & node.name & " has no prepared micro-kernel"
+        elif node.kind == "session" or node.op != "fir.embedding":
+            return "node " & node.name & " (" & node.op & ") encodes host values"
+        else:
+            let ins = node.inputs.splitWhitespace()
+            let output = node.outputs.splitWhitespace()[0]
+            let weight = model.graph.buffers[ins[1]]
+            if weight.dims.len != 2 or model.graph.buffers[output].elements != weight.dims[1]:
+                return "embedding " & node.name & " is not one row"
+            if weight.perLayer or not model.fp32.hasKey(fgTensorName(weight, 0)):
+                return "embedding " & node.name & " has no resident table"
+    return ""
+
+function fgRecordStep(model: var FirGraph, token: int): seq[float32]
+    ## Encodes one decode step into a command buffer that is kept (sessionBeginRecording), runs
+    ## it, and returns its logits. The token and position come from a host-visible buffer and the
+    ## logits land in another, so later steps only rewrite one, replay and read the other
+    ## (fgReplayStep): no per-step encode. Empty: recording could not start (the caller encodes).
+    let be = model.backend.kind.toByby()
+    let vocab = model.graph.symbols["vocab"]
+    model.replayScalars = sessionHostBuffer(be, 2)
+    model.replayLogits = sessionHostBuffer(be, vocab, true)
+    if not sessionHostWrite(be, model.replayScalars, [float32(token), float32(model.position)]) or not sessionBeginRecording(be):
+        sessionFree(be, model.replayScalars)
+        sessionFree(be, model.replayLogits)
+        model.replayState = -1
+        fgReplaySay("[fir] decode replay off: recording could not start")
+        return @[]
+    inc model.sessions
+    let before = model.dispatched
+    model.replayEncoding = true
+    var ended = false
+    try:
+        fgEncodeScalarsIn(model, model.replayScalars)
+        fgEncodeGraph(model, token, "")
+        fgEncodeLogitsOut(model, model.replayLogits)
+        if not sessionHostReadBarrier(be):
+            raise newException(ValueError, "FIR graph replay host barrier failed")
+        model.replayEncoding = false
+        ended = true
+        if not sessionEnd(be):
+            raise newException(ValueError, "FIR graph sessionEnd failed")
+    except:
+        model.failed = true
+        raise
+    finally:
+        model.replayEncoding = false
+        if not ended:
+            discard sessionEnd(be)
+    model.replayDispatched = model.dispatched - before
+    result = sessionHostRead(be, model.replayLogits, vocab)
+    if result.len != vocab:
+        model.failed = true
+        raise newException(ValueError, "FIR graph logits read length mismatch")
+    let id = sessionLastRecording(be)
+    if id < 0:
+        model.replayState = -1
+        sessionFree(be, model.replayScalars)
+        sessionFree(be, model.replayLogits)
+        fgReplaySay("[fir] decode replay off: the step allocated or staged buffers while recording")
+    else:
+        model.replayState = 1
+        model.replayId = id+1
+        fgReplaySay("[fir] decode replay on: " & $model.replayDispatched & " dispatches recorded once")
+    inc model.logitsReads
+    inc model.position
+
+function fgReplayStep(model: var FirGraph, token: int): seq[float32]
+    ## One decode step from the recording: write token/position, submit, read the logits.
+    let be = model.backend.kind.toByby()
+    let vocab = model.graph.symbols["vocab"]
+    let profile = fgProfileOn()
+    let startedAt = if profile: epochTime() else: 0.0
+    if not sessionHostWrite(be, model.replayScalars, [float32(token), float32(model.position)]):
+        model.failed = true
+        raise newException(ValueError, "FIR graph replay input write failed")
+    let encodedAt = if profile: epochTime() else: 0.0
+    inc model.sessions
+    if not sessionReplay(be, model.replayId-1):
+        model.failed = true
+        raise newException(ValueError, "FIR graph replay failed")
+    let waitedAt = if profile: epochTime() else: 0.0
+    result = sessionHostRead(be, model.replayLogits, vocab)
+    if result.len != vocab:
+        model.failed = true
+        raise newException(ValueError, "FIR graph logits read length mismatch")
+    if profile:
+        let doneAt = epochTime()
+        model.stepEncodeSeconds += encodedAt-startedAt
+        model.stepWaitSeconds += waitedAt-encodedAt
+        model.stepReadSeconds += doneAt-waitedAt
+        inc model.stepProfiled
+    model.dispatched += model.replayDispatched
+    inc model.logitsReads
+    inc model.position
+
 function firGraphStep(model: var FirGraph, token: int, stepKind = "decode"): seq[float32]
     if model.failed:
         raise newException(ValueError, "FIR graph model is closed or a prior session failed")
@@ -1772,6 +1969,18 @@ function firGraphStep(model: var FirGraph, token: int, stepKind = "decode"): seq
     defer:
         if unlikely(firProbeOn):
             probeStepEnd()
+    if model.replayState >= 0:
+        if model.replayState == 0:
+            let blocker = fgReplayBlocker(model)
+            if blocker.len > 0:
+                model.replayState = -1
+                fgReplaySay("[fir] decode replay off: " & blocker)
+            else:
+                let recorded = fgRecordStep(model, token)
+                if recorded.len > 0:
+                    return recorded
+        else:
+            return fgReplayStep(model, token)
     let profile = fgProfileOn()
     let startedAt = if profile: epochTime() else: 0.0
     var encodedAt = 0.0
@@ -1789,30 +1998,9 @@ function firGraphStep(model: var FirGraph, token: int, stepKind = "decode"): seq
     inc model.sessions
     var ended = false
     try:
-        if model.useHandles:
-            let tokenName = firRoleBuffer(model.graph, "token")
-            let positionName = firRoleBuffer(model.graph, "position")
-            let tokenIndex = fgPortHandleIndex(model, tokenName)
-            let tokenOffset = fgPortOffset(model, tokenName)
-            let positionIndex = fgPortHandleIndex(model, positionName)
-            let positionOffset = fgPortOffset(model, positionName)
-            if tokenIndex < 0 or positionIndex < 0:
-                raise newException(ValueError, "FIR graph scalar input needs resident buffers")
-            if not sessionCopyInto(be, scalars, model.handles[tokenIndex], 0, tokenOffset, 1) or not sessionCopyInto(be, scalars, model.handles[positionIndex], 1, positionOffset, 1):
-                raise newException(ValueError, "FIR graph scalar input encode failed")
-        elif not sessionCopyInto(be, scalars, model.arena, 0, model.bindings.memory[firRoleBuffer(model.graph, "token")], 1) or not sessionCopyInto(be, scalars, model.arena, 1, model.bindings.memory[firRoleBuffer(model.graph, "position")], 1):
-            raise newException(ValueError, "FIR graph scalar input encode failed")
+        fgEncodeScalarsIn(model, scalars)
         fgEncodeGraph(model, token, "")
-        let logitsName = firRoleBuffer(model.graph, "logits")
-        if model.useHandles:
-            let logitsIndex = fgPortHandleIndex(model, logitsName)
-            let logitsOffset = fgPortOffset(model, logitsName)
-            if logitsIndex < 0:
-                raise newException(ValueError, "FIR graph logits needs a resident buffer")
-            if not sessionCopyInto(be, model.handles[logitsIndex], model.logitsReadback, logitsOffset, 0, model.graph.symbols["vocab"]):
-                raise newException(ValueError, "FIR graph logits encode failed")
-        elif not sessionCopyInto(be, model.arena, model.logitsReadback, model.bindings.memory[logitsName], 0, model.graph.symbols["vocab"]):
-            raise newException(ValueError, "FIR graph logits encode failed")
+        fgEncodeLogitsOut(model, model.logitsReadback)
         if profile:
             encodedAt = epochTime()
         ended = true
