@@ -4,6 +4,9 @@ import std/[math, os, tables, strformat, strutils, algorithm, monotimes, times]
 import backend, quant, m3_lora, gpu_layers, fp4_gemv_gpu, nimformer, m3_hybrid, customfloat
 import m3_gpu_runtime
 import m3_merge_gpu
+from fp4_gemv_vm import Fp4KmLutLen
+from vendor/bybylang/probe import firProbeOn, probeUploaded
+from vendor/bybylang/backends/metal/metal_backend import metalSessionRead
 
 when defined(macosx):
   {.compile: "m3_inplace_weight_io.m".}
@@ -227,6 +230,34 @@ proc overwritePackedWeight*(ctx: Backend; weight: var SessionHandle;
       if not copied or not finished:raise newException(IOError,"in-place merge transfer failed")
     finally:sessionFree(be,staging)
 
+proc recordMergedFp4Weights(ctx: Backend; cache: Fp4LinCacheGpu) =
+  ## The in-place merge rewrites the packed weights and the LUT on the device, after the upload that the
+  ## FIR recorder saw, so a trace lifted from this run would hold the checkpoint's weights and not the
+  ## merged ones. While the recorder is on, read both buffers back and record them as a fresh upload of
+  ## the same buffers: dispatches recorded from here on bind the merged content. With the recorder off
+  ## this is one boolean test and no readback.
+  if not firProbeOn: return
+  let elements=cache.rows*cache.cols
+  let weightFloats=(elements div 2+elements div 32) div 4
+  var weights,lut:seq[float32]
+  var weightsRaw,lutRaw:pointer
+  case ctx.kind
+  of bkMetal:
+    weights=metalSessionRead(cache.wBuf.metalHandle,weightFloats)
+    lut=metalSessionRead(cache.lutBuf.metalHandle,Fp4KmLutLen)
+    weightsRaw=cache.wBuf.metalHandle
+    lutRaw=cache.lutBuf.metalHandle
+  of bkVulkan:
+    let be=ctx.kind.toByby()
+    weights=sessionRead(be,cache.wBuf,weightFloats)
+    lut=sessionRead(be,cache.lutBuf,Fp4KmLutLen)
+    weightsRaw=cast[pointer](cache.wBuf.vulkanHandle.buf)
+    lutRaw=cast[pointer](cache.lutBuf.vulkanHandle.buf)
+  else:
+    return
+  if weights.len>0:probeUploaded(weightsRaw,addr weights[0],weights.len*4)
+  if lut.len>0:probeUploaded(lutRaw,addr lut[0],lut.len*4)
+
 proc mergeResidentLoraInplace*(m: var NimformerModelJamba; lo: var JambaLora; ctx: Backend): int =
   invalidateM3OneDispatch()
   let scratchMiB=min(64,parseInt(getEnv("BYBY_MERGE_SCRATCH_MIB","64")))
@@ -245,6 +276,7 @@ proc mergeResidentLoraInplace*(m: var NimformerModelJamba; lo: var JambaLora; ct
     echo &"[lora-merge] begin {name}; mode=GPU legacy/in-place; scratch<=8 MiB"
     let mergeStart=getMonoTime()
     let globalScale=mergeFp4ResidentGpu(ctx,gFp4CacheGpu[name],lo.adapters[name],scratchBytes)
+    recordMergedFp4Weights(ctx,gFp4CacheGpu[name])
     lo.quantBase[name].scale= @[globalScale]
     if name in gLoraGpu:
       var ad=gLoraGpu[name]

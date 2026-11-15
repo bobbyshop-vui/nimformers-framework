@@ -93,27 +93,28 @@ fir-lift-test: build
 	cd $(ROOT) && nim c -d:release --hints:off --path:vendor/bybylang \
 	  --nimcache:nimcache/fir-fuse-test -o:$(HERE)/firlift/test_fuse $(HERE)/firlift/test_fuse.nim
 	cd $(ROOT) && $(HERE)/firlift/test_fuse
+	cd $(ROOT) && nim c -d:release --hints:off --path:vendor/bybylang \
+	  --nimcache:nimcache/fir-steps-test -o:$(HERE)/build/test_steps $(HERE)/firlift/test_steps.nim
+	cd $(ROOT) && $(HERE)/build/test_steps
 	cd $(ROOT) && BYBYLANG_NIMCACHE=$(ROOT)/nimcache/fir-raw $(BYBYLANG) $(HERE)/tests/test_fir_raw.bybylang --aot=$(HERE)/build/test_fir_raw --quiet && \
 	  $(HERE)/build/test_fir_raw
 	cd $(ROOT) && nim c -d:release --hints:off --mm:arc --path:vendor/bybylang --path:. --path:kernelfortest \
 	  --nimcache:nimcache/session-gpu-test -o:$(HERE)/firlift/test_session_gpu $(HERE)/firlift/test_session_gpu.nim
 	cd $(ROOT) && nim c -d:release --hints:off --path:vendor/bybylang \
 	  --nimcache:nimcache/fir-backend-available -o:$(HERE)/build/backend_available $(HERE)/firlift/backend_available.nim
-	# Every backend present (Metal, Vulkan/MoltenVK) records an op trace; each must lower completely.
+	# Every backend present (Metal, Vulkan/MoltenVK) records an op trace through pipes (nothing is
+	# written to the disk); each must lower completely.
 	for b in metal vulkan; do \
 	  cd $(ROOT) && $(HERE)/build/backend_available $$b || continue; \
-	  cd $(ROOT) && rm -f $(FIR_LIFT_TMP)/session-ops-$$b.fprobe && \
-	  BACKEND=$$b BYBY_FIR_PROBE=$(FIR_LIFT_TMP)/session-ops-$$b.fprobe BYBY_FIR_PROBE_STEPS=decode:1 $(HERE)/firlift/test_session_gpu || exit 1; \
-	  if test -f $(FIR_LIFT_TMP)/session-ops-$$b.fprobe && grep -q '^op ' $(FIR_LIFT_TMP)/session-ops-$$b.fprobe; then \
-	    $(HERE)/firlift/firlift --trace $(FIR_LIFT_TMP)/session-ops-$$b.fprobe --config $(HERE)/firlift/coverage_config.json \
-	      --out $(FIR_LIFT_TMP)/session-ops-$$b --coverage || exit 1; fi; \
+	  cd $(ROOT) && BACKEND=$$b BYBY_FIR_PROBE_STEPS=decode:1 $(HERE)/firlift/firlift \
+	    --config $(HERE)/firlift/coverage_config.json --out $(FIR_LIFT_TMP)/session-ops-$$b --coverage \
+	    --run $(HERE)/firlift/test_session_gpu || exit 1; \
 	done
 	cd $(ROOT) && nim c -d:release --hints:off --path:vendor/bybylang \
 	  --nimcache:nimcache/builder-test -o:$(HERE)/firlift/builder_test $(HERE)/firlift/builder_test.nim
 	cd $(ROOT) && $(HERE)/firlift/builder_test
 	cd $(ROOT) && $(CLI_BIN) --fir-check $(FIR_LIFT_TMP)/builder/model.fir
 	rm -rf $(FIR_LIFT_TMP)/builder $(FIR_LIFT_TMP)/session-ops-metal $(FIR_LIFT_TMP)/session-ops-vulkan
-	rm -f $(FIR_LIFT_TMP)/session-ops-metal.fprobe $(FIR_LIFT_TMP)/session-ops-vulkan.fprobe
 
 # JSON-lines diagnostic runner; the Python quality check keeps all output in memory.
 fir-probe: $(ROOT)/$(BYBYLANG)

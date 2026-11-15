@@ -60,8 +60,12 @@ proc decode(words: seq[uint32]): seq[OpInfo] =
   var scopes: seq[int]
   while i < words.len:
     let w = words[i]
-    var info = OpInfo(at: i, op: w and 0xFF'u32, a: (w shr 8) and 0x1F'u32,
-      b: (w shr 13) and 0x1F'u32, c: (w shr 18) and 0x1F'u32, match: -1)
+    var info = OpInfo(at: i, op: w and 0xFF'u32,
+      a: ((w shr 8) and 0x1F'u32) or (((w shr 23) and 0x7'u32) shl 5),
+      b: ((w shr 13) and 0x1F'u32) or (((w shr 26) and 0x7'u32) shl 5),
+      c: ((w shr 18) and 0x1F'u32) or (((w shr 29) and 0x7'u32) shl 5), match: -1)
+    # The footprint analysis tracks registers in 64-bit sets: larger programs stay unfused.
+    if max(info.a, max(info.b, info.c)) > 60: reject("register index above the analysis range")
     inc i
     if info.op == OpVtgBegin or info.op == OpGridBarrier or info.op == OpGridEpilogue or
        info.op == OpVtgEnd or info.op == OpLoadVact or
@@ -156,7 +160,8 @@ proc footprintOf(prog: seq[OpInfo]; threads, tg: int; budget: var int): Footprin
         of OpDiv: bin(op, proc(x, y: float32): float32 {.nimcall.} = x / y)
         of OpCmpLt: bin(op, proc(x, y: float32): float32 {.nimcall.} = (if x < y: 1'f32 else: 0'f32))
         of OpFma:
-          let rc = op.imm and 0x1F'u32
+          let rc = op.imm and 0xFF'u32
+          if rc > 60: reject("register index above the analysis range")
           let x = rr(op.b); let y = rr(op.c); let z = rr(rc)
           if rs[op.b] == stKnown and rs[op.c] == stKnown and rs[rc] == stKnown:
             setR(op.a, x * y + z, stKnown)
@@ -291,7 +296,7 @@ proc fusable*(a, b: FuseKernel; roots: Table[string, string]; plan: var FusePlan
       var used = 0
       for o in pa & pb:
         used = max(used, int(max(o.a, max(o.b, o.c))))
-        if o.op == OpFma: used = max(used, int(o.imm and 0x1F'u32))
+        if o.op == OpFma: used = max(used, int(o.imm and 0xFF'u32))
         if o.op == OpULoadIn4: used = max(used, int(o.a) + 3)
       if used + 2 > 31: reject("no free registers for the fused launch")
     let fa = footprintOf(pa, a.threads, a.tg, left)
@@ -312,7 +317,7 @@ proc pack(op: uint32; a = 0'u32; b = 0'u32; c = 0'u32): uint32 =
 proc maxReg(prog: seq[OpInfo]): int =
   for o in prog:
     result = max(result, int(max(o.a, max(o.b, o.c))))
-    if o.op == OpFma: result = max(result, int(o.imm and 0x1F'u32))
+    if o.op == OpFma: result = max(result, int(o.imm and 0xFF'u32))
     if o.op == OpULoadIn4: result = max(result, int(o.a) + 3)
 
 proc groupsOf(k: FuseKernel): int = (k.threads + k.tg - 1) div k.tg

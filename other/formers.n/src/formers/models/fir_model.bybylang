@@ -10,10 +10,144 @@ import "../sampling/sampler.bybylang"
 import "../runtime/console.bybylang"
 import "../runtime/signals.bybylang"
 
+function fmTailWorth(model: FirGraph, graph: FirProgram, name: string, rest: int): bool
+    ## Whether one partial run of phase `name` over `rest` rows beats `rest` decode steps. A partial
+    ## run costs whole row blocks whatever the row count, and how a block compares with a step
+    ## depends on the device, so the warm-up measures both (fmCalibrateTail). Without a
+    ## measurement: an eighth of the phase.
+    if rest < 2:
+        return false
+    if model.stepSeconds > 0 and model.phaseBlockSeconds.hasKey(name):
+        let rowsPerBlock = max(1, model.phaseBlockRows[name])
+        let blocks = (rest + rowsPerBlock - 1) div rowsPerBlock
+        return float(rest)*model.stepSeconds >= float(blocks)*model.phaseBlockSeconds[name]
+    return rest >= max(2, graph.phases[name] div 8)
+
+function fmCalibrateTail(model: var FirGraph, graph: FirProgram, token: int)
+    ## Times one decode step and one row block of every partial phase (two rows launch exactly one
+    ## block; the faster of two runs). The caller resets the model state afterwards.
+    var stepBest = 0.0
+    for i in 0 ..< 2:
+        if model.position+1 > graph.symbols["positions"]:
+            return
+        let t0 = epochTime()
+        discard firGraphStep(model, token)
+        let seconds = epochTime()-t0
+        if stepBest == 0.0 or seconds < stepBest:
+            stepBest = seconds
+    for name in graph.phaseOrder:
+        if name notin graph.phasePartial or graph.phases[name] < 2:
+            continue
+        var rowsPerBlock = 1
+        for node in graph.nodes:
+            if node.phase == name and node.kind == "micro" and graph.kernels.hasKey(node.op):
+                rowsPerBlock = max(rowsPerBlock, graph.kernels[node.op].rowBlock)
+        var best = 0.0
+        for i in 0 ..< 2:
+            if model.position+2 > graph.symbols["positions"]:
+                return
+            let t0 = epochTime()
+            discard firGraphPhase(model, name, @[token, token])
+            let seconds = epochTime()-t0
+            if best == 0.0 or seconds < best:
+                best = seconds
+        model.phaseBlockSeconds[name] = best
+        model.phaseBlockRows[name] = rowsPerBlock
+    model.stepSeconds = stepBest
+
+function fmFirFeedPrompt(model: var FirGraph, graph: FirProgram, ids: seq[int]): seq[float32]
+    ## Consumes the whole prompt and returns the logits after its last token; an empty result
+    ## means Ctrl+C stopped it. Multi-row phases consume the prompt, the largest one that fits
+    ## first. A phase with `logits=` (a row of logits per token) or `last=` (the logits after its
+    ## last row) that takes exactly the remaining tokens finishes the prompt; a state-only phase
+    ## leaves at least one token. A tail shorter than every phase runs through the smallest
+    ## `partial` phase that holds it. What is left runs as decode steps, the last token always
+    ## producing logits.
+    var next = 0
+    var finished = false
+    var ubatch = 0
+    try:
+        ubatch = max(0, parseInt(getEnv("BYBY_UBATCH", "0")))
+    except ValueError:
+        ubatch = 0
+    while not finished and next < ids.len:
+        # When one partial phase holds everything that is left, a single run of it beats several
+        # runs of a smaller phase: leave the rest to the tail below.
+        var tailFits = false
+        for name in graph.phaseOrder:
+            let rows = graph.phases[name]
+            let rest = if graph.phaseLast.hasKey(name): ids.len-next else: ids.len-1-next
+            if name in graph.phasePartial and rows >= rest and fmTailWorth(model, graph, name, rest):
+                tailFits = true
+        if tailFits:
+            break
+        var chosen = ""
+        var width = 0
+        for name in graph.phaseOrder:
+            let phaseRows = graph.phases[name]
+            let rows = if ubatch > 0 and name notin graph.phaseLogits: min(phaseRows, ubatch) else: phaseRows
+            if graph.phaseLogits.hasKey(name):
+                if rows == ids.len-next and rows > width:
+                    chosen = name
+                    width = rows
+            elif graph.phaseLast.hasKey(name):
+                if rows <= ids.len-next and rows > width:
+                    chosen = name
+                    width = rows
+            elif rows <= ids.len-1-next and rows > width:
+                chosen = name
+                width = rows
+        if width == 0:
+            break
+        if fmStopRequested():
+            return @[]
+        let phaseOut = firGraphPhase(model, chosen, ids[next ..< next+width])
+        next += width
+        if next == ids.len:
+            if graph.phaseLogits.hasKey(chosen):
+                let vocab = graph.symbols["vocab"]
+                result = phaseOut[(width-1)*vocab ..< width*vocab]
+            else:
+                result = phaseOut
+            finished = true
+    if not finished:
+        # The tail: one partial run of a phase instead of single steps. A phase with `last=` takes
+        # every remaining token, a state-only one leaves the last token to a decode step. A run costs
+        # about as much as its row blocks, so a very short tail stays on decode steps.
+        var chosen = ""
+        var width = 0
+        var take = 0
+        for name in graph.phaseOrder:
+            let phaseRows = graph.phases[name]
+            let rows = if ubatch > 0 and name notin graph.phaseLogits: min(phaseRows, ubatch) else: phaseRows
+            let rest = if graph.phaseLast.hasKey(name): ids.len-next else: ids.len-1-next
+            if name in graph.phasePartial and rows >= rest and fmTailWorth(model, graph, name, rest) and (width == 0 or rest > take or (rest == take and rows < width)):
+                chosen = name
+                width = rows
+                take = rest
+        if width > 0:
+            if fmStopRequested():
+                return @[]
+            let phaseOut = firGraphPhase(model, chosen, ids[next ..< next+take])
+            next += take
+            if next == ids.len:
+                result = phaseOut
+    for i in next ..< ids.len:
+        if fmStopRequested():
+            return @[]
+        result = firGraphStep(model, ids[i], "prefill")
+
 function fmRunFir(det: FmDetection, cliOpts: FmOptions): bool
     var opts = cliOpts
+    var ubatch = 0
+    try:
+        ubatch = max(0, parseInt(getEnv("BYBY_UBATCH", "0")))
+    except ValueError:
+        ubatch = 0
     let path = if opts.firFile.len > 0: opts.firFile else: opts.modelsDir / "model.fir"
     var graph = firParse(path, det.files.configPath)
+    if ubatch > 0:
+        fmSay("[formers.n] FIR graph micro-batch: up to " & $ubatch & " rows")
     if opts.firF32:
         graph = firF32Weights(graph)
     let cfg = parseFile(det.files.configPath)
@@ -59,40 +193,56 @@ function fmRunFir(det: FmDetection, cliOpts: FmOptions): bool
     if not useIds:
         for probe in ["\n", "\n\n", " ", "  ", "    ", "\t", "\n    ", "\n\t", "\r\n"]:
             fmExemptFromPenalty(sampler, tok.encode(probe, false))
-    var logits: seq[float32]
+    var warmed = false
+    if not opts.noWarmup and ids.len+3 <= graph.symbols["positions"]:
+        # Run the prompt phases and a few decode steps now, so every kernel is compiled and the
+        # speeds below contain no kernel setup/JIT, then start the real run from a clean state.
+        let warmStart = epochTime()
+        if fmFirFeedPrompt(model, graph, ids).len == 0:
+            return true
+        for i in 0 ..< 2:
+            discard firGraphStep(model, ids[ids.len-1])
+        if graph.phasePartial.len > 0:
+            # Measure a decode step against a row block of each partial phase, so short prompts and
+            # prompt tails take whichever is cheaper on this device.
+            fmCalibrateTail(model, graph, ids[ids.len-1])
+        let measuredStep = model.stepSeconds
+        let measuredBlocks = model.phaseBlockSeconds
+        let measuredRows = model.phaseBlockRows
+        if model.useHandles:
+            # A lifted graph keeps all of its mutable state in buffers that carry their initial data:
+            # firGraphReset restores them, so the warm kernels are reused without loading twice.
+            firGraphReset(model)
+            model.sessions = 0
+            model.logitsReads = 0
+            model.dispatched = 0
+            model.profTime.clear()
+            model.profCount.clear()
+            model.stepEncodeSeconds = 0.0
+            model.stepWaitSeconds = 0.0
+            model.stepReadSeconds = 0.0
+            model.stepProfiled = 0
+        else:
+            # Other graphs: load a fresh one (the compiled pipelines stay cached in the process).
+            firFreeGraph(model)
+            model = firLoadGraph(graph, det.files.nimqPath, ctx)
+            model.stepSeconds = measuredStep
+            model.phaseBlockSeconds = measuredBlocks
+            model.phaseBlockRows = measuredRows
+        warmed = true
+        fmSay("[formers.n] ready: warmup " & formatFloat(epochTime()-warmStart, ffDecimal, 1) & " s (kernel setup/JIT, prompt + 2 decode steps)")
+        if model.stepSeconds > 0:
+            # What the prompt feeder decides with: a partial phase run is used when it is cheaper than
+            # stepping its rows one by one.
+            var line = "[formers.n] measured: decode step " & formatFloat(model.stepSeconds*1000, ffDecimal, 1) & " ms"
+            for name in graph.phaseOrder:
+                if model.phaseBlockSeconds.hasKey(name):
+                    line = line & ", " & name & " block of " & $model.phaseBlockRows[name] & " rows " & formatFloat(model.phaseBlockSeconds[name]*1000, ffDecimal, 1) & " ms"
+            fmSay(line)
     let start = epochTime()
-    var next = 0
-    # Multi-row phases consume the prompt: a phase with `logits=` that takes exactly the remaining
-    # tokens finishes the prompt in one pass (its last row is the next-token distribution);
-    # otherwise the largest state-only phase that leaves at least one token goes first. The rest
-    # runs as decode steps, the last token always producing logits.
-    var done = false
-    while not done and next < ids.len:
-        var chosen = ""
-        var width = 0
-        for name in graph.phaseOrder:
-            let rows = graph.phases[name]
-            if graph.phaseLogits.hasKey(name):
-                if rows == ids.len-next and rows > width:
-                    chosen = name
-                    width = rows
-                    done = true
-            elif rows <= ids.len-1-next and rows > width and not done:
-                chosen = name
-                width = rows
-        if width == 0:
-            break
-        if fmStopRequested():
-            return true
-        let phaseOut = firGraphPhase(model, chosen, ids[next ..< next+width])
-        next += width
-        if graph.phaseLogits.hasKey(chosen) and done:
-            let vocab = graph.symbols["vocab"]
-            logits = phaseOut[(width-1)*vocab ..< width*vocab]
-    for i in next ..< ids.len:
-        if fmStopRequested():
-            return true
-        logits = firGraphStep(model, ids[i], "prefill")
+    var logits = fmFirFeedPrompt(model, graph, ids)
+    if logits.len == 0:
+        return true
     let prefillSeconds = epochTime()-start
     var decodeSeconds = 0.0
     var decodeSteps = 0
@@ -135,7 +285,16 @@ function fmRunFir(det: FmDetection, cliOpts: FmOptions): bool
         fmOut().flushFile()
     finally:
         fmSetGenerating(false)
-    fmSay("[formers.n] FIR graph prefill (" & $graph.phaseOrder.len & " multi-row phases): " & $(ids.len-generated) & " tokens, " & $prefillSeconds & " s, " & $(float64(ids.len-generated)/prefillSeconds) & " tok/s; decode: " & $decodeSteps & " steps, " & $decodeSeconds & " s, " & $(if decodeSteps > 0: float64(decodeSteps)/decodeSeconds else: 0.0) & " tok/s")
+    let jitNote = if warmed: "without kernel setup/JIT" else: "with kernel setup/JIT, no warmup"
+    let promptTokens = ids.len-generated
+    fmSay("[formers.n] FIR graph prefill (" & $graph.phaseOrder.len & " multi-row phases): " & $promptTokens & " tokens in " & formatFloat(prefillSeconds, ffDecimal, 3) & " s -> " & formatFloat(float64(promptTokens)/prefillSeconds, ffDecimal, 2) & " tok/s (" & jitNote & ")")
+    if decodeSteps > 0:
+        fmSay("[formers.n] FIR graph decode: " & $decodeSteps & " steps in " & formatFloat(decodeSeconds, ffDecimal, 3) & " s -> " & formatFloat(float64(decodeSteps)/decodeSeconds, ffDecimal, 2) & " tok/s (" & formatFloat(decodeSeconds*1000/float64(decodeSteps), ffDecimal, 1) & " ms/token, " & jitNote & ")")
     fmSay("[formers.n] FIR graph sessions=" & $model.sessions & ", logits reads=" & $model.logitsReads & ", weights=" & (if opts.firF32: "fp32" else: "FIR dtype") & "")
+    for line in firGraphProfileReport(model):
+        fmSay("[fir-profile] " & line)
+    if model.stepProfiled > 0:
+        let steps = float64(model.stepProfiled)
+        fmSay("[fir-profile] decode steps: " & $model.stepProfiled & ", encode " & formatFloat(model.stepEncodeSeconds*1000/steps, ffDecimal, 2) & " ms, gpu wait " & formatFloat(model.stepWaitSeconds*1000/steps, ffDecimal, 2) & " ms, logits read " & formatFloat(model.stepReadSeconds*1000/steps, ffDecimal, 2) & " ms (mean per step)")
     fmSay("[formers.n] FIR graph: " & $generated & " generated tokens in " & $(epochTime()-start) & " s; FIR: " & $model.dispatched & " VM programs, backend=" & $ctx.kind)
     result = true

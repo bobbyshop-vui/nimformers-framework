@@ -3,6 +3,7 @@ import std/[strutils, tables, sets, algorithm, os]
 import micro_kernel/slot_layout
 import ./firlift
 import ./firvm
+import ./sidecar
 
 type
   SessionUnit* = object
@@ -13,6 +14,7 @@ type
     trace*: Trace
     firstSession*, sessionCount*, occurrence*, dispatches*: int
     prefillFirst*, decodeFirst*: int
+    resetCopies*: int                ## state-clearing copies left out of the replayed units
 
 proc sessions*(t: Trace): seq[SessionUnit] =
   var current = SessionUnit(first: -1)
@@ -70,6 +72,45 @@ proc opName(op: Op): string =
 
 proc isUpload(op: Op): bool = op.opName.startsWith("sessionUpload")
 
+proc isRopeTableUpload*(t: Trace; upload: Op; buffer: int): bool =
+  ## RoPE tables can be exactly one hidden vector in size. They are persistent inputs,
+  ## not token-row embeddings, even when the same buffer ID is reused as decode scratch later.
+  var afterUpload = false
+  for candidate in t.ops:
+    if not afterUpload:
+      if candidate.id == upload.id: afterUpload = true
+      continue
+    for p in candidate.ins:
+      if p.buffer == buffer:
+        return candidate.opName in ["sessionRope", "sessionRopeKvEnc"] and
+          p.name in ["cosT", "sinT"]
+    # A later upload/free/write starts another lifetime of this buffer. Do not infer
+    # the old upload's role from a consumer of the replacement contents.
+    for p in candidate.outs:
+      if p.buffer == buffer: return false
+  false
+
+proc isUploadedRopeTable*(t: Trace; consumer: Op; portName: string): bool =
+  ## Resolve the producer at this use, rather than assigning a permanent role to a
+  ## buffer ID that the allocator may reuse for computed tables or token rows.
+  var buffer = -1
+  for p in consumer.ins:
+    if p.name == portName: buffer = p.buffer
+  if buffer < 0: return false
+  for i in countdown(t.ops.high, 0):
+    let producer = t.ops[i]
+    if producer.order >= consumer.order: continue
+    # A recorded upload names its destination in its transfer; its op has no output ports.
+    var writes = false
+    for p in producer.outs:
+      if p.buffer == buffer: writes = true
+    if producer.isUpload:
+      for tr in t.transfers:
+        if tr.kind == "upload" and tr.op == producer.id and tr.dst.buffer == buffer: writes = true
+    if writes:
+      return producer.isUpload and t.isRopeTableUpload(producer, buffer)
+  false
+
 proc accessOf(op: Op; t: Trace; reads, writes: var seq[int]) =
   ## Buffers an op reads and writes, from named ports or from the bytecode's domain access.
   if op.impl == "raw:dispatch":
@@ -87,22 +128,140 @@ proc accessOf(op: Op; t: Trace; reads, writes: var seq[int]) =
 type Dims* = object
   hidden*, vocab*: int
 
+proc captureZeroRange(t: Trace; tr: TransferRec; byteOffset, bytes: int): bool =
+  ## True when bytes [byteOffset, byteOffset+bytes) of an upload's recorded payload are present and all zero.
+  if bytes <= 0 or byteOffset < 0 or tr.captureOffset < 0 or tr.captureBytes <= 0 or
+      tr.captureBytes != tr.dst.bytes or byteOffset+bytes > tr.captureBytes: return false
+  sidecarAllZero(t.sourcePath, tr.captureOffset+byteOffset, bytes)
+
 proc captureZero(t: Trace; tr: TransferRec): bool =
-  if tr.captureOffset < 0 or tr.captureBytes <= 0 or tr.captureBytes != tr.dst.bytes: return false
-  let path = t.sourcePath & ".data"
-  if t.sourcePath.len == 0 or not fileExists(path): return false
-  let f = open(path, fmRead)
-  defer: f.close()
-  f.setFilePos(tr.captureOffset)
-  var buffer = newString(min(tr.captureBytes, 1 shl 20))
-  var left = tr.captureBytes
-  while left > 0:
-    let n = min(buffer.len, left)
-    if f.readBuffer(addr buffer[0], n) != n: return false
-    for c in buffer.toOpenArray(0, n-1):
-      if c != '\0': return false
-    left -= n
+  t.captureZeroRange(tr, 0, tr.captureBytes)
+
+proc attrNum(op: Op; key: string): int =
+  if op.attrs.hasKey(key):
+    try: return parseInt(op.attrs[key])
+    except ValueError: discard
+  0
+
+proc uploadedZero(t: Trace; buffer, byteOffset, bytes, before: int): int =
+  ## Op order of the last upload into `buffer` before op order `before` that touches the byte range,
+  ## when that upload covers the whole range and its recorded payload is all zero there; -1 otherwise.
+  var best = -1
+  var found = -1
+  for i, tr in t.transfers:
+    if tr.kind != "upload" or tr.dst.buffer != buffer or tr.order >= before: continue
+    if tr.dst.offset < byteOffset+bytes and byteOffset < tr.dst.offset+tr.dst.bytes and tr.order >= best:
+      best = tr.order
+      found = i
+  if found < 0: return -1
+  let tr = t.transfers[found]
+  if byteOffset >= tr.dst.offset and byteOffset+bytes <= tr.dst.offset+tr.dst.bytes and
+      t.captureZeroRange(tr, byteOffset-tr.dst.offset, bytes): best else: -1
+
+proc writesBuffer(op: Op; t: Trace; buffer: int): bool =
+  if op.impl == "raw:dispatch":
+    var bound = false
+    for p in op.bindings:
+      if p.buffer == buffer: bound = true
+    if not bound: return false
+  var reads, writes: seq[int]
+  op.accessOf(t, reads, writes)
+  buffer in writes
+
+proc holdsZeros(t: Trace; buffer, byteOffset, bytes, before: int): bool =
+  ## `buffer` still holds the zeros it was uploaded with in the byte range at op order `before`:
+  ## no other op wrote it since that upload.
+  let uploaded = t.uploadedZero(buffer, byteOffset, bytes, before)
+  if uploaded < 0: return false
+  for op in t.ops:
+    if op.order >= before: break
+    if op.order <= uploaded or op.isUpload or op.opName in NonDataOps: continue
+    if op.writesBuffer(t, buffer): return false
   true
+
+type ResetCopy = object
+  op: Op
+  dstBuffer, dstByte, bytes: int   ## the cleared byte range
+
+proc zeroFill(t: Trace; op: Op; reset: var ResetCopy): bool =
+  ## A sessionCopyInto from a range of a still-zero uploaded buffer.
+  var src, dst: PortRef
+  var haveSrc = false
+  var haveDst = false
+  for p in op.ins:
+    if p.name == "src":
+      src = p
+      haveSrc = true
+  for p in op.outs:
+    if p.name == "dst":
+      dst = p
+      haveDst = true
+  let n = op.attrNum("n")
+  if not haveSrc or not haveDst or n <= 0: return false
+  if not t.holdsZeros(src.buffer, src.offset+op.attrNum("srcOffsetElems")*4, n*4, op.order): return false
+  reset = ResetCopy(op: op, dstBuffer: dst.buffer, dstByte: dst.offset+op.attrNum("dstOffsetElems")*4, bytes: n*4)
+  true
+
+const ResetNeutralOps = ["sessionFree", "sessionAllocScratch", "sessionAllocHeap", "sessionAllocFromHeap",
+  "sessionFreeHeap", "sessionJitPrewarm", "sessionGetLastError", "sessionCommitContinue",
+  "sessionTensorCoreRequired", "sessionPacesCommandBuffers", "sessionFlashAttentionPrepare",
+  "sessionMamba2SsdPrepare", "sessionMaxTgThreads", "sessionRecoverQueue", "sessionSetF32GemmTiled",
+  "sessionSetFp4GemmTiled", "sessionCooperativeGemmEnabled", "sessionCooperativeGemmJobs"]
+
+proc stateResets(t: Trace): seq[ResetCopy] =
+  ## The copies of every "reset session": a session that launches no kernel and only copies ranges
+  ## of a zero-filled uploaded buffer over other buffers (the native runtime clears its recurrent
+  ## state between prompts that way).
+  var open = false
+  var clean = false
+  var found: seq[ResetCopy]
+  for op in t.ops:
+    if op.impl == "session:sessionBegin":
+      open = true
+      clean = true
+      found.setLen(0)
+    elif not open:
+      continue
+    elif op.impl == "session:sessionEnd":
+      open = false
+      if clean:
+        for c in found: result.add c
+    elif op.impl == "session:sessionCopyInto" and op.parent < 0:
+      var reset: ResetCopy
+      if t.zeroFill(op, reset): found.add reset
+      else: clean = false
+    elif op.impl.startsWith("session:") and op.opName in ResetNeutralOps:
+      discard
+    else:
+      clean = false
+
+proc droppableResets(t: Trace; carried: HashSet[int]; first, last: int): HashSet[int] =
+  ## The reset copies among the carried ops that the lifted graph does not need. Its buffers start
+  ## from their uploaded contents, so a clear is redundant when the cleared range was uploaded as
+  ## zeros and no replayed op wrote the buffer before the copy. Kept inside a replayed phase the
+  ## clear would wipe the recurrent state again at every use of that phase.
+  let resets = t.stateResets()
+  if resets.len == 0: return
+  var isReset = initHashSet[int]()
+  for r in resets: isReset.incl r.op.order
+  var firstTouch = initTable[int, int]()
+  var firstWrite = initTable[int, int]()
+  for op in t.ops:
+    if op.opName in NonDataOps or op.isUpload: continue
+    if not ((op.order in carried and op.order notin isReset) or (op.order >= first and op.order <= last)):
+      continue
+    var reads, writes: seq[int]
+    op.accessOf(t, reads, writes)
+    for b in reads & writes:
+      if b notin firstTouch: firstTouch[b] = op.order
+    for b in writes:
+      if b notin firstWrite: firstWrite[b] = op.order
+  for r in resets:
+    if r.op.order notin carried: continue
+    if firstWrite.getOrDefault(r.dstBuffer, high(int)) < r.op.order: continue
+    if firstTouch.hasKey(r.dstBuffer) and
+        t.uploadedZero(r.dstBuffer, r.dstByte, r.bytes, firstTouch[r.dstBuffer]) < 0: continue
+    result.incl r.op.order
 
 proc sliceBefore(t: Trace; seeds: HashSet[int]; before: int; dims: Dims;
                  tokenRows: var bool): HashSet[int] =
@@ -241,15 +400,20 @@ proc selectStep*(t: Trace; step = -1; slice = ""; dims = Dims()): StepSelection 
   var carried = initHashSet[int]()   # order of earlier ops that produced state the unit reads
   if slice.len == 0 and result.occurrence == 0:
     carried = stateProducers(t, ss[start].first, ss[start+width-1].last, dims)
-    var earliest = first
-    for order in carried:
-      if order < earliest: earliest = order
-    if earliest < first: result.prefillFirst = earliest
   var last = lastSession
   for op in t.ops:
     if op.order <= lastSession or op.order >= stop: continue
     if op.impl.startsWith("session:sessionUpload"): break
     last = op.order
+  if carried.len > 0:
+    # State clears between prompts are the initial contents of the lifted graph, not replayed work.
+    for order in t.droppableResets(carried, first, last):
+      carried.excl order
+      inc result.resetCopies
+    var earliest = first
+    for order in carried:
+      if order < earliest: earliest = order
+    if earliest < first: result.prefillFirst = earliest
   result.trace.ops = @[]
   for op in t.ops:
     if op.order in carried or (op.order >= first and op.order <= last):
@@ -268,3 +432,33 @@ proc selectStep*(t: Trace; step = -1; slice = ""; dims = Dims()): StepSelection 
   result.trace.decodeFirst = result.decodeFirst
   result.sessionCount = width
   for j in 0 ..< width: result.dispatches += ss[start+j].dispatches
+
+proc withoutSingleRowUnits*(t: Trace; ops: seq[Op]; hidden: int; dropped: var int): seq[Op] =
+  ## The replayed ops without the units that feed a single token (`dropped` counts them). The native
+  ## chat path runs the few tokens left over after its bucketed prefill as plain decode steps, so such
+  ## a unit is the decode unit without its vocabulary head. A phase has two or more rows; the runner
+  ## feeds the remaining tokens through the decode step, which advances the same state.
+  if hidden <= 0: return ops
+  var starts: seq[(int, int)]   # (op order of the token-row upload, rows)
+  for op in ops:
+    if op.phase == 0 or not op.isUpload: continue
+    for tr in t.transfers:
+      if tr.kind == "upload" and tr.op == op.id:
+        if tr.n >= hidden and tr.n mod hidden == 0 and not t.captureZero(tr) and
+            not t.isRopeTableUpload(op, tr.dst.buffer):
+          starts.add (op.order, tr.n div hidden)
+        break
+  starts.sort()
+  var singles = 0
+  for s in starts:
+    if s[1] == 1: inc singles
+  if singles == 0: return ops
+  for op in ops:
+    if op.phase > 0:
+      # Ops before the first token-row upload belong to the first unit.
+      var unit = 0
+      for k, s in starts:
+        if s[0] <= op.order: unit = k
+      if starts[unit][1] == 1: continue
+    result.add op
+  dropped += singles

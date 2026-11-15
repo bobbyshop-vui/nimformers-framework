@@ -83,13 +83,14 @@ function firParse(path: string, configOverride: string = ""): FirProgram
     result.configPath = cfgPath
     let cfg = parseFile(cfgPath)
     result.symbols = initTable[string, int]()
-    if not cfg.hasKey("ssm_cfg"):
-        # Generic graph models: every positive integer config key is a symbol;
-        # the model file adds aliases with `sym` and checks with `require`.
-        for key, value in cfg:
-            if value.kind == JInt and value.getInt() > 0:
-                result.symbols[key] = value.getInt()
-    else:
+    # Every positive integer config key is a symbol (also for Mamba-3 configs), so lifted
+    # files can alias raw keys such as `sym hidden = d_model`; the model file adds aliases
+    # with `sym` and checks with `require`.
+    for key, value in cfg:
+        if value.kind == JInt and value.getInt() > 0:
+            result.symbols[key] = value.getInt()
+    if cfg.hasKey("ssm_cfg"):
+        # Mamba-3 configs also get the derived symbols below; they replace a raw key of the same name.
         let ssm = cfg["ssm_cfg"]
         let hidden = cfg["d_model"].getInt()
         let inter = cfg{"d_intermediate"}.getInt(hidden * ssm{"expand"}.getInt(2))
@@ -144,10 +145,10 @@ function firParse(path: string, configOverride: string = ""): FirProgram
             if headerLayout != "script":
                 raise newException(ValueError, "FIR line " & $lineNo & ": unknown declaration 'script_abi'")
             if sawScriptAbi or w.len != 2:
-                raise newException(ValueError, "FIR line " & $lineNo & ": expected one 'script_abi 1' directive")
-            if w[1] != $FirScriptAbi:
-                raise newException(ValueError, "FIR line " & $lineNo & ": unsupported script_abi " & w[1] & "; runner supports 1")
-            result.scriptAbi = FirScriptAbi
+                raise newException(ValueError, "FIR line " & $lineNo & ": expected one 'script_abi 1|2' directive")
+            if w[1] notin [$FirScriptAbi, $FirScriptResidentQ4Abi]:
+                raise newException(ValueError, "FIR line " & $lineNo & ": unsupported script_abi " & w[1] & "; runner supports 1 and 2")
+            result.scriptAbi = parseInt(w[1])
             sawScriptAbi = true
         of "prefix":
             # Optional tensor-name prefixes tried after the plain name (e.g. "transformer.").
@@ -304,6 +305,16 @@ function firParse(path: string, configOverride: string = ""): FirProgram
                     if not tagOk:
                         raise newException(ValueError, "FIR line " & $lineNo & ": invalid kernel tag")
                     def.tag = kv[1]
+                of "rows":
+                    # rows=B:T : the kernel's threads are ordered by row, every B rows take T threads, and a
+                    # thread touches only its own rows. Launching the first ceil(r/B)*T threads computes rows < r.
+                    let bt = kv[1].split(':')
+                    if bt.len != 2:
+                        raise newException(ValueError, "FIR line " & $lineNo & ": expected rows=BLOCK:THREADS")
+                    def.rowBlock = parseInt(bt[0])
+                    def.rowThreads = parseInt(bt[1])
+                    if def.rowBlock <= 0 or def.rowThreads <= 0:
+                        raise newException(ValueError, "FIR line " & $lineNo & ": rows=BLOCK:THREADS needs positive values")
                 of "size": def.sizeEq = kv[1].split(',')
                 of "expect": def.expects = kv[1].split(',')
                 else:
@@ -318,16 +329,28 @@ function firParse(path: string, configOverride: string = ""): FirProgram
             if w.len < 2:
                 raise newException(ValueError, "FIR line " & $lineNo & ": phase needs a name ('phase NAME rows=N' or 'phase decode')")
             if w[1] != "decode":
-                if w.len < 3 or w.len > 4 or not w[2].startsWith("rows=") or (w.len == 4 and not w[3].startsWith("logits=")):
-                    raise newException(ValueError, "FIR line " & $lineNo & ": expected 'phase NAME rows=N [logits=BUFFER]'")
+                if w.len < 3 or w.len > 5 or not w[2].startsWith("rows="):
+                    raise newException(ValueError, "FIR line " & $lineNo & ": expected 'phase NAME rows=N [logits=BUFFER] [last=BUFFER] [partial]'")
                 let rows = parseInt(w[2][5 .. ^1])
                 if rows < 2:
                     raise newException(ValueError, "FIR line " & $lineNo & ": phase rows must be at least 2")
                 if result.phases.hasKey(w[1]):
                     raise newException(ValueError, "FIR line " & $lineNo & ": duplicate phase " & w[1])
                 result.phases[w[1]] = rows
-                if w.len == 4:
-                    result.phaseLogits[w[1]] = w[3][7 .. ^1]
+                # logits=BUFFER: rows*vocab floats, one row of logits per token row.
+                # last=BUFFER: vocab floats, the logits after the last row the phase ran.
+                # partial: the phase may run over fewer rows (see the check after the loop).
+                for option in w[3 .. ^1]:
+                    if option.startsWith("logits=") and not result.phaseLogits.hasKey(w[1]):
+                        result.phaseLogits[w[1]] = option[7 .. ^1]
+                    elif option.startsWith("last=") and not result.phaseLast.hasKey(w[1]):
+                        result.phaseLast[w[1]] = option[5 .. ^1]
+                    elif option == "partial" and w[1] notin result.phasePartial:
+                        result.phasePartial.add(w[1])
+                    else:
+                        raise newException(ValueError, "FIR line " & $lineNo & ": expected 'phase NAME rows=N [logits=BUFFER] [last=BUFFER] [partial]'")
+                if result.phaseLogits.hasKey(w[1]) and (result.phaseLast.hasKey(w[1]) or w[1] in result.phasePartial):
+                    raise newException(ValueError, "FIR line " & $lineNo & ": a phase with logits= takes neither last= nor partial")
                 result.phaseOrder.add(w[1])
                 currentPhase = w[1]
             else:
@@ -351,4 +374,18 @@ function firParse(path: string, configOverride: string = ""): FirProgram
             raise newException(ValueError, "FIR line " & $lineNo & ": unknown declaration '" & w[0] & "'")
     if not sawHeader or result.model.len == 0 or inRepeat or openKernel.len > 0:
         raise newException(ValueError, "FIR requires a version, model, and closed repeat scopes")
+    # A partial phase runs over fewer rows by launching fewer threads: every node must be the token
+    # embedding or a kernel that declares its row order, up to the node that picks the last row
+    # (sessionCopyInto with lastRowOf=); the nodes after it work on that single row.
+    var singleRow: seq[string]
+    for node in result.nodes:
+        if node.phase.len == 0 or node.phase notin result.phasePartial or node.phase in singleRow:
+            continue
+        if node.kind == "ext" and node.op == "fir.embedding":
+            continue
+        if node.kind == "session" and node.op.startsWith("sessionCopyInto:") and node.op.contains("lastRowOf="):
+            singleRow.add(node.phase)
+            continue
+        if node.kind != "micro" or not result.kernels.hasKey(node.op) or result.kernels[node.op].rowBlock <= 0:
+            raise newException(ValueError, "FIR partial phase " & node.phase & ": node " & node.name & " needs a kernel with rows=BLOCK:THREADS")
     firCheckScriptContract(result)
