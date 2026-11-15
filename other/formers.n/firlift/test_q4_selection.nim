@@ -4,8 +4,8 @@ import std/[os, strutils, tables]
 import ./firlift
 import ./sessionlift
 
-proc configFor(k: int): string =
-  "{\"hidden_size\":" & $k & ",\"max_position_embeddings\":128,\"vocab_size\":4}"
+proc configFor(k: int; vocab = 4): string =
+  "{\"hidden_size\":" & $k & ",\"max_position_embeddings\":128,\"vocab_size\":" & $vocab & "}"
 
 type EnvValue = object
   exists: bool
@@ -20,13 +20,13 @@ proc restoreEnv(name: string; value: EnvValue) =
 
 proc setEnv(name, value: string) = putEnv(name, value)
 
-proc liftQ4(backend: string; k = 128; group = 32; nGroups = 4): string =
+proc liftQ4(backend: string; k = 128; group = 32; nGroups = 4; m = 1; n = 4): string =
   var trace: Trace
   trace.backend = backend
   trace.steps = 1
-  let a = PortRef(name: "a", buffer: 0, bytes: k * 4)
+  let a = PortRef(name: "a", buffer: 0, bytes: m * k * 4)
   let w = PortRef(name: "w", buffer: 1, bytes: 1)
-  let c = PortRef(name: "c", buffer: 2, bytes: 4 * 4)
+  let c = PortRef(name: "c", buffer: 2, bytes: m * n * 4)
   let upload = Op(id: 0, order: 0, step: 1, impl: "session:sessionUpload",
     parent: -1, outs: @[a])
   trace.ops.add upload
@@ -34,22 +34,23 @@ proc liftQ4(backend: string; k = 128; group = 32; nGroups = 4): string =
   var op = Op(id: 1, order: 1, step: 1, impl: "session:sessionMatmulQ4",
     tag: "aten::matmul", parent: -1, ins: @[a, w], outs: @[c])
   for (key, value) in [
-      ("M", "1"), ("k", $k), ("n", "4"), ("group", $group),
+      ("M", $m), ("k", $k), ("n", $n), ("group", $group),
       ("groupsPerRow", $nGroups)]:
     op.attrs[key] = value
   trace.ops.add op
   let read = Op(id: 2, order: 2, step: 1, impl: "session:sessionRead", parent: -1,
     ins: @[PortRef(name: "h", buffer: c.buffer, bytes: c.bytes)])
-  read.attrs["n"] = "4"
+  read.attrs["n"] = $(m * n)
   trace.ops.add read
   trace.stepToken = 1
   trace.names.add NameRec(buffer: 1, offset: 0, bytes: 1,
-    name: "model.layers.0.q_proj.weight", dtype: "q4r", shape: "(4 " & $k & ")")
-  liftSession(trace, configFor(k), "test-model", "")
+    name: "model.layers.0.q_proj.weight", dtype: "q4r", shape: "(" & $n & " " & $k & ")")
+  liftSession(trace, configFor(k, m * n), "test-model", "")
 
 let saved = [
   saveEnv("FIRLIFT_Q4_GEMV"), saveEnv("FIRLIFT_Q4_LANES"), saveEnv("FIRLIFT_TG"),
-  saveEnv("FIRLIFT_SIMD"), saveEnv("FIRLIFT_GENERIC"), saveEnv("FIRLIFT_Q4_WORD_MAX_K")]
+  saveEnv("FIRLIFT_SIMD"), saveEnv("FIRLIFT_GENERIC"), saveEnv("FIRLIFT_Q4_WORD_MAX_K"),
+  saveEnv("FIRLIFT_Q4_GEMM")]
 try:
   delEnv("FIRLIFT_Q4_GEMV")
   delEnv("FIRLIFT_Q4_LANES")
@@ -57,6 +58,7 @@ try:
   delEnv("FIRLIFT_SIMD")
   delEnv("FIRLIFT_GENERIC")
   delEnv("FIRLIFT_Q4_WORD_MAX_K")
+  delEnv("FIRLIFT_Q4_GEMM")
 
   var fir = liftQ4("vulkan")
   doAssert "kernel s.matmul_q4_word_parallel" in fir
@@ -106,6 +108,11 @@ try:
   delEnv("FIRLIFT_Q4_GEMV")
   fir = liftQ4("metal")
   doAssert "kernel s.matmul_q4_simd" in fir
+
+  setEnv("FIRLIFT_Q4_GEMM", "tensor_core")
+  fir = liftQ4("vulkan", k = 64, group = 32, nGroups = 2, m = 16, n = 64)
+  doAssert "kernel s.matmul_q4_tensor_core_micro" in fir
+  doAssert "tg=128" in fir
 finally:
   restoreEnv("FIRLIFT_Q4_GEMV", saved[0])
   restoreEnv("FIRLIFT_Q4_LANES", saved[1])
@@ -113,5 +120,6 @@ finally:
   restoreEnv("FIRLIFT_SIMD", saved[3])
   restoreEnv("FIRLIFT_GENERIC", saved[4])
   restoreEnv("FIRLIFT_Q4_WORD_MAX_K", saved[5])
+  restoreEnv("FIRLIFT_Q4_GEMM", saved[6])
 
-echo "PASS Q4 GEMV backend selection, overrides and fallback labels"
+echo "PASS Q4 GEMV and Tensor Core GEMM selection"

@@ -325,6 +325,14 @@ proc addKernelNode(l: SessionLift; op: Op; hint: string; g: Gen; ins, outs: seq[
   l.nodes.add SNode(kind: "micro", op: l.kernels[idx].name, name: l.nodeName(hint),
     ins: ins, outs: outAll)
 
+proc q4TensorCoreKernel(k: SKern): bool =
+  let words = k.body.splitWhitespace()
+  if words.len < 2 or words[0] != "words": return false
+  try:
+    result = (uint32(parseHexInt(words[1])) and 0xFF'u32) == OP_Q4_COOP_GEMM
+  except ValueError:
+    result = false
+
 # ── op lowering ─────────────────────────────────────────────────────
 
 proc unitRows(l: SessionLift; op: Op; n: int): int =
@@ -578,6 +586,12 @@ proc q4MatrixGemm(m, k, n, group, nGroups: int): tuple[gen: Gen, rowBlock, rowTg
   result.gen = genMatmulQ4Mm(m, k, n, group, nGroups, true)
   if result.gen.tg != result.rowTg: result.rowBlock = 0
 
+proc q4TensorCoreGemm(m, k, n, group, nGroups: int): tuple[gen: Gen, rowBlock, rowTg: int] =
+  result.rowBlock = 16
+  result.rowTg = ((n + 63) div 64) * 128
+  result.gen = genMatmulQ4TensorCore(m, k, n, group, nGroups)
+  if result.gen.tg != 128: result.rowBlock = 0
+
 proc q4SimdGemv(k, n, group, nGroups: int): tuple[gen: Gen, variant: string] =
   let rows = tunerKnob("FIRLIFT_Q4_ROWS", 4, [1, 2, 4, 8])
   let sg = tunerKnob("FIRLIFT_Q4_SG", 2, [1, 2, 4, 8])
@@ -668,7 +682,7 @@ proc lowerMatmulQ4(l: SessionLift; op: Op) =
           gen = genMatmulQ4Par(m, k, n, group, nGroups, q4ParallelLanes(), false, true)
           variant = q4ParallelVariant(gen, false)
   else:
-    let choice = q4Choice("FIRLIFT_Q4_GEMM", "auto", ["auto", "scalar", "scalar_fma", "parallel", "parallel_fma", "fma", "tiled", "tiled_fma", "matrix", "mm"])
+    let choice = q4Choice("FIRLIFT_Q4_GEMM", "auto", ["auto", "scalar", "scalar_fma", "parallel", "parallel_fma", "fma", "tiled", "tiled_fma", "matrix", "mm", "tensor_core", "coop"])
     case choice
     of "scalar":
       gen = genMatmulQ4(m, k, n, group, nGroups, 0, true, false, true)
@@ -692,6 +706,12 @@ proc lowerMatmulQ4(l: SessionLift; op: Op) =
       let matrix = q4MatrixGemm(m, k, n, group, nGroups)
       gen = matrix.gen; rowBlock = matrix.rowBlock; rowTg = matrix.rowTg
       variant = (if gen.tg == 128: "matrix" else: q4ParallelVariant(gen, false))
+    of "tensor_core", "coop":
+      if l.trace.backend != "vulkan":
+        fail("FIRLIFT_Q4_GEMM=tensor_core requires a Vulkan trace; this kernel emits KHR_cooperative_matrix in the FIR micro path")
+      let tensorCore = q4TensorCoreGemm(m, k, n, group, nGroups)
+      gen = tensorCore.gen; rowBlock = tensorCore.rowBlock; rowTg = tensorCore.rowTg
+      variant = "tensor_core_micro"
     else:
       if appleTarget():
         let matrix = q4MatrixGemm(m, k, n, group, nGroups)
@@ -1683,7 +1703,8 @@ proc liftSessionFiles*(trace: Trace; configText, modelName, embeddingName: strin
       if chain: merged.add cur
       chain = false
     for n in nodes:
-      let isRaw = n.kind == "micro" and kernelOf.hasKey(n.op) and l.kernels[kernelOf[n.op]].raw
+      let isRaw = n.kind == "micro" and kernelOf.hasKey(n.op) and l.kernels[kernelOf[n.op]].raw and
+        not q4TensorCoreKernel(l.kernels[kernelOf[n.op]])
       if not isRaw:
         flush()
         merged.add n
@@ -1831,7 +1852,8 @@ proc liftSessionFiles*(trace: Trace; configText, modelName, embeddingName: strin
         rmw: true, phase: chain[0].phase), "")
     var merged: seq[SNode]
     var run: seq[SNode]
-    proc isRaw(n: SNode): bool = n.kind == "micro" and kernelOf.hasKey(n.op) and l.kernels[kernelOf[n.op]].raw
+    proc isRaw(n: SNode): bool = n.kind == "micro" and kernelOf.hasKey(n.op) and
+      l.kernels[kernelOf[n.op]].raw and not q4TensorCoreKernel(l.kernels[kernelOf[n.op]])
     proc settle() =
       var pending = run
       run = @[]

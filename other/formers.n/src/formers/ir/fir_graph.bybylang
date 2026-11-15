@@ -501,6 +501,15 @@ function fgPlanRebase(model: var FirGraph)
             model.graph.rebaseUnit[name] = base
             model.graph.rebaseOff[name] = buffer.viewOffset
 
+function fgQ4CoopKernel(def: FirKernelDef): bool
+    for line in def.body:
+        if line.mnemonic == "words" and line.args.len > 0:
+            try:
+                return (uint32(parseHexInt(line.args[0])) and 0xFF'u32) == OP_Q4_COOP_GEMM
+            except ValueError:
+                return false
+    false
+
 function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): FirGraph
     if graph.runtime != "graph":
         raise newException(ValueError, "FIR graph executor requires 'runtime graph' in the model file")
@@ -518,6 +527,10 @@ function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): 
     if q4Backend notin ["micro", "native"]:
         raise newException(ValueError, "BYBY_FIR_Q4_BACKEND must be micro or native")
     result.nativeQ4 = q4Backend == "native"
+    if result.nativeQ4:
+        for node in graph.nodes:
+            if node.kind == "micro" and graph.kernels.hasKey(node.op) and fgQ4CoopKernel(graph.kernels[node.op]):
+                raise newException(ValueError, "FIR Q4 Tensor Core micro-kernel requires BYBY_FIR_Q4_BACKEND=micro; native Q4 would bypass the custom micro-kernel")
     result.backend = backend
     firValidate(graph, registry, result.bindings)
     if backend.kind.toByby() != gbCpu:
@@ -567,6 +580,13 @@ function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): 
                 # keeps one program per node.
                 let relocatable = be == gbMetal and not result.useHandles and not isSlots and getEnv("BYBY_FIR_RELOC", "1") != "0"
                 let kernel = firMicroKernel(node, result.graph, registry, nodeBindings, relocatable)
+                if kernel.program.words.len > 0 and
+                    (kernel.program.words[0] and 0xFF'u32) == OP_Q4_COOP_GEMM:
+                    if be == gbVulkan:
+                        if not sessionCooperativeGemmEnabled(be):
+                            raise newException(ValueError, "FIR Q4 Tensor Core micro-kernel requires Vulkan KHR_cooperative_matrix support")
+                    elif be != gbCpu:
+                        raise newException(ValueError, "FIR Q4 Tensor Core micro-kernel is Vulkan-only")
                 var prepared = FgResidentProgram(kernel: kernel, stage: staged, metaOffset: -1)
                 if kernel.relocBuffers.len > 0:
                     prepared.metaOffset = result.bindings.memoryFloats + metaFloats
