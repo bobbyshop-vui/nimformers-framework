@@ -553,28 +553,41 @@ proc sessionTests2() =
     let g = genMatmulQ4TensorCore(M, K, N, gs, nG)
     doAssert g.threads == 128 and g.tg == 128 and "q4coop " in g.body
     chkResidentQ4("tensor_core_micro M16 K64 N64", g, a, packed, want)
-    let program = assemble(g.body, 2, 1, @[a.len, packed.len], @[want.len], 1e-5'f32, slotLayout = true)
-    let shader = lowerBytecodeToGlsl(program, "q4_tensor_core_source_test")
-    doAssert "GL_KHR_cooperative_matrix" in shader
-    doAssert "coopMatMulAdd" in shader
-    doAssert "sessionMatmulQ4" notin shader
-    echo "PASS Q4 Tensor Core micro shader lowering"
+    # Row tiles: 16 for one 16-row block, 32 for a narrow 64-row prefill layer,
+    # 64 for a wide one (one dequantization per 64 rows).
+    doAssert q4CoopRowTile(16, 64) == 16
+    doAssert q4CoopRowTile(64, 4096) == 32
+    doAssert q4CoopRowTile(64, 11008) == 64
+    doAssert genMatmulQ4TensorCore(64, 4096, 4096, 128, 32).threads == 2 * 64 * 128
+    doAssert genMatmulQ4TensorCore(64, 4096, 11008, 128, 32).threads == 172 * 128
     let glslc = findExe("glslc")
-    if glslc.len > 0:
-      let shaderPath = getTempDir() / ("fir_q4_tc_" & $getCurrentProcessId() & ".comp")
-      let spvPath = shaderPath & ".spv"
-      writeFile(shaderPath, shader)
-      defer:
+    for shape in [(M, K, N, gs, nG, packed.len), (64, 4096, 4096, 128, 32, 0), (64, 11008, 4096, 128, 86, 0),
+                  (64, 4096, 11008, 128, 32, 0), (49, 4096, 11008, 128, 32, 0)]:
+      let (sm, sk, sn, sgs, sng, spacked) = shape
+      let sg = genMatmulQ4TensorCore(sm, sk, sn, sgs, sng)
+      let weightFloats = if spacked > 0: spacked else: (sn * (sk div 2) + 3) div 4 + 2 * sn * sng
+      let program = assemble(sg.body, 2, 1, @[sm * sk, weightFloats], @[sm * sn], 1e-5'f32, slotLayout = true)
+      let shader = lowerBytecodeToGlsl(program, "q4_tensor_core_source_test")
+      let tag = "M" & $sm & " K" & $sk & " N" & $sn
+      doAssert "GL_KHR_cooperative_matrix" in shader
+      doAssert "coopMatMulAdd" in shader
+      doAssert "sessionMatmulQ4" notin shader
+      doAssert ("const uint BM = " & $q4CoopRowTile(sm, sn) & "u;") in shader, tag
+      echo "PASS Q4 Tensor Core micro shader lowering ", tag
+      if glslc.len > 0:
+        let shaderPath = getTempDir() / ("fir_q4_tc_" & $getCurrentProcessId() & ".comp")
+        let spvPath = shaderPath & ".spv"
+        writeFile(shaderPath, shader)
+        let compile = startProcess(glslc, args = ["--target-env=vulkan1.3", "-o", spvPath, shaderPath],
+          options = {poUsePath, poStdErrToStdOut})
+        let compileOutput = compile.outputStream.readAll()
+        let compileCode = compile.waitForExit()
+        compile.close()
         if fileExists(shaderPath): removeFile(shaderPath)
         if fileExists(spvPath): removeFile(spvPath)
-      let compile = startProcess(glslc, args = ["--target-env=vulkan1.3", "-o", spvPath, shaderPath],
-        options = {poUsePath, poStdErrToStdOut})
-      let compileOutput = compile.outputStream.readAll()
-      let compileCode = compile.waitForExit()
-      compile.close()
-      if compileCode != 0:
-        raise newException(ValueError, "glslc rejected the Q4 Tensor Core micro shader: " & compileOutput)
-      echo "PASS Q4 Tensor Core micro shader glslc compile"
+        if compileCode != 0:
+          raise newException(ValueError, "glslc rejected the Q4 Tensor Core micro shader " & tag & ": " & compileOutput)
+        echo "PASS Q4 Tensor Core micro shader glslc compile ", tag
 
   # argmax keeps the first maximum
   block:
