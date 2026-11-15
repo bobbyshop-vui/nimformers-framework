@@ -86,6 +86,8 @@ fir-graph-test: $(ROOT)/$(BYBYLANG)
 fir-lift-test: build
 	cd $(ROOT) && nim c -r -d:release --hints:off --path:vendor/bybylang \
 	  --nimcache:nimcache/fir-rope-upload-test -o:$(HERE)/build/test_rope_uploads $(HERE)/firlift/test_rope_uploads.nim
+	cd $(ROOT) && nim c -r -d:release --hints:off --path:vendor/bybylang \
+	  --nimcache:nimcache/fir-q4-selection-test -o:$(HERE)/build/test_q4_selection $(HERE)/firlift/test_q4_selection.nim
 	mkdir -p $(FIR_LIFT_TMP)
 	cd $(ROOT) && nim c -d:release --hints:off --path:vendor/bybylang \
 	  --nimcache:nimcache/firlift -o:$(HERE)/firlift/firlift $(HERE)/firlift/firlift_main.nim

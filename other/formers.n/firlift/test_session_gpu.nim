@@ -58,7 +58,7 @@ proc runKernel(ctx: Backend; g: Gen; ins: seq[seq[float32]]; outLen: int; tgSize
   # The reference launch is not part of the model trace: keep it out of the probe.
   let probing = firProbeOn
   firProbeOn = false
-  discard runMicroVm(ctx, prog, mem, g.threads, 16, "gen", tgSize)
+  discard runMicroVm(ctx, prog, mem, g.threads, max(16, g.tgBytes), "gen", if tgSize > 0: tgSize else: max(1, g.tg))
   firProbeOn = probing
   mem[outBase ..< outBase + outLen]
 
@@ -117,6 +117,34 @@ proc moreOps(ctx: Backend; be: byby.GpuBackend) =
       doAssert sessionMatmulQ4(be, ha, w, yh, M)
     agree("matmul_q4", runKernel(ctx, genMatmulQ4(M, K, N, gs, nG), @[a, bytesAsFloats(bytes), scales, zeros], M*N),
           sessionRead(be, yh, M*N), 5e-3'f32)
+
+  # Word-parallel Q4 GEMV against native resident Q4 weights. Odd N and an
+  # incomplete last group catch row-stride and tail handling on the GPU.
+  for (K, gs, T) in [(256, 128, 16), (384, 256, 32), (4096, 128, 64), (11008, 128, 32)]:
+    let N = 5
+    let nG = (K + gs - 1) div gs
+    let bpr = (K + 1) div 2
+    var bytes = newSeq[uint8](N*bpr)
+    var q = newSeq[int](N*K)
+    for n in 0 ..< N:
+      for kk in 0 ..< K:
+        q[n*K + kk] = (n*13 + kk*9 + kk div 5 + 1) mod 16
+        let bi = n*bpr + kk div 2
+        bytes[bi] = bytes[bi] or uint8(q[n*K + kk] shl (if kk mod 2 == 0: 0 else: 4))
+    let scales = fill(N*nG, 0.31, 0.07)
+    var zeros = newSeq[float32](N*nG)
+    for i in 0 ..< zeros.len: zeros[i] = 5.4'f32 + float32(i mod 5) * 0.73'f32
+    let a = fill(K, 0.67, 0.9)
+    var yh: SessionHandle
+    session:
+      let w = residentUploadQ4(be, bytes, scales, zeros, K, N, gs, nG)
+      let ha = sessionUpload(be, a)
+      yh = sessionAllocScratch(be, N)
+      doAssert sessionMatmulQ4(be, ha, w, yh, 1)
+    let g = genMatmulQ4WordPar(K, N, gs, nG, T)
+    let packed = bytesAsFloats(bytes) & scales & zeros
+    agree("matmul_q4_wordpar.K" & $K & ".gs" & $gs,
+          runKernel(ctx, g, @[a, packed], N, g.tg), sessionRead(be, yh, N), 5e-3'f32)
 
   # argmax / compare / split slice / permute
   block:

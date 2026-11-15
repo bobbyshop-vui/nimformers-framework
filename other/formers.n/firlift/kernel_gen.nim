@@ -1202,7 +1202,9 @@ proc storeLaneZero(k: KB; lf, zeroF, T, ci: int; outPort: string) =
 
 proc parWidth(n: int; limit = 32): int =
   ## Largest power of two <= limit that divides n (1 when n is odd).
-  var t = limit
+  if limit < 2: return 1
+  var t = 1
+  while t <= limit div 2: t *= 2
   while t > 1 and n mod t != 0: t = t div 2
   t
 
@@ -1323,6 +1325,105 @@ proc genMatmulQ4Par*(M, K, N, groupSize, nGroups: int; T = 32; useFma = false; r
     k.e("uaddk", ci, ci, N)
     # ai/bi continue into the next row of A; bi restarts at the row base each m
     )
+  result = Gen(body: k.text, threads: N * t, ins: 2, outs: 1, tg: t, tgBytes: max(16, t * 4))
+
+proc supportsQ4WordPar*(K, groupSize, nGroups: int; T = 32): bool =
+  ## Whether the aligned-word GEMV has a useful power-of-two threadgroup width.
+  let gs = if groupSize > 0: groupSize else: K
+  if K <= 0 or gs < 8 or (gs and (gs - 1)) != 0 or K mod gs != 0 or K mod 8 != 0 or nGroups != K div gs:
+    return false
+  return parWidth(K div 8, T) >= 2
+
+proc genMatmulQ4WordPar*(K, N, groupSize, nGroups: int; T = 32; residentWeights = false): Gen =
+  ## Q4 GEMV with one threadgroup per output column. Each lane walks aligned 32-bit packed
+  ## weights (eight nibbles) and eight activations across K, then lanes reduce through tg memory.
+  ## Group scale/zero are applied to each pack as fma(scale, dot - zero * sum(activations), acc).
+  ## Supports power-of-two groups >= 8, divisible K, and K divisible by eight. Other shapes
+  ## use the general packed Q4 threadgroup kernel.
+  let gs = if groupSize > 0: groupSize else: K
+  if N <= 0 or not supportsQ4WordPar(K, gs, nGroups, T):
+    return genMatmulQ4Par(1, K, N, groupSize, nGroups, T, true, residentWeights)
+  let t = parWidth(K div 8, T)
+  let rowBytes = K div 2
+  let wqF = (N * rowBytes + 3) div 4
+  let scalesAddr = "@in1+" & $wqF
+  let zerosAddr = "@in1+" & $(wqF + N * nGroups)
+  let k = newKB()
+  let loadA = if residentWeights: "uloadin" else: "uloadf32"
+  let loadScale = if residentWeights: "uloadconstf" else: "uloadf32"
+  let ng = k.u()
+  let ul = k.u()
+  let wqb = k.u()
+  let rowb = k.u()
+  let laneW = k.u()
+  let ai = k.u()
+  let bi = k.u()
+  let si = k.u()
+  let gi = k.u()
+  let ci = k.u()
+  let pk = k.u()
+  let tmp = k.u()
+  let lf = k.r()
+  let zeroF = k.cf(0)
+  let acc = k.r()
+  let sc = k.r()
+  let zp = k.r()
+  let correction = k.r()
+  var a = newSeq[int](8)
+  for j in 0 ..< 8: a[j] = k.r()
+  let asum = k.r()
+  let x = k.r()
+  let y = k.r()
+  let d = k.r()
+  let q = k.r()
+  var gShift = 0
+  while (1 shl gShift) < gs: inc gShift
+
+  k.e("utgid", ng)
+  k.e("ulid", ul)
+  k.e("loadlid", lf)
+  k.e("uconst", wqb, "@in1")
+  k.e("umulk", wqb, wqb, 4)
+  k.e("umulk", rowb, ng, rowBytes)
+  k.e("uadd", rowb, rowb, wqb)
+  k.e("uaddk", ci, ng, 0)
+  k.e("uaddk", ai, ul, 0)
+  k.e("umulk", ai, ai, 8)
+  k.e("umulk", laneW, ul, 4)
+  k.e("uadd", bi, rowb, laneW)
+  k.e("umulk", si, ng, nGroups)
+  k.e("loadconstf32", acc, 0)
+  k.forN((K div 8) div t, proc() =
+    k.e("ushrk", gi, ai, gShift)
+    k.e("uadd", gi, gi, si)
+    k.e(loadScale, sc, gi, scalesAddr)
+    k.e(loadScale, zp, gi, zerosAddr)
+    for j in 0 ..< 8:
+      k.e(loadA, a[j], ai, "@in0+" & $j)
+    # A balanced sum reduces error in the zero-point correction.
+    k.e("add", x, a[0], a[1])
+    k.e("add", y, a[2], a[3])
+    k.e("add", x, x, y)
+    k.e("add", y, a[4], a[5])
+    k.e("add", d, a[6], a[7])
+    k.e("add", y, y, d)
+    k.e("add", asum, x, y)
+    k.e("uloadu32", pk, bi, 0)
+    # Low/high nibbles of bytes 0..3, ordered as the eight Q4 values.
+    for j in countdown(7, 0):
+      let shift = 8 * (j div 2) + 4 * (j mod 2)
+      k.e("ushrk", tmp, pk, shift)
+      if j < 7: k.e("uandk", tmp, tmp, 15)
+      k.e("utor", q, tmp)
+      if j == 7: k.e("mul", d, a[j], q)
+      else: k.e("fma", d, a[j], q, d)
+    k.e("mul", correction, zp, asum)
+    k.e("sub", d, d, correction)
+    k.e("fma", acc, sc, d, acc)
+    k.e("uaddk", ai, ai, 8 * t)
+    k.e("uaddk", bi, bi, 4 * t))
+  k.tgSum(lf, acc, t)
+  k.storeLaneZero(lf, zeroF, t, ci, "@out0")
   result = Gen(body: k.text, threads: N * t, ins: 2, outs: 1, tg: t, tgBytes: max(16, t * 4))
 
 proc genMatmulQ4Simd*(K, N, groupSize, nGroups: int; rows = 4; sg = 2; packs = 1; residentWeights = false): Gen =
