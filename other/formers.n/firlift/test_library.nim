@@ -553,13 +553,49 @@ proc sessionTests2() =
     let g = genMatmulQ4TensorCore(M, K, N, gs, nG)
     doAssert g.threads == 128 and g.tg == 128 and "q4coop " in g.body
     chkResidentQ4("tensor_core_micro M16 K64 N64", g, a, packed, want)
-    # Row tiles: 16 for one 16-row block, 32 for a narrow 64-row prefill layer,
-    # 64 for a wide one (one dequantization per 64 rows).
+    # Row tiles follow the device and the rows of a dispatch: the tallest tile whose grid
+    # still gives each SM/CU two workgroups, never more than twice the rows it holds.
     doAssert q4CoopRowTile(16, 64) == 16
-    doAssert q4CoopRowTile(64, 4096) == 32
+    doAssert q4CoopRowTile(64, 4096) == 32            # unknown device: 64 units
     doAssert q4CoopRowTile(64, 11008) == 64
+    doAssert q4CoopRowTile(64, 4096, 40) == 32        # Tesla T4: 40 SMs
+    doAssert q4CoopRowTile(64, 11008, 40) == 64
+    doAssert q4CoopRowTile(20, 11008, 40) == 32       # a short last block
+    doAssert q4CoopRowTile(64, 4096, 16) == 64        # a small GPU fills with tall tiles
+    doAssert q4CoopRowTile(64, 4096, 40, 4) == 16     # more workgroups per SM requested
+    doAssert q4CoopRowTile(512, 4096, 40) == 64
     doAssert genMatmulQ4TensorCore(64, 4096, 4096, 128, 32).threads == 2 * 64 * 128
     doAssert genMatmulQ4TensorCore(64, 4096, 11008, 128, 32).threads == 172 * 128
+
+    # The CPU reference does not depend on the grid the runtime picks.
+    block:
+      let M2 = 40
+      let N2 = 80
+      var bytes2 = newSeq[uint8](N2*bpr)
+      var q2 = newSeq[int](N2*K)
+      for n in 0 ..< N2:
+        for kk in 0 ..< K:
+          q2[n*K + kk] = (n*5 + kk*3 + kk div 5 + 1) mod 16
+          let b = n*bpr + kk div 2
+          bytes2[b] = bytes2[b] or uint8(q2[n*K + kk] shl (if kk mod 2 == 0: 0 else: 4))
+      let scales2 = fill(N2*nG, 0.41, 0.07)
+      let zeros2 = fill(N2*nG, 4.9, 1.3)
+      var a2 = newSeq[float32](M2*K)
+      for i in 0 ..< a2.len: a2[i] = float32((i*7 mod 29) - 14) / 23
+      var want2 = newSeq[float32](M2*N2)
+      for m in 0 ..< M2:
+        for n in 0 ..< N2:
+          var sum = 0.0'f32
+          for kk in 0 ..< K:
+            let gi = n*nG + kk div gs
+            sum += a2[m*K + kk] * ((float32(q2[n*K + kk]) - zeros2[gi]) * scales2[gi])
+          want2[m*N2 + n] = sum
+      let packed2 = bytesAsFloats(bytes2) & scales2 & zeros2
+      var g2 = genMatmulQ4TensorCore(M2, K, N2, gs, nG)
+      for tile in Q4CoopRowTiles:
+        g2.threads = ((M2 + tile - 1) div tile) * 2 * 128
+        chkResidentQ4("tensor_core_micro M40 K64 N80 grid for tile " & $tile, g2, a2, packed2, want2)
+
     let glslc = findExe("glslc")
     for shape in [(M, K, N, gs, nG, packed.len), (64, 4096, 4096, 128, 32, 0), (64, 11008, 4096, 128, 86, 0),
                   (64, 4096, 11008, 128, 32, 0), (49, 4096, 11008, 128, 32, 0)]:
@@ -567,27 +603,29 @@ proc sessionTests2() =
       let sg = genMatmulQ4TensorCore(sm, sk, sn, sgs, sng)
       let weightFloats = if spacked > 0: spacked else: (sn * (sk div 2) + 3) div 4 + 2 * sn * sng
       let program = assemble(sg.body, 2, 1, @[sm * sk, weightFloats], @[sm * sn], 1e-5'f32, slotLayout = true)
-      let shader = lowerBytecodeToGlsl(program, "q4_tensor_core_source_test")
-      let tag = "M" & $sm & " K" & $sk & " N" & $sn
-      doAssert "GL_KHR_cooperative_matrix" in shader
-      doAssert "coopMatMulAdd" in shader
-      doAssert "sessionMatmulQ4" notin shader
-      doAssert ("const uint BM = " & $q4CoopRowTile(sm, sn) & "u;") in shader, tag
-      echo "PASS Q4 Tensor Core micro shader lowering ", tag
-      if glslc.len > 0:
-        let shaderPath = getTempDir() / ("fir_q4_tc_" & $getCurrentProcessId() & ".comp")
-        let spvPath = shaderPath & ".spv"
-        writeFile(shaderPath, shader)
-        let compile = startProcess(glslc, args = ["--target-env=vulkan1.3", "-o", spvPath, shaderPath],
-          options = {poUsePath, poStdErrToStdOut})
-        let compileOutput = compile.outputStream.readAll()
-        let compileCode = compile.waitForExit()
-        compile.close()
-        if fileExists(shaderPath): removeFile(shaderPath)
-        if fileExists(spvPath): removeFile(spvPath)
-        if compileCode != 0:
-          raise newException(ValueError, "glslc rejected the Q4 Tensor Core micro shader " & tag & ": " & compileOutput)
-        echo "PASS Q4 Tensor Core micro shader glslc compile ", tag
+      doAssert ("const uint BM = " & $q4CoopRowTile(sm, sn) & "u;") in lowerBytecodeToGlsl(program, "q4_tc_default")
+      for tile in Q4CoopRowTiles:
+        let shader = lowerQ4CoopGlsl(program, "q4_tensor_core_source_test", tile)
+        let tag = "M" & $sm & " K" & $sk & " N" & $sn & " tile " & $tile
+        doAssert "GL_KHR_cooperative_matrix" in shader
+        doAssert "coopMatMulAdd" in shader
+        doAssert "sessionMatmulQ4" notin shader
+        doAssert ("const uint BM = " & $tile & "u;") in shader, tag
+        echo "PASS Q4 Tensor Core micro shader lowering ", tag
+        if glslc.len > 0:
+          let shaderPath = getTempDir() / ("fir_q4_tc_" & $getCurrentProcessId() & ".comp")
+          let spvPath = shaderPath & ".spv"
+          writeFile(shaderPath, shader)
+          let compile = startProcess(glslc, args = ["--target-env=vulkan1.3", "-o", spvPath, shaderPath],
+            options = {poUsePath, poStdErrToStdOut})
+          let compileOutput = compile.outputStream.readAll()
+          let compileCode = compile.waitForExit()
+          compile.close()
+          if fileExists(shaderPath): removeFile(shaderPath)
+          if fileExists(spvPath): removeFile(spvPath)
+          if compileCode != 0:
+            raise newException(ValueError, "glslc rejected the Q4 Tensor Core micro shader " & tag & ": " & compileOutput)
+          echo "PASS Q4 Tensor Core micro shader glslc compile ", tag
 
   # argmax keeps the first maximum
   block:

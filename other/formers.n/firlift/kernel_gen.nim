@@ -2190,6 +2190,9 @@ proc genMatmulQ4TensorCore*(M, K, N, groupSize, nGroups: int): Gen =
   if M <= 0 or N < 16 or K <= 0 or K mod 64 != 0 or groupSize < 2 or
       groupSize mod 2 != 0 or K mod groupSize != 0 or nGroups != K div groupSize:
     raise newException(GenError, "Q4 Tensor Core micro-kernel requires M>0, N>=16, K divisible by 64 and an even group size dividing K")
+  # The grid here is the default for a device of unknown size. On Vulkan the FIR runtime picks
+  # the row tile per dispatch from the GPU's SM/CU count and the rows it runs, and sizes the
+  # grid itself; the CPU reference does not depend on the grid.
   let cols = (N + 63) div 64
   let bm = q4CoopRowTile(M, N)
   let rows = (M + bm - 1) div bm

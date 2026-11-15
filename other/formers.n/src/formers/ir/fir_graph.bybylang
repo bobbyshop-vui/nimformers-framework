@@ -32,6 +32,8 @@ type
     cpuFn*: pointer                 ## compiled CPU function (nil = interpret the bytecode)
     stage*: seq[FgStagePort]        ## arena-layout kernel in a handle graph: ports staged contiguously
     metaOffset*: int                ## position-independent kernel: float offset of this node's address table in the arena (-1: none)
+    coopTiles*: seq[int]            ## Q4 Tensor Core micro-kernel: row tiles built for this node (chosen per dispatch)
+    coopNames*, coopSources*: seq[string]
   FirGraph* = object
     graph*: FirProgram
     registry*: FirRegistry
@@ -68,6 +70,9 @@ type
     phaseBlockSeconds*: Table[string, float]  ## measured at warm-up: one row block of a partial phase
     phaseBlockRows*: Table[string, int]       ## rows one block of that phase covers (largest rows=B of its kernels)
     stepProfiled*: int
+    computeUnits*: int                        ## SM/CU count of the device (0: unknown); sizes Q4 Tensor Core tiles
+    coopForcedRows*: int                      ## BYBY_FIR_Q4_COOP_ROWS: fixed Q4 Tensor Core row tile (0: per dispatch)
+    coopPerUnit*: int                         ## BYBY_FIR_Q4_COOP_WG_PER_UNIT: workgroups each SM/CU should get
 
 function fgTensorName(buffer: FirBuffer, layer: int): string
     buffer.tensorName.replace("{i}", $layer)
@@ -510,6 +515,13 @@ function fgQ4CoopKernel(def: FirKernelDef): bool
                 return false
     false
 
+function fgQ4CoopTile(model: FirGraph, rows, n: int): int
+    ## Row tile (rows per workgroup) of a Q4 Tensor Core micro-kernel dispatch over `rows` rows on
+    ## this device: the tallest tile whose grid still gives each SM/CU coopPerUnit workgroups.
+    if model.coopForcedRows > 0:
+        return model.coopForcedRows
+    q4CoopRowTile(rows, n, model.computeUnits, model.coopPerUnit)
+
 function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): FirGraph
     if graph.runtime != "graph":
         raise newException(ValueError, "FIR graph executor requires 'runtime graph' in the model file")
@@ -539,6 +551,16 @@ function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): 
     let be = backend.kind.toByby()
     if not ensureGpuInit(be):
         raise newException(ValueError, "FIR graph backend initialization failed")
+    result.computeUnits = gpuComputeUnits(be)
+    result.coopPerUnit = parseInt(getEnv("BYBY_FIR_Q4_COOP_WG_PER_UNIT", "2"))
+    if result.coopPerUnit < 1:
+        raise newException(ValueError, "BYBY_FIR_Q4_COOP_WG_PER_UNIT must be at least 1")
+    let forcedRows = getEnv("BYBY_FIR_Q4_COOP_ROWS", "")
+    if forcedRows.len > 0:
+        result.coopForcedRows = parseInt(forcedRows)
+        if result.coopForcedRows notin Q4CoopRowTiles:
+            raise newException(ValueError, "BYBY_FIR_Q4_COOP_ROWS must be 16, 32 or 64")
+    let coopVerbose = getEnv("BYBY_FIR_Q4_COOP_VERBOSE", "0") != "0"
     var cfg = defaultJitConfig()
     cfg.enableMetalJit = be == gbMetal
     cfg.hotThreshold = 1
@@ -601,11 +623,28 @@ function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): 
                         raise newException(ValueError, "FIR graph Metal JIT compilation failed: " & node.op)
                 elif be == gbVulkan:
                     prepared.name = kernelNameFor(jit, kernel.program, node.op)
-                    prepared.source = glslSourceFor(jit, kernel.program, node.op)
-                    # Subgroup kernels (FIRLIFT_Q4_GEMV=simd) size their grid for 32-lane subgroups.
-                    if prepared.source.contains("GL_KHR_shader_subgroup_arithmetic") and gpuFixedSubgroupWidth(be) != 32:
-                        raise newException(ValueError, "FIR kernel " & node.op & " reduces across 32-lane subgroups, which this Vulkan device does not guarantee; re-lift with FIRLIFT_Q4_GEMV=word_parallel and FIRLIFT_SIMD=0")
-                    jobs.add((prepared.name, prepared.source))
+                    if isQ4CoopProgram(kernel.program):
+                        # Build every row tile a dispatch of 1..M rows can pick on this device;
+                        # fgEncodeMicroBody chooses one and sizes the grid per dispatch.
+                        let shape = q4CoopShape(kernel.program)
+                        for rows in 1 .. shape.M:
+                            let tile = fgQ4CoopTile(result, rows, shape.N)
+                            if tile notin prepared.coopTiles:
+                                let tileName = prepared.name & "_r" & $tile
+                                prepared.coopTiles.add(tile)
+                                prepared.coopNames.add(tileName)
+                                prepared.coopSources.add(lowerQ4CoopGlsl(kernel.program, tileName, tile))
+                                jobs.add((tileName, prepared.coopSources[^1]))
+                        prepared.source = prepared.coopSources[prepared.coopTiles.find(fgQ4CoopTile(result, shape.M, shape.N))]
+                        if coopVerbose and layer == 0:
+                            let fullTile = fgQ4CoopTile(result, shape.M, shape.N)
+                            stderr.writeLine("[fir] Q4 Tensor Core " & node.op & " K=" & $shape.K & " N=" & $shape.N & " M=" & $shape.M & ": row tile " & $fullTile & " (tiles built " & $prepared.coopTiles & ", " & $result.computeUnits & " SM/CU)")
+                    else:
+                        prepared.source = glslSourceFor(jit, kernel.program, node.op)
+                        # Subgroup kernels (FIRLIFT_Q4_GEMV=simd) size their grid for 32-lane subgroups.
+                        if prepared.source.contains("GL_KHR_shader_subgroup_arithmetic") and gpuFixedSubgroupWidth(be) != 32:
+                            raise newException(ValueError, "FIR kernel " & node.op & " reduces across 32-lane subgroups, which this Vulkan device does not guarantee; re-lift with FIRLIFT_Q4_GEMV=word_parallel and FIRLIFT_SIMD=0")
+                        jobs.add((prepared.name, prepared.source))
                 elif be == gbCpu and cpuJitEnabled() and not kernel.slotLayout and staged.len == 0:
                     # Compile the micro-kernel to native code; unsupported programs keep the interpreter.
                     let cpuName = cpuJitFunctionName(kernel.program)
@@ -1026,7 +1065,20 @@ function fgEncodeMicroBody(model: var FirGraph, prepared: FgResidentProgram, nod
                 return false
             return cpu_backend.vmRunBound(k.program.words, views, threads, (k.tgBytes+3) div 4, k.tgSize)
         let vk = be == gbVulkan
-        if not sessionEncPipeline(vk, prepared.name, prepared.source):
+        var pipelineName = prepared.name
+        var pipelineSource = prepared.source
+        if vk and prepared.coopTiles.len > 0:
+            # Q4 Tensor Core micro-kernel: row tile and grid follow the rows this dispatch runs.
+            let shape = q4CoopShape(k.program)
+            let rows = if model.activeRows > 0: min(shape.M, model.activeRows) else: shape.M
+            let tile = fgQ4CoopTile(model, rows, shape.N)
+            let index = prepared.coopTiles.find(tile)
+            if index < 0:
+                return false
+            pipelineName = prepared.coopNames[index]
+            pipelineSource = prepared.coopSources[index]
+            threads = ((rows + tile - 1) div tile) * ((shape.N + 63) div 64) * k.tgSize
+        if not sessionEncPipeline(vk, pipelineName, pipelineSource):
             return false
         for i in 0 .. 4:
             if k.slotBuffers[i].len == 0:
