@@ -15,7 +15,11 @@ CLI_SRC     := $(HERE)/src/formers_cli.bybylang
 CLI_BIN     := $(HERE)/formers-cli
 TEST_SRC    := $(HERE)/tests/test_detect.bybylang
 FIR_TEST_SRC := $(HERE)/tests/test_fir.bybylang
+FIR_Q4_MICRO_CHECK := $(HERE)/tests/fixtures/q4_tensor_core_micro/model.fir
 SOURCES     := $(shell find $(ROOT)/$(HERE)/src -name '*.bybylang')
+# The compiler imports the micro-VM and embeds shader sources. Updating a
+# submodule must invalidate the compiler even when bybylang.nim is unchanged.
+BYBYLANG_SOURCES := $(shell find $(ROOT)/vendor/bybylang -type f \( -name '*.nim' -o -name '*.c' -o -name '*.h' -o -name '*.m' -o -name '*.comp' -o -name '*.glsl' \))
 
 export BYBYLANG_NIMCACHE ?= $(ROOT)/nimcache/formers-n
 export FIR_LIFT_TMP ?= /tmp/fir-lift-tests
@@ -24,7 +28,7 @@ export FIR_LIFT_TMP ?= /tmp/fir-lift-tests
 
 all: build
 
-$(ROOT)/$(BYBYLANG): $(ROOT)/vendor/bybylang/bybylang.nim
+$(ROOT)/$(BYBYLANG): $(BYBYLANG_SOURCES)
 	$(MAKE) -C $(ROOT)/vendor/bybylang build
 
 # BybyLang writes <out>.nim next to <out> and compiles it; Nim picks up
@@ -33,6 +37,7 @@ $(ROOT)/$(BYBYLANG): $(ROOT)/vendor/bybylang/bybylang.nim
 build: $(ROOT)/$(BYBYLANG)
 	cd $(ROOT) && mkdir -p $(HERE)/build && \
 	  $(BYBYLANG) $(CLI_SRC) --aot=$(HERE)/build/formers_cli --quiet && \
+	  $(HERE)/build/formers_cli --fir-check $(FIR_Q4_MICRO_CHECK) && \
 	  cp $(HERE)/build/formers_cli $(CLI_BIN)
 	@echo "[formers.n] built $(CLI_BIN)"
 ifeq ($(shell uname -s),Darwin)

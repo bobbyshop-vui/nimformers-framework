@@ -318,6 +318,11 @@ For a Vulkan dGPU that exposes `VK_KHR_cooperative_matrix`, lift Q4 prefill GEMM
 as custom Tensor Core micro-kernels with `FIRLIFT_Q4_GEMM=tensor_core`. The FIR
 node's Vulkan JIT emits `coopMatMulAdd` directly; it remains on the FIR micro
 dispatch path. The mode requires `K` divisible by 64 and even Q4 groups.
+After updating the repository and submodules, rebuild `make formers-cli` as
+well as `firlift`: the AOT CLI contains its own VM opcode validator and JIT.
+The CLI build checks a tiny Tensor Core FIR fixture before installing the
+binary. Rebuilding only `firlift` leaves an older CLI unable to accept opcode
+`0xAA` (`q4coop`). Run the lifted graph with `BYBY_FIR_Q4_BACKEND=micro`.
 
 Without `--fir`, the model directory's `model.fir` is used. This is one-shot
 completion (`-cnv` chat uses the model's chat template); partial offload, unsupported config variants and context overflow
