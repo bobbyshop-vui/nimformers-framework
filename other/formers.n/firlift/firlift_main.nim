@@ -5,22 +5,8 @@ import ./firlift
 import ./corelift
 import ./sessionlift
 import ./steps
-
-proc fnvRange(f: File; offset, bytes: int): string =
-  if bytes <= 0: return "0"
-  f.setFilePos(offset)
-  var hash = 0xcbf29ce484222325'u64
-  let chunk = min(bytes, 1 shl 20)
-  var buffer = newString(chunk)
-  var left = bytes
-  while left > 0:
-    let n = min(chunk, left)
-    if f.readBuffer(addr buffer[0], n) != n:
-      raise newException(IOError, "truncated probe sidecar")
-    for i in 0 ..< n:
-      hash = (hash xor uint64(uint8(buffer[i]))) * 0x100000001b3'u64
-    left -= n
-  toHex(hash, 16)
+import ./sidecar
+import ./record
 
 proc compactTraceData(model: var string; tracePath, outDir: string) =
   ## Copy only the byte ranges the model references and merge ranges with equal
@@ -34,14 +20,11 @@ proc compactTraceData(model: var string; tracePath, outDir: string) =
     entries.add (i, parseInt(parts[3]), parseInt(parts[4]), parts[1],
       (if parts.len > 5: parts[5] else: ""))
   if entries.len == 0: return
-  let source = tracePath & ".data"
-  if not fileExists(source):
-    raise newException(IOError, "missing upload sidecar " & source)
-  var input = open(source, fmRead)
+  if not sidecarAvailable(tracePath):
+    raise newException(IOError, "missing upload sidecar " & sidecarPath(tracePath))
   var hashes = newSeq[string](entries.len)
   for i, entry in entries:
-    hashes[i] = fnvRange(input, entry.srcOffset, entry.bytes)
-  input.close()
+    hashes[i] = if entry.bytes <= 0: "0" else: sidecarFnv(tracePath, entry.srcOffset, entry.bytes)
   var assigned = initTable[string, int]()
   var unique: seq[int]
   var total = 0
@@ -55,25 +38,13 @@ proc compactTraceData(model: var string; tracePath, outDir: string) =
     var line = "init " & entry.name & " trace.data " & $assigned[key] & " " & $entry.bytes
     if entry.fingerprint.len > 0: line.add " " & entry.fingerprint
     rewritten[i] = line
-  input = open(source, fmRead)
   var target = open(outDir / "trace.data", fmWrite)
   try:
-    var buffer = newString(min(total, 1 shl 20))
-    if buffer.len == 0: buffer = newString(1)
     for i in unique:
       let entry = entries[i]
-      input.setFilePos(entry.srcOffset)
-      var left = entry.bytes
-      while left > 0:
-        let n = min(buffer.len, left)
-        if input.readBuffer(addr buffer[0], n) != n:
-          raise newException(IOError, "truncated probe sidecar")
-        if target.writeBuffer(addr buffer[0], n) != n:
-          raise newException(IOError, "cannot write compacted trace.data")
-        left -= n
+      sidecarWrite(tracePath, entry.srcOffset, entry.bytes, target)
   finally:
     target.close()
-    input.close()
   for i, entry in entries:
     lines[entry.index] = rewritten[i]
   var rebuilt = ""
@@ -83,9 +54,11 @@ proc compactTraceData(model: var string; tracePath, outDir: string) =
   model = rebuilt & "\n"
 
 proc usage() =
-  echo "usage: firlift --trace FILE --config FILE --out DIR [--weights CHECKPOINT]... [--slice A:B | --step N] [--name NAME] [--embedding TENSOR] [--report] [--coverage] [--fuse] [--grid-tg N | --dynamic-grid-tg N] [--core-idiom [--q4]]"
+  echo "usage: firlift (--trace FILE | --run COMMAND...) --config FILE --out DIR [--weights CHECKPOINT]... [--slice A:B | --step N] [--context TOKENS] [--name NAME] [--embedding TENSOR] [--report] [--coverage] [--fuse] [--grid-tg N | --dynamic-grid-tg N] [--core-idiom [--q4]]"
+  echo "  --run COMMAND...: record the command's trace in memory through pipes (no .fprobe or .data file); must be last"
   echo "  --slice A:B: zero-based complete session range, B exclusive"
   echo "  --step N: zero-based occurrence of the automatically detected repeating unit"
+  echo "  --context TOKENS: cap the lifted graph's KV buffers and position kernels (also writes config.json)"
   quit(2)
 
 proc main() =
@@ -99,12 +72,15 @@ proc main() =
   var coverage = false
   var fuseDispatches = false
   var gridTg = 0
+  var contextSize = 0
   var dynamicGrid = false
+  var recordRun = false
+  var runCommand: seq[string]
   var args = commandLineParams()
   var i = 0
   while i < args.len:
     case args[i]
-    of "--weights", "--slice", "--step", "--embedding":
+    of "--weights", "--slice", "--step", "--embedding", "--context":
       let flag = args[i]
       inc i
       if i >= args.len: usage()
@@ -112,6 +88,7 @@ proc main() =
       of "--weights": weightsPaths.add args[i]
       of "--slice": slice = args[i]
       of "--step": step = parseInt(args[i])
+      of "--context": contextSize = parseInt(args[i])
       else: embedding = args[i]
     of "--trace":
       inc i
@@ -148,15 +125,51 @@ proc main() =
       coverage = true
     of "--core-idiom":
       coreIdiom = true
+    of "--run":
+      # Everything after --run is the command to record; it is not parsed here.
+      runCommand = args[i + 1 .. ^1]
+      recordRun = true
+      break
     else:
       usage()
     inc i
+  if recordRun:
+    if tracePath.len > 0: raise newException(ValueError, "--run records in memory; do not pass --trace")
+    if runCommand.len == 0: usage()
+    tracePath = MemorySource
   if tracePath.len == 0 or configPath.len == 0 or outDir.len == 0: usage()
   if name.len == 0: name = extractFilename(parentDir(configPath))
   if slice.len > 0 and step >= 0: raise newException(ValueError, "choose --slice or --step")
-  var parsed = parseTrace(readFile(tracePath))
-  parsed.sourcePath = absolutePath(tracePath)
-  let cfgJson = parseJson(readFile(configPath))
+  if contextSize < 0: raise newException(ValueError, "--context must be a positive token count")
+  var parsed: Trace
+  if recordRun:
+    # The command writes its trace and upload bytes into pipes; nothing reaches the disk.
+    let recorded = recordCommand(runCommand)
+    if recorded.exitCode != 0:
+      stderr.writeLine("firlift: the recorded command exited with code " & $recorded.exitCode)
+    if recorded.trace.len == 0:
+      raise newException(IOError, "the command wrote no trace (does it use the core recorder?)")
+    echo "recorded in memory: trace ", recorded.trace.len, " bytes, upload data ", recorded.data.len, " bytes"
+    useMemory(recorded.data)
+    parsed = parseTrace(recorded.trace)
+    parsed.sourcePath = MemorySource
+  else:
+    parsed = parseTrace(readFile(tracePath))
+    parsed.sourcePath = absolutePath(tracePath)
+  var cfgJson = parseJson(readFile(configPath))
+  if contextSize > 0:
+    let contextKeys = ["max_position_embeddings", "n_positions", "n_ctx", "seq_length"]
+    var declaredContext = high(int)
+    for key in contextKeys:
+      if cfgJson.hasKey(key) and cfgJson[key].kind == JInt:
+        declaredContext = min(declaredContext, cfgJson[key].getInt())
+    if declaredContext == high(int) or declaredContext <= 0:
+      raise newException(ValueError, "--context requires a positive context length in config.json")
+    if contextSize > declaredContext:
+      raise newException(ValueError, "--context cannot exceed config.json context length " & $declaredContext)
+    for key in contextKeys:
+      if cfgJson.hasKey(key) and cfgJson[key].kind == JInt:
+        cfgJson[key] = newJInt(contextSize)
   var dims = Dims()
   for key in ["hidden_size", "n_embd", "d_model", "dim"]:
     if cfgJson.hasKey(key) and cfgJson[key].kind == JInt: dims.hidden = cfgJson[key].getInt()
@@ -166,7 +179,9 @@ proc main() =
   if selected.sessionCount > 0:
     echo "selected sessions ", selected.firstSession, ":", selected.firstSession+selected.sessionCount,
       " (", selected.dispatches, " dispatches, occurrence ", selected.occurrence, ")"
-  let cfgText = readFile(configPath)
+    if selected.resetCopies > 0:
+      echo "state resets left to the graph's initial contents: ", selected.resetCopies, " copies"
+  let cfgText = if contextSize > 0: $cfgJson else: readFile(configPath)
   if coverage:
     let report = liftSessionFiles(trace, cfgText, name, embedding, true, weightsPaths)
     echo report
@@ -175,6 +190,8 @@ proc main() =
   var model = if trace.graphOps().len > 0: buildModel(trace, cfgText, name)
               elif coreIdiom: liftCore(trace, cfgText, name, embedding, useQ4)
               else: liftSessionFiles(trace, cfgText, name, embedding, false, weightsPaths, fuseDispatches, gridTg, dynamicGrid)
+  if droppedSingleRowUnits > 0:
+    echo "single-token units left to the decode step: ", droppedSingleRowUnits
   if gridTg > 0:
     echo "persistent chains: ", fuseStats.chains, " built from ", fuseStats.chained, " dispatches (", gridTg, " threadgroups)"
   if fuseDispatches or gridTg > 0:
@@ -200,7 +217,10 @@ proc main() =
           except CatchableError: copyFile(path, target)
         break
   if configPath != outDir / "config.json":
-    copyFile(configPath, outDir / "config.json")
+    if contextSize > 0:
+      writeFile(outDir / "config.json", cfgText & "\n")
+    else:
+      copyFile(configPath, outDir / "config.json")
   if doReport:
     var graphNodes = 0
     for op in trace.ops:

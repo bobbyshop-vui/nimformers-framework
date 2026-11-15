@@ -418,13 +418,17 @@ function fmDetect(opts: FmOptions): FmDetection
             let graph = firParse(firPath, result.files.configPath)
             firValidate(graph, firDefaultRegistry(), firGraphBindings(graph, true))
             let rawData = firDataGraph(graph)
+            # A native .nimq checkpoint is read as stored (packed Q4 goes to the GPU unchanged).
+            let nativeWeights = not rawData and result.files.nimqPath.endsWith(".nimq")
             if rawData:
                 firCheckDataWeights(graph, result.files.nimqPath)
+            elif nativeWeights:
+                firCheckNativeWeights(graph, result.files.nimqPath)
             var header: FmSafeHeader
-            if not rawData:
+            if not rawData and not nativeWeights:
                 header = fmReadSafeHeader(result.files.nimqPath)
             for name, buffer in graph.buffers:
-                if buffer.kind != "weight" or rawData:
+                if buffer.kind != "weight" or rawData or nativeWeights:
                     continue
                 for layer in 0 ..< (if buffer.tensorName.contains("{i}"): graph.symbols["layers"] else: 1):
                     let tensor = buffer.tensorName.replace("{i}", $layer)

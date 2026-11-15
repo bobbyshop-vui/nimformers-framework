@@ -109,7 +109,10 @@ The initial config adapter reads Mamba dimensions: `hidden`, `inter`, `layers`,
 `vocab`, `dstate`, `headdim`, `nheads`, and `rope`. `inter` uses an explicit
 `d_intermediate` or defaults to `hidden*ssm_cfg.expand`. `nheads=inter/headdim`;
 `rope=dstate/4`. RMS epsilon comes from `layer_norm_epsilon` (default `1e-5`),
-and is a float field rather than an integer dimension.
+and is a float field rather than an integer dimension. Every positive integer key of
+`config.json` (for example `d_model`, `n_layer`, `vocab_size`) is also a symbol, so a
+lifted file can alias it with `sym hidden = d_model`; a derived name above replaces a
+raw key of the same name.
 
 `buf name f32 count` describes an activation or state. `per_layer` marks
 persistent state belonging to each layer. `weight name dtype tensor.name tensor

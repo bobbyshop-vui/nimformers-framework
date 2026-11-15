@@ -4,8 +4,8 @@ import session_vm
 
 type Th = object
   pc: int
-  R: array[32, float32]
-  U: array[32, uint32]
+  R: array[VmMaxRegisters, float32]
+  U: array[VmMaxRegisters, uint32]
   stack: seq[tuple[pc, reg, it: int]]
   done, wait: bool
   simdReg: int            ## >= 0: waiting in OP_SIMD_SUM for this destination register
@@ -31,7 +31,7 @@ proc stepUntilBarrier(t: var Th; p: VmProgram; mem: var seq[float32];
     if t.pc >= p.words.len: t.done = true; break
     let w = p.words[t.pc]; inc t.pc
     let op = w and 0xFF'u32
-    let a = int((w shr 8) and 0x1F); let b = int((w shr 13) and 0x1F); let c = int((w shr 18) and 0x1F)
+    let a = int(vmRegA(w)); let b = int(vmRegB(w)); let c = int(vmRegC(w))
     var k = 0'u32
     if opHasWord(op): k = p.words[t.pc]; inc t.pc
     template R: untyped = t.R
@@ -44,7 +44,7 @@ proc stepUntilBarrier(t: var Th; p: VmProgram; mem: var seq[float32];
     of OP_LOAD_CONST: R[a] = cast[float32](k)
     of OP_ADD: R[a] = R[b] + R[c]
     of OP_MUL: R[a] = R[b] * R[c]
-    of OP_FMA: R[a] = R[b] * R[c] + R[int(k and 0x1F)]
+    of OP_FMA: R[a] = R[b] * R[c] + R[int(k and 0xFF)]
     of OP_SUB: R[a] = R[b] - R[c]
     of OP_DIV: R[a] = R[b] / R[c]
     of OP_EXP: R[a] = exp(R[b])

@@ -120,10 +120,13 @@ function firDefaultRegistry(): FirRegistry
     firRegisterExt(result, "m3.gemv_q4", "backend.beMatmulQ4", 2, 1, firQ4Backend)
     firRegisterExt(result, "m3.embedding", "backend.beEmbeddingLookup", 2, 1, firEmbeddingBackend)
 
-function firMicroKernel(node: FirNode, model: FirProgram, registry: FirRegistry, bindings: FirBindings): FirKernel
+function firMicroKernel(node: FirNode, model: FirProgram, registry: FirRegistry, bindings: FirBindings, relocatable = false): FirKernel
     # A kernel defined in the model file wins; otherwise use a framework kernel.
     if model.kernels.hasKey(node.op):
-        result = firAssembleKernel(model.kernels[node.op], model, node, bindings.memory)
+        if relocatable:
+            result = firAssembleRelocatable(model.kernels[node.op], model, node, bindings.memory)
+        else:
+            result = firAssembleKernel(model.kernels[node.op], model, node, bindings.memory)
     elif not registry.micro.hasKey(node.op) or registry.micro[node.op].isNil:
         raise newException(ValueError, "FIR unknown micro kernel '" & node.op & "' (node " & node.name & ")")
     else:

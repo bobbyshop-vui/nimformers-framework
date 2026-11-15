@@ -685,24 +685,33 @@ proc sampleToken(logits: seq[float32], vocab: int, cfg: SamplerCfg,
   var nBad = 0
   var adj = newSeq[float32](vocab)
   for i in 0 ..< vocab:
-    var v = logits[i]
+    let v = logits[i]
     if v.classify in {fcNan, fcInf, fcNegInf}:
       adj[i] = NegInfF32
       inc nBad
-      continue
-    if cfg.repeatPenalty != 1.0'f32 and recent.len > 0:
-      if not (noPenalty.len == vocab and noPenalty[i]):
-        for rid in recent:
-          if rid == i:
-            if v > 0'f32: v = v / cfg.repeatPenalty
-            else: v = v * cfg.repeatPenalty
-            break
-    if banned.len == vocab and banned[i]:
+    elif banned.len == vocab and banned[i]:
       adj[i] = NegInfF32
-      continue
-    adj[i] = v
-    if v > maxL:
-      maxL = v
+    else:
+      adj[i] = v
+  # The repetition penalty only touches the tokens of the recent window, each one once. It used to
+  # compare every vocabulary entry with every recent id (128256 x 64 comparisons, about 5 ms per
+  # token on the Intel host) to reach exactly the same result.
+  if cfg.repeatPenalty != 1.0'f32 and recent.len > 0:
+    for k in 0 ..< recent.len:
+      let rid = recent[k]
+      if rid < 0 or rid >= vocab: continue
+      var repeated = false
+      for j in 0 ..< k:
+        if recent[j] == rid:
+          repeated = true
+          break
+      if repeated or adj[rid] <= NegInfF32: continue      # already penalised, or banned / NaN / Inf
+      if noPenalty.len == vocab and noPenalty[rid]: continue
+      if adj[rid] > 0'f32: adj[rid] = adj[rid] / cfg.repeatPenalty
+      else: adj[rid] = adj[rid] * cfg.repeatPenalty
+  for i in 0 ..< vocab:
+    if adj[i] > maxL:
+      maxL = adj[i]
       argMaxI = i
   if nBad > 0 and not gNanWarned:
     gNanWarned = true
@@ -1180,6 +1189,37 @@ proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenize
   let traceN = envInt("BYBY_TRACE_TOKENS", 0)
   let traceBlocks = getEnv("BYBY_TRACE_BLOCKS", "0") != "0"
 
+  # Diagnostic: BYBY_PREFILL_BENCH=N times this prompt's prefill N times under each prefill scheduler
+  # mode inside one process (one untimed warm-up round first, modes interleaved), so the modes can be
+  # compared on this machine without the process-to-process noise of kernel setup and clocks.
+  let prefillBenchRuns = envInt("BYBY_PREFILL_BENCH", 0)
+  if prefillBenchRuns > 0 and ids.len > 1:
+    let benchIds = ids[0 ..< ids.len - 1]
+    let modes = [("off (one command buffer per micro-batch)", "0", "0"),
+                 ("commit every 4 layers (Apple GPU path)", "0", "4"),
+                 ("command buffers of ~300 ms (Intel/AMD path)", "300", "0")]
+    let savedCb = (existsEnv("BYBY_PREFILL_CB_MS"), getEnv("BYBY_PREFILL_CB_MS"))
+    let savedLayers = (existsEnv("BYBY_PREFILL_LAYERS_PER_CB"), getEnv("BYBY_PREFILL_LAYERS_PER_CB"))
+    var benchTimes: array[3, seq[float]]
+    for rep in 0 .. prefillBenchRuns:
+      for k in 0 ..< modes.len:
+        putEnv("BYBY_PREFILL_CB_MS", modes[k][1])
+        putEnv("BYBY_PREFILL_LAYERS_PER_CB", modes[k][2])
+        resetGpuGenState(m, ctx)
+        let t0 = monoSecs()
+        forwardPrefillBatch(m, lora, benchIds, ctx)
+        if rep > 0: benchTimes[k].add(monoSecs() - t0)
+    if savedCb[0]: putEnv("BYBY_PREFILL_CB_MS", savedCb[1]) else: delEnv("BYBY_PREFILL_CB_MS")
+    if savedLayers[0]: putEnv("BYBY_PREFILL_LAYERS_PER_CB", savedLayers[1])
+    else: delEnv("BYBY_PREFILL_LAYERS_PER_CB")
+    stderr.writeLine &"== Prefill scheduler benchmark: {benchIds.len} tokens, {prefillBenchRuns} runs per mode, " &
+                     "without kernel setup/JIT =="
+    for k in 0 ..< modes.len:
+      benchTimes[k].sort()
+      let median = benchTimes[k][benchTimes[k].len div 2]
+      stderr.writeLine &"  best {benchTimes[k][0]:.3f}s, median {median:.3f}s -> " &
+                       &"{(benchIds.len.float / median):.1f} tok/s  {modes[k][0]}"
+
   resetGpuGenState(m, ctx)
   let prefillSetupStart = gM3Runtime.kernelSetupSeconds
   let prefillStart = monoSecs()
@@ -1298,22 +1338,27 @@ proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenize
   stderr.writeLine &"[infer] tong ket: sinh {genIds.len} token, {distinctGen.len} id khac nhau, " &
                    &"{sd.emitted.len} byte van ban in ra (prompt {promptLen} token)."
   stderr.writeLine "\n== Speed stats =="
-  stderr.writeLine &"Prefill: {max(0, promptLen - 1)} tokens in {prefillTime:.3f}s -> " &
-                   &"{(max(0, promptLen - 1).float / max(prefillTime, 1e-9)):.2f} tok/s"
-  stderr.writeLine &"         kernel setup/JIT {prefillSetupTime:.3f}s; " &
-                   &"outside setup {max(0.0, prefillTime - prefillSetupTime):.3f}s"
+  # The speeds leave out the one-off kernel setup/JIT of the process (listed on its own line);
+  # only the Total line is wall time.
+  let prefillTokens = max(0, promptLen - 1)
+  let prefillRun = max(1e-9, prefillTime - prefillSetupTime)
+  stderr.writeLine &"Prefill: {prefillTokens} tokens in {prefillRun:.3f}s -> " &
+                   &"{(prefillTokens.float / prefillRun):.2f} tok/s (without kernel setup/JIT)"
+  stderr.writeLine &"         kernel setup/JIT {prefillSetupTime:.3f}s (one-off); wall time {prefillTime:.3f}s"
   if genIds.len > 0 and decodeTime > 0:
-    stderr.writeLine &"Decode:  {genIds.len} tokens in {decodeTime:.3f}s -> " &
-                     &"{(genIds.len.float / decodeTime):.2f} tok/s " &
-                     &"({(decodeTime * 1000 / genIds.len.float):.1f} ms/token)"
-    stderr.writeLine &"         first token kernel setup/JIT {firstStepSetupTime:.3f}s"
+    let decodeRun = max(1e-9, decodeTime - firstStepSetupTime)
+    stderr.writeLine &"Decode:  {genIds.len} tokens in {decodeRun:.3f}s -> " &
+                     &"{(genIds.len.float / decodeRun):.2f} tok/s " &
+                     &"({(decodeRun * 1000 / genIds.len.float):.1f} ms/token) (without kernel setup/JIT)"
+    stderr.writeLine &"         first token kernel setup/JIT {firstStepSetupTime:.3f}s (one-off); " &
+                     &"wall time {decodeTime:.3f}s"
     if genIds.len > 1:
       let steady = decodeTime - firstStepTime
       stderr.writeLine &"         first token {firstStepTime:.3f}s; {genIds.len - 1} later tokens " &
                        &"{(float(genIds.len - 1) / max(steady, 1e-9)):.2f} tok/s " &
                        &"({(steady * 1000 / float(genIds.len - 1)):.1f} ms/token)"
   stderr.writeLine &"Total: {(max(0, promptLen - 1) + genIds.len)} tokens in " &
-                   &"{(prefillTime + decodeTime):.3f}s"
+                   &"{(prefillTime + decodeTime):.3f}s (wall time, setup included)"
   if getEnv("BYBY_DECODE_PROFILE", "0") != "0":
     let profSummary = decodeProfileSummary()
     if profSummary.len > 0: stderr.writeLine profSummary

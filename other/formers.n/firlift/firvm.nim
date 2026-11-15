@@ -141,9 +141,9 @@ proc disassemble*(words: openArray[uint32]; ports: seq[LiftPort]): string =
   while i < words.len:
     let w = words[i]
     let op = w and 0xFF'u32
-    let a = (w shr 8) and 0x1F'u32
-    let b = (w shr 13) and 0x1F'u32
-    let c = (w shr 18) and 0x1F'u32
+    let a = ((w shr 8) and 0x1F'u32) or (((w shr 23) and 0x7'u32) shl 5)
+    let b = ((w shr 13) and 0x1F'u32) or (((w shr 26) and 0x7'u32) shl 5)
+    let c = ((w shr 18) and 0x1F'u32) or (((w shr 29) and 0x7'u32) shl 5)
     inc i
     var args: seq[string]
     var mnemonic = ""
@@ -213,7 +213,7 @@ proc disassemble*(words: openArray[uint32]; ports: seq[LiftPort]): string =
       pushU a; pushU b; push(fmtFloat(floatOf(value)))
     of OpFma:
       let value = words[i]; inc i
-      mnemonic = "fma"; pushU a; pushU b; pushU c; pushU (value and 0x1F)
+      mnemonic = "fma"; pushU a; pushU b; pushU c; pushU (value and 0xFF)
     of OpTgLoadF32, OpTgStoreF32:
       let value = words[i]; inc i
       mnemonic = if op == OpTgLoadF32: "tgloadf32" else: "tgstoref32"
