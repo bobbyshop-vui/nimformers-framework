@@ -276,11 +276,37 @@ function fmMambaTensorCores(ctx: Backend): bool
     ## later turns could not carry it into a prefill there.
     result = sessionTensorCoreRequired(ctx.kind.toByby()) and getEnv("BYBY_ONE_DISPATCH", "0") == "0"
 
+function fmMambaPrefillMinRows(): int
+    ## BYBY_PREFILL_MIN_ROWS (default 5): a prompt tail of at least this many tokens goes
+    ## through the batched prefill; a shorter one runs as decode steps. 1 batches every tail of
+    ## two or more tokens; 128 or more keeps whole chunks only (the old behaviour).
+    result = 5
+    try:
+        result = parseInt(getEnv("BYBY_PREFILL_MIN_ROWS", "5"))
+    except ValueError:
+        discard
+    result = max(1, result)
+
+function fmMambaTailSizes(chunk, minRows: int): seq[int]
+    ## The tail chunk lengths, largest first: the halvings of the chunk down to 8 rows that
+    ## are at least minRows, and minRows itself (at least 2 rows). A fixed set, so the scan
+    ## kernels compile for a bounded number of lengths, and a FIR graph lifted from a prompt
+    ## that runs every size once holds a phase for each.
+    let rows = max(2, minRows)
+    var size = chunk div 2
+    while size >= 8:
+        if size >= rows:
+            result.add(size)
+        size = size div 2
+    if rows < chunk and rows notin result:
+        result.add(rows)
+
 function fmMambaPrefillPieces(n: int, tensorCores: bool): seq[int]
     ## Splits n prefill tokens into whole chunks: BYBY_PREFILL_BATCH_SIZE ones,
-    ## then (tensor cores) 16-token ones. The scan kernels are JIT-compiled per
-    ## chunk length, so only these two lengths ever compile; the remainder
-    ## (under one chunk) goes through decode.
+    ## then (tensor cores) 16-token ones, or else the tail sizes of
+    ## fmMambaTailSizes, largest first. The scan kernels are JIT-compiled per
+    ## chunk length, so only these lengths ever compile; the remainder
+    ## (under the smallest size) goes through decode.
     let chunk = fmMambaPrefillChunk()
     var left = n
     if left >= chunk:
@@ -289,6 +315,11 @@ function fmMambaPrefillPieces(n: int, tensorCores: bool): seq[int]
     if tensorCores and chunk > FmMambaTensorCoreChunk:
         for i in 0 ..< left div FmMambaTensorCoreChunk:
             result.add(FmMambaTensorCoreChunk)
+    elif not tensorCores:
+        for size in fmMambaTailSizes(chunk, fmMambaPrefillMinRows()):
+            while left >= size:
+                result.add(size)
+                left -= size
 
 function fmMambaFeed(mm: var FmMambaModel, ctx: Backend, chat: var FmMambaChat, newIds: seq[int]): seq[float32]
     ## Consumes pending + newIds; returns the logits after the last one.
@@ -310,9 +341,13 @@ function fmMambaFeed(mm: var FmMambaModel, ctx: Backend, chat: var FmMambaChat, 
     if first:
         resetGpuGenState(mm.model, ctx)
     var start = 0
+    # Every piece continues the state (zero after the reset above) when the resident prefill
+    # runs: one kernel set per chunk length serves the first piece and the later ones alike, so
+    # a FIR graph lifted from these pieces runs any prompt the same way.
+    let carryAll = residentPrefillReason(mm.model, ctx).len == 0
     if first or tensorCores:
         for piece in fmMambaPrefillPieces(input.len - 1, tensorCores):
-            m2infer.forwardPrefillBatch(mm.model, mm.lora, input[start ..< start + piece], ctx, continued = not first or start > 0)
+            m2infer.forwardPrefillBatch(mm.model, mm.lora, input[start ..< start + piece], ctx, continued = carryAll or not first or start > 0)
             chat.ids.add(input[start ..< start + piece])
             start += piece
         if start > 0 and getEnv("BYBY_PREFILL_KEEP_SCRATCH", "0") != "1":

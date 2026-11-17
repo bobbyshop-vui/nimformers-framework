@@ -1383,7 +1383,10 @@ proc prepareGpuModel*(m: var NimformerModelJamba, lora: var JambaLora, ctx: Back
   #   - encodeLin(gLmHead) -> "encodeVmKernel: could not bind pipeline ''"
   # Scratch = Shared, lives for the whole process (like the old infer version that worked).
   if not gGpuModelReady:
-    gHXPersist      = sessionAllocScratch(be, hidden)          # residual, overwritten in place by every layer
+    # Residual, overwritten in place by every layer. Uploaded as zeros, not allocated: the kernel
+    # warm-up pass reads it before the first embedding arrives, and a defined start keeps that
+    # pass (and a trace recorded from this run) free of undefined memory.
+    gHXPersist      = sessionUpload(be, newSeq[float32](hidden))
     gHNormPersist   = sessionAllocScratch(be, hidden)          # shared pre-norm scratch
     gHFinalPersist  = sessionAllocScratch(be, hidden)          # output normF
     gHLogitsPersist = sessionAllocScratch(be, m.outProj.outF)  # logits [vocab]

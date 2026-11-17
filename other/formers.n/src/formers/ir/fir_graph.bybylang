@@ -53,6 +53,7 @@ type
     rawPools*: seq[SessionHandle]       # GPU backends: raw weights packed into a few large buffers
     rawBase*: Table[string, int]        # float offset of a packed raw weight inside its pool
     rawPlan*: seq[seq[string]]          # members of each pool, in packing order
+    rawSolo*: seq[string]               # raw weights read by session replays: a buffer of their own, bound at offset 0
     q4*: Table[string, ResidentWeightHandle]
     programs*: Table[string, FgResidentProgram]
     backend*: Backend
@@ -86,6 +87,8 @@ type
     replayScalars*, replayLogits*: SessionHandle   ## host-visible token/position input and logits output of the recording
     replayDispatched*: int                    ## dispatches inside the recording (counted per replayed step)
     replayEncoding*: bool                     ## encoding the recording: embedding rows are gathered on the GPU
+    sessionOps*, copies*: int                 ## session replay ops and buffer copies encoded (dispatched counts micro-kernels)
+    replaySessionOps*, replayCopies*: int     ## the same inside the decode recording
 
 function fgTensorName(buffer: FirBuffer, layer: int): string
     buffer.tensorName.replace("{i}", $layer)
@@ -230,12 +233,14 @@ function firFreeGraph(model: var FirGraph)
         beResidentFreeQ4(weight)
     for weight in model.fp32.mvalues:
         sessionFree(be, weight)
-    if model.rawPools.len > 0:
-        for pool in model.rawPools.mitems:
-            sessionFree(be, pool)
-    else:
+    for pool in model.rawPools.mitems:
+        sessionFree(be, pool)
+    if model.rawPools.len == 0 and model.rawSolo.len == 0:
         for weight in model.rawWeights.mvalues:
             sessionFree(be, weight)
+    for name in model.rawSolo:
+        if model.rawWeights.hasKey(name):
+            sessionFree(be, model.rawWeights[name])
     for i in 0 ..< model.handles.len:
         sessionFree(be, model.handles[i])
     sessionFree(be, model.arena)
@@ -256,6 +261,7 @@ function firFreeGraph(model: var FirGraph)
     model.fp32.clear()
     model.rawWeights.clear()
     model.rawPools.setLen(0)
+    model.rawSolo.setLen(0)
     model.rawBase.clear()
     model.handles.setLen(0)
     model.handleIndex.clear()
@@ -463,7 +469,12 @@ function fgPlanPools(model: var FirGraph)
     var parent = initTable[string, string]()
     for name in names:
         parent[name] = name
+    var rebasedNames = initTable[string, bool]()
+    var sessionPorts = initTable[string, bool]()
     for node in model.graph.nodes:
+        if node.kind == "session":
+            for port in node.inputs.splitWhitespace():
+                sessionPorts[port] = true
         if node.kind != "micro" or not model.graph.kernels.hasKey(node.op):
             continue
         var rebased = false
@@ -479,6 +490,7 @@ function fgPlanPools(model: var FirGraph)
             let base = if model.graph.buffers[port].viewOf.len > 0: model.graph.buffers[port].viewOf else: port
             if not parent.hasKey(base):
                 continue
+            rebasedNames[base] = true
             if first.len == 0:
                 first = base
             else:
@@ -486,6 +498,11 @@ function fgPlanPools(model: var FirGraph)
     var groups = initTable[string, seq[string]]()
     var order: seq[string]
     for name in names:
+        # A whole raw weight that a session replay reads (an RMSNorm gamma) and no kernel reaches
+        # through `rebase` gets a buffer of its own, so the replay binds it without a staging copy.
+        if sessionPorts.hasKey(name) and not rebasedNames.hasKey(name):
+            model.rawSolo.add(name)
+            continue
         let root = fgFindRoot(parent, name)
         if not groups.hasKey(root):
             groups[root] = newSeq[string]()
@@ -529,7 +546,7 @@ function fgQ4CoopKernel(def: FirKernelDef): bool
     for line in def.body:
         if line.mnemonic == "words" and line.args.len > 0:
             try:
-                return (uint32(parseHexInt(line.args[0])) and 0xFF'u32) == OP_Q4_COOP_GEMM
+                return (uint32(parseHexInt(line.args[0])) and 0xFF'u32) in [OP_Q4_COOP_GEMM, OP_FP4_COOP_GEMM]
             except ValueError:
                 return false
     false
@@ -680,12 +697,15 @@ function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): 
                 let relocatable = be == gbMetal and not result.useHandles and not isSlots and getEnv("BYBY_FIR_RELOC", "1") != "0"
                 let kernel = firMicroKernel(node, result.graph, registry, nodeBindings, relocatable)
                 if kernel.program.words.len > 0 and
-                    (kernel.program.words[0] and 0xFF'u32) == OP_Q4_COOP_GEMM:
+                    (kernel.program.words[0] and 0xFF'u32) in [OP_Q4_COOP_GEMM, OP_FP4_COOP_GEMM]:
                     if be == gbVulkan:
                         if not sessionCooperativeGemmEnabled(be):
-                            raise newException(ValueError, "FIR Q4 Tensor Core micro-kernel requires Vulkan KHR_cooperative_matrix support")
+                            raise newException(ValueError, "FIR Tensor Core micro-kernel " & node.op & " requires Vulkan KHR_cooperative_matrix support; re-lift on this device")
+                    elif be == gbMetal:
+                        if not sessionSimdgroupMatrixEnabled(be):
+                            raise newException(ValueError, "FIR Tensor Core micro-kernel " & node.op & " " & SimdgroupMatrixRequired & "; re-lift on this device")
                     elif be != gbCpu:
-                        raise newException(ValueError, "FIR Q4 Tensor Core micro-kernel is Vulkan-only")
+                        raise newException(ValueError, "FIR Tensor Core micro-kernel " & node.op & " runs on Vulkan (cooperative matrix) or Metal (simdgroup_matrix) only; re-lift on this backend")
                 if isQ4GemvProgram(kernel.program) and be notin [gbVulkan, gbCpu]:
                     raise newException(ValueError, "FIR Q4 subgroup GEMV micro-kernel is Vulkan-only; re-lift with FIRLIFT_Q4_GEMV=simd or word_parallel")
                 var prepared = FgResidentProgram(kernel: kernel, stage: staged, metaOffset: -1)
@@ -696,29 +716,48 @@ function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): 
                         result.metaWrites.add((prepared.metaOffset + 2*i, float32(address div 4096)))
                         result.metaWrites.add((prepared.metaOffset + 2*i + 1, float32(address mod 4096)))
                     metaFloats += ((2*kernel.relocBuffers.len + 3) div 4)*4
-                if be == gbMetal:
+                if be == gbMetal and isCoopGemmProgram(kernel.program):
+                    # Tensor Core GEMM on an Apple GPU: one simdgroup_matrix pipeline per row tile a
+                    # dispatch of 1..M rows can pick (same tiles and grid as Vulkan, see fgEncodeMicroBody).
+                    prepared.name = "jit_" & programKeyNoSession(kernel.program, node.op)
+                    let shape = coopGemmShape(kernel.program)
+                    for rows in 1 .. shape.M:
+                        let tile = fgQ4CoopTile(result, rows, shape.N)
+                        if tile notin prepared.coopTiles:
+                            let tileName = prepared.name & "_r" & $tile
+                            let source = lowerCoopGemmMetal(kernel.program, tileName, tile)
+                            if not tryMetalJitCompile(source, tileName):
+                                raise newException(ValueError, "FIR graph Metal JIT compilation failed: " & node.op & " (simdgroup_matrix row tile " & $tile & ")")
+                            prepared.coopTiles.add(tile)
+                            prepared.coopNames.add(tileName)
+                            prepared.coopSources.add(source)
+                    prepared.source = prepared.coopSources[prepared.coopTiles.find(fgQ4CoopTile(result, shape.M, shape.N))]
+                    if coopVerbose and not coopLogged.hasKey(node.op):
+                        coopLogged[node.op] = true
+                        stderr.writeLine("[fir] " & (if isFp4CoopProgram(kernel.program): "FP4" else: "Q4") & " simdgroup_matrix " & node.op & " K=" & $shape.K & " N=" & $shape.N & " M=" & $shape.M & ": row tiles built " & $prepared.coopTiles)
+                elif be == gbMetal:
                     prepared.name = dispatchProgramNoSession(jit, kernel.program, node.op)
                     if prepared.name == "micro_vm_kernel":
                         raise newException(ValueError, "FIR graph Metal JIT compilation failed: " & node.op)
                 elif be == gbVulkan:
                     prepared.name = kernelNameFor(jit, kernel.program, node.op)
-                    if isQ4CoopProgram(kernel.program):
+                    if isCoopGemmProgram(kernel.program):
                         # Build every row tile a dispatch of 1..M rows can pick on this device;
                         # fgEncodeMicroBody chooses one and sizes the grid per dispatch.
-                        let shape = q4CoopShape(kernel.program)
+                        let shape = coopGemmShape(kernel.program)
                         for rows in 1 .. shape.M:
                             let tile = fgQ4CoopTile(result, rows, shape.N)
                             if tile notin prepared.coopTiles:
                                 let tileName = prepared.name & "_r" & $tile
                                 prepared.coopTiles.add(tile)
                                 prepared.coopNames.add(tileName)
-                                prepared.coopSources.add(lowerQ4CoopGlsl(kernel.program, tileName, tile, result.coopFragments))
+                                prepared.coopSources.add(lowerCoopGemmGlsl(kernel.program, tileName, tile, result.coopFragments))
                                 jobs.add((tileName, prepared.coopSources[^1]))
                         prepared.source = prepared.coopSources[prepared.coopTiles.find(fgQ4CoopTile(result, shape.M, shape.N))]
                         if coopVerbose and not coopLogged.hasKey(node.op):
                             coopLogged[node.op] = true
                             let fullTile = fgQ4CoopTile(result, shape.M, shape.N)
-                            stderr.writeLine("[fir] Q4 Tensor Core " & node.op & " K=" & $shape.K & " N=" & $shape.N & " M=" & $shape.M & ": row tile " & $fullTile & " (tiles built " & $prepared.coopTiles & ", " & $result.computeUnits & " SM/CU, " & $result.coopFragments & " fragment(s) per subgroup)")
+                            stderr.writeLine("[fir] " & (if isFp4CoopProgram(kernel.program): "FP4" else: "Q4") & " Tensor Core " & node.op & " K=" & $shape.K & " N=" & $shape.N & " M=" & $shape.M & ": row tile " & $fullTile & " (tiles built " & $prepared.coopTiles & ", " & $result.computeUnits & " SM/CU, " & $result.coopFragments & " fragment(s) per subgroup)")
                     elif isQ4GemvProgram(kernel.program):
                         # Rows per subgroup, workgroup width and the reduction follow the device; the
                         # grid follows from them. The first variant is the default; fgTuneGemv times
@@ -898,7 +937,9 @@ function fgAllocate(model: var FirGraph, memory: seq[float32])
     for node in model.graph.nodes:
         if node.kind == "session":
             for port in (node.inputs & " " & node.outputs).splitWhitespace():
-                if model.graph.buffers.hasKey(port):
+                # Weights are bound whole (or staged into scratch only as an RMSNorm gamma, which
+                # is no longer than the rows it scales).
+                if model.graph.buffers.hasKey(port) and model.graph.buffers[port].kind != "weight":
                     scratch = max(scratch, model.graph.buffers[port].elements)
     largest = max(largest, scratch)
     model.scratchA = sessionAllocScratch(be, scratch)
@@ -913,6 +954,8 @@ function fgLoadRawWeights(model: var FirGraph, checkpoint: string)
             if firResidentRaw(model.graph, name):
                 model.rawWeights[name] = sessionUploadPrivate(be, firReadRawInitializer(model.graph, checkpoint, buffer))
         return
+    for name in model.rawSolo:
+        model.rawWeights[name] = sessionUploadPrivate(be, firReadRawInitializer(model.graph, checkpoint, model.graph.buffers[name]))
     for members in model.rawPlan:
         # One pool of host memory at a time; no checkpoint-sized arena.
         var pending = newSeq[float32]()
@@ -1163,9 +1206,10 @@ function fgEncodeMicroBody(model: var FirGraph, prepared: FgResidentProgram, nod
         var tgSize = k.tgSize
         var pipelineName = prepared.name
         var pipelineSource = prepared.source
-        if vk and prepared.coopTiles.len > 0:
-            # Q4 Tensor Core micro-kernel: row tile and grid follow the rows this dispatch runs.
-            let shape = q4CoopShape(k.program)
+        if prepared.coopTiles.len > 0:
+            # Q4/FP4 Tensor Core micro-kernel (Vulkan cooperative matrix or Metal simdgroup_matrix):
+            # row tile and grid follow the rows this dispatch runs.
+            let shape = coopGemmShape(k.program)
             let rows = if model.activeRows > 0: min(shape.M, model.activeRows) else: shape.M
             let tile = fgQ4CoopTile(model, rows, shape.N)
             let index = prepared.coopTiles.find(tile)
@@ -1193,7 +1237,9 @@ function fgEncodeMicroBody(model: var FirGraph, prepared: FgResidentProgram, nod
                 raise newException(ValueError, "FIR Q4 micro-kernel " & node.op & ": " & k.slotBuffers[i] & " starts at float " & $offset & ", not on a 16-byte boundary")
             if not sessionEncBindVkOrMetal(vk, slot, handle.metalHandle, handle.vulkanHandle, offset):
                 return false
-        if not sessionEncTgBytes(vk, 0, k.tgBytes):
+        # The Metal simdgroup_matrix kernels declare their threadgroup tiles statically.
+        let dynamicTg = vk or prepared.coopTiles.len == 0
+        if dynamicTg and not sessionEncTgBytes(vk, 0, k.tgBytes):
             return false
         return sessionEncDispatch(vk, threads, tgSize, k.tgBytes)
     if be == gbCpu and prepared.cpuFn != nil and not model.useHandles and cpuJitRun(prepared.cpuFn, model.arena.cpuData, threads, k.tgSize):
@@ -1202,12 +1248,15 @@ function fgEncodeMicroBody(model: var FirGraph, prepared: FgResidentProgram, nod
         return fgDispatchArena(model, prepared, false, threads)
     # Handle graph: copy the ports into the staging arena, run the kernel there, copy the outputs back.
     for port in prepared.stage:
+        if port.reads:
+            inc model.copies
         if port.reads and not sessionCopyInto(be, fgPortHandle(model, port.name), model.stage, fgPortOffset(model, port.name), port.offset, port.elements):
             return false
     result = fgDispatchArena(model, prepared, true, threads)
     if result:
         for port in prepared.stage:
             if port.writes:
+                inc model.copies
                 let index = fgPortHandleIndex(model, port.name)
                 if index < 0 or not sessionCopyInto(be, model.stage, model.handles[index], port.offset, fgPortOffset(model, port.name), port.elements):
                     return false
@@ -1374,6 +1423,101 @@ function fgEncodeNativeQ4(model: var FirGraph, node: FirNode, layer: int): bool
         return sessionCopyInto(be, target, model.handles[targetIndex], 0, targetOffset, count)
     sessionCopyInto(be, target, model.arena, 0, model.bindings.memory[outputName], count)
 
+function fgDirectPort(model: FirGraph, name: string, index: var int, handle: var SessionHandle): bool
+    ## A port that starts at float 0 of a buffer of its own: a session replay binds that buffer
+    ## as the recorded runtime did, with no staging copy. index: the activation handle (-1: a
+    ## raw weight).
+    index = -1
+    if not model.graph.buffers.hasKey(name) or fgPortOffset(model, name) != 0:
+        return false
+    let base = fgPortBase(model, name)
+    if firResidentQ4(model.graph, base):
+        return false
+    if model.handleIndex.hasKey(base):
+        index = model.handleIndex[base]
+        handle = model.handles[index]
+        return true
+    if model.rawWeights.hasKey(base) and not model.rawBase.hasKey(base):
+        handle = model.rawWeights[base]
+        return true
+    return false
+
+function fgDirectDisabled(): bool
+    ## BYBY_FIR_SESSION_DIRECT=0 stages every session replay through scratch buffers (diagnostic).
+    var state {.global.}: int
+    if state == 0:
+        state = if getEnv("BYBY_FIR_SESSION_DIRECT", "1") == "0": 2 else: 1
+    result = state == 2
+
+function fgMatmulNTReplay(be: GpuBackend, name: string, a, b: SessionHandle, c: var SessionHandle, attrs: Table[string, string]): bool
+    ## The recorded FP32 GEMM C(M x N) = A(M x K) @ B(N x K)^T, called as the runtime called it.
+    let m = fgAttrInt(attrs, "M", 0)
+    let k = fgAttrInt(attrs, "K", 0)
+    let n = fgAttrInt(attrs, "N", 0)
+    let bOff = fgAttrInt(attrs, "bOff", 0)
+    if m <= 0 or k <= 0 or n <= 0:
+        return false
+    if name == "sessionMatmulNTAccelerated" and bOff == 0:
+        return sessionMatmulNTAccelerated(be, a, b, c, m, k, n)
+    sessionMatmulNT(be, a, b, c, m, k, n, bOff)
+
+function fgEncodeSessionDirect(model: var FirGraph, name: string, attrs: Table[string, string], ins, outs: seq[string], done: var bool): bool
+    ## Replays RMSNorm / vector op / activation on the graph's own buffers when every port is a
+    ## whole buffer at offset 0. done=false: a port is a view or packed, the caller stages it.
+    done = false
+    if fgDirectDisabled():
+        return false
+    let be = model.backend.kind.toByby()
+    var xi, bi, yi: int
+    var x, b, y: SessionHandle
+    if not fgDirectPort(model, ins[0], xi, x) or not fgDirectPort(model, outs[0], yi, y) or yi < 0:
+        return false
+    if name == "sessionRmsnormEnc":
+        # Each row is reduced before it is written: the output must not alias an input.
+        if ins.len < 2 or not fgDirectPort(model, ins[1], bi, b) or yi == xi or (bi >= 0 and yi == bi):
+            return false
+        let n = fgAttrInt(attrs, "cols", 0)
+        if n <= 0:
+            return false
+        done = true
+        inc model.sessionOps
+        result = sessionRmsnormEnc(be, x, b, y, fgAttrInt(attrs, "rows", 1), n, fgAttrBits(attrs, "eps", 1e-5'f32))
+    elif name == "sessionVecOp":
+        # Element-wise: c may alias a or b, as in the recorded runtime.
+        if ins.len < 2 or not fgDirectPort(model, ins[1], bi, b) or not attrs.hasKey("op"):
+            return false
+        let n = fgAttrInt(attrs, "n", 0)
+        if n <= 0:
+            return false
+        done = true
+        inc model.sessionOps
+        result = sessionVecOp(be, attrs["op"], x, b, y, n)
+    elif name == "sessionActivation":
+        let n = fgAttrInt(attrs, "n", 0)
+        if n <= 0 or not attrs.hasKey("op"):
+            return false
+        done = true
+        inc model.sessionOps
+        result = sessionActivation(be, attrs["op"], x, y, n, fgAttrBits(attrs, "p", 0'f32))
+    elif name == "sessionFp4GemmMetal":
+        var li: int
+        var lut: SessionHandle
+        if ins.len < 3 or not fgDirectPort(model, ins[1], bi, b) or not fgDirectPort(model, ins[2], li, lut) or yi == xi:
+            return false
+        done = true
+        inc model.sessionOps
+        result = sessionFp4GemmMetal(be, x, b, lut, y, fgAttrInt(attrs, "M", 0), fgAttrInt(attrs, "K", 0), fgAttrInt(attrs, "N", 0), fgAttrInt(attrs, "simdgroup", 0) == 1)
+    elif name == "sessionMatmulNT" or name == "sessionMatmulNTAccelerated":
+        if ins.len < 2 or not fgDirectPort(model, ins[1], bi, b) or yi == xi or (bi >= 0 and yi == bi):
+            return false
+        done = true
+        inc model.sessionOps
+        result = fgMatmulNTReplay(be, name, x, b, y, attrs)
+    else:
+        return false
+    if result:
+        model.handles[yi] = y
+
 function fgEncodeSessionHandles(model: var FirGraph, node: FirNode, layer: int): bool
     let be = model.backend.kind.toByby()
     let ins = node.inputs.splitWhitespace()
@@ -1383,10 +1527,17 @@ function fgEncodeSessionHandles(model: var FirGraph, node: FirNode, layer: int):
     var attrs = initTable[string, string]()
     if colon >= 0:
         attrs = fgAttrTable(node.op[colon+1 .. ^1])
+    var direct = false
+    let directOk = fgEncodeSessionDirect(model, name, attrs, ins, outs, direct)
+    if direct:
+        return directOk
+    if name != "sessionCopyInto":
+        inc model.sessionOps
     if name == "sessionRmsnormEnc":
         let n = fgAttrInt(attrs, "cols", 0)
         if n <= 0:
             return false
+        model.copies += 3
         let count = n*fgAttrInt(attrs, "rows", 1)
         let source = fgPortHandle(model, ins[0])
         let sourceOffset = fgPortOffset(model, ins[0])
@@ -1410,6 +1561,7 @@ function fgEncodeSessionHandles(model: var FirGraph, node: FirNode, layer: int):
         let n = fgAttrInt(attrs, "n", 0)
         if n <= 0 or not attrs.hasKey("op"):
             return false
+        model.copies += 3
         let a = fgPortHandle(model, ins[0])
         let aOffset = fgPortOffset(model, ins[0])
         let b = fgPortHandle(model, ins[1])
@@ -1431,6 +1583,7 @@ function fgEncodeSessionHandles(model: var FirGraph, node: FirNode, layer: int):
         let n = fgAttrInt(attrs, "n", 0)
         if n <= 0 or not attrs.hasKey("op"):
             return false
+        model.copies += 2
         let source = fgPortHandle(model, ins[0])
         let sourceOffset = fgPortOffset(model, ins[0])
         if not sessionCopyInto(be, source, model.scratchA, sourceOffset, 0, n):
@@ -1449,6 +1602,7 @@ function fgEncodeSessionHandles(model: var FirGraph, node: FirNode, layer: int):
         let n = fgAttrInt(attrs, "n", 0)
         if n <= 0:
             return false
+        inc model.copies
         let source = fgPortHandle(model, ins[0])
         let sourceOffset = fgPortOffset(model, ins[0]) + fgCopySourceOffset(model, attrs, n)
         let targetIndex = fgPortHandleIndex(model, outs[0])
@@ -1456,6 +1610,46 @@ function fgEncodeSessionHandles(model: var FirGraph, node: FirNode, layer: int):
         if targetIndex < 0:
             return false
         return sessionCopyInto(be, source, model.handles[targetIndex], sourceOffset, targetOffset, n)
+    if name == "sessionFp4GemmMetal":
+        # The activation ports are views: stage them; the packed weight and its table are bound whole.
+        let m = fgAttrInt(attrs, "M", 0)
+        let k = fgAttrInt(attrs, "K", 0)
+        let n = fgAttrInt(attrs, "N", 0)
+        var wi, li: int
+        var w, lut: SessionHandle
+        if m <= 0 or k <= 0 or n <= 0 or not fgDirectPort(model, ins[1], wi, w) or not fgDirectPort(model, ins[2], li, lut):
+            raise newException(ValueError, "FIR graph FP4 GEMM replay needs whole weight and table buffers: " & node.name)
+        let targetIndex = fgPortHandleIndex(model, outs[0])
+        if targetIndex < 0:
+            return false
+        model.copies += 2
+        if not sessionCopyInto(be, fgPortHandle(model, ins[0]), model.scratchA, fgPortOffset(model, ins[0]), 0, m*k):
+            return false
+        var c = model.scratchC
+        if not sessionFp4GemmMetal(be, model.scratchA, w, lut, c, m, k, n, fgAttrInt(attrs, "simdgroup", 0) == 1):
+            return false
+        model.scratchC = c
+        return sessionCopyInto(be, model.scratchC, model.handles[targetIndex], 0, fgPortOffset(model, outs[0]), m*n)
+    if name == "sessionMatmulNT" or name == "sessionMatmulNTAccelerated":
+        # The activation ports are views: stage them; the weight is bound whole.
+        let m = fgAttrInt(attrs, "M", 0)
+        let k = fgAttrInt(attrs, "K", 0)
+        let n = fgAttrInt(attrs, "N", 0)
+        var wi: int
+        var w: SessionHandle
+        if m <= 0 or k <= 0 or n <= 0 or not fgDirectPort(model, ins[1], wi, w):
+            raise newException(ValueError, "FIR graph FP32 GEMM replay needs a whole weight buffer: " & node.name)
+        let targetIndex = fgPortHandleIndex(model, outs[0])
+        if targetIndex < 0:
+            return false
+        model.copies += 2
+        if not sessionCopyInto(be, fgPortHandle(model, ins[0]), model.scratchA, fgPortOffset(model, ins[0]), 0, m*k):
+            return false
+        var c = model.scratchC
+        if not fgMatmulNTReplay(be, name, model.scratchA, w, c, attrs):
+            return false
+        model.scratchC = c
+        return sessionCopyInto(be, model.scratchC, model.handles[targetIndex], 0, fgPortOffset(model, outs[0]), m*n)
     raise newException(ValueError, "FIR graph unsupported session replay: " & node.op)
 
 function fgEncodeSession(model: var FirGraph, node: FirNode, layer: int): bool
@@ -1520,13 +1714,46 @@ function fgEncodeSession(model: var FirGraph, node: FirNode, layer: int): bool
         let dstOffset = memory[outs[0]] + fgAttrInt(attrs, "dstOff", 0)
         var dst = model.arena
         return sessionCopyInto(be, model.arena, dst, srcOffset, dstOffset, n)
+    if name == "sessionFp4GemmMetal" or (name == "sessionMatmulNTAccelerated" and be != gbCpu):
+        # These replays bind the weight at offset 0 (the accelerated GEMM may round its inputs to
+        # FP16 on the GPU, which the offset FP32 GEMM below would not): only a handle graph has
+        # whole weight buffers. Recorded graphs, the only ones with these nodes, always use handles.
+        raise newException(ValueError, "FIR graph session replay " & name & " needs a handle graph (raw recorded buffers): " & node.name)
+    if name == "sessionMatmulNT" or name == "sessionMatmulNTAccelerated":
+        # The weight is read in place from the arena (an offset B); A is staged, C copied back.
+        # On the CPU the accelerated call is the FP32 GEMM.
+        let m = fgAttrInt(attrs, "M", 0)
+        let k = fgAttrInt(attrs, "K", 0)
+        let n = fgAttrInt(attrs, "N", 0)
+        if m <= 0 or k <= 0 or n <= 0:
+            return false
+        if not sessionCopyInto(be, model.arena, model.scratchA, memory[ins[0]], 0, m*k):
+            return false
+        var c = model.scratchC
+        if not sessionMatmulNT(be, model.scratchA, model.arena, c, m, k, n, memory[ins[1]] + fgAttrInt(attrs, "bOff", 0)):
+            return false
+        model.scratchC = c
+        return sessionCopyInto(be, model.scratchC, model.arena, 0, memory[outs[0]], m*n)
     raise newException(ValueError, "FIR graph unsupported session replay: " & node.op)
 
 function fgEncodeGather(model: var FirGraph, table, dst, index: SessionHandle, dstOffset, indexOffset, width, tableRows: int): bool
-    ## Vulkan: dst[dstOffset + i] = table[row*width + i] with row = index[indexOffset], read on
-    ## the GPU (clamped to the table). The offsets are constants of the shader, so every binding
-    ## starts at 0.
+    ## dst[dstOffset + i] = table[row*width + i] with row = index[indexOffset], read on the GPU
+    ## (clamped to the table). The offsets are constants of the shader (Vulkan GLSL, Metal MSL), so
+    ## every binding starts at 0.
     let name = "fir_embed_gather_w" & $width & "_r" & $tableRows & "_d" & $dstOffset & "_i" & $indexOffset
+    if model.backend.kind.toByby() == gbMetal:
+        var msl = "#include <metal_stdlib>\nusing namespace metal;\n"
+        msl.add("kernel void " & name & "(device float* dst [[buffer(0)]], device const float* table [[buffer(1)]], device const float* index [[buffer(2)]], uint i [[thread_position_in_grid]]) {\n")
+        msl.add("    if (i >= " & $width & "u) return;\n")
+        msl.add("    uint row = min(uint(max(index[" & $indexOffset & "u], 0.0f)), " & $(tableRows-1) & "u);\n")
+        msl.add("    dst[" & $dstOffset & "u + i] = table[row * " & $width & "u + i];\n")
+        msl.add("}\n")
+        inc model.dispatched
+        if not sessionMetalJitCompile(name, msl) or not sessionEncPipeline(false, name):
+            return false
+        if not sessionEncBindVkOrMetal(false, 0, dst.metalHandle, dst.vulkanHandle, 0) or not sessionEncBindVkOrMetal(false, 1, table.metalHandle, table.vulkanHandle, 0) or not sessionEncBindVkOrMetal(false, 2, index.metalHandle, index.vulkanHandle, 0):
+            return false
+        return sessionEncDispatch(false, width, 256)
     var source = "#version 450\n"
     source.add("layout(local_size_x_id = 0) in;\n")
     source.add("layout(std430, set=0, binding=0) buffer DstBuf { float dst[]; };\n")
@@ -1679,13 +1906,16 @@ function firGraphReset(model: var FirGraph)
     # are unreachable. No cache clear or host transfer is needed.
     let be = model.backend.kind.toByby()
     if model.initialState.len > 0:
-        if not sessionBegin(be):
-            raise newException(ValueError, "FIR graph state reset session failed")
-        try:
-            for item in model.initialState:
-                let buffer = model.graph.buffers[item.name]
-                let data = fgInitValues(model, buffer)
-                var source = sessionUpload(be, data)
+        # One session per buffer: the upload may be freed only after the GPU copied it (on Metal a
+        # freed upload goes back to a pool and the next upload reuses it while the copy is pending).
+        for item in model.initialState:
+            let buffer = model.graph.buffers[item.name]
+            let data = fgInitValues(model, buffer)
+            var source = sessionUpload(be, data)
+            if not sessionBegin(be):
+                sessionFree(be, source)
+                raise newException(ValueError, "FIR graph state reset session failed")
+            try:
                 try:
                     var ok = false
                     if model.useHandles:
@@ -1699,9 +1929,9 @@ function firGraphReset(model: var FirGraph)
                     if not ok:
                         raise newException(ValueError, "FIR graph state reset copy failed")
                 finally:
-                    sessionFree(be, source)
-        finally:
-            discard sessionEnd(be)
+                    discard sessionEnd(be)
+            finally:
+                sessionFree(be, source)
     model.position = 0
 
 const FgCommitRowNodes = 512              # row-nodes per command buffer inside a multi-row phase
@@ -1846,7 +2076,7 @@ function fgReplayBlocker(model: FirGraph): string
     let be = model.backend.kind.toByby()
     if getEnv("BYBY_FIR_DECODE_REPLAY", "1") == "0":
         return "BYBY_FIR_DECODE_REPLAY=0"
-    if be != gbVulkan or not sessionCanRecord(be):
+    if (be != gbVulkan and be != gbMetal) or not sessionCanRecord(be):
         return "backend cannot replay a recorded session"
     if model.nativeQ4:
         return "BYBY_FIR_Q4_BACKEND=native"
@@ -1861,7 +2091,16 @@ function fgReplayBlocker(model: FirGraph): string
             let key = fgNodeKey(node, 0)
             if not model.programs.hasKey(key):
                 return "node " & node.name & " has no prepared micro-kernel"
-        elif node.kind == "session" or node.op != "fir.embedding":
+        elif node.kind == "session":
+            # Exact session replays bind preallocated scratch buffers and take every size from
+            # the node's attributes; only a lastRowOf copy follows the rows of a partial run.
+            let colon = node.op.find(':')
+            let opName = if colon >= 0: node.op[0 ..< colon] else: node.op
+            if opName notin ["sessionRmsnormEnc", "sessionVecOp", "sessionActivation", "sessionCopyInto"]:
+                return "node " & node.name & " (" & node.op & ") encodes host values"
+            if colon >= 0 and fgAttrTable(node.op[colon+1 .. ^1]).hasKey("lastRowOf"):
+                return "node " & node.name & " (" & node.op & ") follows the active rows"
+        elif node.op != "fir.embedding":
             return "node " & node.name & " (" & node.op & ") encodes host values"
         else:
             let ins = node.inputs.splitWhitespace()
@@ -1890,6 +2129,8 @@ function fgRecordStep(model: var FirGraph, token: int): seq[float32]
         return @[]
     inc model.sessions
     let before = model.dispatched
+    let opsBefore = model.sessionOps
+    let copiesBefore = model.copies
     model.replayEncoding = true
     var ended = false
     try:
@@ -1910,20 +2151,23 @@ function fgRecordStep(model: var FirGraph, token: int): seq[float32]
         if not ended:
             discard sessionEnd(be)
     model.replayDispatched = model.dispatched - before
+    model.replaySessionOps = model.sessionOps - opsBefore
+    model.replayCopies = model.copies - copiesBefore
     result = sessionHostRead(be, model.replayLogits, vocab)
     if result.len != vocab:
         model.failed = true
         raise newException(ValueError, "FIR graph logits read length mismatch")
     let id = sessionLastRecording(be)
+    let note = sessionRecordingNote(be, id)
     if id < 0:
         model.replayState = -1
         sessionFree(be, model.replayScalars)
         sessionFree(be, model.replayLogits)
-        fgReplaySay("[fir] decode replay off: the step allocated or staged buffers while recording")
+        fgReplaySay("[fir] decode replay off: the step allocated or staged buffers while recording" & (if note.len > 0: " (" & note & ")" else: ""))
     else:
         model.replayState = 1
         model.replayId = id+1
-        fgReplaySay("[fir] decode replay on: " & $model.replayDispatched & " dispatches recorded once")
+        fgReplaySay("[fir] decode replay on: " & $model.replayDispatched & " dispatches recorded once (plus " & $model.replaySessionOps & " session replay ops and " & $model.replayCopies & " buffer copies)" & (if note.len > 0: ", Metal replay: " & note else: ""))
     inc model.logitsReads
     inc model.position
 

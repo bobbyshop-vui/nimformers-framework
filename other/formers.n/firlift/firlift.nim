@@ -53,12 +53,13 @@ type
     order*: int
     fingerprint*: string
     captureOffset*, captureBytes*: int
+    failed*: bool        ## a copy whose call returned false (ok=false): it wrote nothing
 
   Trace* = object
     sourcePath*: string
     selectionSession*: int
     backend*: string
-    device*: string      ## device features of the recorded run ("coopmatrix", "plain"; "unspecified" for older traces)
+    device*: string      ## device features of the recorded run ("coopmatrix" on Vulkan, "simdmatrix" on Metal, "plain"; "unspecified" for older traces)
     bufs*: seq[BufferRec]
     programs*: Table[string, seq[uint32]]
     ops*: seq[Op]
@@ -302,6 +303,7 @@ proc parseTrace*(text: string): Trace =
         of "data":
           for w in v.split(','): t.data.add uint32(parseHexInt(w))
         of "fingerprint": t.fingerprint = v
+        of "ok": t.failed = v == "false"
         of "capture":
           let parts = v.split(':')
           t.captureOffset = parseInt(parts[0])

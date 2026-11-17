@@ -6,6 +6,7 @@ import m3_gpu_runtime
 import m3_merge_gpu
 from fp4_gemv_vm import Fp4KmLutLen
 from vendor/bybylang/probe import firProbeOn, probeUploaded
+from vendor/bybylang/backends/vulkan/vulkan_driver import vulkanSessionRead
 from vendor/bybylang/backends/metal/metal_backend import metalSessionRead
 
 when defined(macosx):
@@ -248,15 +249,16 @@ proc recordMergedFp4Weights(ctx: Backend; cache: Fp4LinCacheGpu) =
     weightsRaw=cache.wBuf.metalHandle
     lutRaw=cache.lutBuf.metalHandle
   of bkVulkan:
-    let be=ctx.kind.toByby()
-    weights=sessionRead(be,cache.wBuf,weightFloats)
-    lut=sessionRead(be,cache.lutBuf,Fp4KmLutLen)
+    # The driver read is not a recorded op: a recorded weight-sized read-back would look like a
+    # logits pass to the lifter and drag the merge shaders into the lifted step.
+    weights=vulkanSessionRead(cache.wBuf.vulkanHandle,weightFloats)
+    lut=vulkanSessionRead(cache.lutBuf.vulkanHandle,Fp4KmLutLen)
     weightsRaw=cast[pointer](cache.wBuf.vulkanHandle.buf)
     lutRaw=cast[pointer](cache.lutBuf.vulkanHandle.buf)
   else:
     return
-  if weights.len>0:probeUploaded(weightsRaw,addr weights[0],weights.len*4)
-  if lut.len>0:probeUploaded(lutRaw,addr lut[0],lut.len*4)
+  if weights.len>0:probeUploaded(weightsRaw,addr weights[0],weights.len*4,always=true)
+  if lut.len>0:probeUploaded(lutRaw,addr lut[0],lut.len*4,always=true)
 
 proc mergeResidentLoraInplace*(m: var NimformerModelJamba; lo: var JambaLora; ctx: Backend): int =
   invalidateM3OneDispatch()
