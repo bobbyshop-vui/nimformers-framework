@@ -562,7 +562,11 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
   # BYBY_SSD_STATE_MB, so the pass never outgrows VRAM.
   var ssdQ = parseInt(getEnv("BYBY_SSD_CHUNK", "64"))
   var ssd = false
-  if be == gbVulkan and getEnv("BYBY_SSD", "auto") != "0" and
+  # While a FIR recording runs (firlift --run), "auto" keeps the micro-VM scan: the SSD pass is
+  # native shaders without a micro-VM program, which a lifted graph cannot replay.
+  # BYBY_SSD=1 forces it anyway.
+  let ssdChoice = getEnv("BYBY_SSD", "auto")
+  if be == gbVulkan and ssdChoice != "0" and not (ssdChoice == "auto" and byby.firProbeOn) and
       T >= parseInt(getEnv("BYBY_SSD_MIN_T", "0")):
     let budget = parseInt(getEnv("BYBY_SSD_STATE_MB", "1024")) * 1024 * 1024
     proc ssdScratchBytes(q: int): int =

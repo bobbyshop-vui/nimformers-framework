@@ -24,6 +24,7 @@ type
     conversation*: bool           ## chat: "> " turns, context kept between turns
     ctxSize*: int                 ## KV capacity in tokens; 0 = automatic
     promptSet*, nPredictSet*: bool
+    samplerSet*: seq[string]      ## sampler flags given on the command line (they win over config defaults)
     noWarmup*: bool               ## skip the startup warmup run
     verbose*: bool                ## show the library logs (loader, JIT, kernels, profiles)
     firF32*: bool
@@ -178,14 +179,19 @@ function fmParseOptions(args: seq[string]): FmOptions
             result.nPredictSet = true
         of "--temp", "--temperature":
             result.temperature = fmToFloat(fmOptValue(args, i, flag, inlineVal, hasInline, result.errors), flag, result.errors)
+            result.samplerSet.add("temperature")
         of "--top-p":
             result.topP = fmToFloat(fmOptValue(args, i, flag, inlineVal, hasInline, result.errors), flag, result.errors)
+            result.samplerSet.add("top_p")
         of "--min-p":
             result.minP = fmToFloat(fmOptValue(args, i, flag, inlineVal, hasInline, result.errors), flag, result.errors)
+            result.samplerSet.add("min_p")
         of "--repeat-penalty":
             result.repeatPenalty = fmToFloat(fmOptValue(args, i, flag, inlineVal, hasInline, result.errors), flag, result.errors)
+            result.samplerSet.add("repeat_penalty")
         of "--repeat-last-n":
             result.repeatLastN = fmToInt(fmOptValue(args, i, flag, inlineVal, hasInline, result.errors), flag, result.errors)
+            result.samplerSet.add("repeat_last_n")
         of "-s", "--seed":
             result.seed = fmToInt(fmOptValue(args, i, flag, inlineVal, hasInline, result.errors), flag, result.errors).int64
         of "--backend":

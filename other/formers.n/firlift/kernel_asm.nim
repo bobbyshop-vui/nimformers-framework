@@ -140,6 +140,8 @@ proc assemble*(body: string; ins, outs: int; inSize, outSize: seq[int]; eps: flo
     of "mmstoremem": result.emitMmStoreMem(parseInt(a[0]).uint32, parseInt(a[1]).uint32, uint32(evalExpr(a[2], syms)))
     of "q4coop": result.emitQ4CoopGemm(uint32(evalExpr(a[0], syms)), uint32(evalExpr(a[1], syms)),
       uint32(evalExpr(a[2], syms)), uint32(evalExpr(a[3], syms)), uint32(evalExpr(a[4], syms)))
+    of "fp4coop": result.emitFp4CoopGemm(uint32(evalExpr(a[0], syms)), uint32(evalExpr(a[1], syms)),
+      uint32(evalExpr(a[2], syms)), uint32(evalExpr(a[3], syms)), uint32(evalExpr(a[4], syms)))
     of "q4gemv": result.emitQ4Gemv(uint32(evalExpr(a[0], syms)), uint32(evalExpr(a[1], syms)),
       uint32(evalExpr(a[2], syms)), uint32(evalExpr(a[3], syms)), uint32(evalExpr(a[4], syms)))
     of "simdw": result.emitSimdW(parseInt(a[0]).uint32)

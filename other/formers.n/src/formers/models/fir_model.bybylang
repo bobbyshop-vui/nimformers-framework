@@ -66,6 +66,13 @@ function fmFirFeedPrompt(model: var FirGraph, graph: FirProgram, ids: seq[int]):
     var next = 0
     var finished = false
     var ubatch = 0
+    # BYBY_PREFILL_MIN_ROWS (default 5): phases shorter than this many rows are not used, so
+    # their tokens run as decode steps (the native Codestral runtime splits prompts the same way).
+    var minRows = 5
+    try:
+        minRows = max(1, parseInt(getEnv("BYBY_PREFILL_MIN_ROWS", "5")))
+    except ValueError:
+        minRows = 5
     try:
         ubatch = max(0, parseInt(getEnv("BYBY_UBATCH", "512")))
     except ValueError:
@@ -85,6 +92,8 @@ function fmFirFeedPrompt(model: var FirGraph, graph: FirProgram, ids: seq[int]):
         var width = 0
         for name in graph.phaseOrder:
             let phaseRows = graph.phases[name]
+            if phaseRows < minRows:
+                continue
             let rows = if ubatch > 0 and name notin graph.phaseLogits: min(phaseRows, ubatch) else: phaseRows
             if graph.phaseLogits.hasKey(name):
                 if rows == ids.len-next and rows > width:
@@ -119,6 +128,8 @@ function fmFirFeedPrompt(model: var FirGraph, graph: FirProgram, ids: seq[int]):
         var take = 0
         for name in graph.phaseOrder:
             let phaseRows = graph.phases[name]
+            if phaseRows < minRows:
+                continue
             let rows = if ubatch > 0 and name notin graph.phaseLogits: min(phaseRows, ubatch) else: phaseRows
             let rest = if graph.phaseLast.hasKey(name): ids.len-next else: ids.len-1-next
             if name in graph.phasePartial and rows >= rest and fmTailWorth(model, graph, name, rest) and (width == 0 or rest > take or (rest == take and rows < width)):
@@ -152,19 +163,18 @@ function fmRunFir(det: FmDetection, cliOpts: FmOptions): bool
         graph = firF32Weights(graph)
     let cfg = parseFile(det.files.configPath)
     # A model may declare sampler defaults in config.json ("formers_sampler"). They apply only
-    # to settings still at the built-in default, so command-line flags always win.
+    # to settings not given on the command line, so command-line flags always win.
     let declared = cfg{"formers_sampler"}
     if declared != nil and declared.kind == JObject:
-        let builtin = fmDefaultOptions()
-        if opts.temperature == builtin.temperature and declared.hasKey("temperature"):
+        if "temperature" notin opts.samplerSet and declared.hasKey("temperature"):
             opts.temperature = float32(declared["temperature"].getFloat())
-        if opts.topP == builtin.topP and declared.hasKey("top_p"):
+        if "top_p" notin opts.samplerSet and declared.hasKey("top_p"):
             opts.topP = float32(declared["top_p"].getFloat())
-        if opts.minP == builtin.minP and declared.hasKey("min_p"):
+        if "min_p" notin opts.samplerSet and declared.hasKey("min_p"):
             opts.minP = float32(declared["min_p"].getFloat())
-        if opts.repeatPenalty == builtin.repeatPenalty and declared.hasKey("repeat_penalty"):
+        if "repeat_penalty" notin opts.samplerSet and declared.hasKey("repeat_penalty"):
             opts.repeatPenalty = float32(declared["repeat_penalty"].getFloat())
-        if opts.repeatLastN == builtin.repeatLastN and declared.hasKey("repeat_last_n"):
+        if "repeat_last_n" notin opts.samplerSet and declared.hasKey("repeat_last_n"):
             opts.repeatLastN = declared["repeat_last_n"].getInt()
     let useIds = opts.promptIds.len > 0
     var tok: native_hf_tokenizer.HFTokenizer
@@ -210,7 +220,7 @@ function fmRunFir(det: FmDetection, cliOpts: FmOptions): bool
         let measuredStep = model.stepSeconds
         let measuredBlocks = model.phaseBlockSeconds
         let measuredRows = model.phaseBlockRows
-        if model.useHandles:
+        if model.useHandles and getEnv("BYBY_FIR_WARM_RELOAD", "0") == "0":
             # A lifted graph keeps all of its mutable state in buffers that carry their initial data:
             # firGraphReset restores them, so the warm kernels are reused without loading twice.
             firGraphReset(model)

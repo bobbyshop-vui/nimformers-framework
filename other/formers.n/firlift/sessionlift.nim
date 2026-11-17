@@ -22,7 +22,7 @@ import ./kernel_asm
 import session_vm
 import ./fuse
 import ./sidecar
-from ./steps import withoutSingleRowUnits, isRopeTableUpload, isUploadedRopeTable
+from ./steps import withoutSingleRowUnits, isRopeTableUpload, isUploadedRopeTable, dispatchAccess
 import micro_kernel/slot_layout
 import probe_weights
 
@@ -81,6 +81,7 @@ type
     phaseRows: Table[int, int]           ## phase number -> token rows that phase consumes per run
     phaseLogits: Table[int, (string, int)] ## phase number -> (buffer, rows) of vocabulary-sized output rows
     phaseLast: Table[int, string]          ## phase number -> buffer with the logits after the phase's last row
+    fp4Blobs: HashSet[(int, int)]          ## (phase, trace buffer) of raw FP4-KM weights whose decode table that phase already appended
 
 const Bookkeeping = [
   "sessionBegin", "sessionEnd", "sessionFree", "sessionAllocScratch", "sessionAllocHeap",
@@ -331,7 +332,7 @@ proc q4TensorCoreKernel(k: SKern): bool =
   let words = k.body.splitWhitespace()
   if words.len < 2 or words[0] != "words": return false
   try:
-    result = (uint32(parseHexInt(words[1])) and 0xFF'u32) in [OP_Q4_COOP_GEMM, OP_Q4_GEMV]
+    result = (uint32(parseHexInt(words[1])) and 0xFF'u32) in [OP_Q4_COOP_GEMM, OP_Q4_GEMV, OP_FP4_COOP_GEMM]
   except ValueError:
     result = false
 
@@ -379,6 +380,12 @@ proc genericKernels(): bool =
   ## FIRLIFT_GENERIC=1: lane-per-output kernels that every VM backend can run. The default kernels
   ## follow the Metal ones (threadgroups, simdgroups) and need simd ops.
   getEnv("FIRLIFT_GENERIC").len > 0
+
+proc traceHasTensorCore(l: SessionLift): bool =
+  ## The recorded device runs the Tensor Core GEMM micro-kernels: a Vulkan device with
+  ## KHR_cooperative_matrix ("coopmatrix") or an Apple GPU with MSL simdgroup_matrix ("simdmatrix").
+  (l.trace.backend == "vulkan" and l.trace.device == "coopmatrix") or
+    (l.trace.backend == "metal" and l.trace.device == "simdmatrix")
 
 proc simdKernels(l: SessionLift): bool =
   ## Whether the decode matmuls may reduce with simdgroup ops. Those kernels follow Metal: a
@@ -588,6 +595,12 @@ proc q4MatrixGemm(m, k, n, group, nGroups: int): tuple[gen: Gen, rowBlock, rowTg
   result.gen = genMatmulQ4Mm(m, k, n, group, nGroups, true)
   if result.gen.tg != result.rowTg: result.rowBlock = 0
 
+proc q4TensorCoreShape(m, k, n, group, nGroups: int): bool =
+  ## The shapes genMatmulQ4TensorCore accepts; auto selection falls back to the other kernels
+  ## for the rest instead of failing the lift.
+  m > 0 and n >= 16 and k > 0 and k mod 64 == 0 and group >= 2 and group mod 2 == 0 and
+    k mod group == 0 and nGroups == k div group
+
 proc q4TensorCoreGemm(m, k, n, group, nGroups: int): tuple[gen: Gen, rowBlock, rowTg: int] =
   result.rowBlock = q4CoopRowTile(m, n)
   result.rowTg = ((n + 63) div 64) * 128
@@ -725,8 +738,8 @@ proc lowerMatmulQ4(l: SessionLift; op: Op) =
       gen = matrix.gen; rowBlock = matrix.rowBlock; rowTg = matrix.rowTg
       variant = (if gen.tg == 128: "matrix" else: q4ParallelVariant(gen, false))
     of "tensor_core", "coop":
-      if l.trace.backend != "vulkan":
-        fail("FIRLIFT_Q4_GEMM=tensor_core requires a Vulkan trace; this kernel emits KHR_cooperative_matrix in the FIR micro path")
+      if l.trace.backend notin ["vulkan", "metal"]:
+        fail("FIRLIFT_Q4_GEMM=tensor_core requires a Vulkan or Metal trace; the FIR runtime lowers this kernel to KHR_cooperative_matrix (Vulkan) or simdgroup_matrix (Apple GPUs)")
       let tensorCore = q4TensorCoreGemm(m, k, n, group, nGroups)
       gen = tensorCore.gen; rowBlock = tensorCore.rowBlock; rowTg = tensorCore.rowTg
       variant = "tensor_core_micro"
@@ -735,8 +748,9 @@ proc lowerMatmulQ4(l: SessionLift; op: Op) =
         let matrix = q4MatrixGemm(m, k, n, group, nGroups)
         gen = matrix.gen; rowBlock = matrix.rowBlock; rowTg = matrix.rowTg
         variant = (if gen.tg == 128: "matrix" else: q4ParallelVariant(gen, false))
-      elif l.trace.backend == "vulkan" and l.trace.device == "coopmatrix" and not genericKernels():
-        # The recorded device has KHR_cooperative_matrix: the prefill GEMMs run on the Tensor Cores.
+      elif l.traceHasTensorCore() and not genericKernels() and q4TensorCoreShape(m, k, n, group, nGroups):
+        # The recorded device has KHR_cooperative_matrix (Vulkan) or simdgroup_matrix (Apple GPU)
+        # and the shape fits the kernel: the prefill GEMMs run on the matrix units.
         let tensorCore = q4TensorCoreGemm(m, k, n, group, nGroups)
         gen = tensorCore.gen; rowBlock = tensorCore.rowBlock; rowTg = tensorCore.rowTg
         variant = "tensor_core_micro"
@@ -749,6 +763,79 @@ proc lowerMatmulQ4(l: SessionLift; op: Op) =
         variant = q4ParallelVariant(gen, false)
   if gen.tg != rowTg: rowBlock = 0   # a fallback uses no row-tile launch metadata
   l.addKernelNode(op, "matmul_q4_" & variant, gen, @[a, wn], @[c], rowBlock = rowBlock, rows = m, residentQ4 = true)
+
+const Fp4GemmOps = ["sessionFp4GemmTiledEnc", "sessionFp4GemmTensorCore"]
+
+proc fp4TensorCoreGemm(m, k, n: int): tuple[gen: Gen, rowBlock, rowTg: int] =
+  ## Same launch shape as the Q4 Tensor Core kernel: 128-thread workgroups ordered by row tile,
+  ## one per 64 output columns.
+  result.rowBlock = q4CoopRowTile(m, n)
+  result.rowTg = ((n + 63) div 64) * 128
+  result.gen = genFp4GemmTensorCore(m, k, n)
+  if result.gen.tg != 128: result.rowBlock = 0
+
+proc fp4UsesTensorCore(l: SessionLift; k, n: int): bool =
+  ## FIRLIFT_FP4_GEMM=auto|coop|generic. auto picks the Tensor Core micro-kernel when the trace
+  ## comes from a Vulkan device with KHR_cooperative_matrix or an Apple GPU with simdgroup_matrix
+  ## and the shape is supported; coop forces it (the graph then needs such a device); generic keeps
+  ## the lane-per-column kernel.
+  let choice = q4Choice("FIRLIFT_FP4_GEMM", "auto", ["auto", "coop", "tensor_core", "generic"])
+  let supported = fp4CoopSupported(k, n, 32, k div 32)
+  case choice
+  of "coop", "tensor_core":
+    if l.trace.backend notin ["vulkan", "metal"]:
+      fail("FIRLIFT_FP4_GEMM=coop requires a Vulkan or Metal trace; the FIR runtime lowers this kernel to KHR_cooperative_matrix (Vulkan) or simdgroup_matrix (Apple GPUs)")
+    if not supported:
+      fail("FIRLIFT_FP4_GEMM=coop needs K divisible by 64 and N >= 16 (K=" & $k & ", N=" & $n & ")")
+    true
+  of "generic": false
+  else:
+    l.traceHasTensorCore() and not genericKernels() and supported
+
+proc fp4RawBlob(l: SessionLift; op: Op; w, lut: PortRef; k, n: int): string =
+  ## A raw trace keeps an FP4-KM weight as two recorded buffers: the packed bytes and the 272-float
+  ## decode table. The FIR kernels read one blob (fp4kmLayout: the table after the packed bytes),
+  ## so the weight buffer is extended by the table and the phase copies the table into that tail
+  ## before its first GEMM on that weight (272 floats per weight and phase run).
+  if w.offset != 0: fail("FP4 weight b" & $w.buffer & " starts at byte " & $w.offset & "; the blob needs its own buffer")
+  let base = "b" & $w.buffer
+  if not l.bufIdx.hasKey(base): fail("missing raw FP4 weight buffer " & base)
+  let idx = l.bufIdx[base]
+  let lutWord = fp4CoopLutWord(k, n)
+  if w.bytes > 0 and w.bytes < lutWord * 4:
+    fail("FP4 weight " & base & " has " & $w.bytes & " bytes, the packed [" & $n & "," & $k & "] weight needs " & $(lutWord * 4))
+  if l.bufs[idx].elements < lutWord + 272:
+    l.bufs[idx].elements = lutWord + 272
+  l.bufs[idx].rawWeight = false   # the graph writes the table tail
+  let key = (op.phase, w.buffer)
+  if key notin l.fp4Blobs:
+    l.fp4Blobs.incl key
+    l.nodes.add SNode(kind: "session", name: l.nodeName("fp4_table"), ins: @[l.rd(lut)], outs: @[base],
+      op: "sessionCopyInto:srcOff=0,dstOff=" & $lutWord & ",n=272", rmw: true)
+  base
+
+proc lowerFp4Gemm(l: SessionLift; op: Op) =
+  let m = op.attrInt("M")
+  let k = op.attrInt("K")
+  let n = op.attrInt("N")
+  let a = l.rd(op.ins.port("a"))
+  let w = op.ins.port("w")
+  var wn: string
+  if l.raw:
+    wn = l.fp4RawBlob(op, w, op.ins.port("lut"), k, n)
+  else:
+    let rec = (if l.coverage and not hasName(l.trace, w):
+                 NameRec(name: "coverage.fp4" & $w.buffer, shape: "(" & $n & " " & $k & ")")
+               else: findName(l.trace, w))
+    if shapeOf(rec) != @[n, k]: fail("FP4 weight " & rec.name & " is not [" & $n & "," & $k & "]")
+    wn = l.weightName(rec, "fp4km", @[n, k])
+  let c = l.wr(op, op.outs.port("c"))
+  if l.fp4UsesTensorCore(k, n):
+    let tensorCore = fp4TensorCoreGemm(m, k, n)
+    l.addKernelNode(op, "fp4_gemm_tensor_core_micro", tensorCore.gen, @[a, wn], @[c],
+      rowBlock = tensorCore.rowBlock, rows = m, residentQ4 = true)
+  else:
+    l.addKernelNode(op, "fp4_gemm_generic", genFp4Gemm(m, k, n), @[a, wn], @[c])
 
 proc lowerMatmulNT(l: SessionLift; op: Op; bPort = "b") =
   let m = op.attrInt("M")
@@ -778,7 +865,8 @@ proc table(l: SessionLift; p: PortRef): seq[int] =
       return
   fail("table " & p.name & " (b" & $p.buffer & ") was not recorded; the table upload is outside the recorded step")
 
-const ExactSessionOps = ["sessionRmsnormEnc", "sessionVecOp", "sessionActivation", "sessionCopyInto"]
+const ExactSessionOps = ["sessionRmsnormEnc", "sessionVecOp", "sessionActivation", "sessionCopyInto",
+  "sessionFp4GemmMetal", "sessionMatmulNT", "sessionMatmulNTAccelerated"]
 
 proc lowerSessionExact(l: SessionLift; op: Op) =
   ## Raw replay of a session API call. The runner stages the operands in dedicated
@@ -815,6 +903,21 @@ proc lowerSessionExact(l: SessionLift; op: Op) =
     outs = @[l.rd(op.outs.port("dst"))]
     attrs = "srcOff=" & $srcOff &
       ",dstOff=" & $op.attrInt("dstOffsetElems", 0) & ",n=" & $op.attrInt("n")
+  of "sessionFp4GemmMetal":
+    # The packed FP4-KM prefill GEMM of the Metal backend (a native shader, no micro-VM program):
+    # the runner calls the same op on the graph's buffers.
+    ins = @[l.rd(op.ins.port("a")), l.rd(op.ins.port("w")), l.rd(op.ins.port("lut"))]
+    outs = @[l.rd(op.outs.port("c"))]
+    attrs = "M=" & $op.attrInt("M") & ",K=" & $op.attrInt("K") & ",N=" & $op.attrInt("N") &
+      ",simdgroup=" & (if op.attrStr("simdgroup") == "true": "1" else: "0")
+  of "sessionMatmulNT", "sessionMatmulNTAccelerated":
+    # The FP32 GEMM C = A @ B^T of the backend (a native shader; on an FP16 cooperative-matrix
+    # device the accelerated call rounds its inputs to FP16): the runner calls the same op.
+    let bPort = (if op.ins.len >= 2 and op.ins[1].name == "w": "w" else: "b")
+    ins = @[l.rd(op.ins.port("a")), l.rd(op.ins.port(bPort))]
+    outs = @[l.rd(op.outs.port("c"))]
+    attrs = "M=" & $op.attrInt("M") & ",K=" & $op.attrInt("K") & ",N=" & $op.attrInt("N") &
+      ",bOff=" & $op.attrInt("bOffsetElems", 0)
   else:
     fail("no exact session replay for " & op.implName)
   let label = op.implName[7 .. ^1]
@@ -1034,24 +1137,87 @@ proc lowerOp(l: SessionLift; op: Op) =
     let dm = l.table(op.ins.port("dimsMap"))
     l.addKernelNode(op, "permute", genPermute(ns, os, dm, op.attrInt("n")), @[src], @[dst])
   of "sessionFp4GemmTiledEnc", "sessionFp4GemmTensorCore":
-    let m = op.attrInt("M")
-    let k = op.attrInt("K")
-    let n = op.attrInt("N")
-    let a = l.rd(op.ins.port("a"))
-    let w = op.ins.port("w")
-    let rec = (if l.coverage and not hasName(l.trace, w):
-                 NameRec(name: "coverage.fp4" & $w.buffer, shape: "(" & $n & " " & $k & ")")
-               else: findName(l.trace, w))
-    if shapeOf(rec) != @[n, k]: fail("FP4 weight " & rec.name & " is not [" & $n & "," & $k & "]")
-    let wn = l.weightName(rec, "fp4km", @[n, k])
-    let c = l.wr(op, op.outs.port("c"))
-    l.addKernelNode(op, "fp4_gemm", genFp4Gemm(m, k, n), @[a, wn], @[c])
+    l.lowerFp4Gemm(op)
   else:
     fail("no micro-kernel mapping for " & op.impl & " (tag " & op.tag & "); add a generator")
 
 # ── whole step ──────────────────────────────────────────────────────
 
 proc isBookkeeping(op: Op): bool = op.implName in Bookkeeping
+
+proc returnedFalse(op: Op): bool =
+  ## A session call that reported it did not run (an unsupported route): it changed nothing.
+  op.impl.startsWith("session:") and op.attrs.getOrDefault("result") == "false"
+
+const OptionalGemmOps = ["sessionFp4GemmTiledEnc", "sessionFp4GemmTensorCore", "sessionMatmulNTFp16Coop",
+  "sessionMatmulNTAccelerated", "sessionMatmulNTTiledEnc"]
+  ## Session GEMMs that report false on a device without their route; the caller then runs a fallback.
+
+proc dispatchWrites(op: Op; buffer: int): bool =
+  let access = dispatchAccess(op)
+  for p in op.bindings:
+    if p.buffer == buffer and p.name in access.writes: return true
+  false
+
+proc dispatchReads(op: Op; buffer: int): bool =
+  let access = dispatchAccess(op)
+  for p in op.bindings:
+    if p.buffer == buffer and p.name in access.reads: return true
+  false
+
+proc gemmPorts(op: Op): (int, int) =
+  ## (weight buffer, output buffer) of a session GEMM; -1 when absent.
+  result = (-1, -1)
+  for p in op.ins:
+    if p.name in ["w", "b"]: result[0] = p.buffer
+  for p in op.outs:
+    if p.name == "c": result[1] = p.buffer
+
+proc gemmFallback(ops: seq[Op]; i: int): seq[int] =
+  ## The raw dispatches right after the optional GEMM ops[i] (bookkeeping aside) that compute its
+  ## result again: they read its weight and write its output buffer. The native caller only does
+  ## that when the session call did not run (the recorder does not keep a call's return value), so
+  ## such a call is a no-op and these dispatches are what really computed the product.
+  let (weight, output) = ops[i].gemmPorts
+  if weight < 0 or output < 0: return
+  var j = i + 1
+  while j < ops.len:
+    let o = ops[j]
+    if o.isBookkeeping:
+      inc j
+      continue
+    if o.implName in OptionalGemmOps and o.gemmPorts == (weight, output):
+      # A second optional route tried for the same product (a caller may try one route per
+      # branch before its fallback): no-op too when the fallback follows.
+      inc j
+      continue
+    if o.impl != "raw:dispatch" or o.words.len == 0 or not (o.dispatchReads(weight) and o.dispatchWrites(output)):
+      break
+    result.add j
+    inc j
+
+var replacedFp4Fallbacks* = 0   ## failed FP4 GEMMs of the last lift lowered in place of their native fallback
+var droppedFailedCalls* = 0     ## session calls of the last lift that did not run (returned false)
+
+proc withoutFailedCalls(l: SessionLift; ops: seq[Op]): seq[Op] =
+  ## Drops session calls that did not run: a recorded false result, or an optional GEMM whose
+  ## result the native fallback (packed micro-VM tiles) computes right after it. When the lifted
+  ## graph should run such an FP4 GEMM on the Tensor Cores (FIRLIFT_FP4_GEMM), the GEMM is
+  ## lowered instead and its fallback dispatches are dropped.
+  var dropped = initHashSet[int]()
+  for i, op in ops:
+    if op.isBookkeeping or not op.impl.startsWith("session:"): continue
+    var fallback: seq[int]
+    if op.implName in OptionalGemmOps: fallback = gemmFallback(ops, i)
+    if fallback.len == 0 and not op.returnedFalse: continue
+    if op.implName in Fp4GemmOps and fallback.len > 0 and l.fp4UsesTensorCore(op.attrInt("K"), op.attrInt("N")):
+      inc replacedFp4Fallbacks
+      for j in fallback: dropped.incl j
+      continue
+    inc droppedFailedCalls
+    dropped.incl i
+  for i, op in ops:
+    if i notin dropped: result.add op
 
 proc transferOf(t: Trace; op: Op): int =
   for i, tr in t.transfers:
@@ -1186,8 +1352,7 @@ proc prepareRaw(l: SessionLift; ops: seq[Op]; weightsPaths: seq[string]) =
   var unknown: seq[string]
   for op in ops:
     if op.impl == "raw:dispatch":
-      if op.words.len == 0: fail("dispatch d" & $(-1-op.id) & " has no recorded program words")
-      let access = vmAccess(op.words)
+      let access = dispatchAccess(op)
       op.ins = @[]
       op.outs = @[]
       for domain in ["mem", "u8", "lut", "input", "u32"]:
@@ -1224,7 +1389,7 @@ proc prepareRaw(l: SessionLift; ops: seq[Op]; weightsPaths: seq[string]) =
       if not firstUse.hasKey(p.buffer):
         firstUse[p.buffer] = op.order
         firstPhase[p.buffer] = op.phase
-    let access = if op.impl == "raw:dispatch": vmAccess(op.words) else: VmAccess()
+    let access = if op.impl == "raw:dispatch": dispatchAccess(op) else: VmAccess()
     for p in op.ins:
       if op.impl == "raw:dispatch" and p.name notin access.reads: continue
       if p.buffer notin seenWrites: needsInitial.incl p.buffer
@@ -1331,7 +1496,19 @@ proc prepareRaw(l: SessionLift; ops: seq[Op]; weightsPaths: seq[string]) =
               transfer.fingerprint != upload.fingerprint:
             constantWeight = false
         if not constantWeight:
-          fail("per-step host upload b" & $id & " has no token/position/embedding rule; refusing to freeze host-computed data")
+          var consumer = "none"
+          for op in ops:
+            if op.order < upload.order: continue
+            var reads = false
+            for p in op.ins:
+              if p.buffer == id: reads = true
+            if reads:
+              consumer = op.implName & (if op.impl == "raw:dispatch": " pipe=" & op.attrs.getOrDefault("pipe") else: "") &
+                " (o" & $op.id & ")"
+              break
+          fail("per-step host upload b" & $id & " @" & $upload.order & " (replayed ops start @" & $first & "; " & $upload.n & " floats, " & $upload.dst.bytes & " bytes, data " &
+            (if upload.data.len > 0: $upload.data[0 ..< min(8, upload.data.len)] elif upload.captureOffset >= 0: "captured" else: "not recorded") &
+            ", first reader " & consumer & ") has no token/position/embedding rule; refusing to freeze host-computed data")
       if match >= 0:
         b.tensor = index[match].name
         b.initFile = if index[match].source == primary: "checkpoint"
@@ -1356,7 +1533,40 @@ proc prepareRaw(l: SessionLift; ops: seq[Op]; weightsPaths: seq[string]) =
         unknown.add name & " (" & $bytes & " bytes): " &
           (if match == -2: "ambiguous checkpoint match" else: "no checkpoint identity or captured upload bytes")
     elif b.rawWeight or id in needsInitial:
-      unknown.add name & " (" & $bytes & " bytes): no recorded upload or checkpoint identity"
+      var reader = "none"
+      for op in ops:
+        var reads = false
+        for p in op.ins:
+          if p.buffer == id: reads = true
+        if reads:
+          reader = op.implName & (if op.impl == "raw:dispatch": " pipe=" & op.attrs.getOrDefault("pipe") else: "") &
+            " (o" & $op.id & ", phase " & $op.phase & ")"
+          break
+      var history: seq[string]
+      for op in l.trace.ops:
+        if history.len >= 6: break
+        var touches = false
+        for p in op.ins & op.outs & op.bindings:
+          if p.buffer == id: touches = true
+        if touches: history.add op.implName & " o" & $op.id & "@" & $op.order
+      # The ops recorded just before the first reader, with their ports (who should have written it).
+      var firstOrder = high(int)
+      for op in l.trace.ops:
+        var touches = false
+        for p in op.ins & op.outs & op.bindings:
+          if p.buffer == id: touches = true
+        if touches: firstOrder = min(firstOrder, op.order)
+      var before: seq[string]
+      for op in l.trace.ops:
+        if op.order >= firstOrder or op.order < firstOrder-12 or op.parent >= 0: continue
+        var ports: seq[string]
+        for p in op.ins: ports.add "in " & p.name & "=b" & $p.buffer
+        for p in op.outs: ports.add "out " & p.name & "=b" & $p.buffer
+        before.add op.implName & " o" & $op.id & "@" & $op.order & "[" & ports.join(" ") & "]"
+      history.add "preceded by: " & before.join("; ")
+      let origin = if id < l.trace.bufs.len: l.trace.bufs[id].origin else: "?"
+      unknown.add name & " (" & $bytes & " bytes, origin " & origin & "): no recorded upload or checkpoint identity; first reader " &
+        reader & "; recorded uses: " & history.join(", ")
     # A never-uploaded scratch buffer starts undefined, and must be written before reads.
     # Do not silently invent contents for externally initialized state.
     l.bufs[l.bufIdx[name]] = b
@@ -1440,6 +1650,7 @@ proc liftSessionFiles*(trace: Trace; configText, modelName, embeddingName: strin
     # Recurrent raw graphs need no context-sized allocation. This is an I/O
     # position counter limit; recorded buffer extents still constrain kernels.
     l.positions = int(high(int32))
+  if not coverage: ops = l.withoutFailedCalls(ops)
   if l.raw and not coverage: ops = withoutSingleRowUnits(trace, ops, l.hidden, droppedSingleRowUnits)
   if l.raw: l.prepareRaw(ops, weightsPaths)
   for k in ["rms_norm_eps", "layer_norm_epsilon", "layer_norm_eps", "norm_eps"]:
@@ -1991,6 +2202,11 @@ proc liftSessionFiles*(trace: Trace; configText, modelName, embeddingName: strin
   var hasResidentQ4 = false
   for weight in l.weights:
     if weight.dtype.startsWith("q4r"):
+      hasResidentQ4 = true
+  for k in l.kernels:
+    # Shape-op micro-kernels (FP4 Tensor Core GEMM) write through an output slot, which the
+    # runner accepts from script_abi 2 with the resident_q4 feature.
+    if k.name in usedKernel and ":out" in k.slots:
       hasResidentQ4 = true
   var outText = "fir 1\nmodel " & modelName & "\nconfig config.json\nruntime graph\nlayout script\nscript_abi " &
     (if hasResidentQ4: "2" else: "1") & "\n"

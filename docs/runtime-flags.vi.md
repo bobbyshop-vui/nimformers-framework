@@ -18,7 +18,7 @@ không cần flag nào. Chỉ đặt flag để tắt một tối ưu, ép một
 | `BYBY_PREFILL_CB_MS` | `300` (native), `450` (lift) | `300` | thời gian đích một command buffer prefill native; FIR graph không đọc |
 | `BYBY_VULKAN_Q4_SPLIT_QKV` | `0` / `1` (A/B) | `auto` | tự đo QKV gộp hay tách |
 | `BYBY_FIR_Q4_BACKEND` | `micro` | `micro` | node Q4 của FIR chạy micro-kernel đã lift |
-| `FIRLIFT_Q4_GEMM` | `tensor_core` | `auto` | `auto` lift GEMM Tensor Core khi thiết bị Vulkan lúc ghi trace có cooperative matrix |
+| `FIRLIFT_Q4_GEMM` | `tensor_core` | `auto` | `auto` lift GEMM Tensor Core khi trace ghi nhận hỗ trợ Vulkan cooperative matrix hoặc Metal simdgroup matrix |
 | `FIRLIFT_Q4_GEMV` | `word_parallel` / `auto` | `auto` | `auto` lift GEMV subgroup trên Vulkan (nhanh hơn `word_parallel`) |
 | `BYBY_FIR_PROBE_STEPS` | `prefill:2,decode:1` | mọi bước | các bước recorder giữ (chỉ khi lift) |
 | `BYBY_FIR_PROBE_DATA` | `0` | `1` dưới `firlift --run` | pipe dữ liệu upload (chỉ khi lift) |
@@ -32,10 +32,15 @@ chờ (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 
 | Flag | Mặc định | Tác dụng |
 | --- | --- | --- |
-| `BYBY_FIR_DECODE_REPLAY` | `1` | Vulkan: ở bước đầu ghi bước decode vào một command buffer dùng lại được; các bước sau chỉ ghi token/position vào buffer host-visible, phát lại, rồi đọc logits từ buffer đã map (không encode trên host). Hàng embedding được gather trên GPU. `0`: encode mỗi bước. Tự tắt khi có probe, `BYBY_FIR_PROFILE=2` hoặc `BYBY_FIR_Q4_BACKEND=native`. |
+| `BYBY_FIR_DECODE_REPLAY` | `1` | Vulkan và Metal: ở bước đầu ghi bước decode một lần (Vulkan: một command buffer dùng lại được; Metal: các dispatch của bước, xem `BYBY_METAL_REPLAY_ICB`); các bước sau chỉ ghi token/position vào buffer host-visible, phát lại, rồi đọc logits từ buffer đã map (không encode trên host). Hàng embedding được gather trên GPU. Các node session chính xác được hỗ trợ (RMSNorm, vector/activation, FP4 Metal GEMM và NT GEMM) cũng phát lại thao tác session native. `0`: encode mỗi bước. Tự tắt khi có probe, `BYBY_FIR_PROFILE=2` hoặc `BYBY_FIR_Q4_BACKEND=native`, và khi bước upload, cấp phát hoặc giải phóng buffer trong lúc ghi. |
+| `BYBY_METAL_REPLAY_ICB` | `1` | Metal phát lại session đã ghi (`BYBY_FIR_DECODE_REPLAY`): `1` dựng một indirect command buffer một lần rồi chạy bằng `executeCommandsInBuffer` khi GPU hỗ trợ; `0` phát lại các dispatch đã ghi trên encoder thường trong một vòng lặp (cả hai đều không duyệt graph). |
+| `BYBY_METAL_REPLAY_LOG` | không đặt | Đặt: log mỗi lần Metal ghi session (số lệnh, pipeline, buffer) và lý do không giữ được bản ghi. |
 | `BYBY_FIR_DECODE_REPLAY_VERBOSE` | `0` | `1` in `[fir] decode replay on/off: ...` (cũng in khi có `BYBY_FIR_PROFILE`). |
 | `BYBY_FIR_DECODE_CB_NODES` | `64` | Bước decode phải encode (replay tắt): submit không chờ sau mỗi chừng này node (lần đầu sau 16) để GPU chạy trong lúc host encode. `0`: một command buffer. |
 | `BYBY_FIR_Q4_BACKEND` | `micro` | `micro`: micro-kernel Q4 đã lift. `native`: công tắc chẩn đoán qua `sessionMatmulQ4` (không dùng được với node Tensor Core). |
+| `BYBY_FIR_SESSION_DIRECT` | `1` | `0` chuyển các lần phát lại session chính xác qua buffer scratch; `1` phát lại trực tiếp các thao tác session được hỗ trợ trên buffer graph. |
+| `BYBY_FIR_WARM_RELOAD` | `0` | `1` nạp lại weight mô hình cho lần chạy warm thay vì reset trạng thái graph đã lift. |
+| `BYBY_METAL_SIMDGROUP_MATRIX` | `1` | `0` ẩn hỗ trợ simdgroup matrix của MSL, nên trace Metal ghi `device="plain"` và không dựng micro-kernel Tensor Core nào. |
 | `BYBY_FIR_Q4_GEMV_TUNE` | `1` | Vulkan: lúc load, đo mọi số hàng mỗi subgroup (1, 2, 4) và độ rộng workgroup (64, 128, 256) cho từng shape GEMV trên weight thật, giữ tổ hợp nhanh nhất. `0`: giữ lựa chọn lúc lift. |
 | `BYBY_FIR_Q4_GEMV_ROWS` | theo lift | Ép số hàng output mỗi subgroup của GEMV (1, 2 hoặc 4). |
 | `BYBY_FIR_Q4_GEMV_THREADS` | theo lift | Ép độ rộng workgroup GEMV (64, 128 hoặc 256). Ép cả hai: không tune. |
@@ -47,6 +52,7 @@ chờ (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_FIR_RELOC` | `1` | Graph arena trên Metal: một pipeline mỗi kernel. `0`: một pipeline mỗi node. |
 | `BYBY_FIR_PROFILE` | `0` | `1`: trung bình encode trên host / chờ GPU / đọc logits mỗi bước decode. `2`: kết thúc session sau mỗi node và báo thời gian từng kernel (chậm; chỉ để chẩn đoán). |
 | `BYBY_UBATCH` | `512` | Giới hạn số hàng một lần chạy phase prompt (trừ phase có logits mỗi hàng). `0`: không giới hạn. |
+| `BYBY_PREFILL_MIN_ROWS` | `5` | Codestral (native và FIR): prompt hoặc phần đuôi prompt có từ chừng này token trở lên chạy một lần prefill nhiều hàng; ít hơn thì chạy từng token. `1`: gộp mọi phần đuôi từ 2 token; `128` trở lên: chỉ các đoạn 128 hàng (hành vi cũ). Native và FIR phải dùng cùng giá trị, và FIR graph phải được lift với giá trị đó (graph có một phase cho mỗi cỡ đuôi). |
 
 ## Inference native (`nim_inference`, route native của `formers-cli`)
 
@@ -110,14 +116,17 @@ chờ (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_Q4_TUNE_VERBOSE` | `0` | Log các kernel bị loại vì sai parity. |
 | `BYBY_FLASH_ATTENTION` | `auto` | Loại flash attention; `scalar` ép FP32. |
 | `BYBY_FUSE_ROPE` | `1` | Gộp RoPE vào bước append KV. |
-| `BYBY_SSD` | `auto` | Kernel SSD của Mamba2. |
+| `BYBY_SSD` | `auto` | Kernel SSD của Mamba2. Trong lúc đang ghi FIR, `auto` giữ đường scan micro-VM bật vì shader SSD native không thể được graph đã lift phát lại; `1` ép dùng SSD và `0` tắt nó. |
 
 ## Lift (`firlift --run`)
 
 | Flag | Mặc định | Tác dụng |
 | --- | --- | --- |
 | `FIRLIFT_Q4_GEMV` | `auto` | Kernel matmul Q4 một hàng. `auto` trên Vulkan: micro-kernel subgroup (thuật toán decode native), không thì word-parallel. Còn có `scalar`, `scalar_fma`, `parallel`, `parallel_fma`, `simd`, `word_parallel`, `subgroup`. |
-| `FIRLIFT_Q4_GEMM` | `auto` | Kernel matmul Q4 nhiều hàng. `auto`: micro-kernel Tensor Core khi trace ghi thiết bị Vulkan có cooperative matrix (`device=coopmatrix` trên dòng backend của trace), `matrix` với `FIRLIFT_TARGET=apple`, còn lại tiled FMA. Còn có `scalar`, `scalar_fma`, `parallel`, `parallel_fma`, `tiled`, `matrix`, `tensor_core`. |
+| `FIRLIFT_Q4_GEMM` | `auto` | Kernel matmul Q4 nhiều hàng. `auto`: micro-kernel Tensor Core khi trace ghi nhận Vulkan `device=coopmatrix` hoặc Metal `device=simdmatrix`, trừ khi đặt `FIRLIFT_GENERIC`; nếu không thì theo lựa chọn kernel generic. Còn có `scalar`, `scalar_fma`, `parallel`, `parallel_fma`, `tiled`, `matrix`, `tensor_core`/`coop` (cần trace Vulkan hoặc Metal). |
+| `FIRLIFT_FP4_GEMM` | `auto` | GEMM prefill FP4-KM. `auto`: micro-kernel Tensor Core cho shape được hỗ trợ trên thiết bị Vulkan `coopmatrix` hoặc Metal `simdmatrix` đã ghi trace, trừ khi đặt `FIRLIFT_GENERIC`. `coop`/`tensor_core` ép dùng (cần trace Vulkan hoặc Metal; yêu cầu K chia hết cho 64 và N >= 16); `generic` chọn kernel mỗi lane một cột. |
+| `FIRLIFT_SLICE_REPORT` | `0` | Giá trị bất kỳ ngoài `0` sẽ in lý do các op được phát lại sớm nhất được chọn vào lát lift. |
+| `FIRLIFT_SLICE_REPORT_N` | `40` | Số dòng lý do tối đa được in khi bật `FIRLIFT_SLICE_REPORT`. |
 | `FIRLIFT_Q4_WORD_MAX_K` | `4096` | K lớn nhất của GEMV word-parallel khi `auto`. |
 | `FIRLIFT_Q4_LANES`, `FIRLIFT_TG` | theo kernel | Số lane / độ rộng threadgroup của kernel parallel. |
 | `FIRLIFT_GEMM_TILE`, `FIRLIFT_GEMM_REG` | `64x128`, `8x8` | Tile và block thanh ghi của GEMM f32. |
@@ -130,6 +139,10 @@ chờ (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `FIRLIFT_NOREUSE` | không đặt | Mỗi output có buffer riêng (không dùng lại buffer tạm). |
 | `BYBY_FIR_PROBE_STEPS` | mọi bước | Các bước recorder giữ, ví dụ `prefill:2,decode:1`. |
 | `BYBY_FIR_PROBE_DATA` | `1` dưới `--run` | Gửi dữ liệu upload chính xác qua pipe dữ liệu (cần cho upload không tên như LUT). `0` khi mọi weight đều có tên trong `model.nimq`. |
+
+Để lift Codestral cần `BYBY_MERGE_LORA=1` và `BYBY_MEMORY_LIMIT_MB=10000`.
+
+Header trace ghi `device="coopmatrix"` cho cooperative matrix của Vulkan, `device="simdmatrix"` cho simdgroup matrix của Metal, hoặc `device="plain"` nếu không có. Micro-kernel Tensor Core được tự động chọn cho Vulkan có cooperative matrix hoặc Metal trên Apple GPU family 7+; các thiết bị khác dùng kernel generic.
 
 Trace ghi backend và tính năng thiết bị của lần chạy, nên graph lift trên T4 nhắm
 tới Tensor Core còn graph lift trên thiết bị không có cooperative matrix thì không.

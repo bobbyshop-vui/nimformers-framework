@@ -11,7 +11,8 @@
 ## optimization layered on the same ports.
 
 import std/[strutils, math]
-from session_vm import q4CoopRowTile, q4GemvSupported, q4GemvThreadCount, Q4GemvDefaultRows, Q4GemvThreads
+from session_vm import q4CoopRowTile, q4GemvSupported, q4GemvThreadCount, Q4GemvDefaultRows, Q4GemvThreads,
+  fp4CoopSupported
 
 const RegLimit* = 256   ## register index limit of the VM encoding; a kernel declares only what it uses
 
@@ -2199,6 +2200,27 @@ proc genMatmulQ4TensorCore*(M, K, N, groupSize, nGroups: int): Gen =
   result = Gen(body: "q4coop " & $M & " " & $K & " " & $N & " " & $groupSize & " " & $nGroups,
     threads: rows * cols * 128, ins: 2, outs: 1, tg: 128,
     tgBytes: (bm * 72 + 64 * 72) * 2 + 4 * 256 * 4)
+  genHiR = 0
+  genHiU = 0
+
+proc genFp4GemmTensorCore*(M, K, N: int): Gen =
+  ## Vulkan FIR micro-kernel for FP4-KM prefill GEMMs (sessionFp4GemmTiledEnc /
+  ## sessionFp4GemmTensorCore) using KHR_cooperative_matrix directly: FP16 tiles decoded from the
+  ## packed weights, FP32 accumulation. The VM instruction `fp4coop M K N 32 K/32` carries the
+  ## shape; the Vulkan JIT lowers it into a dedicated shader and the CPU VM runs it as a scalar
+  ## reference. Same design and slot layout as genMatmulQ4TensorCore: slot 0 = C [M,N], slots 1
+  ## and 2 = the FP4-KM blob (fp4kmLayout: nibble bytes, scale bytes, then the 272-float decode
+  ## table), slot 3 = A [M,K]. It never calls the native FP4 session GEMM.
+  if M <= 0 or not fp4CoopSupported(K, N, 32, K div 32):
+    raise newException(GenError, "FP4 Tensor Core micro-kernel requires M>0, N>=16 and K divisible by 64")
+  # Default grid for a device of unknown size; the FIR runtime picks the row tile per dispatch
+  # (q4CoopRowTile, the same choice as Q4) and sizes the grid itself.
+  let cols = (N + 63) div 64
+  let bm = q4CoopRowTile(M, N)
+  let rows = (M + bm - 1) div bm
+  result = Gen(body: "fp4coop " & $M & " " & $K & " " & $N & " 32 " & $(K div 32),
+    threads: rows * cols * 128, ins: 2, outs: 1, tg: 128,
+    tgBytes: (bm * 72 + 64 * 72) * 2 + 4 * 256 * 4 + 16 * 4)
   genHiR = 0
   genHiU = 0
 

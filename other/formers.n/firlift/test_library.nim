@@ -10,8 +10,44 @@ import backends/cpu/cpu_backend as cpu
 import ./kernel_library
 import ./kernel_gen
 import ./kernel_asm
+when defined(macosx):
+  import backends/metal/metal_backend
 
 proc near(a, b: float32; tol = 1e-4'f32): bool = abs(a - b) <= tol
+
+var gMetalCompilerFound = -1   # -1 untried, 0 missing, 1 `xcrun -sdk macosx metal` works
+
+proc mslCompileCheck(source, tag: string) =
+  ## Compiles a generated MSL kernel offline (MSL 2.3, what simdgroup_matrix needs) when the
+  ## Metal toolchain is installed, like the glslc check of the GLSL kernels; skipped otherwise.
+  if gMetalCompilerFound < 0:
+    gMetalCompilerFound = 0
+    if findExe("xcrun").len > 0:
+      let probe = execCmdEx("xcrun -sdk macosx -f metal")
+      if probe.exitCode == 0: gMetalCompilerFound = 1
+    if gMetalCompilerFound == 0:
+      echo "INFO MSL offline compile: no `xcrun -sdk macosx metal`; compiling through the Metal framework instead"
+  if gMetalCompilerFound == 0:
+    when defined(macosx):
+      # The Metal framework compiler (newLibraryWithSource, MSL 2.3) of this machine's GPU.
+      let check = metalLibraryCompileCheck(source)
+      if not check.ok:
+        raise newException(ValueError, "the Metal framework compiler rejected the simdgroup_matrix micro shader " & tag & ": " & check.error)
+      echo "PASS MSL framework compile ", tag
+    return
+  let path = getTempDir() / ("fir_simd_" & $getCurrentProcessId() & ".metal")
+  let air = path & ".air"
+  writeFile(path, source)
+  let compile = startProcess("xcrun", args = ["-sdk", "macosx", "metal", "-std=macos-metal2.3", "-c", path, "-o", air],
+    options = {poUsePath, poStdErrToStdOut})
+  let output = compile.outputStream.readAll()
+  let code = compile.waitForExit()
+  compile.close()
+  if fileExists(path): removeFile(path)
+  if fileExists(air): removeFile(air)
+  if code != 0:
+    raise newException(ValueError, "the Metal compiler rejected the simdgroup_matrix micro shader " & tag & ": " & output)
+  echo "PASS MSL offline compile ", tag
 
 proc runCase(name, body: string; ins, outs: int; inData: seq[seq[float32]];
              expected: seq[float32]; threads: int; tgFloats = 4; tgSize = 1;
@@ -131,6 +167,62 @@ proc chkResidentQ4(name: string; g: Gen; a, packed, expected: seq[float32]; tol 
     if not near(output[i], expected[i], tol):
       raise newException(ValueError, name & " resident mismatch at " & $i & ": got " & $output[i] & " want " & $expected[i])
   echo "PASS resident Q4 kernel ", name
+
+proc fp4kmCase(M, K, N: int; seed: int): tuple[a, blob, want: seq[float32]] =
+  ## A random-looking FP4-KM problem in the fp4kmLayout blob and its scalar FP32 reference:
+  ## byte j of a 32-value group holds element j (low nibble) and j+16 (high nibble),
+  ## weight = lut[nibble] * lut[16 + scale byte].
+  let nG = K div 32
+  let lay = fp4kmLayout(N, K)
+  var bytes = newSeq[uint8](lay.blobWords * 4)
+  var nibs = newSeq[int](N*K)
+  var sbytes = newSeq[int](N*nG)
+  for n in 0 ..< N:
+    for kk in 0 ..< K:
+      nibs[n*K + kk] = (n*11 + kk*7 + kk div 3 + seed) mod 16
+  for i in 0 ..< N*nG: sbytes[i] = (i*37 + 11 + 5*seed) mod 256
+  for n in 0 ..< N:
+    for g in 0 ..< nG:
+      for j in 0 ..< 16:
+        let lo = nibs[n*K + g*32 + j]
+        let hi = nibs[n*K + g*32 + j + 16]
+        bytes[n*(K div 2) + g*16 + j] = uint8(lo or (hi shl 4))
+      bytes[N*(K div 2) + n*nG + g] = uint8(sbytes[n*nG + g])
+  var lut = newSeq[float32](272)
+  const fp4 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+  for i in 0 ..< 16: lut[i] = float32(if i < 8: fp4[i] else: -fp4[i - 8])
+  for i in 0 ..< 256: lut[16 + i] = float32(float(i) * 0.0009765625 + 0.003)
+  result.blob = bytesAsFloats(bytes)
+  doAssert result.blob.len == lay.lutWord
+  result.blob.add lut
+  result.a = newSeq[float32](M*K)
+  for i in 0 ..< result.a.len: result.a[i] = float32((i*13 + 7*seed) mod 41 - 20) / 31
+  result.want = newSeq[float32](M*N)
+  for m in 0 ..< M:
+    for n in 0 ..< N:
+      var acc = 0.0
+      for kk in 0 ..< K:
+        let w = lut[nibs[n*K + kk]] * lut[16 + sbytes[n*nG + kk div 32]]
+        acc += float(result.a[m*K + kk]) * float(w)
+      result.want[m*N + n] = float32(acc)
+
+proc chkResidentFp4(name: string; g: Gen; a, blob, expected: seq[float32]; rel = 1e-3) =
+  ## Runs a slot-layout FP4-KM kernel on the CPU VM: out -> slot 0, blob -> slots 1 and 2,
+  ## activations -> slot 3. Each output must be within `rel` of the reference (relative to
+  ## max(1, |reference|)).
+  let program = assemble(g.body, 2, 1, @[a.len, blob.len], @[expected.len], 1e-5'f32, slotLayout = true)
+  var output = newSeq[float32](expected.len)
+  var views: array[5, cpu.CpuVmView]
+  views[0] = cpu.CpuVmView(base: cast[ptr float32](addr output[0]), elements: output.len, allocationElements: output.len)
+  views[1] = cpu.CpuVmView(base: cast[ptr float32](unsafeAddr blob[0]), elements: blob.len, allocationElements: blob.len)
+  views[2] = views[1]
+  views[3] = cpu.CpuVmView(base: cast[ptr float32](unsafeAddr a[0]), elements: a.len, allocationElements: a.len)
+  if not cpu.vmRunBound(program.words, views, g.threads, max(4, g.tgBytes div 4), max(1, g.tg)):
+    raise newException(ValueError, name & ": resident CPU VM rejected the program: " & cpu.cpuLastErrorMessage())
+  for i in 0 ..< expected.len:
+    if abs(float(output[i]) - float(expected[i])) > rel * max(1.0, abs(float(expected[i]))):
+      raise newException(ValueError, name & " resident mismatch at " & $i & ": got " & $output[i] & " want " & $expected[i])
+  echo "PASS resident FP4 kernel ", name
 
 proc sessionTests2() =
   block:
@@ -604,6 +696,21 @@ proc sessionTests2() =
       let weightFloats = if spacked > 0: spacked else: (sn * (sk div 2) + 3) div 4 + 2 * sn * sng
       let program = assemble(sg.body, 2, 1, @[sm * sk, weightFloats], @[sm * sn], 1e-5'f32, slotLayout = true)
       doAssert ("const uint BM = " & $q4CoopRowTile(sm, sn) & "u;") in lowerBytecodeToGlsl(program, "q4_tc_default")
+      # Metal lowers the same op to MSL simdgroup_matrix (Apple GPUs).
+      doAssert ("constant constexpr uint BM = " & $q4CoopRowTile(sm, sn) & "u;") in lowerBytecodeToMetal(program, "q4_tc_metal")
+      for tile in Q4CoopRowTiles:
+        let msl = lowerCoopGemmMetal(program, "q4_simd_source_test", tile)
+        let tag = "M" & $sm & " K" & $sk & " N" & $sn & " tile " & $tile
+        doAssert msl == lowerQ4CoopMetal(program, "q4_simd_source_test", tile), tag
+        doAssert "kernel void q4_simd_source_test(" in msl, tag
+        doAssert "#include <metal_simdgroup_matrix>" in msl and "simdgroup_float8x8" in msl, tag
+        doAssert "simdgroup_load(" in msl and "simdgroup_multiply_accumulate(" in msl and "simdgroup_store(" in msl, tag
+        doAssert ("constant constexpr uint BM = " & $tile & "u;") in msl, tag
+        doAssert ("constant constexpr uint Q4_M = " & $sm & "u;") in msl and ("constant constexpr uint Q4_K = " & $sk & "u;") in msl, tag
+        doAssert ("constant constexpr uint Q4_N = " & $sn & "u;") in msl and ("constant constexpr uint Q4_GROUP_SIZE = " & $sgs & "u;") in msl, tag
+        doAssert ("constant constexpr uint Q4_N_GROUPS = " & $sng & "u;") in msl and "@" notin msl, tag
+        mslCompileCheck(msl, "Q4 " & tag)
+        echo "PASS Q4 simdgroup_matrix micro shader lowering ", tag
       for (tile, frags) in [(16, 1), (32, 1), (64, 1), (16, 2), (32, 2), (64, 2)]:
         let shader = lowerQ4CoopGlsl(program, "q4_tensor_core_source_test", tile, frags)
         let tag = "M" & $sm & " K" & $sk & " N" & $sn & " tile " & $tile & " fragments " & $frags
@@ -627,6 +734,98 @@ proc sessionTests2() =
           if compileCode != 0:
             raise newException(ValueError, "glslc rejected the Q4 Tensor Core micro shader " & tag & ": " & compileOutput)
           echo "PASS Q4 Tensor Core micro shader glslc compile ", tag
+
+  # Vulkan cooperative-matrix FP4-KM GEMM (Codestral Mamba-2 weights) is a custom micro-VM op
+  # too: same tiles, slots and grid as the Q4 one. The CPU VM runs it as a scalar reference.
+  block:
+    for (M, K, N) in [(16, 64, 64), (40, 128, 80), (3, 64, 17), (64, 256, 130)]:
+      let (a, blob, want) = fp4kmCase(M, K, N, M + N)
+      var g = genFp4GemmTensorCore(M, K, N)
+      let tag = "M" & $M & " K" & $K & " N" & $N
+      doAssert g.tg == 128 and ("fp4coop " & $M & " " & $K & " " & $N & " 32 " & $(K div 32)) == g.body, tag
+      doAssert g.threads == ((M + q4CoopRowTile(M, N) - 1) div q4CoopRowTile(M, N)) * ((N + 63) div 64) * 128, tag
+      chkResidentFp4("tensor_core_micro " & tag, g, a, blob, want)
+      # The CPU reference does not depend on the grid the runtime picks.
+      for tile in Q4CoopRowTiles:
+        g.threads = ((M + tile - 1) div tile) * ((N + 63) div 64) * 128
+        chkResidentFp4("tensor_core_micro " & tag & " grid for tile " & $tile, g, a, blob, want)
+    # The same FP4-KM blob through the generic lane-per-column kernel gives the same product.
+    block:
+      let (a, blob, want) = fp4kmCase(2, 64, 5, 3)
+      chk("fp4_gemm generic on the tensor core case", genFp4Gemm(2, 64, 5), @[a, blob], want, 2e-3'f32)
+    var rejected = 0
+    for (M, K, N) in [(0, 64, 64), (4, 96, 64), (4, 64, 8)]:
+      try:
+        discard genFp4GemmTensorCore(M, K, N)
+      except GenError:
+        inc rejected
+    doAssert rejected == 3, "FP4 Tensor Core shape checks"
+    # Codestral Mamba-2 7B prefill shapes, M = 64 rows: in_proj K=4096 N=18560, out_proj K=8192 N=4096.
+    # Unknown device (64 units): in_proj takes 64-row tiles (290 column tiles already fill it),
+    # out_proj 32-row tiles (2 x 64 workgroups); a Tesla T4 (40 SMs) picks the same tiles.
+    doAssert q4CoopRowTile(64, 18560) == 64 and q4CoopRowTile(64, 4096) == 32
+    doAssert q4CoopRowTile(64, 18560, 40) == 64 and q4CoopRowTile(64, 4096, 40) == 32
+    doAssert genFp4GemmTensorCore(64, 4096, 18560).threads == 290 * 128
+    doAssert genFp4GemmTensorCore(64, 8192, 4096).threads == 2 * 64 * 128
+    doAssert genFp4GemmTensorCore(64, 4096, 18560).tg == 128
+    doAssert genFp4GemmTensorCore(64, 8192, 4096).tg == 128
+    echo "PASS FP4 Tensor Core grid for Codestral in_proj (290 x 128 threads) and out_proj (128 x 128 threads)"
+
+    let glslc = findExe("glslc")
+    for (sm, sk, sn) in [(16, 64, 64), (64, 4096, 18560), (64, 8192, 4096), (49, 4096, 18560), (3, 64, 17)]:
+      let sg = genFp4GemmTensorCore(sm, sk, sn)
+      let blobFloats = fp4kmLayout(sn, sk).totalWords
+      let program = assemble(sg.body, 2, 1, @[sm * sk, blobFloats], @[sm * sn], 1e-5'f32, slotLayout = true)
+      doAssert program.words.len == 7 and (program.words[0] and 0xFF'u32) == OP_FP4_COOP_GEMM
+      doAssert program.words[1 .. 5] == @[uint32(sm), uint32(sk), uint32(sn), 32'u32, uint32(sk div 32)]
+      doAssert isCoopGemmProgram(program) and not isQ4CoopProgram(program)
+      let shape = coopGemmShape(program)
+      doAssert shape.M == sm and shape.K == sk and shape.N == sn and shape.groupSize == 32 and shape.nGroups == sk div 32
+      doAssert opImmediateWords(OP_FP4_COOP_GEMM) == 5
+      let defaultShader = lowerBytecodeToGlsl(program, "fp4_tc_default")
+      doAssert ("const uint BM = " & $q4CoopRowTile(sm, sn) & "u;") in defaultShader
+      doAssert ("const uint LUT_BASE = (SCALE_BASE + FP4_N * FP4_N_GROUPS + 3u) / 4u;") in defaultShader
+      # Metal lowers the same op to MSL simdgroup_matrix (Apple GPUs).
+      let metalDefault = lowerBytecodeToMetal(program, "fp4_tc_metal")
+      doAssert ("constant constexpr uint BM = " & $q4CoopRowTile(sm, sn) & "u;") in metalDefault
+      for tile in Q4CoopRowTiles:
+        let msl = lowerCoopGemmMetal(program, "fp4_simd_source_test", tile)
+        let tag = "M" & $sm & " K" & $sk & " N" & $sn & " tile " & $tile
+        doAssert msl == lowerFp4CoopMetal(program, "fp4_simd_source_test", tile), tag
+        doAssert "kernel void fp4_simd_source_test(" in msl, tag
+        doAssert "#include <metal_simdgroup_matrix>" in msl and "simdgroup_float8x8" in msl, tag
+        doAssert "simdgroup_load(" in msl and "simdgroup_multiply_accumulate(" in msl and "simdgroup_store(" in msl, tag
+        doAssert ("constant constexpr uint BM = " & $tile & "u;") in msl, tag
+        doAssert ("constant constexpr uint FP4_M = " & $sm & "u;") in msl and ("constant constexpr uint FP4_K = " & $sk & "u;") in msl, tag
+        doAssert ("constant constexpr uint FP4_N = " & $sn & "u;") in msl and ("constant constexpr uint FP4_N_GROUPS = " & $(sk div 32) & "u;") in msl, tag
+        doAssert "@" notin msl and "sessionFp4Gemm" notin msl, tag
+        mslCompileCheck(msl, "FP4 " & tag)
+        echo "PASS FP4 simdgroup_matrix micro shader lowering ", tag
+      for (tile, frags) in [(16, 1), (32, 1), (64, 1), (16, 2), (32, 2), (64, 2)]:
+        let shader = lowerCoopGemmGlsl(program, "fp4_tensor_core_source_test", tile, frags)
+        let tag = "M" & $sm & " K" & $sk & " N" & $sn & " tile " & $tile & " fragments " & $frags
+        doAssert shader == lowerFp4CoopGlsl(program, "fp4_tensor_core_source_test", tile, frags), tag
+        doAssert ("const uint FRAGS = " & $frags & "u;") in shader, tag
+        doAssert ("const uint BM = " & $tile & "u;") in shader, tag
+        doAssert ("const uint FP4_K = " & $sk & "u;") in shader and ("const uint FP4_N = " & $sn & "u;") in shader, tag
+        doAssert "GL_KHR_cooperative_matrix" in shader
+        doAssert "coopMatMulAdd" in shader
+        doAssert "sessionFp4Gemm" notin shader and "@" notin shader, tag
+        echo "PASS FP4 Tensor Core micro shader lowering ", tag
+        if glslc.len > 0:
+          let shaderPath = getTempDir() / ("fir_fp4_tc_" & $getCurrentProcessId() & ".comp")
+          let spvPath = shaderPath & ".spv"
+          writeFile(shaderPath, shader)
+          let compile = startProcess(glslc, args = ["--target-env=vulkan1.3", "-o", spvPath, shaderPath],
+            options = {poUsePath, poStdErrToStdOut})
+          let compileOutput = compile.outputStream.readAll()
+          let compileCode = compile.waitForExit()
+          compile.close()
+          if fileExists(shaderPath): removeFile(shaderPath)
+          if fileExists(spvPath): removeFile(spvPath)
+          if compileCode != 0:
+            raise newException(ValueError, "glslc rejected the FP4 Tensor Core micro shader " & tag & ": " & compileOutput)
+          echo "PASS FP4 Tensor Core micro shader glslc compile ", tag
 
   # Vulkan Q4 decode GEMV with the native decode algorithm is a shape-op micro-kernel too.
   # The CPU VM runs the same instruction as a scalar reference; the Vulkan JIT lowers it to

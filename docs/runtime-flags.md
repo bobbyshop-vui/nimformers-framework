@@ -19,7 +19,7 @@ an optimization off, force one choice, or get diagnostics.
 | `BYBY_PREFILL_CB_MS` | `300` (native), `450` (lift) | `300` | native prefill command-buffer target; the FIR graph does not read it |
 | `BYBY_VULKAN_Q4_SPLIT_QKV` | `0` / `1` (A/B) | `auto` | autotunes fused vs split QKV |
 | `BYBY_FIR_Q4_BACKEND` | `micro` | `micro` | FIR Q4 nodes run their lifted micro-kernels |
-| `FIRLIFT_Q4_GEMM` | `tensor_core` | `auto` | `auto` lifts Tensor Core GEMMs when the recorded Vulkan device has cooperative matrix |
+| `FIRLIFT_Q4_GEMM` | `tensor_core` | `auto` | `auto` lifts Tensor Core GEMMs when the trace records Vulkan cooperative matrix or Metal simdgroup matrix support |
 | `FIRLIFT_Q4_GEMV` | `word_parallel` / `auto` | `auto` | `auto` lifts the subgroup GEMV micro-kernel on Vulkan (faster than `word_parallel`) |
 | `BYBY_FIR_PROBE_STEPS` | `prefill:2,decode:1` | every step | steps the recorder keeps (lift only) |
 | `BYBY_FIR_PROBE_DATA` | `0` | `1` under `firlift --run` | upload payload pipe (lift only) |
@@ -33,10 +33,15 @@ without waiting (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 
 | Flag | Default | Effect |
 | --- | --- | --- |
-| `BYBY_FIR_DECODE_REPLAY` | `1` | Vulkan: record the decode step in one reusable command buffer at the first step, then each step only writes token/position into a host-visible buffer, replays it, and reads logits from a mapped buffer (no host encode). The embedding row is gathered on the GPU. `0` encodes every step. Turns itself off with probe, `BYBY_FIR_PROFILE=2` or `BYBY_FIR_Q4_BACKEND=native`. |
+| `BYBY_FIR_DECODE_REPLAY` | `1` | Vulkan and Metal: record the decode step once at the first step (Vulkan: one reusable command buffer; Metal: the step's dispatches, see `BYBY_METAL_REPLAY_ICB`), then each step only writes token/position into a host-visible buffer, replays it, and reads logits from a mapped buffer (no host encode). The embedding row is gathered on the GPU. Supported exact session nodes (RMSNorm, vector/activation, FP4 Metal GEMM and NT GEMM) also replay their native session operation. `0` encodes every step. Turns itself off with probe, `BYBY_FIR_PROFILE=2` or `BYBY_FIR_Q4_BACKEND=native`, and when the step uploads, allocates or frees buffers while recording. |
+| `BYBY_METAL_REPLAY_ICB` | `1` | Metal replay of a recorded session (`BYBY_FIR_DECODE_REPLAY`): `1` builds an indirect command buffer once and runs it with `executeCommandsInBuffer` when the GPU supports it; `0` re-issues the recorded dispatches on a plain encoder in one loop (no graph walk either way). |
+| `BYBY_METAL_REPLAY_LOG` | unset | Set: log each Metal session recording (commands, pipelines, buffers) and why one was not kept. |
 | `BYBY_FIR_DECODE_REPLAY_VERBOSE` | `0` | `1` prints `[fir] decode replay on/off: ...` (also printed with `BYBY_FIR_PROFILE`). |
 | `BYBY_FIR_DECODE_CB_NODES` | `64` | Encoded decode step (replay off): submit without waiting every this many nodes (the first after 16) so the GPU starts while the host encodes. `0`: one command buffer. |
 | `BYBY_FIR_Q4_BACKEND` | `micro` | `micro`: lifted Q4 micro-kernels. `native`: diagnostic switch through `sessionMatmulQ4` (not allowed with Tensor Core nodes). |
+| `BYBY_FIR_SESSION_DIRECT` | `1` | `0` stages exact session replays through scratch buffers; `1` replays supported session operations directly on graph buffers. |
+| `BYBY_FIR_WARM_RELOAD` | `0` | `1` reloads model weights for the warm run instead of resetting lifted graph state. |
+| `BYBY_METAL_SIMDGROUP_MATRIX` | `1` | `0` hides MSL simdgroup matrix support, so Metal traces record `device="plain"` and no Tensor Core micro-kernel is built. |
 | `BYBY_FIR_Q4_GEMV_TUNE` | `1` | Vulkan: at load, time every rows-per-subgroup (1, 2, 4) and workgroup width (64, 128, 256) per GEMV shape on the resident weights and keep the fastest. `0` keeps the lifted choice. |
 | `BYBY_FIR_Q4_GEMV_ROWS` | lifted | Force GEMV output rows per subgroup (1, 2 or 4). |
 | `BYBY_FIR_Q4_GEMV_THREADS` | lifted | Force GEMV workgroup width (64, 128 or 256). Both forced: no tune. |
@@ -48,6 +53,7 @@ without waiting (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_FIR_RELOC` | `1` | Metal arena graphs: share one pipeline per kernel. `0`: one per node. |
 | `BYBY_FIR_PROFILE` | `0` | `1`: mean host encode / GPU wait / logits read per decode step. `2`: ends the session after every node and reports per-kernel wall time (slow; diagnostics only). |
 | `BYBY_UBATCH` | `512` | Caps the rows of a prompt phase run (phases with per-row logits excepted). `0`: no cap. |
+| `BYBY_PREFILL_MIN_ROWS` | `5` | Codestral (native and FIR): a prompt or prompt tail of at least this many tokens runs as one batched multi-row prefill; fewer run as single-token steps. `1`: batch every tail of 2+ tokens; `128` or more: whole 128-row chunks only (old behaviour). Native and FIR must use the same value, and the FIR graph must be lifted with it (it holds a phase per tail size). |
 
 ## Native inference (`nim_inference`, `formers-cli` native route)
 
@@ -111,14 +117,17 @@ without waiting (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_Q4_TUNE_VERBOSE` | `0` | Log autotune parity rejects. |
 | `BYBY_FLASH_ATTENTION` | `auto` | Flash attention kind; `scalar` forces FP32. |
 | `BYBY_FUSE_ROPE` | `1` | Fuse RoPE into the KV append. |
-| `BYBY_SSD` | `auto` | Mamba2 SSD kernel. |
+| `BYBY_SSD` | `auto` | Mamba2 SSD kernel. During an active FIR recording, `auto` leaves the micro-VM scan path enabled because the native SSD shaders cannot be replayed by a lifted graph; `1` forces SSD and `0` disables it. |
 
 ## Lifting (`firlift --run`)
 
 | Flag | Default | Effect |
 | --- | --- | --- |
 | `FIRLIFT_Q4_GEMV` | `auto` | One-row Q4 matmul kernel. `auto` on Vulkan: subgroup micro-kernel (the native decode algorithm), else word-parallel. Also `scalar`, `scalar_fma`, `parallel`, `parallel_fma`, `simd`, `word_parallel`, `subgroup`. |
-| `FIRLIFT_Q4_GEMM` | `auto` | Multi-row Q4 matmul kernel. `auto`: Tensor Core micro-kernel when the trace says the Vulkan device has cooperative matrix (`device=coopmatrix` on the trace's backend line), `matrix` for `FIRLIFT_TARGET=apple`, else tiled FMA. Also `scalar`, `scalar_fma`, `parallel`, `parallel_fma`, `tiled`, `matrix`, `tensor_core`. |
+| `FIRLIFT_Q4_GEMM` | `auto` | Multi-row Q4 matmul kernel. `auto`: Tensor Core micro-kernel when the trace records Vulkan `device=coopmatrix` or Metal `device=simdmatrix`, unless `FIRLIFT_GENERIC` is set; otherwise follows the generic kernel choice. Also `scalar`, `scalar_fma`, `parallel`, `parallel_fma`, `tiled`, `matrix`, `tensor_core`/`coop` (Vulkan or Metal trace required). |
+| `FIRLIFT_FP4_GEMM` | `auto` | FP4-KM prefill GEMM. `auto`: Tensor Core micro-kernel for a supported shape on a recorded Vulkan `coopmatrix` or Metal `simdmatrix` device, unless `FIRLIFT_GENERIC` is set. `coop`/`tensor_core` forces it (Vulkan or Metal trace; requires K divisible by 64 and N >= 16); `generic` selects lane-per-column kernels. |
+| `FIRLIFT_SLICE_REPORT` | `0` | Any value except `0` prints why the earliest replayed ops were selected for the lift slice. |
+| `FIRLIFT_SLICE_REPORT_N` | `40` | Maximum number of slice-reason lines printed when `FIRLIFT_SLICE_REPORT` is enabled. |
 | `FIRLIFT_Q4_WORD_MAX_K` | `4096` | Largest K of the word-parallel GEMV in `auto`. |
 | `FIRLIFT_Q4_LANES`, `FIRLIFT_TG` | per kernel | Lanes / threadgroup width of the parallel kernels. |
 | `FIRLIFT_GEMM_TILE`, `FIRLIFT_GEMM_REG` | `64x128`, `8x8` | f32 GEMM tile and register block. |
@@ -131,6 +140,10 @@ without waiting (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `FIRLIFT_NOREUSE` | unset | Give every op output its own buffer (no temporary reuse). |
 | `BYBY_FIR_PROBE_STEPS` | every step | Steps the recorder keeps, for example `prefill:2,decode:1`. |
 | `BYBY_FIR_PROBE_DATA` | `1` under `--run` | Send exact upload payloads down the data pipe (needed for unnamed uploads such as LUTs). `0` when every weight is named in `model.nimq`. |
+
+Lifting Codestral requires `BYBY_MERGE_LORA=1` and `BYBY_MEMORY_LIMIT_MB=10000`.
+
+Trace headers record `device="coopmatrix"` for Vulkan cooperative matrix, `device="simdmatrix"` for Metal simdgroup matrix, or `device="plain"` otherwise. Tensor Core micro-kernels are selected automatically for Vulkan with cooperative matrix or Metal on Apple GPU family 7+; other devices use generic kernels.
 
 The trace records the backend and device features of the run, so a graph lifted
 on a T4 targets its Tensor Cores and a graph lifted on a device without

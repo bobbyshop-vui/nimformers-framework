@@ -144,32 +144,48 @@ proc main() =
   var parsed: Trace
   if recordRun:
     # The command writes its trace and upload bytes into pipes; nothing reaches the disk.
-    let recorded = recordCommand(runCommand)
+    var recorded = recordCommand(runCommand)
     if recorded.exitCode != 0:
       stderr.writeLine("firlift: the recorded command exited with code " & $recorded.exitCode)
     if recorded.trace.len == 0:
       raise newException(IOError, "the command wrote no trace (does it use the core recorder?)")
     echo "recorded in memory: trace ", recorded.trace.len, " bytes, upload data ", recorded.data.len, " bytes"
-    useMemory(recorded.data)
+    useMemory(move recorded.data)   # the upload bytes can be GBs: no copy
     parsed = parseTrace(recorded.trace)
     parsed.sourcePath = MemorySource
   else:
     parsed = parseTrace(readFile(tracePath))
     parsed.sourcePath = absolutePath(tracePath)
-  var cfgJson = parseJson(readFile(configPath))
+  # HF configs written by Python may hold bare Infinity/NaN (Codestral's
+  # "time_step_limit": [0.0, Infinity]); they become null, as in the CLI's detection.
+  let rawCfgText = readFile(configPath)
+  var cfgJson: JsonNode
+  var cfgSanitized = false
+  try:
+    cfgJson = parseJson(rawCfgText)
+  except JsonParsingError:
+    cfgJson = parseJson(rawCfgText.multiReplace(("-Infinity", "null"), ("Infinity", "null"), ("NaN", "null")))
+    cfgSanitized = true
   if contextSize > 0:
     let contextKeys = ["max_position_embeddings", "n_positions", "n_ctx", "seq_length"]
     var declaredContext = high(int)
+    var declared = false
     for key in contextKeys:
       if cfgJson.hasKey(key) and cfgJson[key].kind == JInt:
         declaredContext = min(declaredContext, cfgJson[key].getInt())
-    if declaredContext == high(int) or declaredContext <= 0:
+        declared = true
+    if declared and declaredContext <= 0:
       raise newException(ValueError, "--context requires a positive context length in config.json")
-    if contextSize > declaredContext:
+    if declared and contextSize > declaredContext:
       raise newException(ValueError, "--context cannot exceed config.json context length " & $declaredContext)
-    for key in contextKeys:
-      if cfgJson.hasKey(key) and cfgJson[key].kind == JInt:
-        cfgJson[key] = newJInt(contextSize)
+    if declared:
+      for key in contextKeys:
+        if cfgJson.hasKey(key) and cfgJson[key].kind == JInt:
+          cfgJson[key] = newJInt(contextSize)
+    else:
+      # A recurrent model declares no context length; --context then sets the
+      # graph's position capacity.
+      cfgJson["max_position_embeddings"] = newJInt(contextSize)
   var dims = Dims()
   for key in ["hidden_size", "n_embd", "d_model", "dim"]:
     if cfgJson.hasKey(key) and cfgJson[key].kind == JInt: dims.hidden = cfgJson[key].getInt()
@@ -181,7 +197,8 @@ proc main() =
       " (", selected.dispatches, " dispatches, occurrence ", selected.occurrence, ")"
     if selected.resetCopies > 0:
       echo "state resets left to the graph's initial contents: ", selected.resetCopies, " copies"
-  let cfgText = if contextSize > 0: $cfgJson else: readFile(configPath)
+  let rewriteConfig = contextSize > 0 or cfgSanitized
+  let cfgText = if rewriteConfig: $cfgJson else: rawCfgText
   if coverage:
     let report = liftSessionFiles(trace, cfgText, name, embedding, true, weightsPaths)
     echo report
@@ -192,6 +209,10 @@ proc main() =
               else: liftSessionFiles(trace, cfgText, name, embedding, false, weightsPaths, fuseDispatches, gridTg, dynamicGrid)
   if droppedSingleRowUnits > 0:
     echo "single-token units left to the decode step: ", droppedSingleRowUnits
+  if droppedFailedCalls > 0:
+    echo "session calls that did not run (their native fallback follows): ", droppedFailedCalls
+  if replacedFp4Fallbacks > 0:
+    echo "failed FP4 GEMMs lowered in place of their native fallback tiles: ", replacedFp4Fallbacks
   if gridTg > 0:
     echo "persistent chains: ", fuseStats.chains, " built from ", fuseStats.chained, " dispatches (", gridTg, " threadgroups)"
   if fuseDispatches or gridTg > 0:
@@ -217,7 +238,7 @@ proc main() =
           except CatchableError: copyFile(path, target)
         break
   if configPath != outDir / "config.json":
-    if contextSize > 0:
+    if rewriteConfig:
       writeFile(outDir / "config.json", cfgText & "\n")
     else:
       copyFile(configPath, outDir / "config.json")

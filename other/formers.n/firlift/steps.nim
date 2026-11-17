@@ -111,16 +111,53 @@ proc isUploadedRopeTable*(t: Trace; consumer: Op; portName: string): bool =
       return producer.isUpload and t.isRopeTableUpload(producer, buffer)
   false
 
+proc dispatchAccess*(op: Op): VmAccess =
+  ## The domain access of a recorded dispatch, failing with the dispatch and pipeline it belongs to.
+  if op.words.len == 0:
+    raise newException(ValueError, "dispatch d" & $(-1-op.id) & " (pipe " & op.attrs.getOrDefault("pipe") &
+      ") has no recorded program words; its kernel is not a micro-VM program")
+  try:
+    result = vmAccess(op.words)
+  except ValueError as e:
+    raise newException(ValueError, "dispatch d" & $(-1-op.id) & " (pipe " & op.attrs.getOrDefault("pipe") &
+      ", " & $op.words.len & " words): " & e.msg)
+
+var childCache = initTable[int, seq[int]]()   ## session call id -> indices of its child dispatches
+var childCacheKey = (0, -1, -1, -1, "")       ## (op storage address, ops, first/last order, source) of the trace it was built for
+
 proc accessOf(op: Op; t: Trace; reads, writes: var seq[int]) =
   ## Buffers an op reads and writes, from named ports or from the bytecode's domain access.
   if op.impl == "raw:dispatch":
-    let access = vmAccess(op.words)
+    if op.words.len == 0:
+      # An opaque kernel (hand-written shader, no micro-VM program): conservatively it reads and
+      # writes every binding. Lifting it fails later if the selected ops need it.
+      for p in op.bindings:
+        reads.add p.buffer
+        writes.add p.buffer
+      return
+    let access = dispatchAccess(op)
     for p in op.bindings:
       if p.name in access.reads: reads.add p.buffer
       if p.name in access.writes: writes.add p.buffer
   else:
     for p in op.ins: reads.add p.buffer
     for p in op.outs: writes.add p.buffer
+    if op.impl.startsWith("session:") and not op.isUpload:
+      # A session call that writes through a handle it takes by value (an arena) records that
+      # handle as an input only. What its own dispatches write is what the call writes, so the
+      # slice keeps it (and lifting then fails loudly) instead of silently dropping a writer.
+      let key = (cast[int](unsafeAddr t.ops[0]), t.ops.len, t.ops[0].order, t.ops[^1].order, t.sourcePath)
+      if childCacheKey != key:
+        childCache.clear()
+        for k, child in t.ops:
+          if child.impl == "raw:dispatch" and child.parent >= 0:
+            childCache.mgetOrPut(child.parent, @[]).add k
+        childCacheKey = key
+      for k in childCache.getOrDefault(op.id):
+        var childReads, childWrites: seq[int]
+        t.ops[k].accessOf(t, childReads, childWrites)
+        for b in childWrites:
+          if b notin writes: writes.add b
     if op.isUpload:
       for tr in t.transfers:
         if tr.kind == "upload" and tr.op == op.id: writes.add tr.dst.buffer
@@ -263,6 +300,43 @@ proc droppableResets(t: Trace; carried: HashSet[int]; first, last: int): HashSet
         t.uploadedZero(r.dstBuffer, r.dstByte, r.bytes, firstTouch[r.dstBuffer]) < 0: continue
     result.incl r.op.order
 
+var seedReaders = initTable[int, string]()   ## first reader of each seed buffer (diagnostics)
+let sliceReport = getEnv("FIRLIFT_SLICE_REPORT", "0") != "0"   ## print why the earliest replayed ops were selected
+var sliceReasons = initTable[int, string]()  ## op order -> why the slice took it (FIRLIFT_SLICE_REPORT)
+
+proc copyFailed(t: Trace; op: Op): bool =
+  ## The recorder notes a sessionCopyInto's result on its copy event (ok=false: nothing was written).
+  for tr in t.transfers:
+    if tr.kind == "copy" and tr.op == op.id and tr.failed: return true
+
+proc definedRanges(op: Op; t: Trace): seq[tuple[buffer, lo, hi: int]] =
+  ## Byte ranges an op overwrites completely with contents of its own: a host upload or a
+  ## sessionCopyInto. Dispatches are left out: a binding does not say which bytes a kernel writes.
+  if op.isUpload:
+    for tr in t.transfers:
+      if tr.kind == "upload" and tr.op == op.id and tr.dst.bytes > 0:
+        result.add (tr.dst.buffer, tr.dst.offset, tr.dst.offset+tr.dst.bytes)
+  elif op.opName == "sessionCopyInto" and op.attrs.getOrDefault("ok", "true") != "false" and
+      not t.copyFailed(op):
+    let n = op.attrNum("n")
+    if n <= 0: return
+    for p in op.outs:
+      if p.name == "dst":
+        let lo = p.offset+op.attrNum("dstOffsetElems")*4
+        result.add (p.buffer, lo, lo+n*4)
+
+proc covers(ranges: seq[(int, int)]; size: int): bool =
+  ## True when the union of the byte ranges covers [0, size).
+  if size <= 0: return false
+  var sorted = ranges
+  sorted.sort()
+  var reach = 0
+  for r in sorted:
+    if r[0] > reach: return false
+    reach = max(reach, r[1])
+    if reach >= size: return true
+  false
+
 proc sliceBefore(t: Trace; seeds: HashSet[int]; before: int; dims: Dims;
                  tokenRows: var bool): HashSet[int] =
   ## Backward data-flow slice: orders of the ops before `before` that wrote buffers in `seeds`
@@ -275,13 +349,21 @@ proc sliceBefore(t: Trace; seeds: HashSet[int]; before: int; dims: Dims;
   for op in t.ops:
     if op.impl == "raw:dispatch" and op.parent >= 0: rawParents.incl op.parent
   var micro = initHashSet[int]()
+  var microOrder = initTable[int, int]()   # micro wrapper id -> its order
   for op in t.ops:
-    if op.impl.startsWith("micro:"): micro.incl op.id
+    if op.impl.startsWith("micro:"):
+      micro.incl op.id
+      microOrder[op.id] = op.order
   var needed = seeds
+  var neededBy = initTable[int, string]()   # buffer -> the op that made it needed (diagnostics)
+  for b in seeds: neededBy[b] = seedReaders.getOrDefault(b, "the selected unit")
   var released = initHashSet[int]()
   for op in t.ops:
     if op.order < before and op.opName == "sessionFree":
       for p in op.outs: released.incl p.buffer
+  # Bytes of each needed buffer that later uploads/copies already define: once they cover the
+  # whole buffer, earlier writers are dead and the buffer is no longer needed.
+  var defined = initTable[int, seq[(int, int)]]()
   for i in countdown(t.ops.high, 0):
     let op = t.ops[i]
     if op.order >= before or op.opName in NonDataOps: continue
@@ -293,9 +375,55 @@ proc sliceBefore(t: Trace; seeds: HashSet[int]; before: int; dims: Dims;
     var hit = false
     for b in writes:
       if b in needed and (not op.isUpload or b in released): hit = true
+    var killed: seq[int]
+    for r in op.definedRanges(t):
+      if r.buffer notin needed: continue
+      defined.mgetOrPut(r.buffer, @[]).add (r.lo, r.hi)
+      let size = if r.buffer >= 0 and r.buffer < t.bufs.len: t.bufs[r.buffer].bytes else: 0
+      if defined[r.buffer].covers(size): killed.add r.buffer
+    for b in killed:
+      needed.excl b
+      defined.del b
     if not hit: continue
+    if op.impl == "raw:dispatch" and op.words.len == 0:
+      var why = ""
+      for b in writes:
+        if b notin needed: continue
+        let info = if b >= 0 and b < t.bufs.len: $t.bufs[b].bytes & " bytes, origin " & t.bufs[b].origin else: "unknown"
+        why.add " b" & $b & " (" & info & "; needed by " & neededBy.getOrDefault(b) & "; writers:"
+        var shown = 0
+        for other in t.ops:
+          if shown >= 8: break
+          if other.opName in NonDataOps: continue
+          var r2, w2: seq[int]
+          other.accessOf(t, r2, w2)
+          if b in w2:
+            why.add " " & (if other.impl == "raw:dispatch": "d" & $(-1-other.id) & "[" & other.attrs.getOrDefault("pipe") & "]"
+                           else: other.impl & " o" & $other.id) & "@" & $other.order
+            inc shown
+        why.add ")"
+      raise newException(ValueError, "dispatch d" & $(-1-op.id) & " (pipe " & op.attrs.getOrDefault("pipe") &
+        ") has no recorded program words but may write state the step reads:" & why)
     result.incl op.order
-    for b in reads: needed.incl b
+    if sliceReport:
+      var why: seq[string]
+      for b in writes:
+        if b in needed: why.add "b" & $b & "<-" & neededBy.getOrDefault(b)
+      sliceReasons[op.order] = (if op.impl == "raw:dispatch": "d" & $(-1-op.id) & " pipe " & op.attrs.getOrDefault("pipe")
+                                else: op.impl & " o" & $op.id) & " writes " & why.join(", ")
+    if op.impl == "raw:dispatch" and op.parent in micro:
+      # The lifter keeps a replayed dispatch only together with its micro wrapper (the
+      # sessionJitMicroVmEnc/sessionMicroVmEnc call that launched it). The wrapper is not a
+      # top-level op, so without this its programs (e.g. a Mamba-2 prefill scan) would vanish
+      # from the multi-row phase. The wrapper itself has no data effect.
+      result.incl microOrder[op.parent]
+    let label =(if op.impl == "raw:dispatch": "d" & $(-1-op.id) & " pipe " & op.attrs.getOrDefault("pipe")
+                 else: op.impl & " o" & $op.id)
+    for b in reads:
+      if b notin needed:
+        neededBy[b] = label
+        defined.del b   # read before the later definitions: earlier writers matter again
+      needed.incl b
     if op.isUpload and dims.hidden > 0:
       for tr in t.transfers:
         if tr.kind == "upload" and tr.op == op.id and tr.n >= dims.hidden and
@@ -308,11 +436,23 @@ proc stateProducers(t: Trace; first, last: int; dims: Dims): HashSet[int] =
   ## the original run are not part of it.
   var dummy = false
   var seeds = initHashSet[int]()
+  var unitDefined = initTable[int, seq[(int, int)]]()
+  var fullyDefined = initHashSet[int]()
   for op in t.ops:
     if op.order < first or op.order > last: continue
     var reads, writes: seq[int]
     op.accessOf(t, reads, writes)
-    for b in reads: seeds.incl b
+    for b in reads:
+      # A buffer the unit itself defined completely before reading it carries no earlier state.
+      if b in fullyDefined: continue
+      if b notin seeds and b notin seedReaders:
+        seedReaders[b] = (if op.impl == "raw:dispatch": "unit d" & $(-1-op.id) & " pipe " & op.attrs.getOrDefault("pipe")
+                          else: "unit " & op.impl & " o" & $op.id)
+      seeds.incl b
+    for r in op.definedRanges(t):
+      unitDefined.mgetOrPut(r.buffer, @[]).add (r.lo, r.hi)
+      let size = if r.buffer >= 0 and r.buffer < t.bufs.len: t.bufs[r.buffer].bytes else: 0
+      if unitDefined[r.buffer].covers(size): fullyDefined.incl r.buffer
   result = sliceBefore(t, seeds, first, dims, dummy)
   if dims.vocab <= 0: return
   for op in t.ops:
@@ -342,6 +482,20 @@ proc selectStep*(t: Trace; step = -1; slice = ""; dims = Dims()): StepSelection 
     start = parseInt(parts[0])
     width = parseInt(parts[1])-start
   else:
+    # A decode step returns logits: a vocabulary-sized read after its kernels and before the next
+    # session. When the trace has such sessions, only units that contain one are candidates, so
+    # the longer run of prompt tokens (no logits) is not taken for the step.
+    var logits = newSeq[bool](ss.len)
+    var anyLogits = false
+    if dims.vocab > 0:
+      var k = 0
+      for op in t.ops:
+        while k < ss.len and k+1 < ss.len and op.order >= ss[k+1].first: inc k
+        if k >= ss.len or op.order < ss[k].first or op.opName != "sessionRead" or op.parent >= 0: continue
+        let n = (if op.attrs.hasKey("n"): parseInt(op.attrs["n"]) else: 0)
+        if n >= dims.vocab and n mod dims.vocab == 0:
+          logits[k] = true
+          anyLogits = true
     var bestScore = 0
     var occurrences = 0
     for a in 0 ..< ss.len:
@@ -355,6 +509,11 @@ proc selectStep*(t: Trace; step = -1; slice = ""; dims = Dims()): StepSelection 
           if not equal: break
           inc count
         if count < 2: continue
+        if anyLogits:
+          var hasLogits = false
+          for j in 0 ..< period:
+            if logits[a+j]: hasLogits = true
+          if not hasLogits: continue
         var cost = 0
         for j in 0 ..< period:
           cost += max(1, ss[a+j].signature.len)
@@ -413,6 +572,12 @@ proc selectStep*(t: Trace; step = -1; slice = ""; dims = Dims()): StepSelection 
     var earliest = first
     for order in carried:
       if order < earliest: earliest = order
+    if sliceReport:
+      var orders: seq[int]
+      for order in carried: orders.add order
+      orders.sort()
+      for k in 0 ..< min(orders.len, parseInt(getEnv("FIRLIFT_SLICE_REPORT_N", "40"))):
+        echo "slice: @", orders[k], " ", sliceReasons.getOrDefault(orders[k], "(state producer of a logits pass or micro wrapper)")
     if earliest < first: result.prefillFirst = earliest
   result.trace.ops = @[]
   for op in t.ops:
