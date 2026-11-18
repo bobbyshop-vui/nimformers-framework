@@ -1,12 +1,13 @@
 # Thin FIR scheduler: framework resident linears and session_vm programs share
 # one session per token. No host activation/KV staging and no FIR interpreter.
-import nim "std/[tables, strutils, algorithm]"
+import nim "std/[tables, strutils, algorithm, math]"
 import nim "backend"
 import nim "quant"
 import nim "customfloat"
 import nim "session_vm"
 import nim "session_vm_dispatch"
 import nim "jit_vm"
+import nim "fp4_gemv_vm"
 import nim "vendor/bybylang/gpubackend"
 import nim "vendor/bybylang/backends/cpu/cpu_backend"
 import nim "vendor/bybylang/backends/cpu/cpu_jit"
@@ -37,6 +38,8 @@ type
     gemvRows*: int                  ## Q4 subgroup GEMV micro-kernel: output rows per 32 invocations (0: not one)
     gemvThreads*: int               ## Q4 subgroup GEMV micro-kernel: workgroup width
     gemvVariants*: seq[tuple[rows, threads: int, name, source: string]]   ## shaders fgTuneGemv chooses from
+    fp4Tg*, fp4TgBytes*: int        ## FP4-KM decode GEMV micro-kernel: threadgroup width and memory of the chosen variant (0: the lifted kernel's)
+    fp4Variants*: seq[tuple[tg, tgBytes: int, name, source: string]]   ## the lifted FP4-KM GEMV first, then the variants fgTuneFp4Gemv times
   FirGraph* = object
     graph*: FirProgram
     registry*: FirRegistry
@@ -588,6 +591,93 @@ function fgUseGemvVariant(prepared: var FgResidentProgram, index: int)
     prepared.name = variant.name
     prepared.source = variant.source
 
+function fgUseFp4Variant(prepared: var FgResidentProgram, index: int)
+    let variant = prepared.fp4Variants[index]
+    prepared.fp4Tg = variant.tg
+    prepared.fp4TgBytes = variant.tgBytes
+    prepared.name = variant.name
+    prepared.source = variant.source
+
+function fgFp4GemvKind(words: seq[uint32], K, N, rows, tg: int): string
+    ## Which FP4-KM decode GEMV builder (kernelfortest/fp4_gemv_vm) produced these words: "tuned",
+    ## "simd", "4row" or "" (not one of them). Exact word comparison, so a match is that program.
+    if K <= 0 or N <= 0 or K mod 32 != 0:
+        return ""
+    if rows == 4 and tg == GemvTg and N mod 4 == 0 and words == buildFp4KmGemv4RowProgram(K, N).words:
+        return "4row"
+    if rows in [2, 4] and tg in [32, 64, 128, 256, 512, 1024] and K mod (tg*8) == 0 and N mod rows == 0:
+        if words == buildFp4KmGemvTunedProgram(K, N, tg, rows).words:
+            return "tuned"
+        if words == buildFp4KmGemvSimdProgram(K, N, tg, rows).words:
+            return "simd"
+    return ""
+
+function fgFp4GemvVariants(model: FirGraph, jit: var JitCache, kernel: FirKernel, op: string, liftedName, liftedSource: string, jobs: var seq[tuple[name, source: string]]): seq[tuple[tg, tgBytes: int, name, source: string]]
+    ## A lifted FP4-KM decode GEMV (the native runner's autotuned kernel at trace time, for that
+    ## device and moment) and the other threadgroup widths the native autotune chooses from: the
+    ## tree-reduction kernel on both backends and the simdgroup-reduction kernel on Metal. Same
+    ## bindings (out, packed weights, LUT, x) and the same rows per threadgroup, so a variant only
+    ## changes the pipeline, the width and the threadgroup memory. Empty: not such a kernel.
+    let be = model.backend.kind.toByby()
+    let tg = kernel.tgSize
+    if not kernel.slotLayout or tg <= 0 or kernel.threads mod tg != 0 or kernel.tgBytes mod 4 != 0:
+        return
+    let shared = kernel.tgBytes div 4 - Fp4KmLutLen
+    if shared <= 0 or shared mod tg != 0:
+        return
+    let rows = shared div tg
+    let n = (kernel.threads div tg) * rows
+    if rows notin [2, 4] or n <= 0:
+        return
+    # K from the packed weight (N*K/2 code bytes + N*K/32 scale bytes, as floats) or the input.
+    var ks: seq[int]
+    for slot in [1, 3]:
+        let name = kernel.slotBuffers[slot]
+        if name.len == 0 or not model.graph.buffers.hasKey(name):
+            continue
+        let elements = model.graph.buffers[name].elements
+        let k = if slot == 1: (elements*128) div (17*n) else: elements
+        if k > 0 and k notin ks:
+            ks.add(k)
+    var kind = ""
+    var K = 0
+    for k in ks:
+        kind = fgFp4GemvKind(kernel.program.words, k, n, rows, tg)
+        if kind.len > 0:
+            K = k
+            break
+    if kind.len == 0:
+        return
+    result.add((tg, kernel.tgBytes, liftedName, liftedSource))
+    var kinds = @["tuned"]
+    if be == gbMetal:
+        kinds.add("simd")
+    for variantKind in kinds:
+        for width in [32, 64, 128, 256, 512, 1024]:
+            if K mod (width*8) != 0 or (variantKind == kind and width == tg):
+                continue
+            let bytes = (Fp4KmLutLen + rows*width)*4
+            if bytes > 32768:
+                continue
+            let program = if variantKind == "simd": buildFp4KmGemvSimdProgram(K, n, width, rows) else: buildFp4KmGemvTunedProgram(K, n, width, rows)
+            let tag = op & "_fp4_" & variantKind & $rows & "_tg" & $width
+            if be == gbMetal:
+                let name = dispatchProgramNoSession(jit, program, tag)
+                if name.len == 0 or name == "micro_vm_kernel":
+                    continue
+                result.add((width, bytes, name, ""))
+            else:
+                let name = kernelNameFor(jit, program, tag)
+                let source = glslSourceFor(jit, program, tag)
+                if name.len == 0 or source.len == 0:
+                    continue
+                result.add((width, bytes, name, source))
+                jobs.add((name, source))
+    if result.len == 1:
+        result.setLen(0)
+    elif getEnv("BYBY_FIR_Q4_COOP_VERBOSE", "0") != "0":
+        stderr.writeLine("[fir] FP4 GEMV " & op & " K=" & $K & " N=" & $n & " lifted " & kind & $rows & "-tg" & $tg & ": " & $(result.len-1) & " other variants built")
+
 function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): FirGraph
     if graph.runtime != "graph":
         raise newException(ValueError, "FIR graph executor requires 'runtime graph' in the model file")
@@ -661,6 +751,9 @@ function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): 
     cfg.maxCacheEntries = 1024
     var jit = initJitCache(cfg)
     var jobs: seq[tuple[name, source: string]]
+    # FP4-KM decode GEMV variants per kernel definition (BYBY_FIR_FP4_GEMV_TUNE=0: keep the lifted kernel).
+    let fp4Tune = be in [gbMetal, gbVulkan] and getEnv("BYBY_FIR_FP4_GEMV_TUNE", "1") != "0"
+    var fp4Built = initTable[string, seq[tuple[tg, tgBytes: int, name, source: string]]]()
     var cpuUnits: seq[CpuJitUnit]
     var cpuSeen = initTable[string, bool]()
     var metaFloats = 0
@@ -790,6 +883,12 @@ function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): 
                             cpuSeen[cpuName] = true
                     if cpuSeen[cpuName]:
                         prepared.name = cpuName
+                if fp4Tune and isSlots and prepared.coopTiles.len == 0 and prepared.gemvVariants.len == 0:
+                    if not fp4Built.hasKey(node.op):
+                        fp4Built[node.op] = fgFp4GemvVariants(result, jit, kernel, node.op, prepared.name, prepared.source, jobs)
+                    prepared.fp4Variants = fp4Built[node.op]
+                    if prepared.fp4Variants.len > 0:
+                        fgUseFp4Variant(prepared, 0)
                 result.programs[fgNodeKey(node, layer)] = prepared
         elif node.kind notin ["ext", "session"]:
             raise newException(ValueError, "FIR graph executor supports micro, ext and session nodes: " & node.name)
@@ -1206,6 +1305,12 @@ function fgEncodeMicroBody(model: var FirGraph, prepared: FgResidentProgram, nod
         var tgSize = k.tgSize
         var pipelineName = prepared.name
         var pipelineSource = prepared.source
+        var tgBytes = k.tgBytes
+        if prepared.fp4Tg > 0 and prepared.fp4Tg != k.tgSize:
+            # FP4-KM GEMV variant: the same threadgroups (rows per group unchanged), another width.
+            threads = (threads div k.tgSize) * prepared.fp4Tg
+            tgSize = prepared.fp4Tg
+            tgBytes = prepared.fp4TgBytes
         if prepared.coopTiles.len > 0:
             # Q4/FP4 Tensor Core micro-kernel (Vulkan cooperative matrix or Metal simdgroup_matrix):
             # row tile and grid follow the rows this dispatch runs.
@@ -1239,9 +1344,9 @@ function fgEncodeMicroBody(model: var FirGraph, prepared: FgResidentProgram, nod
                 return false
         # The Metal simdgroup_matrix kernels declare their threadgroup tiles statically.
         let dynamicTg = vk or prepared.coopTiles.len == 0
-        if dynamicTg and not sessionEncTgBytes(vk, 0, k.tgBytes):
+        if dynamicTg and not sessionEncTgBytes(vk, 0, tgBytes):
             return false
-        return sessionEncDispatch(vk, threads, tgSize, k.tgBytes)
+        return sessionEncDispatch(vk, threads, tgSize, tgBytes)
     if be == gbCpu and prepared.cpuFn != nil and not model.useHandles and cpuJitRun(prepared.cpuFn, model.arena.cpuData, threads, k.tgSize):
         return true
     if prepared.stage.len == 0:
@@ -1265,6 +1370,153 @@ function fgEncodeMicro(model: var FirGraph, prepared: FgResidentProgram, node: F
     fgEncodeMicroBody(model, prepared, node, layer)
 
 const FgGemvTuneReps = 32                 # dispatches per timed command buffer of the Q4 GEMV tune
+const FgFp4TuneReps = 8                   # dispatches per timed command buffer of the FP4-KM GEMV tune
+
+function fgTuneFp4Gemv(model: var FirGraph)
+    ## The native FP4-KM decode GEMV autotune (gpu_layers.tuneFp4Plan) for lifted FP4 GEMV
+    ## micro-kernels: the lifted kernel is the one the native runner picked while it was traced,
+    ## which need not be the fastest now. For each kernel definition, one of its nodes runs every
+    ## variant fgFp4GemvVariants built on its resident weights (a parity check against the lifted
+    ## kernel on a test input first, then back-to-back dispatches, the GPU wait of one command
+    ## buffer, best of three interleaved rounds), and every node of that kernel takes the fastest.
+    ## The writes land in activation buffers the run overwrites. Choices are kept per process.
+    let be = model.backend.kind.toByby()
+    if be notin [gbMetal, gbVulkan]:
+        return
+    let vk = be == gbVulkan
+    var cache {.global.}: Table[string, int]
+    let verbose = getEnv("BYBY_FIR_Q4_COOP_VERBOSE", "0") != "0"
+    let savedDispatched = model.dispatched
+    let savedRows = model.activeRows
+    model.activeRows = 0
+    # One node per kernel definition, preferably one whose output and input start their buffers.
+    var probe = initTable[string, FirNode]()
+    var probeDirect = initTable[string, bool]()
+    var order: seq[string]
+    for node in model.graph.nodes:
+        if node.kind != "micro":
+            continue
+        let key = fgNodeKey(node, 0)
+        if not model.programs.hasKey(key) or model.programs[key].fp4Variants.len < 2:
+            continue
+        let k = model.programs[key].kernel
+        let direct = fgPortOffset(model, k.slotBuffers[0]) == 0 and fgPortOffset(model, k.slotBuffers[3]) == 0
+        if not probe.hasKey(node.op):
+            order.add(node.op)
+            probe[node.op] = node
+            probeDirect[node.op] = direct
+        elif direct and not probeDirect[node.op]:
+            probe[node.op] = node
+            probeDirect[node.op] = true
+    var chosen = initTable[string, int]()      # lifted pipeline name -> variant index
+    for op in order:
+        let node = probe[op]
+        let prepared = model.programs[fgNodeKey(node, 0)]
+        let k = prepared.kernel
+        let cacheKey = $be & ":" & prepared.fp4Variants[0].name & ":" & $k.threads
+        if cache.hasKey(cacheKey):
+            chosen[prepared.fp4Variants[0].name] = cache[cacheKey]
+            continue
+        let rows = (k.tgBytes div 4 - Fp4KmLutLen) div k.tgSize
+        let n = (k.threads div k.tgSize) * rows
+        let inName = k.slotBuffers[3]
+        let outName = k.slotBuffers[0]
+        let inElements = model.graph.buffers[inName].elements
+        var inHandle = fgPortHandle(model, inName)
+        let inOffset = fgPortOffset(model, inName)
+        let outHandle = fgPortHandle(model, outName)
+        let outOffset = fgPortOffset(model, outName)
+        var data = newSeq[float32](inElements)
+        for i in 0 ..< data.len:
+            data[i] = float32((i*17 mod 101) - 50) / 64
+        var test = sessionUpload(be, data)
+        let count = prepared.fp4Variants.len
+        var valid = newSeq[bool](count)
+        var seconds = newSeq[float](count)
+        var reference: seq[float32]
+        for index in 0 ..< count:
+            var trial = prepared
+            fgUseFp4Variant(trial, index)
+            seconds[index] = 1e30
+            # Untimed: builds the pipeline, checks its width limit and the result on the test input.
+            if not sessionBegin(be):
+                raise newException(ValueError, "FIR FP4 GEMV tune: sessionBegin failed")
+            var ok = sessionCopyInto(be, test, inHandle, 0, inOffset, inElements)
+            if ok and sessionEncPipeline(vk, trial.name, trial.source):
+                let maxTg = sessionEncMaxTg(vk)
+                ok = maxTg <= 0 or maxTg >= trial.fp4Tg
+            else:
+                ok = false
+            if ok:
+                ok = fgEncodeMicroBody(model, trial, node, 0)
+            if not sessionEnd(be):
+                discard sessionRecoverQueue(be)
+                ok = false
+            if not ok:
+                if index == 0:
+                    raise newException(ValueError, "FIR FP4 GEMV tune: the lifted kernel failed: " & op)
+                continue
+            let values = sessionRead(be, outHandle, outOffset+n)[outOffset ..< outOffset+n]
+            if index == 0:
+                reference = values
+                valid[index] = true
+            else:
+                var err, mag: float32
+                var finite = true
+                for j, v in values:
+                    if classify(v) in {fcNan, fcInf, fcNegInf}:
+                        finite = false
+                    err = max(err, abs(v - reference[j]))
+                    mag = max(mag, abs(reference[j]))
+                valid[index] = finite and err <= max(1e-5'f32, mag*1e-4'f32)
+        sessionFree(be, test)
+        for round in 0 ..< 3:
+            for j in 0 ..< count:
+                let index = if round mod 2 == 0: j else: count-1-j
+                if not valid[index]:
+                    continue
+                var trial = prepared
+                fgUseFp4Variant(trial, index)
+                if not sessionBegin(be):
+                    raise newException(ValueError, "FIR FP4 GEMV tune: sessionBegin failed")
+                for rep in 0 ..< FgFp4TuneReps:
+                    if not fgEncodeMicroBody(model, trial, node, 0):
+                        discard sessionEnd(be)
+                        raise newException(ValueError, "FIR FP4 GEMV tune: dispatch failed for " & trial.name)
+                let startedAt = epochTime()
+                if not sessionEnd(be):
+                    raise newException(ValueError, "FIR FP4 GEMV tune: sessionEnd failed for " & trial.name)
+                seconds[index] = min(seconds[index], (epochTime()-startedAt) / float(FgFp4TuneReps))
+            if round == 0:
+                # Later rounds only separate the contenders: drop variants 30% behind the fastest.
+                var fastest = 1e30
+                for index in 0 ..< count:
+                    if valid[index]:
+                        fastest = min(fastest, seconds[index])
+                for index in 1 ..< count:
+                    if valid[index] and seconds[index] > fastest*1.3:
+                        valid[index] = false
+        var best = 0
+        for index in 0 ..< count:
+            if valid[index] and seconds[index] < seconds[best]:
+                best = index
+        chosen[prepared.fp4Variants[0].name] = best
+        cache[cacheKey] = best
+        if verbose:
+            var line = "[fir] FP4 GEMV tune " & op & " N=" & $n & ":"
+            for index, variant in prepared.fp4Variants:
+                line = line & " tg" & $variant.tg & (if index == 0: "(lifted)" else: "") & "=" & (if seconds[index] < 1e30: formatFloat(seconds[index]*1e3, ffDecimal, 3) & "ms" else: "invalid")
+            stderr.writeLine(line & " -> tg" & $prepared.fp4Variants[best].tg)
+    var keys: seq[string]
+    for key, item in model.programs:
+        if item.fp4Variants.len > 1 and chosen.hasKey(item.fp4Variants[0].name):
+            keys.add(key)
+    for key in keys:
+        var item = model.programs[key]
+        fgUseFp4Variant(item, chosen[item.fp4Variants[0].name])
+        model.programs[key] = item
+    model.dispatched = savedDispatched
+    model.activeRows = savedRows
 
 function firGraphTuneGemv(model: var FirGraph)
     ## The native Q4 autotune for the FIR Q4 GEMV micro-kernel: for each GEMV shape, time every
@@ -1273,6 +1525,8 @@ function firGraphTuneGemv(model: var FirGraph)
     ## the GPU wait of one command buffer, best of three), then give every node of that shape
     ## the fastest. The writes land in activation buffers the run overwrites. Choices are kept
     ## per process, so a graph loaded again reuses them. BYBY_FIR_Q4_GEMV_TUNE=0 skips it.
+    ## FP4-KM GEMV micro-kernels are tuned first (fgTuneFp4Gemv, Metal and Vulkan).
+    fgTuneFp4Gemv(model)
     if not model.gemvTune or model.backend.kind.toByby() != gbVulkan:
         return
     var cache {.global.}: Table[string, int]
