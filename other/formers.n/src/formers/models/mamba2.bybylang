@@ -257,14 +257,19 @@ function fmMambaSetNorm(mm: FmMambaModel)
     stderr.writeLine("[formers.n] norm preset " & preset)
 
 function fmMambaPrefillChunk(): int
-    ## The resident prefill runs in chunks of BYBY_PREFILL_BATCH_SIZE tokens
-    ## and JIT-compiles its scan kernels for each chunk length.
+    ## The resident prefill runs in chunks of BYBY_UBATCH tokens (BYBY_PREFILL_BATCH_SIZE is the
+    ## older name) and JIT-compiles its scan kernels for each chunk length. formers.n keeps 128 by
+    ## default: its chunk and tail lengths are the phases of a lifted FIR graph, and the lifted
+    ## models were recorded with 128. Up to ResidentPrefillMaxT runs a longer prompt in one pass
+    ## (the warmup prompt and the lifted phases change with it).
     result = 128
     try:
-        result = parseInt(getEnv("BYBY_PREFILL_BATCH_SIZE", "128"))
+        result = parseInt(getEnv("BYBY_UBATCH", getEnv("BYBY_PREFILL_BATCH_SIZE", "128")))
     except ValueError:
         discard
-    result = max(2, min(result, 128))
+    if result == 0:
+        result = ResidentPrefillMaxT
+    result = max(2, min(result, ResidentPrefillMaxT))
 
 function fmMambaTensorCores(ctx: Backend): bool
     ## Vulkan dGPU with KHR_cooperative_matrix: prefill GEMMs run on the tensor
@@ -347,8 +352,10 @@ function fmMambaFeed(mm: var FmMambaModel, ctx: Backend, chat: var FmMambaChat, 
     # a FIR graph lifted from these pieces runs any prompt the same way.
     let carryAll = residentPrefillReason(mm.model, ctx).len == 0
     if first or tensorCores:
+        # The pieces are whole chunks, and the prefill splits them with the same chunk length.
+        let chunk = fmMambaPrefillChunk()
         for piece in fmMambaPrefillPieces(input.len - 1):
-            m2infer.forwardPrefillBatch(mm.model, mm.lora, input[start ..< start + piece], ctx, continued = carryAll or not first or start > 0)
+            m2infer.forwardPrefillBatch(mm.model, mm.lora, input[start ..< start + piece], ctx, continued = carryAll or not first or start > 0, ubatch = chunk)
             chat.ids.add(input[start ..< start + piece])
             start += piece
         if start > 0 and getEnv("BYBY_PREFILL_KEEP_SCRATCH", "0") != "1":

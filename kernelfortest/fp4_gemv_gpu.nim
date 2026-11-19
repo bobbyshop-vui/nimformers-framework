@@ -45,6 +45,10 @@ type
     m4GlslSrc*: string
     tgBytes*: int          ## threadgroup memory (LUT + vung reduce) - xem fp4GemvTgBytes
     decSimd*: bool         ## the selected decode kernel reduces with simdgroup sums (fused variants follow it)
+    decKind*: string       ## family of the selected decode kernel: "" (legacy/wide/simd), "dec" or "sg"
+    decRows*: int          ## output rows per subgroup ("sg") or per threadgroup ("dec")
+    decUnroll*: int        ## packed words in flight per lane and row ("sg")
+    decLutConst*: bool     ## FP4 table read from the constant buffer instead of threadgroup memory ("sg")
     residentReady*: bool
 
 var gFp4CacheGpu* = initTable[string, Fp4LinCacheGpu]()

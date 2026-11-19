@@ -95,6 +95,24 @@ doAssert releaseResidentPrefill()>0
 doAssert error(longStates,states())<3e-4'f32
 doAssert error(longLogits,forwardStepJambaGpu(m,11,ctx).data)<3e-4'f32
 echo "PASS infer_lora 257 tokens in 128 + 128 + 1 with R/P/G and LoRA"
+# Whole micro-batch: 300 tokens in one resident pass (default BYBY_UBATCH), the scan picked by
+# the autotune (or the SSD pass on Vulkan).
+delEnv("BYBY_PREFILL_BATCH_SIZE")
+putEnv("BYBY_PREFILL_SCAN","auto")
+var ubatchIds: seq[int]
+for i in 0..<300: ubatchIds.add((i*5+1) mod m.vocab)
+warmupGpuForParallelPrefill(m,ctx)
+for id in ubatchIds: discard forwardStepJambaGpu(m,id,ctx,produceLogits=false)
+let ubatchStates=states()
+let ubatchLogits=forwardStepJambaGpu(m,11,ctx).data
+resetGpuGenState(m,ctx)
+forwardPrefillBatch(m,lo,ubatchIds,ctx)
+doAssert releaseResidentPrefill()>0
+let ubStateError=error(ubatchStates,states())
+let ubLogitError=error(ubatchLogits,forwardStepJambaGpu(m,11,ctx).data)
+doAssert ubStateError<3e-4'f32 and ubLogitError<3e-4'f32,
+  &"one micro-batch of 300: state={ubStateError} logits={ubLogitError}"
+echo &"PASS infer_lora 300 tokens as one micro-batch state={ubStateError:.3g} logits={ubLogitError:.3g}"
 # Existing disable switch still selects the tokenwise fallback.
 putEnv("BYBY_PREFILL_PARALLEL","0")
 resetGpuGenState(m,ctx)

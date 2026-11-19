@@ -48,6 +48,8 @@ const
   CFG_MIN_LR* = 3e-5'f32       # floor of the cosine decay
   CFG_WARMUP_STEPS* = 300      # linear warmup; also replayed after every resume (Adam restarts)
   CFG_LR_DECAY_STEPS* = 30_000 # global step where the cosine decay reaches CFG_MIN_LR
+  CFG_RESUME_LR* = 1e-4'f32    # peak of the cosine restarted for a run resumed past CFG_LR_DECAY_STEPS
+  CFG_RESUME_MIN_LR* = 1e-5'f32 # floor of that restarted cosine, reached at the end of the run
   CFG_REQUANTIZE_EVERY* = 50   # see the explanation in trainStep below
   CFG_LOG_EVERY* = 100         # log the loss every N steps
   CFG_BPE_TRAIN_CHARS* = 300_000  # number of leading corpus chars used to train BPE
@@ -1609,9 +1611,17 @@ when isMainModule:
     ## where the checkpoint stopped instead of jumping back to the peak. Adam moments are not
     ## saved, so every run (fresh or resumed) warms up again from its own first step - a full
     ## LR step on zeroed moments is what makes the loss spike right after a resume.
-    let progress = clamp(float64(step) / float64(max(1, CFG_LR_DECAY_STEPS)), 0.0, 1.0)
+    ## A run resumed past CFG_LR_DECAY_STEPS would otherwise sit at CFG_MIN_LR forever, so it
+    ## restarts a cosine over its own CFG_N_STEPS, from CFG_RESUME_LR down to CFG_RESUME_MIN_LR.
+    var peak = float64(CFG_LR)
+    var lrFloor = float64(CFG_MIN_LR)
+    var progress = clamp(float64(step) / float64(max(1, CFG_LR_DECAY_STEPS)), 0.0, 1.0)
+    if startStep >= CFG_LR_DECAY_STEPS:
+      peak = float64(CFG_RESUME_LR)
+      lrFloor = float64(CFG_RESUME_MIN_LR)
+      progress = clamp(float64(step - startStep) / float64(max(1, CFG_N_STEPS)), 0.0, 1.0)
     let cosine = 0.5 * (1.0 + cos(PI * progress))
-    let decayed = float64(CFG_MIN_LR) + (float64(CFG_LR) - float64(CFG_MIN_LR)) * cosine
+    let decayed = lrFloor + (peak - lrFloor) * cosine
     let local = step - startStep
     let warm = if CFG_WARMUP_STEPS > 0: min(1.0, float64(local) / float64(CFG_WARMUP_STEPS)) else: 1.0
     float32(decayed * warm)
@@ -1630,7 +1640,8 @@ when isMainModule:
       result.ids[b] = xIds
       result.targets[b] = tgt
 
-  var rng = initRand(42)
+  # Seeded by the resume point: a fixed seed made every resumed run train on the same batches.
+  var rng = initRand(42 + startStep)
   echo &"== Starting demo training: {CFG_N_STEPS} steps (from step {startStep + 1}), batch={CFG_BATCH_SIZE}, seq={CFG_SEQ_LEN} =="
   # The loop runs the NEXT CFG_N_STEPS steps after startStep (not
   # always back to step 1) - resume uses the step count saved in the checkpoint.

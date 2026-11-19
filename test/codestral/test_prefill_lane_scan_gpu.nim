@@ -8,7 +8,8 @@ let ctx = newBackend(getEnv("BYBY_INFER_BACKEND", "metal"))
 let be = ctx.kind.toByby()
 ensureTgCap(ctx)
 for (H, D, N, G, C) in [(8, 4, 32, 2, 32), (8, 4, 128, 2, 32), (128, 64, 128, 8, 8192)]:
-  for T in [2, 17, 33, 128]:
+  # 512 = the default prefill micro-batch (BYBY_UBATCH): the whole prompt in one scan.
+  for T in [2, 17, 33, 128, 512]:
     if H == 128 and T > 17: continue
     let L = prefixLayout(1, T, H, D, N, G, 4, C, 1e-5'f32, G, true)
     var seed = newSeq[float32](L.fwdEnd)

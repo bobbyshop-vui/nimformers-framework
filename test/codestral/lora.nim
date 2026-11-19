@@ -1417,6 +1417,17 @@ proc prepareGpuModel*(m: var NimformerModelJamba, lora: var JambaLora, ctx: Back
     of bkMamba, bkSpectron:
       raise newException(ValueError,
         "prepareGpuModel: M/S blocks have no 100% GPU path yet")
+  # The fused out_proj + residual GEMVs of the R blocks compile here with the rest, not inside the
+  # first decode session.
+  var fusedResidual = 0
+  for i in 0 ..< m.blocks.len:
+    if m.blocks[i].kind == bkMambaReal and
+        fusedResidualGemv("block" & $i & ".mambaReal.outProj.weight").kn.len > 0:
+      inc fusedResidual
+  if fusedResidual > 0:
+    prewarmVulkanJit(be)
+    stderr.writeLine "[infer] decode: out_proj + residual fused into one GEMV in " &
+      $fusedResidual & " R blocks"
 
   # ── Persistent buffers + normF + lm_head ─────────────────────────────────
   # Nobody used to initialise these: gHXPersist/gHNormPersist/gHFinalPersist/
