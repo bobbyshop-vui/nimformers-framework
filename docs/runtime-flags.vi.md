@@ -63,7 +63,7 @@ chờ (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_PREFAULT` | `1` | Đọc tuần tự một lượt file đã map để nạp page cache. |
 | `BYBY_EMBED_RAM` | `1` | Giữ embedding không tied trong RAM. |
 | `BYBY_LM_HEAD` | `q4` | Lượng tử hoá `lm_head` fp32 sang Q4 để chạy GEMV đã tune. `fp32`: giữ nguyên. |
-| `BYBY_UBATCH` | `512` | Số hàng micro-batch prefill. `0`: không giới hạn trên thiết bị có pacing. |
+| `BYBY_UBATCH` | `512` | Số hàng micro-batch prefill. `0`: không giới hạn trên thiết bị có pacing. Codestral (`infer_lora`): prompt tới chừng này token chạy một lượt resident prefill (mọi GEMM và SSD/lane scan trên toàn bộ prompt, shader biên dịch một lần); prompt dài hơn chạy theo từng lượt cỡ này, state nối giữa các lượt. Khoảng 2..4096, `0` = 4096; `BYBY_PREFILL_BATCH_SIZE` là tên cũ. Codestral trong `formers-cli` giữ 128 nếu không đặt, vì FIR graph đã lift có một phase cho mỗi độ dài đoạn và đuôi. |
 | `BYBY_PREFILL_CB_MS` | `300` | Thời gian GPU đích của một command buffer prefill. |
 | `BYBY_PREFILL_MAX_ROWS` | `512` | Số hàng tối đa của một đoạn prefill. |
 | `BYBY_PREFILL_SESSION_MB` | `1024` | Ngân sách scratch của một session prefill. |
@@ -73,6 +73,8 @@ chờ (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_DECODE_LAYERS_PER_CB` | tự động | Số layer mỗi command buffer decode (`0`: một buffer mỗi token). |
 | `BYBY_DECODE_FIRST_CB` | `0` | Commit sau chừng này layer đầu để GPU bắt đầu sớm. |
 | `BYBY_DECODE_REPLAY` | `1` | Codestral (`infer_lora`, `formers-cli`), Vulkan và Metal: sau một bước encode, bước decode được ghi lại một lần (có và không có head) rồi submit lại mỗi token; host chỉ ghi hàng embedding và đọc logits. Bản ghi bị bỏ khi chuẩn bị model GPU, reset state và merge LoRA. Tắt khi bật FIR recorder, `BYBY_DECODE_SPLIT`, `BYBY_G_DIAGNOSTICS` và one-dispatch. `0`: encode mỗi bước. `BYBY_DECODE_REPLAY_VERBOSE=1` in lại dòng bật/tắt. |
+| `BYBY_DECODE_FUSE_RESIDUAL` | `1` | Decode Codestral: GEMV out_proj của block R tự cộng vào residual (bớt một dispatch và một barrier mỗi layer) khi kernel decode FP4-KM đã autotune là kernel subgroup-row (`sg`) hoặc decode (`dec`) và projection không có bias. `0`: GEMV và phép cộng tách riêng. |
+| `BYBY_GEMV_SUBGROUP` | `auto` | Autotune GEMV decode FP4-KM thử thêm các micro-kernel subgroup-row: một subgroup 32 lane cho 1-8 hàng output, mỗi lane giữ hai word weight đang tải, rút gọn bằng `subgroupAdd`/`simd_sum`, LUT ở threadgroup hoặc constant memory. `auto`: Vulkan có subgroup cố định 32 lane mà không phải Intel (NVIDIA T4), và GPU Apple trên Metal. `1`: thử trên mọi GPU (pipeline mà driver chạy hẹp hơn 32 lane sẽ trượt parity và bị loại); `0`: không bao giờ. |
 | `BYBY_MERGE_QKV_ATTN_SESSION` | `1` | Gộp QKV và attention vào một session. |
 | `BYBY_MERGE_ALL_LAYERS_SESSION` | `1` | Giữ mọi layer của một token trong một session. |
 | `BYBY_HEAD_IN_SESSION` | `1` | Chạy norm cuối và `lm_head` trong session decode. |
@@ -121,7 +123,7 @@ chờ (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_VULKAN_JIT_DIR` | thư mục tạm | Thư mục cache SPIR-V và pipeline. |
 | `BYBY_VULKAN_JIT_VERBOSE` | `0` | Log biên dịch JIT và binding dispatch. |
 | `BYBY_JIT_DUMP_SOURCE` | `0` | In GLSL của mọi kernel JIT. |
-| `BYBY_VULKAN_TIMESTAMPS` | `0` | Timestamp thiết bị mỗi session. |
+| `BYBY_VULKAN_TIMESTAMPS` | `0` | Timestamp thiết bị mỗi session. Autotune GEMV decode FP4 tự bật nó cho các lượt đo của mình, nên lựa chọn so thời gian GPU chứ không phải độ trễ submit. |
 | `BYBY_VULKAN_STRICT` | `0` | Báo lỗi khi offset binding vượt buffer thay vì kẹp lại. |
 | `BYBY_Q4_TUNED` | `1` | Autotune GEMV/GEMM Q4 (`0`: kernel mặc định). |
 | `BYBY_GPU_AUTOTUNE` | `1` | Công tắc chung của autotune GPU. |
@@ -129,7 +131,7 @@ chờ (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_Q4_TUNE_VERBOSE` | `0` | Log các kernel bị loại vì sai parity. |
 | `BYBY_FLASH_ATTENTION` | `auto` | Loại flash attention; `scalar` ép FP32. |
 | `BYBY_FUSE_ROPE` | `1` | Gộp RoPE vào bước append KV. |
-| `BYBY_SSD` | `auto` | Kernel SSD của Mamba2. Trong lúc đang ghi FIR, `auto` giữ đường scan micro-VM bật vì shader SSD native không thể được graph đã lift phát lại; `1` ép dùng SSD và `0` tắt nó. |
+| `BYBY_SSD` | `auto` | Kernel SSD của Mamba2. Trong lúc đang ghi FIR, `auto` giữ đường scan micro-VM bật vì shader SSD native không thể được graph đã lift phát lại; `1` ép dùng SSD và `0` tắt nó. Khi pass SSD chạy, resident prefill bỏ qua autotune scan (parity lane và đo serial/parallel) vì không encode kernel scan nào. |
 
 ## Lift (`firlift --run`)
 

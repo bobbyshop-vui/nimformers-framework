@@ -64,7 +64,7 @@ without waiting (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_PREFAULT` | `1` | One sequential pass over the mapped file to fill the page cache. |
 | `BYBY_EMBED_RAM` | `1` | Keep an untied embedding in RAM. |
 | `BYBY_LM_HEAD` | `q4` | Quantize an fp32 `lm_head` to Q4 for the tuned GEMV. `fp32` keeps it. |
-| `BYBY_UBATCH` | `512` | Prefill micro-batch rows. `0`: uncapped on paced devices. |
+| `BYBY_UBATCH` | `512` | Prefill micro-batch rows. `0`: uncapped on paced devices. Codestral (`infer_lora`): a prompt up to this many tokens runs as one resident prefill pass (every GEMM and the SSD/lane scan over all of it, shaders compiled once); longer prompts run in passes of this size with the state carried between them. Range 2..4096, `0` = 4096; `BYBY_PREFILL_BATCH_SIZE` is the older name. Codestral in `formers-cli` keeps 128 unless set, because a lifted FIR graph holds one phase per chunk and tail length. |
 | `BYBY_PREFILL_CB_MS` | `300` | Target GPU time of one prefill command buffer. |
 | `BYBY_PREFILL_MAX_ROWS` | `512` | Upper bound of rows in one prefill chunk. |
 | `BYBY_PREFILL_SESSION_MB` | `1024` | Scratch budget of one prefill session. |
@@ -74,6 +74,8 @@ without waiting (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_DECODE_LAYERS_PER_CB` | auto | Layers per decode command buffer (`0`: one per token). |
 | `BYBY_DECODE_FIRST_CB` | `0` | Commit after this many layers first so the GPU starts early. |
 | `BYBY_DECODE_REPLAY` | `1` | Codestral (`infer_lora`, `formers-cli`), Vulkan and Metal: after one encoded step the decode step is recorded once (with and without the head) and resubmitted per token; the host only writes the embedding row and reads the logits. Recordings are dropped on GPU model preparation, state reset and LoRA merge. Off under the FIR recorder, `BYBY_DECODE_SPLIT`, `BYBY_G_DIAGNOSTICS` and one-dispatch. `0` encodes every step. `BYBY_DECODE_REPLAY_VERBOSE=1` repeats the on/off line. |
+| `BYBY_DECODE_FUSE_RESIDUAL` | `1` | Codestral decode: the out_proj GEMV of an R block adds into the residual itself (one dispatch and one barrier less per layer) when its autotuned FP4-KM decode kernel is a subgroup-row (`sg`) or decode (`dec`) kernel and the projection has no bias. `0`: separate GEMV and add. |
+| `BYBY_GEMV_SUBGROUP` | `auto` | FP4-KM decode GEMV autotune also tries the subgroup-row micro-kernels: one 32-lane subgroup per 1-8 output rows, two weight words per lane in flight, `subgroupAdd`/`simd_sum` reduction, LUT in threadgroup or constant memory. `auto`: Vulkan with fixed 32-lane subgroups that is not Intel (NVIDIA T4), and Apple GPUs on Metal. `1`: try them on any GPU (a pipeline the driver runs narrower than 32 lanes fails the parity check and is dropped); `0`: never. |
 | `BYBY_MERGE_QKV_ATTN_SESSION` | `1` | Merge QKV and attention into one session. |
 | `BYBY_MERGE_ALL_LAYERS_SESSION` | `1` | Keep all layers of a token in one session. |
 | `BYBY_HEAD_IN_SESSION` | `1` | Run final norm and `lm_head` in the decode session. |
@@ -122,7 +124,7 @@ without waiting (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_VULKAN_JIT_DIR` | temp dir | SPIR-V and pipeline cache directory. |
 | `BYBY_VULKAN_JIT_VERBOSE` | `0` | Log JIT compiles and dispatch bindings. |
 | `BYBY_JIT_DUMP_SOURCE` | `0` | Print the GLSL of every JIT kernel. |
-| `BYBY_VULKAN_TIMESTAMPS` | `0` | Device timestamps per session. |
+| `BYBY_VULKAN_TIMESTAMPS` | `0` | Device timestamps per session. The FP4 decode GEMV autotune turns them on for its own timing runs, so its choice compares GPU time instead of submit latency. |
 | `BYBY_VULKAN_STRICT` | `0` | Fail on a binding offset past the buffer instead of clamping. |
 | `BYBY_Q4_TUNED` | `1` | Q4 GEMV/GEMM autotune (`0`: default kernels). |
 | `BYBY_GPU_AUTOTUNE` | `1` | Global switch of GPU autotuning. |
@@ -130,7 +132,7 @@ without waiting (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_Q4_TUNE_VERBOSE` | `0` | Log autotune parity rejects. |
 | `BYBY_FLASH_ATTENTION` | `auto` | Flash attention kind; `scalar` forces FP32. |
 | `BYBY_FUSE_ROPE` | `1` | Fuse RoPE into the KV append. |
-| `BYBY_SSD` | `auto` | Mamba2 SSD kernel. During an active FIR recording, `auto` leaves the micro-VM scan path enabled because the native SSD shaders cannot be replayed by a lifted graph; `1` forces SSD and `0` disables it. |
+| `BYBY_SSD` | `auto` | Mamba2 SSD kernel. During an active FIR recording, `auto` leaves the micro-VM scan path enabled because the native SSD shaders cannot be replayed by a lifted graph; `1` forces SSD and `0` disables it. When the SSD pass runs, the resident prefill skips the scan autotune (lane parity and serial/parallel timing), since no scan kernel is encoded. |
 
 ## Lifting (`firlift --run`)
 

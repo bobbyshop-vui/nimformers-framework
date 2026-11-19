@@ -501,9 +501,19 @@ proc residentPrefillReason*(m: NimformerModelJamba; ctx: Backend): string =
       if lin.isFp4 and gFp4CacheGpu[name].m4JitName.len == 0:
         return "missing FP4 batch kernel"
 
+const
+  ResidentPrefillMaxT* = 4096
+    ## Longest prefix one resident prefill pass takes. Every kernel of the pass covers all T rows
+    ## at once (GEMMs over T rows, the SSD/lane scan over the whole sequence), so the bound comes
+    ## from scratch memory and the T-unrolled lane-scan programs, not from a threadgroup size.
+  DefaultPrefillUbatch* = 512
+    ## Default micro-batch (BYBY_UBATCH): a prompt up to this length runs as one pass, so its
+    ## shaders are compiled once and no chunk carries state into the next.
+
 proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Backend; continuation = false) =
   ensureTgCap(ctx)
-  require(ids.len >= 2 and ids.len <= 128, "prefix length must be 2..128")
+  require(ids.len >= 2 and ids.len <= ResidentPrefillMaxT,
+    "prefix length must be 2.." & $ResidentPrefillMaxT)
   require(residentPrefillReason(m,ctx).len == 0, residentPrefillReason(m,ctx))
   let be = ctx.kind.toByby()
   gPrefixMps=0;gPrefixTensorCore=0;gPrefixPackedTiles=0;gPrefixFusedEpilogues=0
@@ -530,17 +540,6 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
       discard
   let requestedScan = getEnv("BYBY_PREFILL_SCAN","auto")
   require(requestedScan in ["auto","serial","coalesced","parallel","lanes"], "invalid BYBY_PREFILL_SCAN")
-  let scanMode=if requestedScan=="auto":
-      chooseScanMode(ctx,T,mr.numHeads,mr.headDim,mr.dState,mr.nGroups,
-        mr.convKernel,mr.intermediateSize,mr.normEps,mr.nGroups,continuation)
-    else:requestedScan
-  let parallel = scanMode.startsWith("parallel")
-  let parallelStateLanes =
-    if scanMode.startsWith("parallel_n"): parseInt(scanMode["parallel_n".len .. ^1])
-    else: 1
-  let coalesced = scanMode == "coalesced"
-  let lanes = scanMode == "lanes"
-  require(not lanes or laneScanStates(mr.dState) > 0, "lane scan needs dState = 32*k <= 256")
   # Every prompt takes the chunked SSD/FLA pass (matmuls on tensor cores, or
   # FP32 tiles without them) when its Vulkan pipelines pass parity; the scan
   # kernels stay the fallback. BYBY_SSD_MIN_T sends shorter prompts back to
@@ -560,6 +559,24 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
     while ssdQ < 256 and ssdScratchBytes(ssdQ) > budget: ssdQ *= 2
     if ssdScratchBytes(ssdQ) <= budget:
       ssd = sessionMamba2SsdPrepare(be, mr.dState, mr.headDim, ssdQ).len > 0
+  # The SSD pass replaces the scan step, so the scan autotune (lane parity, serial/parallel
+  # timing) only runs when a scan kernel will actually be encoded. A forced BYBY_PREFILL_SCAN
+  # keeps its meaning for the fallback path.
+  let scanMode =
+    if ssd: "ssd"
+    elif requestedScan == "auto":
+      chooseScanMode(ctx,T,mr.numHeads,mr.headDim,mr.dState,mr.nGroups,
+        mr.convKernel,mr.intermediateSize,mr.normEps,mr.nGroups,continuation)
+    else: requestedScan
+  let parallel = scanMode.startsWith("parallel")
+  let parallelStateLanes =
+    if scanMode.startsWith("parallel_n"): parseInt(scanMode["parallel_n".len .. ^1])
+    else: 1
+  let coalesced = scanMode == "coalesced"
+  let lanes = scanMode == "lanes"
+  require(not lanes or laneScanStates(mr.dState) > 0, "lane scan needs dState = 32*k <= 256")
+  require(not parallel or m2ScanTgSize(T) > 0,
+    "parallel scan needs T <= the threadgroup limit; use BYBY_PREFILL_SCAN=lanes or serial")
   let L = prefixLayout(1, T, mr.numHeads, mr.headDim, mr.dState,
     mr.nGroups, mr.convKernel, mr.intermediateSize, mr.normEps, mr.nGroups,
     compact = ssd or not parallel)
@@ -1240,11 +1257,24 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
     flushStage("inproj")
     pfTime("enc.copy"):
       copy(hProjection, hMamba, 0, L.proj, T * L.P)
-      # convW|convB are adjacent in both layouts; aLog|dSkip|dtBias|normW are
-      # adjacent in both too (the two blocks are ordered differently, so this
-      # stays two copies instead of six, halving the Vulkan global barriers).
-      copy(layer.hWork, hMamba, layer.off.offConvW, L.convW, L.cDim * L.K + L.cDim)
-      copy(layer.hWork, hMamba, layer.off.offALog, L.aLog, 3 * L.H + L.C)
+      # convW|convB and aLog|dSkip|dtBias|normW are adjacent in the prefill arena. The decode
+      # layout aligns every region to 64 floats, so they are adjacent there too only when H and
+      # cDim*K are multiples of 64 (Codestral): then two copies instead of six, halving the Vulkan
+      # global barriers. Other shapes copy region by region.
+      let o = layer.off
+      if o.offConvB == o.offConvW + L.cDim * L.K:
+        copy(layer.hWork, hMamba, o.offConvW, L.convW, L.cDim * L.K + L.cDim)
+      else:
+        copy(layer.hWork, hMamba, o.offConvW, L.convW, L.cDim * L.K)
+        copy(layer.hWork, hMamba, o.offConvB, L.convB, L.cDim)
+      if o.offDSkip == o.offALog + L.H and o.offDtBias == o.offDSkip + L.H and
+          o.offNormW == o.offDtBias + L.H:
+        copy(layer.hWork, hMamba, o.offALog, L.aLog, 3 * L.H + L.C)
+      else:
+        copy(layer.hWork, hMamba, o.offALog, L.aLog, L.H)
+        copy(layer.hWork, hMamba, o.offDSkip, L.dSkip, L.H)
+        copy(layer.hWork, hMamba, o.offDtBias, L.dtBias, L.H)
+        copy(layer.hWork, hMamba, o.offNormW, L.normW, L.C)
       if continuation:
         copy(layer.hWork,hMamba,layer.off.offSsm,L.states,L.HD*L.N)
         copy(layer.hWork,hMamba,layer.off.offConvSt,historyOff,L.cDim*(L.K-1))

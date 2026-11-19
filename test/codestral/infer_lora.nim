@@ -1049,8 +1049,18 @@ proc parallelPrefillFallbackReason(m: NimformerModelJamba; lora: JambaLora;
   if hasP and lpScanTgSize(tokenIds.len) == 0:
     return "Linear++ parallel scan is unavailable for this sequence length/device"
 
+proc prefillUbatch*(): int =
+  ## Tokens per resident prefill pass: BYBY_UBATCH (BYBY_PREFILL_BATCH_SIZE is the older name),
+  ## default 512, so a prompt up to that length runs as one pass over all of its tokens.
+  ## 0: the longest pass (ResidentPrefillMaxT).
+  result = envInt("BYBY_UBATCH", envInt("BYBY_PREFILL_BATCH_SIZE", DefaultPrefillUbatch))
+  if result == 0: result = ResidentPrefillMaxT
+  if result notin 2..ResidentPrefillMaxT:
+    raise newException(ValueError, "BYBY_UBATCH must be 2.." & $ResidentPrefillMaxT)
+
 proc forwardParallelPrefill(m: var NimformerModelJamba; lora: JambaLora;
-                            tokenIds: seq[int]; ctx: Backend; continued = false) =
+                            tokenIds: seq[int]; ctx: Backend; continued = false;
+                            ubatch = 0) =
   pfReset()
   gPfActive = true
   let pfWall0 = getMonoTime()
@@ -1059,9 +1069,11 @@ proc forwardParallelPrefill(m: var NimformerModelJamba; lora: JambaLora;
     if gPfEnabled:
       pfReport(float((getMonoTime() - pfWall0).inNanoseconds) / 1e6)
   if getEnv("BYBY_PREFILL_RESIDENT", "1") != "0" and residentPrefillReason(m, ctx).len == 0:
-    let batchSize=envInt("BYBY_PREFILL_BATCH_SIZE",128)
-    if batchSize notin 2..128:
-      raise newException(ValueError,"BYBY_PREFILL_BATCH_SIZE must be 2..128")
+    # One micro-batch per resident pass: the whole prompt when it fits the ubatch, so every
+    # GEMM and the sequence scan see all of it at once.
+    let batchSize = if ubatch > 0: ubatch else: prefillUbatch()
+    if batchSize notin 2..ResidentPrefillMaxT:
+      raise newException(ValueError,"prefill ubatch must be 2.." & $ResidentPrefillMaxT)
     var offset=0
     while offset < tokenIds.len:
       let count=min(batchSize,tokenIds.len-offset)
@@ -1099,11 +1111,13 @@ proc forwardParallelPrefill(m: var NimformerModelJamba; lora: JambaLora;
        &"R/P blocks={m.blocks.len}, P sidecars={pCount}; terminal recurrent states imported."
 
 proc forwardPrefillBatch*(m: var NimformerModelJamba; lora: JambaLora;
-                          tokenIds: seq[int]; ctx: Backend; continued = false) =
+                          tokenIds: seq[int]; ctx: Backend; continued = false;
+                          ubatch = 0) =
   ## Prefill R/P prefixes with sequence-parallel scans, then import each
   ## terminal state into the recurrent decode buffers. Decode remains one-token
   ## causal. Unsupported presets/blocks use the existing fallback; resident R/P/G
-  ## prefixes use compact inference scans and GPU MPS tiles in chunks up to 128.
+  ## prefixes run in micro-batches of `ubatch` tokens (0: BYBY_UBATCH, default 512) with
+  ## compact scans.
   ## continued: the tokens extend the current recurrent state (a later chat
   ## turn) instead of starting a sequence. Only the resident prefill carries
   ## a state in; without it the tokens run through decode steps.
@@ -1115,7 +1129,7 @@ proc forwardPrefillBatch*(m: var NimformerModelJamba; lora: JambaLora;
     fallbackReason = "continued prefill needs the resident prefill"
   if fallbackReason.len == 0:
     try:
-      forwardParallelPrefill(m, lora, tokenIds, ctx, continued)
+      forwardParallelPrefill(m, lora, tokenIds, ctx, continued, ubatch)
       return
     except CatchableError as e:
       # A reset would drop the state the continued tokens extend.

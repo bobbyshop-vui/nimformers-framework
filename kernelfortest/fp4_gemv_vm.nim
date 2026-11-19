@@ -775,6 +775,89 @@ proc buildFp4KmGemvDecodeProgram*(K, N, tg, rows: int; simd: bool;
   else: p.emitDecodeReduceTree(acc, tg, accumulate)
   p
 
+const Fp4SubgroupWidth* = 32   ## lanes per subgroup the subgroup-row GEMV is written for
+
+proc fp4KmGemvSubgroupSupported*(K, N, tg, rows, unroll: int): bool =
+  tg in [32, 64, 128, 256] and rows in [1, 2, 4, 8] and unroll in [1, 2, 4] and
+    K > 0 and K mod (Fp4SubgroupWidth * 8 * unroll) == 0 and
+    N > 0 and N mod (rows * (tg div Fp4SubgroupWidth)) == 0
+
+proc fp4KmGemvSubgroupRowsPerTg*(tg, rows: int): int = rows * (tg div Fp4SubgroupWidth)
+
+proc fp4KmGemvSubgroupTgBytes*(lutConst: bool): int = (if lutConst: 16 else: 16 * 4)
+
+proc buildFp4KmGemvSubgroupProgram*(K, N, tg, rows, unroll: int; lutConst = false;
+                                    accumulate = false): VmProgram =
+  ## FP4-KM decode GEMV with one 32-lane subgroup per `rows` output rows, the structure of the
+  ## Llama/DeepSeek decode GEMV: the lanes of a subgroup split K, every lane keeps its partial sums
+  ## in registers and one subgroup sum per row finishes the dot product. No threadgroup reduction
+  ## and no barrier after the FP4 table (none at all with `lutConst`), so a threadgroup of
+  ## tg / 32 subgroups covers rows * tg / 32 independent rows.
+  ## Per iteration a lane reads `unroll` packed words per row (8 weights each, the 32 lanes of a
+  ## subgroup cover 256 consecutive weights of the row) before it decodes any of them, so several
+  ## global loads are in flight per lane; the activations come as two 16-byte loads per word.
+  ## Weights: nibble bytes [N, K/2] then scale bytes [N, K/32] in slot u8 (byte j of a 32-value
+  ## group holds element j in the low nibble and j + 16 in the high one); decode table in slot lut
+  ## (16 FP4 values, then 256 scale values). `accumulate` adds the result to the output (a fused
+  ## residual connection). Needs subgroups of exactly 32 lanes: callers check parity before use.
+  doAssert fp4KmGemvSubgroupSupported(K, N, tg, rows, unroll)
+  let subgroups = tg div Fp4SubgroupWidth
+  proc word(u, r: int): uint32 = uint32(32 + u * 8 + r)
+  proc scaleByte(u, r: int): uint32 = uint32(64 + u * 8 + r)
+  proc acc(r: int): uint32 = uint32(32 + r)
+  proc partial(r: int): uint32 = uint32(48 + r)
+  var p: VmProgram
+  p.emitUTgid(0); p.emitULid(1)
+  if not lutConst:
+    p.emitUToR(11, 1); p.emitLoadConstF32(12, 16); p.emitCmpLt(13, 11, 12)
+    sessionVmIfGpu(p, 13):
+      p.emitULoadConstF(9, 1, 0); p.emitTgStoreF32(9, 11, 0)
+    p.emitBarrierTg()
+  p.emitUAndK(2, 1, uint32(Fp4SubgroupWidth - 1))              # U2 = lane
+  p.emitUShrK(8, 1, 5)                                         # U8 = subgroup in the threadgroup
+  p.emitUMulK(4, 0, uint32(subgroups * rows))
+  p.emitUMulK(9, 8, uint32(rows)); p.emitUAdd(4, 4, 9)         # U4 = first output row
+  p.emitUMulK(5, 4, uint32(K div 2))
+  p.emitUShlK(9, 2, 2); p.emitUAdd(5, 5, 9)                    # U5 = weight byte of the lane
+  p.emitUMulK(6, 4, uint32(K div 32)); p.emitUAddK(6, 6, uint32(N * (K div 2)))
+  p.emitUShrK(9, 2, 2); p.emitUAdd(6, 6, 9)                    # U6 = scale byte of the lane
+  p.emitUShlK(7, 9, 5); p.emitUAndK(10, 2, 3); p.emitUShlK(10, 10, 2)
+  p.emitUAdd(7, 7, 10)                                         # U7 = first activation of the lane
+  for r in 0 ..< rows: p.emitLoadConstF32(acc(r), 0)
+  p.emitLoadConstF32(5, float32(K div (Fp4SubgroupWidth * 8 * unroll)))
+  sessionVmForGpu(p, 5):
+    for u in 0 ..< unroll:
+      for r in 0 ..< rows:
+        p.emitULoadU32(word(u, r), 5, uint32(r * (K div 2) + u * 128))
+        p.emitULoadU8(scaleByte(u, r), 6, uint32(r * (K div 32) + u * 8))
+    for u in 0 ..< unroll:
+      p.emitULoadIn4(16, 7, uint32(u * 256))
+      p.emitULoadIn4(20, 7, uint32(u * 256 + 16))
+      for r in 0 ..< rows: p.emitLoadConstF32(partial(r), 0)
+      for t in 0 ..< 4:
+        for hi in 0 ..< 2:
+          for r in 0 ..< rows:
+            p.emitUShrK(3, word(u, r), uint32(8 * t + 4 * hi)); p.emitUAndK(3, 3, 15)
+            if lutConst: p.emitULoadConstF(1, 3, 0)
+            else:
+              p.emitUToR(1, 3); p.emitTgLoadF32(1, 1, 0)
+            p.emitFma(partial(r), 1, uint32(16 + t + 4 * hi), partial(r))
+      for r in 0 ..< rows:
+        p.emitULoadConstF(2, scaleByte(u, r), 16)
+        p.emitFma(acc(r), 2, partial(r), acc(r))
+    p.emitUAddK(5, 5, uint32(128 * unroll))
+    p.emitUAddK(6, 6, uint32(8 * unroll))
+    p.emitUAddK(7, 7, uint32(256 * unroll))
+  for r in 0 ..< rows: p.emitSimdSum(acc(r), acc(r))
+  p.emitUToR(1, 2); p.emitLoadConstF32(8, 1); p.emitCmpLt(9, 1, 8)
+  sessionVmIfGpu(p, 9):
+    for r in 0 ..< rows:
+      if accumulate:
+        p.emitULoadF32(1, 4, uint32(r)); p.emitAdd(acc(r), acc(r), 1)
+      p.emitUStoreF32(acc(r), 4, uint32(r))
+  p.emitHalt()
+  p
+
 proc buildFp4KmGemmTunedProgram*(K, N, tg, batchRows: int): VmProgram =
   ## Batched variant: decode one packed word/scale for all input rows.
   doAssert tg in [32, 64, 128, 256, 512, 1024] and batchRows in [4, 8]

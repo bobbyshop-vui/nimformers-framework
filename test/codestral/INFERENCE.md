@@ -63,8 +63,42 @@ make infer-lora BYBY_INFER_BACKEND=vulkan
 make infer-lora BYBY_PREFILL_GEMM=mps BYBY_PREFILL_SCAN=serial
 ```
 
-Prefill batches default to 128 tokens (`BYBY_PREFILL_BATCH_SIZE=2..128`).
-State carries across chunks. `BYBY_PREFILL_LAYERS_PER_COMMIT` defaults to four.
+## Whole-prompt prefill (micro-batch)
+
+A prompt of up to `BYBY_UBATCH` tokens (default 512, range 2..4096, `0` = 4096;
+`BYBY_PREFILL_BATCH_SIZE` is the older name) runs as **one** resident prefill pass: every
+projection is one GEMM over all of its rows, and the sequence scan covers the whole prompt. On
+Vulkan with tensor cores that scan is the chunked SSD pass (its matmuls on the tensor cores, so the
+time axis is parallel too); elsewhere the register lane scan runs one 32-lane group per channel over
+the whole prompt (the timestep-parallel scan is limited to a threadgroup of rows, so `auto` falls
+back to it only for short prompts). A longer prompt runs in passes of this size with the recurrent
+state carried between them. One pass also means one set of T-specialized shaders: a 246-token
+prompt used to compile and autotune twice (128 + 118 rows).
+
+When the SSD pass runs, the scan autotune (lane parity, serial/parallel timing) is skipped, since no
+scan kernel is encoded. `BYBY_PREFILL_LAYERS_PER_COMMIT` defaults to four on Metal, eight on Vulkan.
+
+`formers-cli` keeps 128-token chunks for Codestral unless `BYBY_UBATCH` is set: a lifted FIR graph
+holds one phase per chunk and tail length, and the lifted models were recorded with 128.
+
+The prefill copies the Mamba parameters (`convW|convB`, `aLog|dSkip|dtBias|normW`) out of the
+decode work buffer. That buffer aligns every region to 64 floats, so the regions are adjacent only
+when H and cDim*K are multiples of 64 (Codestral); other shapes are copied region by region. (Before
+this, small test models read a shifted `dSkip`/`dtBias` and the integration test failed.)
+
+## Decode GEMV: subgroup rows and the fused residual
+
+The FP4 decode GEMV autotune times on the GPU (Vulkan timestamps are turned on for its runs), so
+its choice is not dominated by submit latency. With fixed 32-lane subgroups (NVIDIA on Vulkan,
+Apple GPUs on Metal; `BYBY_GEMV_SUBGROUP=auto|1|0`) it also tries subgroup-row micro-kernels
+(`buildFp4KmGemvSubgroupProgram`): one subgroup per 2-4 output rows, two weight words per lane in
+flight, a `subgroupAdd`/`simd_sum` reduction instead of the shared-memory tree, the LUT in
+threadgroup or constant memory. Every candidate must reproduce the baseline kernel first, so a
+pipeline the driver runs narrower than 32 lanes (Intel picks SIMD16 under register pressure) is
+dropped. When the chosen out_proj kernel is a subgroup-row or decode kernel, the R block's out_proj
+adds into the residual itself (`BYBY_DECODE_FUSE_RESIDUAL=1`, default): one dispatch and one barrier
+less per layer. `test_fp4_gemv_subgroup.nim` checks every geometry (plain and fused) against the
+baseline kernel, and `test_decode_replay.nim` (`REPLAY_EMBED=256`) compares fused and unfused logits.
 
 `BYBY_PREFILL_SCAN=auto` benchmarks compact serial and timestep-parallel scans
 on the selected GPU; set `serial`, `parallel`, or `coalesced` to force a route.
@@ -175,6 +209,8 @@ tokens were Metal 61.44 -> 25.98 ms, Vulkan 96.65 -> 28.61 ms. These measure
 the scan only, including state transpose overhead, not whole-model tokens/s.
 
 `test_resident_prefill_integration.nim` covers R/P/G with nonzero LoRA, bias,
-serial/coalesced/parallel scans, MPS/packed GEMMs, state carry and 257 tokens.
+serial/coalesced/parallel scans, MPS/packed GEMMs, state carry, 257 tokens in 128-token chunks
+and 300 tokens as one micro-batch. `test_prefill_lane_scan_gpu.nim` checks the lane scan up to
+512 timesteps.
 `test_inplace_lora_merge.nim` covers error and memory guards, packed-bit
 preservation, buffer identity and decode logits after an accepted merge.

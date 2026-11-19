@@ -231,8 +231,26 @@ var gLinCache* = initTable[string, GpuLin]()   ## the single source of truth: EV
 
 type Fp4Plan = object
   kn, label: string
-  tg, rows, bytes: int
+  tg, rows, bytes: int   ## rows: output rows per threadgroup (the dispatch covers N / rows groups)
   simd: bool
+  kind: string           ## "" (legacy, wide, simd), "dec" or "sg" (kernels with a fused-residual form)
+  kernelRows: int        ## rows per threadgroup ("dec") or per subgroup ("sg")
+  unroll: int
+  lutConst: bool
+
+proc fp4SubgroupCandidates(be: byby.GpuBackend): bool =
+  ## BYBY_GEMV_SUBGROUP = auto | 1 | 0: try the subgroup-row FP4 decode GEMV. auto: on Vulkan
+  ## devices whose compute subgroups are 32 lanes (NVIDIA, AMD wave32) and on Apple GPUs. The
+  ## tuner still checks every candidate against the baseline kernel before timing it.
+  let setting = getEnv("BYBY_GEMV_SUBGROUP", "auto")
+  if setting == "0": return false
+  if setting == "1": return true
+  if be == byby.gbVulkan:
+    let caps = vkDriver.vulkanDeviceCaps()
+    return caps.subgroupSize == Fp4SubgroupWidth and caps.properties.vendorID != 0x8086'u32
+  when defined(macosx):
+    if be == byby.gbMetal: return metalDriver.metalIsAppleGpu()
+  false
 
 var gFp4Plans = initTable[string, Fp4Plan]()
 
@@ -303,7 +321,24 @@ proc tuneFp4Plan(ctx: Backend; c: Fp4LinCacheGpu; batch: int): Fp4Plan =
             let kn = vmKernelForBe(buildFp4KmGemvDecodeProgram(c.cols, c.rows, tg, dRows, simd),
               "fp4_" & label & "_" & key, be)
             candidates.add Fp4Plan(kn: kn, label: label, tg: tg, rows: dRows,
-              bytes: fp4KmGemvDecodeTgBytes(dRows, tg), simd: simd)
+              bytes: fp4KmGemvDecodeTgBytes(dRows, tg), simd: simd, kind: "dec", kernelRows: dRows)
+          except CatchableError as e:
+            stderr.writeLine "[gpu-tune] skip " & label & ": " & e.msg
+  if batch == 1 and fp4SubgroupCandidates(be):
+    # One 32-lane subgroup per few rows, subgroup sums only (the Llama/DeepSeek decode GEMV).
+    for tg in [64, 128]:
+      if tg > maxThreads: continue
+      for sRows in [2, 4]:
+        for lutConst in [false, true]:
+          let unroll = 2
+          if not fp4KmGemvSubgroupSupported(c.cols, c.rows, tg, sRows, unroll): continue
+          let label = "sg" & $sRows & "u" & $unroll & (if lutConst: "c" else: "t") & "-tg" & $tg
+          try:
+            let kn = vmKernelForBe(buildFp4KmGemvSubgroupProgram(c.cols, c.rows, tg, sRows, unroll,
+              lutConst), "fp4_" & label & "_" & key, be)
+            candidates.add Fp4Plan(kn: kn, label: label, tg: tg,
+              rows: fp4KmGemvSubgroupRowsPerTg(tg, sRows), bytes: fp4KmGemvSubgroupTgBytes(lutConst),
+              simd: true, kind: "sg", kernelRows: sRows, unroll: unroll, lutConst: lutConst)
           except CatchableError as e:
             stderr.writeLine "[gpu-tune] skip " & label & ": " & e.msg
   if candidates.len == 1: return baseline
@@ -314,12 +349,19 @@ proc tuneFp4Plan(ctx: Backend; c: Fp4LinCacheGpu; batch: int): Fp4Plan =
   for i in 0 ..< data.len: data[i] = float32((i * 17 mod 101) - 50) / 64
   var hX = byby.sessionUpload(be, data)
   var hY = byby.sessionAllocScratch(be, batch * c.rows)
+  # Device timestamps on Vulkan too: one decode GEMV is a fraction of a millisecond, far below the
+  # submit + fence latency a wall clock would add to every sample.
+  let gpuTimed = byby.sessionSetGpuTiming(be, true)
   defer:
+    discard byby.sessionSetGpuTiming(be, false)
     byby.sessionFree(be, hX); byby.sessionFree(be, hY)
-  # Several dispatches per command buffer, so the per-kernel time is not buried under the submit
-  # latency; the GPU time of the command buffer is used where the backend reports it.
+  # Several dispatches per command buffer; without device time, enough of them that the submit
+  # latency does not decide the ranking.
   let weightBytes = c.rows * (c.cols div 2 + c.cols div 32)
-  let reps = if batch == 1: clamp(16 * 1024 * 1024 div max(weightBytes, 1), 1, 16) else: 1
+  let reps =
+    if batch != 1: 1
+    elif gpuTimed: clamp(48 * 1024 * 1024 div max(weightBytes, 1), 3, 16)
+    else: clamp(512 * 1024 * 1024 div max(weightBytes, 1), 8, 64)
   proc dispatch(plan: Fp4Plan; n = 1): float =
     let start = getMonoTime()
     let g0 = byby.sessionGpuSeconds(be)
@@ -377,7 +419,10 @@ proc tuneFp4Plan(ctx: Backend; c: Fp4LinCacheGpu; batch: int): Fp4Plan =
       best = i; bestMs = timings[i][1]
   result = candidates[best]
   gFp4Plans[key] = result
-  echo &"[gpu-tune] FP4 {c.cols}x{c.rows} M={batch}: {result.label}, {bestMs:.3f}ms (GPU parity checked, {candidates.len} candidates)"
+  let gbps = float(weightBytes) / (bestMs * 1e-3) / 1e9
+  echo &"[gpu-tune] FP4 {c.cols}x{c.rows} M={batch}: {result.label}, {bestMs:.3f}ms" &
+    (if batch == 1: " (" & formatFloat(gbps, ffDecimal, 1) & " GB/s)" else: "") &
+    &" ({(if gpuTimed: \"GPU time\" else: \"wall time\")}, parity checked, {candidates.len} candidates)"
 
 proc linearPpHalf*(): bool =
   ## BYBY_LINEARPP_DTYPE = fp16 (default) | fp32: GPU storage of the FP32 Linear++ sidecar weights
@@ -450,6 +495,8 @@ proc prepareGpuLinForLinear*(ctx: Backend; name: string; lin: var Linear): GpuLi
           let plan = tuneFp4Plan(ctx, c, 1)
           c.jitName = plan.kn; c.rowsPerTg = plan.rows
           c.tgSize = plan.tg; c.tgBytes = plan.bytes; c.decSimd = plan.simd
+          c.decKind = plan.kind; c.decRows = plan.kernelRows
+          c.decUnroll = plan.unroll; c.decLutConst = plan.lutConst
           if be == byby.gbVulkan: c.glslSrc = jit_vm.cachedGlslSource(gJitV2, plan.kn)
         if getEnv("BYBY_PREFILL_FP4_KERNEL", "auto") == "auto" and K mod 256 == 0:
           let plan = tuneFp4Plan(ctx, c, 8)
@@ -625,7 +672,17 @@ proc fp4DecodeFused*(name: string; accumulate, gatedInput: bool): Fp4FusedGemv =
     let c = gFp4CacheGpu[name]
     let tg = if c.tgSize > 0: c.tgSize else: GemvTg
     let rows = max(1, c.rowsPerTg)
-    if fp4KmGemvDecodeSupported(c.cols, c.rows, tg, rows):
+    if c.decKind == "sg":
+      # The selected subgroup-row kernel itself, with the epilogue; it has no gated-input form.
+      if not gatedInput and fp4KmGemvSubgroupSupported(c.cols, c.rows, tg, c.decRows, c.decUnroll):
+        let tag = "fp4_sg" & $c.decRows & "u" & $c.decUnroll & (if c.decLutConst: "c" else: "t") &
+          "_tg" & $tg & (if accumulate: "_acc" else: "") & "_" & $c.cols & "x" & $c.rows
+        result.kn = vmKernelForBe(buildFp4KmGemvSubgroupProgram(c.cols, c.rows, tg, c.decRows,
+          c.decUnroll, c.decLutConst, accumulate), tag, c.wBuf.kind)
+        result.threads = (c.rows div rows) * tg
+        result.tg = tg
+        result.bytes = fp4KmGemvSubgroupTgBytes(c.decLutConst)
+    elif fp4KmGemvDecodeSupported(c.cols, c.rows, tg, rows):
       let tag = "fp4_dec" & $rows & (if c.decSimd: "s" else: "t") & "_tg" & $tg &
         (if accumulate: "_acc" else: "") & (if gatedInput: "_gated" else: "") & "_" & $c.cols & "x" & $c.rows
       result.kn = vmKernelForBe(buildFp4KmGemvDecodeProgram(c.cols, c.rows, tg, rows, c.decSimd,

@@ -316,6 +316,15 @@ proc layerUsesLayerNorm*(blockIdx: int): bool =
   if blockIdx in gLayersV2: return gLayersV2[blockIdx].useLn
   false
 
+proc fusedResidualGemv*(name: string): Fp4FusedGemv =
+  ## The out_proj decode GEMV with the residual add in its epilogue, or an empty kernel name.
+  ## Only for the autotuned subgroup-row ("sg") and decode ("dec") kernels, whose fused form is
+  ## the selected kernel plus one load and add per row. BYBY_DECODE_FUSE_RESIDUAL=0 disables it.
+  if getEnv("BYBY_DECODE_FUSE_RESIDUAL", "1") == "0": return
+  if name notin gLinCache or not gLinCache[name].isFp4 or gLinCache[name].hasBias: return
+  if name notin gFp4CacheGpu or gFp4CacheGpu[name].decKind notin ["sg", "dec"]: return
+  fp4DecodeFused(name, accumulate = true, gatedInput = false)
+
 ## `inputPreNormalized=true` is reserved for a parallel P block whose sidecar
 ## has just written the exact same pre-norm result into `hNorm`.
 proc encodeLayerV2*(ctx: Backend; blockIdx: int;
@@ -361,6 +370,16 @@ proc encodeLayerV2*(ctx: Backend; blockIdx: int;
     encodeVm(l.progRms1, l.hWork, l.rmsThreads1, l.rmsTg1, l.rmsTg1 * 4, "rmsg1")
   else:
     encodeVm(l.progRms, l.hWork, l.rmsThreads, l.rmsTg, l.rmsTg * 4, "rmsg2")
+
+  # 6+7) out_proj and the residual add as one GEMV (hRes += W y) when the autotuned decode kernel
+  # has that form: one dispatch and one barrier less per layer.
+  if addResidual:
+    let fused = fusedResidualGemv(fp4OutName)
+    if fused.kn.len > 0:
+      let c = gFp4CacheGpu[fp4OutName]
+      encodeVmKernel(fused.kn, fused.threads, fused.tg, fused.bytes,
+        hRes, 0, c.wBuf, c.lutBuf, l.hWork, o.offNormed)
+      return
 
   # 6) out_proj: reads DIRECTLY from hWork[offNormed]
   # (the out_proj LoRA delta is already in encodeLin, activation = hWork[offNormed .. +C))
