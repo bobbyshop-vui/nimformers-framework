@@ -196,21 +196,24 @@ Llama chat: load the weights, resident upload + Q4 autotune, allocate the KV cac
 then the KV cache is reset). `ready: warmup N s (decode ~M ms/tok)` is printed before the
 `> ` prompt; `--no-warmup` skips it. A single prompt has no warmup, like `nim_inference`.
 
-Mamba-2 warms up with decode steps until the step time settles. The resident parallel
-prefill JIT-compiles its scan kernels for each chunk length, so only whole chunks of
-`BYBY_PREFILL_BATCH_SIZE` tokens (default 128) go through it; the rest of a prompt, and every
-later chat turn, runs on the decode kernels the warmup already compiled. Prompts shorter
-than one chunk therefore compile nothing after `ready`; the first prompt with a full chunk
-compiles the chunk kernels once and later ones reuse them.
+Mamba-2 warms up with decode steps until the step time settles. Native resident prefill
+consumes every prompt token except the last in batches of `BYBY_UBATCH` rows (default
+512; `BYBY_PREFILL_BATCH_SIZE` is the older name). A 247-token prompt therefore runs one
+246-row prefill, followed by the final decode step for logits. A tail smaller than
+`BYBY_PREFILL_MIN_ROWS` (default 5) uses decode instead. Longer prompts carry state between
+batches; `BYBY_UBATCH=0` permits up to 4096 rows per batch.
 
-On a Vulkan dGPU with tensor cores (`prefill=tensor-cores-only` in the device line;
-`infer_lora`'s cooperative routes then take every GEMM from 2 rows up), prefill beats
-decode even for a few tokens, so the remainder of a prompt also goes through 16-token
-chunks and later turns prefill as well, with `forwardPrefillBatch(continued = true)`
-carrying the chat state in. The warmup runs one 16-token prefill, so these kernels
-compile before `ready` too: only the 128- and 16-token lengths ever compile. With
-`BYBY_ONE_DISPATCH=1` the decode state lives apart from the prefill's, so later turns
-decode instead.
+On a Vulkan dGPU with tensor cores (`prefill=tensor-cores-only` in the device line),
+the warmup also runs one representative batch and later chat turns prefill with the
+current recurrent state. A new native prompt length may compile new scan kernels;
+compile/autotune time is shown separately and excluded from prompt-eval throughput.
+With `BYBY_ONE_DISPATCH=1`, later turns decode because their state lives apart from
+the resident prefill state.
+
+FIR recording (`firlift --run`) and legacy prefill fallbacks retain the fixed sizes:
+128 rows by default, then 64/32/16/8/5-row tails. The recording warmup visits every
+size, preserving the phases needed by existing lifted graphs. Explicit ubatch and
+minimum-tail settings still control those recorded sizes.
 
 Mamba-3 chat feeds each turn through the prefill scheduler of `test/mamba3`: every token
 but the last in chunks of 128, 32 and 8 tokens, the fewer than 8 left over as decode steps,
@@ -256,7 +259,7 @@ options and calls `fmRun`.
 | `arch/detect` | `fmParseConfig`, `fmModelType`, `fmLooksLlama`, `fmLooksMamba2`, `fmExpectShape`, `fmCheckHfTokenizer`, `fmJInt`, `fmJFloat`, `fmJRequired` |
 | `router` | `fmRun`: detection → `fmRunLlama` or `fmRunMamba2`, exit code 3 for an unsupported model |
 | `models/llama` | `fmRunLlama`, `fmLlamaLoad`, `fmLlamaNewChat`, `fmLlamaReset`, `fmLlamaFeed` (flash prefill of a turn, decode if it fails), `fmLlamaWarmup`, `fmLlamaReplyTo`, `fmLlamaChatLoop`, `fmLlamaPromptIds`, `fmLlamaWithBos`, `fmLlamaKvMiB`, `fmLlamaStats`, `fmCommonPrefix` |
-| `models/mamba2` | `fmRunMamba2`, `fmMambaLoadBase`, `fmMambaLoadLora`, `fmMambaPrepareGpu`, `fmMambaNewChat`, `fmMambaFeed`, `fmMambaPrefillChunk`, `fmMambaPrefillPieces`, `fmMambaTensorCores`, `fmMambaWarmup`, `fmMambaReplyTo`, `fmMambaGenerate`, `fmMambaChatLoop`, `fmMambaTurnText`, `fmMambaSetNorm`, `fmMambaStats` |
+| `models/mamba2` | `fmRunMamba2`, `fmMambaLoadBase`, `fmMambaLoadLora`, `fmMambaPrepareGpu`, `fmMambaNewChat`, `fmMambaFeed`, `fmMambaPrefillChunk`, `fmMambaPrefillPieces`, `fmMambaResidentPrefill`, `fmMambaTensorCores`, `fmMambaWarmup`, `fmMambaReplyTo`, `fmMambaGenerate`, `fmMambaChatLoop`, `fmMambaTurnText`, `fmMambaSetNorm`, `fmMambaStats` |
 | `sampling/sampler` | `fmNewSampler` (temp, top-p, min-p, repeat penalty, seed), `fmSample`, `fmSamplerSummary` |
 | `runtime/console` | `fmConsoleInit` (quiet mode: library fd 1/2 → `/dev/null`), `fmSay`, `fmOut`, `fmErr`, `fmQuiet`, `fmReadTurn` (multi-line `\` input), `fmLibStdout`, `fmOutIsTty`, `fmErrIsTty` |
 | `runtime/signals` | `fmOnCtrlC`, `fmStopRequested`, `fmClearStop`, `fmSetGenerating`, `fmShowProgress` / `fmEndProgress` (tok/s in the window title), `fmLiveProgress` |

@@ -1,0 +1,228 @@
+{
+  "imported_on": "2026-11-19",
+  "scope": "nimformers-framework repository",
+  "memory_files": [
+    {
+      "file": "docs/agent-memory/claude/MEMORY.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/MEMORY.md",
+      "bytes": 3933,
+      "sha256": "2d2834b513b0181ad53a960527c38c4669c6f628f92a75a29aae9e94d2255011"
+    },
+    {
+      "file": "docs/agent-memory/claude/address-user-politely.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/address-user-politely.md",
+      "bytes": 635,
+      "sha256": "372c6c3fe576bfda2c7eba6a54265f6b5a4016d7cbe9bb0267e64e9eb9198748"
+    },
+    {
+      "file": "docs/agent-memory/claude/benchmark-doc-style.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/benchmark-doc-style.md",
+      "bytes": 917,
+      "sha256": "6d9a343acc8db88188f27ff4d5b321668d4ee37ea59b1447e114d71dbd064c75"
+    },
+    {
+      "file": "docs/agent-memory/claude/benchmark-gpu-only.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/benchmark-gpu-only.md",
+      "bytes": 411,
+      "sha256": "ef2bb8d651ddcd68ff3ed29741e29e24dfe6e44f03e3b4e68b3e369aa74232b2"
+    },
+    {
+      "file": "docs/agent-memory/claude/cleanup-native-fir.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/cleanup-native-fir.md",
+      "bytes": 434,
+      "sha256": "cc10c3ef0473ebf4d761549b71ed0e8ce45c49939729b9483dcfb62c9673aab8"
+    },
+    {
+      "file": "docs/agent-memory/claude/cleanup-trace-artifacts.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/cleanup-trace-artifacts.md",
+      "bytes": 2030,
+      "sha256": "89f5afab37daa8b3a7c9ff911f9043f6896ec0cc1386564a73ba4985594edb05"
+    },
+    {
+      "file": "docs/agent-memory/claude/code-in-english.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/code-in-english.md",
+      "bytes": 507,
+      "sha256": "e5b66e06be16169a8ec64675cea66b3b742bf29d9701ddc3fb856bee10282316"
+    },
+    {
+      "file": "docs/agent-memory/claude/codestral-fir-work-paused.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/codestral-fir-work-paused.md",
+      "bytes": 1968,
+      "sha256": "52ba9dd2f534b1ff146771818c51d4ece533bf719db01fe6fbf939237fe53e76"
+    },
+    {
+      "file": "docs/agent-memory/claude/codex-coauthor-email.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/codex-coauthor-email.md",
+      "bytes": 408,
+      "sha256": "d8ac33ace65a3d610eb1db9d01f0a1782100a216ccbde3e9c74eb951be127d90"
+    },
+    {
+      "file": "docs/agent-memory/claude/codex-model-routing.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/codex-model-routing.md",
+      "bytes": 746,
+      "sha256": "18c26260646e875d1ff9c76091d42d1a724460f7b3d775246ae49e3af7e53e4a"
+    },
+    {
+      "file": "docs/agent-memory/claude/colab-cell-no-git.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/colab-cell-no-git.md",
+      "bytes": 961,
+      "sha256": "5c7fdf1efc956b2ae7770766d94b11d7b7f8b6b8724959866cb74bee524afd5a"
+    },
+    {
+      "file": "docs/agent-memory/claude/commit-direct-to-main.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/commit-direct-to-main.md",
+      "bytes": 523,
+      "sha256": "beec112865a81c373a23b74e52fe09d8b45667886d59f61882040e29cc05783f"
+    },
+    {
+      "file": "docs/agent-memory/claude/commit-include-notebooks.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/commit-include-notebooks.md",
+      "bytes": 390,
+      "sha256": "db9cfa5b3abc0bda9c76c94a603522c10f87ac6dc65ed9658421c25e89dc0425"
+    },
+    {
+      "file": "docs/agent-memory/claude/commit-message-style.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/commit-message-style.md",
+      "bytes": 550,
+      "sha256": "752070f633b764ab345c3a9c7364745a234328950f4e98a2779f96117d97e049"
+    },
+    {
+      "file": "docs/agent-memory/claude/commit-user-pending-changes.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/commit-user-pending-changes.md",
+      "bytes": 1993,
+      "sha256": "10f16c3aca79a91ac69d5850a8ef9c9c8d841168004454473addb3d96ec46165"
+    },
+    {
+      "file": "docs/agent-memory/claude/core-probe-idea.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/core-probe-idea.md",
+      "bytes": 563,
+      "sha256": "18d14106ffc255ce574e390279634c569c2cb480e04391a61bb2ae8135173419"
+    },
+    {
+      "file": "docs/agent-memory/claude/finish-everything-no-partial.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/finish-everything-no-partial.md",
+      "bytes": 873,
+      "sha256": "d2b996e19511e0ecc5a3207579409f5af1bd0f138e1a88631e4c0475a4252e25"
+    },
+    {
+      "file": "docs/agent-memory/claude/formers-n-framework-design.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/formers-n-framework-design.md",
+      "bytes": 599,
+      "sha256": "e01b3bbad5824e885fba9f4b87f094d44124f55d3d10d1a8752c54e6ec04cb54"
+    },
+    {
+      "file": "docs/agent-memory/claude/jit-script-framework-integration.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/jit-script-framework-integration.md",
+      "bytes": 547,
+      "sha256": "8384d4c7eee8e48bfe9b572b3efbc81509e082b408791f3d83acb4d8d78d939e"
+    },
+    {
+      "file": "docs/agent-memory/claude/keep-lora-merge.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/keep-lora-merge.md",
+      "bytes": 460,
+      "sha256": "d3b44b6da8af6b0f38e7d1674cb26f866fd002bd6b985567f8d2fc033b865026"
+    },
+    {
+      "file": "docs/agent-memory/claude/keep-model-fir.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/keep-model-fir.md",
+      "bytes": 500,
+      "sha256": "c1b71d81f4e790a5b529dcc97be9b0559458d88461ebd23460b02c7ad574559e"
+    },
+    {
+      "file": "docs/agent-memory/claude/lifted-fir-into-project.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/lifted-fir-into-project.md",
+      "bytes": 993,
+      "sha256": "a5f61a02e6ed2bffaabf53a8b7cfc4da7d177c2398bd985739bb937658048579"
+    },
+    {
+      "file": "docs/agent-memory/claude/micro-kernel-only-codestral-mamba3.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/micro-kernel-only-codestral-mamba3.md",
+      "bytes": 1285,
+      "sha256": "c1134da176965996555357209c07c356cfe443c2a016cb41d6273dcd9ad224ef"
+    },
+    {
+      "file": "docs/agent-memory/claude/no-grep-tail.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/no-grep-tail.md",
+      "bytes": 949,
+      "sha256": "478e75286bd0585e7586eb3dcd47df880a835494e1a29bc54abcd8f797321df2"
+    },
+    {
+      "file": "docs/agent-memory/claude/no-heavy-model-runs.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/no-heavy-model-runs.md",
+      "bytes": 637,
+      "sha256": "1c48b4c03fc45ad3d785f83b862e77539f8fee58d14d9c4d8a14c1cc753af2bd"
+    },
+    {
+      "file": "docs/agent-memory/claude/no-log-files.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/no-log-files.md",
+      "bytes": 508,
+      "sha256": "67b449a59fc17a0976324430d4bb6d529fd8bed68905933537f6f898f69ce845"
+    },
+    {
+      "file": "docs/agent-memory/claude/no-nimformers-python-edits-unfinished.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/no-nimformers-python-edits-unfinished.md",
+      "bytes": 637,
+      "sha256": "9aafb303557e760d588d768f36f79b7cf105a47b5e69e4145799ff19c1c1bd0d"
+    },
+    {
+      "file": "docs/agent-memory/claude/no-notebook-edits.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/no-notebook-edits.md",
+      "bytes": 1027,
+      "sha256": "79283bc110892a0ee6b2e1d0e659ceeae68b54dd8d72ca64c5ab88525b03bae0"
+    },
+    {
+      "file": "docs/agent-memory/claude/no-rerun-finished-runs.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/no-rerun-finished-runs.md",
+      "bytes": 896,
+      "sha256": "217461d1bdd52b0f2293d4d69646e7e9cd3a2e31516f23a88ae2b1b1153fa149"
+    },
+    {
+      "file": "docs/agent-memory/claude/no-who-runs-question.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/no-who-runs-question.md",
+      "bytes": 500,
+      "sha256": "3ec3768f92231a72299646cd32d71e16ad1c7a9eadf250126e4263369af47691"
+    },
+    {
+      "file": "docs/agent-memory/claude/one-heavy-run-at-a-time.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/one-heavy-run-at-a-time.md",
+      "bytes": 962,
+      "sha256": "3f55c8684e2c65be20e02c209c0679d76d8928a260797d812ead0abc20f59b30"
+    },
+    {
+      "file": "docs/agent-memory/claude/show-full-log-no-filter.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/show-full-log-no-filter.md",
+      "bytes": 833,
+      "sha256": "edc7552459cb10186ec311f5695233abf0ac3dd3f8a5616413b7c244ea855375"
+    },
+    {
+      "file": "docs/agent-memory/claude/stop-and-report-trace-errors.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/stop-and-report-trace-errors.md",
+      "bytes": 1195,
+      "sha256": "38e64462fae654abe7b07964f0010a943152bc6fe948da349f02260c763be81b"
+    },
+    {
+      "file": "docs/agent-memory/claude/trace-must-be-core-nim.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/trace-must-be-core-nim.md",
+      "bytes": 496,
+      "sha256": "483aa10d0dc4885044c39307f636128ab0516ad9d10f4052fba535e795c72293"
+    },
+    {
+      "file": "docs/agent-memory/claude/trace-without-disk-files.md",
+      "source": "/Users/macos/.claude/projects/-Volumes-Data-Laptrinh-App-nimformers-framework/memory/trace-without-disk-files.md",
+      "bytes": 1121,
+      "sha256": "273b7276267bc577bfd2dca4a2befffd224bb2064f82c9d0c094f05537d05fef"
+    }
+  ],
+  "attachments": [
+    {
+      "source": "/Users/macos/.codex/attachments/e2b00ad2-f1a6-446c-913a-80b49e2ef2ed/Pasted text.txt",
+      "bytes": 252402,
+      "sha256": "fbcb906f6aab4d6f5f61bcc593af2f3ef951fea4d4e6fc4a8728b06ccf55b970"
+    },
+    {
+      "source": "/Users/macos/.codex/attachments/509b5275-718a-4421-ae11-6e21a017fc4b/Pasted text.txt",
+      "bytes": 61204,
+      "sha256": "34ed30408eb98989072c90ffde50bc762cdf8e407f75240d157bca0bbe15d010"
+    }
+  ]
+}
