@@ -1131,6 +1131,7 @@ proc gNormGroups*(nGroups: int): int =
   nGroups
 
 var gHXPersist, gHNormPersist, gHFinalPersist, gHLogitsPersist: SessionHandle
+var gDecodeEmbedding: seq[float32]
 var gNormFGamma: SessionHandle      ## normF gamma (== HF backbone.norm_f, RMSNorm, NO beta)
 var gNormFOnes: SessionHandle       ## gamma=1 (only used with the "-unit" preset: see setGpuNormPreset)
 var gLmHead: GpuLin
@@ -1618,6 +1619,21 @@ proc decodeReplaySignature(): string =
   ## Host switches that change what encodeOneToken records.
   $gSkipAttn & "/" & $gUseNormF & "/" & $gRmsUnitGamma & "/" & gNormPresetName
 
+proc decodeTokenEmbedding(m: NimformerModelJamba; tokenId: int): seq[float32] =
+  ## Copy one host embedding row into a persistent scratch sequence. The normal
+  ## batched lookup builds nested ID sequences and a fresh Tensor for every token.
+  if tokenId < 0 or tokenId >= m.embed.vocab:
+    raise newException(ValueError, "decodeTokenEmbedding: token id outside model vocabulary")
+  let hidden = m.embedDim
+  let offset = tokenId * hidden
+  if m.embed.weight.floatValues.len < offset + hidden:
+    raise newException(ValueError, "decodeTokenEmbedding: embedding weights are incomplete")
+  if gDecodeEmbedding.len != hidden:
+    gDecodeEmbedding.setLen(hidden)
+  copyMem(addr gDecodeEmbedding[0], unsafeAddr m.embed.weight.floatValues[offset],
+          hidden * sizeof(float32))
+  result = gDecodeEmbedding
+
 proc decodeReplaySay(line: string) =
   if not gReplayAnnounced or existsEnv("BYBY_DECODE_REPLAY_VERBOSE"):
     gReplayAnnounced = true
@@ -1731,7 +1747,7 @@ proc forwardStepJambaGpu*(m: var NimformerModelJamba, tokenId: int, ctx: Backend
     warmupGpuKernelsOnce(m, ctx)
     gGpuWarmedUp = true
 
-  var xTensor = m.embed.lookupBatch(@[@[tokenId]], ctx)
+  let embedding = decodeTokenEmbedding(m, tokenId)
   # Decode replay: resubmit the kept recording, or record this step once the buffers have
   # settled (one encoded step since the last invalidation).
   if decodeReplayBlocker(be).len == 0:
@@ -1741,11 +1757,11 @@ proc forwardStepJambaGpu*(m: var NimformerModelJamba, tokenId: int, ctx: Backend
     var logits: seq[float32]
     var replayed = false
     if gReplaySlots[produceLogits].kept:
-      logits = replayDecodeStep(m, be, xTensor.data, produceLogits,
+      logits = replayDecodeStep(m, be, embedding, produceLogits,
                                 gReplaySlots[produceLogits].id, profDecode)
       replayed = true
     elif gReplayEncodedSinceReset > 0:
-      logits = recordDecodeStep(m, ctx, xTensor.data, produceLogits, signature, replayed)
+      logits = recordDecodeStep(m, ctx, embedding, produceLogits, signature, replayed)
     if replayed:
       inc gReplayEncodedSinceReset
       inc gInferStepCount
@@ -1756,7 +1772,7 @@ proc forwardStepJambaGpu*(m: var NimformerModelJamba, tokenId: int, ctx: Backend
         result = Tensor(shape: @[1, 1, 0], data: @[])
       return
 
-  var hEmb = sessionUpload(be, xTensor.data)
+  var hEmb = sessionUpload(be, embedding)
   var statefulDispatchStarted = false
   var stepComplete = false
   var tProf0, tProf1, tProf2, tProf3: float64
@@ -1952,8 +1968,8 @@ proc forwardStepJambaGpuTrace*(m: var NimformerModelJamba, tokenId: int, ctx: Ba
     warmupGpuKernelsOnce(m, ctx)
     gGpuWarmedUp = true
   stats.setLen(0)
-  var xTensor = m.embed.lookupBatch(@[@[tokenId]], ctx)
-  var hEmb = sessionUpload(be, xTensor.data)
+  let embedding = decodeTokenEmbedding(m, tokenId)
+  var hEmb = sessionUpload(be, embedding)
   try:
     if not sessionBegin(be):
       raise newException(CatchableError, "trace: sessionBegin (embedding) failed")

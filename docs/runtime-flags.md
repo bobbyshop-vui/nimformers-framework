@@ -54,7 +54,7 @@ without waiting (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_FIR_RELOC` | `1` | Metal arena graphs: share one pipeline per kernel. `0`: one per node. |
 | `BYBY_FIR_PROFILE` | `0` | `1`: mean host encode / GPU wait / logits read per decode step. `2`: ends the session after every node and reports per-kernel wall time (slow; diagnostics only). |
 | `BYBY_UBATCH` | `512` | Caps the rows of a prompt phase run (phases with per-row logits excepted). `0`: no cap. |
-| `BYBY_PREFILL_MIN_ROWS` | `5` | Codestral (native and FIR, tensor-core GPUs included): a prompt or prompt tail of at least this many tokens runs as one batched multi-row prefill; fewer run as single-token steps. `1`: batch every tail of 2+ tokens; `128` or more: whole 128-row chunks only (old behaviour). Native and FIR must use the same value, and the FIR graph must be lifted with it (it holds a phase per tail size). |
+| `BYBY_PREFILL_MIN_ROWS` | `5` | Codestral CLI: a prompt prefix or final ubatch tail of at least this many tokens uses batched prefill; fewer use decode. `1`: batch every tail of 2+ tokens. Full ubatches always run. Native resident prefill keeps an arbitrary tail as one batch; FIR recording/replay uses fixed tail phases, so their minimum-row settings must match when lifting and replaying. |
 
 ## Native inference (`nim_inference`, `formers-cli` native route)
 
@@ -64,7 +64,7 @@ without waiting (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_PREFAULT` | `1` | One sequential pass over the mapped file to fill the page cache. |
 | `BYBY_EMBED_RAM` | `1` | Keep an untied embedding in RAM. |
 | `BYBY_LM_HEAD` | `q4` | Quantize an fp32 `lm_head` to Q4 for the tuned GEMV. `fp32` keeps it. |
-| `BYBY_UBATCH` | `512` | Prefill micro-batch rows. `0`: uncapped on paced devices. Codestral (`infer_lora`): a prompt up to this many tokens runs as one resident prefill pass (every GEMM and the SSD/lane scan over all of it, shaders compiled once); longer prompts run in passes of this size with the state carried between them. Range 2..4096, `0` = 4096; `BYBY_PREFILL_BATCH_SIZE` is the older name. Codestral in `formers-cli` keeps 128 unless set, because a lifted FIR graph holds one phase per chunk and tail length. |
+| `BYBY_UBATCH` | `512` | Prefill micro-batch rows. `0`: uncapped on paced devices. Codestral (`infer_lora` and native resident `formers-cli`): a prefix up to this many tokens runs as one resident prefill pass; longer prefixes carry state between passes. Codestral range 2..4096, `0` = 4096; `BYBY_PREFILL_BATCH_SIZE` is the older name. The CLI reserves the final prompt token for decode/logits. FIR recording and legacy CLI fallbacks keep the default 128-row chunks and fixed tail sizes for lifted-phase compatibility. New native lengths can JIT; compile/autotune time is reported separately from throughput. |
 | `BYBY_PREFILL_CB_MS` | `300` | Target GPU time of one prefill command buffer. |
 | `BYBY_PREFILL_MAX_ROWS` | `512` | Upper bound of rows in one prefill chunk. |
 | `BYBY_PREFILL_SESSION_MB` | `1024` | Scratch budget of one prefill session. |

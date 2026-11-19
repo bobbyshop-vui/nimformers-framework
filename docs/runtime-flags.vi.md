@@ -53,7 +53,7 @@ chờ (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_FIR_RELOC` | `1` | Graph arena trên Metal: một pipeline mỗi kernel. `0`: một pipeline mỗi node. |
 | `BYBY_FIR_PROFILE` | `0` | `1`: trung bình encode trên host / chờ GPU / đọc logits mỗi bước decode. `2`: kết thúc session sau mỗi node và báo thời gian từng kernel (chậm; chỉ để chẩn đoán). |
 | `BYBY_UBATCH` | `512` | Giới hạn số hàng một lần chạy phase prompt (trừ phase có logits mỗi hàng). `0`: không giới hạn. |
-| `BYBY_PREFILL_MIN_ROWS` | `5` | Codestral (native và FIR, kể cả GPU có Tensor Core): prompt hoặc phần đuôi prompt có từ chừng này token trở lên chạy một lần prefill nhiều hàng; ít hơn thì chạy từng token. `1`: gộp mọi phần đuôi từ 2 token; `128` trở lên: chỉ các đoạn 128 hàng (hành vi cũ). Native và FIR phải dùng cùng giá trị, và FIR graph phải được lift với giá trị đó (graph có một phase cho mỗi cỡ đuôi). |
+| `BYBY_PREFILL_MIN_ROWS` | `5` | Codestral CLI: prefix hoặc đuôi ubatch cuối có từ chừng này token trở lên chạy prefill nhiều hàng; ít hơn thì decode. `1`: gộp mọi đuôi từ 2 token. Ubatch đầy luôn chạy. Native resident prefill gộp đuôi có độ dài bất kỳ thành một batch; ghi/phát lại FIR dùng phase đuôi cố định, nên phải dùng cùng giá trị khi lift và replay. |
 
 ## Inference native (`nim_inference`, route native của `formers-cli`)
 
@@ -63,7 +63,7 @@ chờ (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_PREFAULT` | `1` | Đọc tuần tự một lượt file đã map để nạp page cache. |
 | `BYBY_EMBED_RAM` | `1` | Giữ embedding không tied trong RAM. |
 | `BYBY_LM_HEAD` | `q4` | Lượng tử hoá `lm_head` fp32 sang Q4 để chạy GEMV đã tune. `fp32`: giữ nguyên. |
-| `BYBY_UBATCH` | `512` | Số hàng micro-batch prefill. `0`: không giới hạn trên thiết bị có pacing. Codestral (`infer_lora`): prompt tới chừng này token chạy một lượt resident prefill (mọi GEMM và SSD/lane scan trên toàn bộ prompt, shader biên dịch một lần); prompt dài hơn chạy theo từng lượt cỡ này, state nối giữa các lượt. Khoảng 2..4096, `0` = 4096; `BYBY_PREFILL_BATCH_SIZE` là tên cũ. Codestral trong `formers-cli` giữ 128 nếu không đặt, vì FIR graph đã lift có một phase cho mỗi độ dài đoạn và đuôi. |
+| `BYBY_UBATCH` | `512` | Số hàng micro-batch prefill. `0`: không giới hạn trên thiết bị có pacing. Codestral (`infer_lora` và native resident `formers-cli`): prefix tới chừng này token chạy một lượt resident prefill; prefix dài hơn nối state giữa các lượt. Codestral có khoảng 2..4096, `0` = 4096; `BYBY_PREFILL_BATCH_SIZE` là tên cũ. CLI giữ token prompt cuối để decode lấy logits. Ghi FIR và fallback CLI cũ giữ mặc định 128 hàng cùng các cỡ đuôi cố định để tương thích phase đã lift. Độ dài native mới có thể JIT; thời gian compile/autotune được báo riêng, không tính vào throughput. |
 | `BYBY_PREFILL_CB_MS` | `300` | Thời gian GPU đích của một command buffer prefill. |
 | `BYBY_PREFILL_MAX_ROWS` | `512` | Số hàng tối đa của một đoạn prefill. |
 | `BYBY_PREFILL_SESSION_MB` | `1024` | Ngân sách scratch của một session prefill. |

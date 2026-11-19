@@ -668,6 +668,12 @@ type
     repeatPenalty*: float32 # 1.0 = off
     repeatWindow*: int
 
+  SamplerScratch = object
+    ## Reused across decode tokens so sampling does not allocate two vocab-sized
+    ## float arrays and a fresh candidate list on every step.
+    values: seq[float32]
+    candidates: seq[int]
+
 proc envF32(name: string, dflt: float32): float32 =
   let raw = getEnv(name, "")
   if raw.len == 0: return dflt
@@ -700,25 +706,27 @@ const NegInfF32 = -3.0e38'f32
 
 var gNanWarned = false
 
-proc sampleToken(logits: seq[float32], vocab: int, cfg: SamplerCfg,
+proc sampleToken(logits: seq[float32], vocab: int, cfg: SamplerCfg;
                  banned: seq[bool], noPenalty: seq[bool],
-                 recent: openArray[int], rng: var Rand): int =
+                 recent: openArray[int], rng: var Rand;
+                 scratch: var SamplerScratch): int =
   if vocab <= 0 or logits.len < vocab:
     raise newException(ValueError,
       "[infer] sampleToken: logits.len=" & $logits.len & " < vocab=" & $vocab)
+  if scratch.values.len != vocab:
+    scratch.values.setLen(vocab)
   var maxL = NegInfF32
   var argMaxI = -1
   var nBad = 0
-  var adj = newSeq[float32](vocab)
   for i in 0 ..< vocab:
     let v = logits[i]
     if v.classify in {fcNan, fcInf, fcNegInf}:
-      adj[i] = NegInfF32
+      scratch.values[i] = NegInfF32
       inc nBad
     elif banned.len == vocab and banned[i]:
-      adj[i] = NegInfF32
+      scratch.values[i] = NegInfF32
     else:
-      adj[i] = v
+      scratch.values[i] = v
   # Repetition penalty: walk the recent window once (O(vocab + window)) instead of scanning
   # the whole window for every vocab entry (O(vocab * window)). A token is penalized once even
   # if it repeats in the window; banned/NaN tokens and `noPenalty` tokens are left alone.
@@ -731,13 +739,13 @@ proc sampleToken(logits: seq[float32], vocab: int, cfg: SamplerCfg,
         if recent[j] == rid:
           repeated = true
           break
-      if repeated or adj[rid] <= NegInfF32: continue
+      if repeated or scratch.values[rid] <= NegInfF32: continue
       if noPenalty.len == vocab and noPenalty[rid]: continue
-      if adj[rid] > 0'f32: adj[rid] = adj[rid] / cfg.repeatPenalty
-      else: adj[rid] = adj[rid] * cfg.repeatPenalty
+      if scratch.values[rid] > 0'f32: scratch.values[rid] = scratch.values[rid] / cfg.repeatPenalty
+      else: scratch.values[rid] = scratch.values[rid] * cfg.repeatPenalty
   for i in 0 ..< vocab:
-    if adj[i] > maxL:
-      maxL = adj[i]
+    if scratch.values[i] > maxL:
+      maxL = scratch.values[i]
       argMaxI = i
   if nBad > 0 and not gNanWarned:
     gNanWarned = true
@@ -746,43 +754,45 @@ proc sampleToken(logits: seq[float32], vocab: int, cfg: SamplerCfg,
     raise newException(ValueError, "[infer] every token is banned/NaN")
   if cfg.temperature <= 0'f32:
     return argMaxI
-  var probs = newSeq[float32](vocab)
+  # The adjusted logits are dead after maxL is known, so reuse the same array
+  # for exponentials instead of allocating a second vocab-sized buffer.
   var total = 0'f32
   for i in 0 ..< vocab:
-    if adj[i] <= NegInfF32:
-      probs[i] = 0'f32
+    if scratch.values[i] <= NegInfF32:
+      scratch.values[i] = 0'f32
     else:
-      let e = exp((adj[i] - maxL) / cfg.temperature)
-      probs[i] = e
+      let e = exp((scratch.values[i] - maxL) / cfg.temperature)
+      scratch.values[i] = e
       total += e
   if total <= 0'f32 or total.classify in {fcNan, fcInf}:
     return argMaxI
-  var idx = newSeqOfCap[int](256)
+  scratch.candidates.setLen(0)
   for i in 0 ..< vocab:
-    if probs[i] > 0'f32 and probs[i] >= cfg.minP:
-      idx.add(i)
-  if idx.len == 0: return argMaxI
-  if idx.len == 1: return idx[0]
-  if cfg.topP > 0'f32 and cfg.topP < 1'f32 and idx.len > 1:
-    idx.sort(proc(a, b: int): int = cmp(probs[b], probs[a]))
+    if scratch.values[i] > 0'f32 and scratch.values[i] >= cfg.minP:
+      scratch.candidates.add(i)
+  if scratch.candidates.len == 0: return argMaxI
+  if scratch.candidates.len == 1: return scratch.candidates[0]
+  if cfg.topP > 0'f32 and cfg.topP < 1'f32 and scratch.candidates.len > 1:
+    let values = scratch.values
+    scratch.candidates.sort(proc(a, b: int): int = cmp(values[b], values[a]))
     var sumAll = 0'f32
-    for i in idx: sumAll += probs[i]
+    for i in scratch.candidates: sumAll += scratch.values[i]
     var acc = 0'f32
-    var cut = idx.len
-    for k in 0 ..< idx.len:
-      acc += probs[idx[k]]
+    var cut = scratch.candidates.len
+    for k in 0 ..< scratch.candidates.len:
+      acc += scratch.values[scratch.candidates[k]]
       if acc >= cfg.topP * sumAll:
         cut = k + 1
         break
-    idx.setLen(max(cut, 1))
+    scratch.candidates.setLen(max(cut, 1))
   var tot2 = 0'f32
-  for i in idx: tot2 += probs[i]
+  for i in scratch.candidates: tot2 += scratch.values[i]
   let r = float32(rng.rand(1.0)) * tot2
   var acc2 = 0'f32
-  for i in idx:
-    acc2 += probs[i]
+  for i in scratch.candidates:
+    acc2 += scratch.values[i]
     if acc2 >= r: return i
-  return idx[^1]
+  return scratch.candidates[^1]
 
 
 proc quantShapeMatches(lin: Linear; qt: QuantTensor): bool =
@@ -1363,6 +1373,7 @@ proc runBisect(m: var NimformerModelJamba, tok: AnyTokenizer, vocab: int,
   var cfgG = cfgBase
   cfgG.temperature = 0'f32
   var rng = initRand(1)
+  var samplerScratch: SamplerScratch
   stderr.writeLine ""
   stderr.writeLine "════════ [bisect] " & $modes.len & " modes, each: sample-sentence NLL + greedy " & $nTok & " tokens ════════"
   if not hasAttention or not hasLora:
@@ -1411,7 +1422,7 @@ proc runBisect(m: var NimformerModelJamba, tok: AnyTokenizer, vocab: int,
           logits = forwardStepJambaGpuRetry(m, ids[^1], ids, ids.len - 1, ctx)
         let winStart = max(0, ids.len - cfgG.repeatWindow)
         let nid = sampleToken(logits.data, vocab, cfgG, banned, noPenalty,
-                              toOpenArray(ids, winStart, ids.len - 1), rng)
+                              toOpenArray(ids, winStart, ids.len - 1), rng, samplerScratch)
         if isStopAny(tok, nid): break
         ids.add(nid)
         gen.add(nid)
@@ -1504,6 +1515,7 @@ proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenize
   let banned = bannedMask(tok, vocabModel)
   let noPenalty = buildNoPenalty(tok, vocabModel)
   let cfg = defaultSamplerCfg(temperature)
+  var samplerScratch: SamplerScratch
   var nBanned = 0
   for b in banned:
     if b: inc nBanned
@@ -1656,7 +1668,7 @@ proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenize
         stderr.writeLine &"      top#{r}: id={tid} logit={lastLogits[tid]:.3f} banned={banned[tid]} text={txt.escape}"
     
     let nextId = sampleToken(lastLogits, vocabModel, cfg, banned, noPenalty,
-                             toOpenArray(ids, winStart, ids.len - 1), rng)
+                             toOpenArray(ids, winStart, ids.len - 1), rng, samplerScratch)
 
     if step == 0 and getEnv("BYBY_DEBUG_TOP5", "0") != "0":
       stderr.writeLine "==== [top5 logits, step 0] vocab=" & $vocabModel & " " &

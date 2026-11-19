@@ -1,0 +1,34 @@
+- [Xưng hô](address-user-politely.md) — chỉ dùng "tôi/bạn", cấm "mày/tao"
+- [Cấm làm dở](finish-everything-no-partial.md) — làm hết scope một lượt, không dừng hỏi giữa chừng
+- [Không sửa nimformers khi chưa xong](no-nimformers-python-edits-unfinished.md) — hoàn tất việc đang làm trước khi đụng binding Python
+- [Không chạy model nặng](no-heavy-model-runs.md) — đừng tự chạy train/forward 7B để kiểm chứng
+- [Commit thẳng lên main](commit-direct-to-main.md) — không mở PR; bybylang trước rồi repo chính
+- [Tên commit](commit-message-style.md) — commit nhỏ đặt tên ngắn chung chung
+- [Không hỏi ai chạy](no-who-runs-question.md) — cấm hỏi "tôi chạy hay bạn chạy"
+- [Kiểu viết benchmark](benchmark-doc-style.md) — chỉ ghi số hiện tại mỗi máy/backend, tốc độ không tính JIT lạnh
+- [Benchmark chỉ GPU](benchmark-gpu-only.md) — so nimformers với torch chỉ trên GPU
+- [Thiết kế formers.n](formers-n-framework-design.md) — thư mục riêng, code .bybylang, tự viết điều phối
+- [Code in English](code-in-english.md) — comment/log/help/README trong code bằng tiếng Anh
+- [Notebook trong commit](commit-include-notebooks.md) — notebook luôn nằm trong commit
+- [Không tạo file log](no-log-files.md) — xem output trực tiếp, cấm redirect vào file log
+- [Giữ merge LoRA](keep-lora-merge.md) — cấm --no-merge-lora và BYBY_MERGE_LORA=0
+- [Codex routing](codex-model-routing.md) — Codex qua agent codex:codex-rescue (không dùng MCP), cấm codex exec, luna mặc định
+- [Một lượt nặng](one-heavy-run-at-a-time.md) — không 2 sub-agent cùng chạy firlift/inference; agent sau phải đợi
+- [Email co-author Codex](codex-coauthor-email.md) — dùng noreply@openai.com
+- [Nối jit script](jit-script-framework-integration.md) — sau này nối formers.fir vào framework
+- [Dò graph ở lõi](core-probe-idea.md) — ghi dispatch micro-kernel ở lõi để dựng graph
+- [Dọn rác trace](cleanup-trace-artifacts.md) — máy hết GB: dọn chủ động probe/trace/build/thùng rác bằng /bin/rm, báo df
+- [Dọn native FIR](cleanup-native-fir.md) — xong coverage thì dọn other/formers.n/native
+- [Trace ở lõi Nim](trace-must-be-core-nim.md) — cấm Python trace
+- [Lỗi trace/FIR](stop-and-report-trace-errors.md) — mặc định tự sửa tới khi đúng; chỉ dừng báo khi user dặn rõ
+- [Giữ model.fir](keep-model-fir.md) — dọn rác không xoá model.fir và trace.data
+- [Cấm grep/tail](no-grep-tail.md) — không grep, không tail; dùng Read và xem output trực tiếp
+- [Không chạy lại lượt đã xong](no-rerun-finished-runs.md) — dùng output lượt đã chạy, đừng chạy lại để lọc
+- [Trace không ghi file](trace-without-disk-files.md) — dùng firlift --run (pipe/RAM), không .fprobe/.data trên ổ
+- [Hiện đủ log](show-full-log-no-filter.md) — cấm cut/head/awk lọc output lệnh
+- [Commit cả file user sửa](commit-user-pending-changes.md) — commit file user sửa, NHƯNG cấm commit DeepSeek benchmark.md
+- [Không sửa notebook](no-notebook-edits.md) — đưa cell trong chat, không đụng .ipynb
+- [Cell không kèm git](colab-cell-no-git.md) — cell Colab chỉ làm việc của nó, cấm git/update, giữ trật tự notebook
+- [model.fir vào project](lifted-fir-into-project.md) — bản lift cuối đặt ở models/<model>/lifted/, đưa lệnh chạy cho M1 và Intel
+- [Codestral FIR tạm dừng](codestral-fir-work-paused.md) — trạng thái dở tối 16/11/2026: prefill sai token, nhánh Metal simdgroup dở, chưa commit
+- [Chỉ micro kernel](micro-kernel-only-codestral-mamba3.md) — Codestral/Mamba 3 mặc định micro kernel, cấm .metal/.glsl fp4km viết tay; chờ user nhắc mới làm

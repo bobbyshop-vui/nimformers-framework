@@ -25,6 +25,7 @@ import nim "fp4_gemv_gpu"
 import nim "hf_tokenizer"
 import nim "test/codestral/infer_lora as m2infer"
 import nim "native_hf_tokenizer"
+import nim "vendor/bybylang/probe"
 import "../ir/fir_parse.bybylang"
 import "../ir/fir_graph.bybylang"
 import "../cli/options.bybylang"
@@ -256,15 +257,13 @@ function fmMambaSetNorm(mm: FmMambaModel)
         raise newException(ValueError, "[formers.n] invalid norm preset: " & preset)
     stderr.writeLine("[formers.n] norm preset " & preset)
 
-function fmMambaPrefillChunk(): int
-    ## The resident prefill runs in chunks of BYBY_UBATCH tokens (BYBY_PREFILL_BATCH_SIZE is the
-    ## older name) and JIT-compiles its scan kernels for each chunk length. formers.n keeps 128 by
-    ## default: its chunk and tail lengths are the phases of a lifted FIR graph, and the lifted
-    ## models were recorded with 128. Up to ResidentPrefillMaxT runs a longer prompt in one pass
-    ## (the warmup prompt and the lifted phases change with it).
-    result = 128
+function fmMambaPrefillChunk(wholePrompt: bool = false): int
+    ## Native resident prefill uses the backend's default ubatch. FIR recording and legacy
+    ## fallbacks keep 128 and fixed tail sizes, matching the phases of existing lifted graphs.
+    let defaultRows = if wholePrompt: DefaultPrefillUbatch else: 128
+    result = defaultRows
     try:
-        result = parseInt(getEnv("BYBY_UBATCH", getEnv("BYBY_PREFILL_BATCH_SIZE", "128")))
+        result = parseInt(getEnv("BYBY_UBATCH", getEnv("BYBY_PREFILL_BATCH_SIZE", $defaultRows)))
     except ValueError:
         discard
     if result == 0:
@@ -279,9 +278,8 @@ function fmMambaTensorCores(ctx: Backend): bool
     result = sessionTensorCoreRequired(ctx.kind.toByby()) and getEnv("BYBY_ONE_DISPATCH", "0") == "0"
 
 function fmMambaPrefillMinRows(): int
-    ## BYBY_PREFILL_MIN_ROWS (default 5): a prompt tail of at least this many tokens goes
-    ## through the batched prefill; a shorter one runs as decode steps. 1 batches every tail of
-    ## two or more tokens; 128 or more keeps whole chunks only (the old behaviour).
+    ## BYBY_PREFILL_MIN_ROWS (default 5): minimum prefix/final-tail rows to batch; shorter
+    ## tails decode. Full ubatches always run. FIR recording uses this minimum as a tail phase.
     result = 5
     try:
         result = parseInt(getEnv("BYBY_PREFILL_MIN_ROWS", "5"))
@@ -303,38 +301,43 @@ function fmMambaTailSizes(chunk, minRows: int): seq[int]
     if rows < chunk and rows notin result:
         result.add(rows)
 
-function fmMambaPrefillPieces(n: int): seq[int]
-    ## Splits n prefill tokens into whole chunks: BYBY_PREFILL_BATCH_SIZE ones,
-    ## then the tail sizes of fmMambaTailSizes, largest first (tensor-core GEMMs
-    ## take any row count from 2 up, so every GPU uses the same sizes). The scan
-    ## kernels are JIT-compiled per chunk length, so only these lengths ever
-    ## compile; the remainder (under the smallest size) goes through decode.
-    let chunk = fmMambaPrefillChunk()
+function fmMambaPrefillPieces(n: int, wholePrompt: bool = false): seq[int]
+    ## Native resident prefill consumes the whole prefix in one call (the backend caps each
+    ## pass at ubatch). Keep a sub-minimum tail for decode. Recorded FIR phases retain the
+    ## fixed chunk/tail decomposition so a lifted graph can replay every recorded length.
+    let chunk = fmMambaPrefillChunk(wholePrompt)
+    let minRows = fmMambaPrefillMinRows()
+    if wholePrompt:
+        let tail = n mod chunk
+        let batched = if tail < max(2, minRows): n - tail else: n
+        if batched >= chunk or batched >= max(2, minRows):
+            result.add(batched)
+        return
     var left = n
     if left >= chunk:
         result.add((left div chunk) * chunk)
         left = left mod chunk
-    for size in fmMambaTailSizes(chunk, fmMambaPrefillMinRows()):
+    for size in fmMambaTailSizes(chunk, minRows):
         while left >= size:
             result.add(size)
             left -= size
 
-function fmMambaWarmupPromptLen(): int
-    ## Prompt length that runs every prefill chunk length once: a full chunk, each tail
-    ## size, then the last token through decode.
-    let chunk = fmMambaPrefillChunk()
+function fmMambaWarmupPromptLen(wholePrompt: bool = false): int
+    ## One representative native batch, or every fixed FIR length, plus the final decode token.
+    let chunk = fmMambaPrefillChunk(wholePrompt)
     result = chunk + 1
-    for size in fmMambaTailSizes(chunk, fmMambaPrefillMinRows()):
-        result += size
+    if not wholePrompt:
+        for size in fmMambaTailSizes(chunk, fmMambaPrefillMinRows()):
+            result += size
+
+function fmMambaResidentPrefill(mm: FmMambaModel, ctx: Backend): bool
+    result = getEnv("BYBY_PREFILL_RESIDENT", "1") != "0" and residentPrefillReason(mm.model, ctx).len == 0
 
 function fmMambaFeed(mm: var FmMambaModel, ctx: Backend, chat: var FmMambaChat, newIds: seq[int]): seq[float32]
     ## Consumes pending + newIds; returns the logits after the last one.
-    ## The first input starts the state. Only whole prefill chunks go through
-    ## the resident parallel prefill, so its kernels are compiled for a fixed
-    ## set of chunk lengths, once; the rest continues the state token by token
-    ## with the decode kernels the warmup already compiled (state is O(1),
-    ## there is no context limit). On tensor-core GPUs later turns also
-    ## prefill, carrying the chat state in.
+    ## The first input starts the state. Native resident prefill batches the whole prefix;
+    ## FIR recording retains fixed chunk lengths. The last token runs through decode for
+    ## logits. On tensor-core GPUs later turns also prefill, carrying the chat state in.
     let input = chat.pending & newIds
     chat.pending.setLen(0)
     if input.len == 0:
@@ -347,14 +350,13 @@ function fmMambaFeed(mm: var FmMambaModel, ctx: Backend, chat: var FmMambaChat, 
     if first:
         resetGpuGenState(mm.model, ctx)
     var start = 0
-    # Every piece continues the state (zero after the reset above) when the resident prefill
-    # runs: one kernel set per chunk length serves the first piece and the later ones alike, so
-    # a FIR graph lifted from these pieces runs any prompt the same way.
-    let carryAll = residentPrefillReason(mm.model, ctx).len == 0
+    # Resident pieces continue the state, zero after the first reset. Recording keeps one
+    # kernel set per fixed chunk length so a lifted FIR graph can replay the same phases.
+    let carryAll = fmMambaResidentPrefill(mm, ctx)
+    let wholePrompt = carryAll and not firProbeOn
     if first or tensorCores:
-        # The pieces are whole chunks, and the prefill splits them with the same chunk length.
-        let chunk = fmMambaPrefillChunk()
-        for piece in fmMambaPrefillPieces(input.len - 1):
+        let chunk = fmMambaPrefillChunk(wholePrompt)
+        for piece in fmMambaPrefillPieces(input.len - 1, wholePrompt):
             m2infer.forwardPrefillBatch(mm.model, mm.lora, input[start ..< start + piece], ctx, continued = carryAll or not first or start > 0, ubatch = chunk)
             chat.ids.add(input[start ..< start + piece])
             start += piece
@@ -368,24 +370,22 @@ function fmMambaFeed(mm: var FmMambaModel, ctx: Backend, chat: var FmMambaChat, 
             result = res.data
 
 function fmMambaWarmup(mm: var FmMambaModel, tok: hf_tokenizer.HfTokenizer, ctx: Backend, opts: FmOptions)
-    ## Before the first prompt: decode steps until the step time settles
-    ## (kernel JIT, autotuning, first-use buffers). Prompts shorter than a
-    ## prefill chunk run on these same kernels, so nothing is compiled after
-    ## the "ready" line (on tensor-core GPUs one prompt runs every prefill chunk
-    ## length, so those kernels compile too). The next real input starts from a
-    ## reset state.
+    ## Warm decode until steady; tensor-core GPUs also warm a representative native batch
+    ## or every fixed FIR length. A new native prompt length can still compile scan kernels;
+    ## compile/autotune time is reported separately from prompt throughput.
     if opts.noWarmup:
         return
     var chat: FmMambaChat
     var ids = encodeHf(tok, "[INST] hi[/INST]")
     if fmMambaTensorCores(ctx):
-        # Long enough to run each prefill chunk length once, so their kernels compile here.
+        let wholePrompt = fmMambaResidentPrefill(mm, ctx) and not firProbeOn
         let unit = ids
-        let want = fmMambaWarmupPromptLen()
+        let want = fmMambaWarmupPromptLen(wholePrompt)
         while ids.len < want:
             ids.add(unit)
         ids.setLen(want)
-        stderr.writeLine("[formers.n] warmup: one " & $want & "-token tensor-core prefill (every chunk length), then decode until steady ...")
+        let sizes = if wholePrompt: "representative batch" else: "every recorded chunk length"
+        stderr.writeLine("[formers.n] warmup: one " & $want & "-token tensor-core prefill (" & sizes & "), then decode until steady ...")
     else:
         stderr.writeLine("[formers.n] warmup: decode until steady ...")
     let t0 = epochTime()
