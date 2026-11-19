@@ -59,6 +59,7 @@ proc error(a,b:seq[float32]):float32=
     result=max(result,abs(a[i]-b[i])); scale=max(scale,abs(a[i]))
   result /= scale
 
+var firstPrefill=true
 for count in [2,10,17,65,129]:
   var ids:seq[int]
   for i in 0..<count:ids.add((i*7+3) mod m.vocab)
@@ -71,7 +72,14 @@ for count in [2,10,17,65,129]:
     for scan in ["serial","coalesced","parallel"]:
       putEnv("BYBY_PREFILL_SCAN",scan)
       resetGpuGenState(m,ctx)
+      let setupBefore=prefillSetupSeconds()
       forwardPrefillBatch(m,lo,ids,ctx)
+      if firstPrefill:
+        # The first prefill of the process builds its kernels: the compile counter must see it.
+        firstPrefill=false
+        let compiled=prefillSetupSeconds().compile-setupBefore.compile
+        doAssert compiled>0, "the first prefill built kernels but no compile time was counted"
+        echo &"PASS first prefill counted {compiled:.3f}s of shader compiles"
       let released=releaseResidentPrefill()
       doAssert released>0
       let stateError=error(expected,states())
@@ -113,6 +121,18 @@ let ubLogitError=error(ubatchLogits,forwardStepJambaGpu(m,11,ctx).data)
 doAssert ubStateError<3e-4'f32 and ubLogitError<3e-4'f32,
   &"one micro-batch of 300: state={ubStateError} logits={ubLogitError}"
 echo &"PASS infer_lora 300 tokens as one micro-batch state={ubStateError:.3g} logits={ubLogitError:.3g}"
+# The same shape again: every kernel is cached and every tune decision is reused, so almost
+# nothing is excluded from the prefill time (only cache lookups).
+let repeatBefore=prefillSetupSeconds()
+resetGpuGenState(m,ctx)
+forwardPrefillBatch(m,lo,ubatchIds,ctx)
+doAssert releaseResidentPrefill()>0
+let repeatAfter=prefillSetupSeconds()
+let repeatCompile=repeatAfter.compile-repeatBefore.compile
+let repeatTune=repeatAfter.tune-repeatBefore.tune
+doAssert repeatCompile<0.05 and repeatTune<0.05,
+  &"a repeated prefill of the same shape counted compile={repeatCompile:.3f}s tune={repeatTune:.3f}s"
+echo &"PASS repeated 300-token prefill excluded compile={repeatCompile*1000:.2f} ms tune={repeatTune*1000:.2f} ms"
 # Existing disable switch still selects the tokenwise fallback.
 putEnv("BYBY_PREFILL_PARALLEL","0")
 resetGpuGenState(m,ctx)

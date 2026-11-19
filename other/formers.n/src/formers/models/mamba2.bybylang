@@ -447,6 +447,19 @@ function fmMambaStats(label: string, nTok: int, seconds: float)
     if nTok > 0:
         fmSay("[formers.n] " & label & ": " & $nTok & " tok / " & formatFloat(seconds, ffDecimal, 3) & " s = " & formatFloat(nTok.float / max(seconds, 1e-9), ffDecimal, 2) & " tok/s")
 
+function fmSetupSince(before: tuple[compile, tune: float]): float
+    ## Seconds of shader compiles and one-time prefill autotune since `before`.
+    let after = prefillSetupSeconds()
+    result = (after.compile - before.compile) + (after.tune - before.tune)
+
+function fmPromptStats(nTok: int, seconds, setup: float)
+    ## Prompt throughput without the shader compile/autotune seconds (wall time shown apart).
+    if setup < 0.0005:
+        fmMambaStats("prompt eval", nTok, seconds)
+    elif nTok > 0:
+        let compute = max(seconds - setup, 1e-9)
+        fmSay("[formers.n] prompt eval: " & $nTok & " tok / " & formatFloat(compute, ffDecimal, 3) & " s = " & formatFloat(nTok.float / compute, ffDecimal, 2) & " tok/s (excluding " & formatFloat(setup, ffDecimal, 3) & " s shader compile/autotune; wall " & formatFloat(seconds, ffDecimal, 3) & " s)")
+
 function fmMambaGenerate(mm: var FmMambaModel, tok: hf_tokenizer.HfTokenizer, ctx: Backend, opts: FmOptions): string
     ## One prompt, one completion (prompt echoed like llama-cli).
     fmMambaSetNorm(mm)
@@ -457,15 +470,17 @@ function fmMambaGenerate(mm: var FmMambaModel, tok: hf_tokenizer.HfTokenizer, ct
         raise newException(ValueError, "[formers.n] the prompt encodes to 0 tokens")
     fmOut().write(decodeHf(tok, ids))
     fmOut().flushFile()
+    let setup0 = prefillSetupSeconds()
     let t0 = epochTime()
     let logits = fmMambaFeed(mm, ctx, chat, ids)
     let prefillTime = epochTime() - t0
+    let prefillSetup = fmSetupSince(setup0)
     let reply = fmMambaReplyTo(mm, tok, ctx, chat, logits, opts.nPredict, opts)
     fmOut().write("\n")
     fmOut().flushFile()
     if fmStopRequested():
         fmSay("[formers.n] stopped by Ctrl+C")
-    fmMambaStats("prompt eval", ids.len, prefillTime)
+    fmPromptStats(ids.len, prefillTime, prefillSetup)
     fmMambaStats("eval       ", reply.tokens, reply.seconds)
     result = reply.text
 
@@ -492,13 +507,15 @@ function fmMambaChatLoop(mm: var FmMambaModel, tok: hf_tokenizer.HfTokenizer, ct
             if chat.pending.len > 0 and not isStopIdHf(tok, chat.pending[^1]):
                 newIds.add(tok.eosId)
             newIds.add(encodeHf(tok, fmMambaTurnText(opts, turn.text, false), false, false))
+        let setup0 = prefillSetupSeconds()
         let t0 = epochTime()
         let logits = fmMambaFeed(mm, ctx, chat, newIds)
         let feedTime = epochTime() - t0
+        let feedSetup = fmSetupSince(setup0)
         let reply = fmMambaReplyTo(mm, tok, ctx, chat, logits, opts.nPredict, opts)
         fmOut().write("\n")
         fmOut().flushFile()
-        fmMambaStats("prompt eval", newIds.len, feedTime)
+        fmPromptStats(newIds.len, feedTime, feedSetup)
         fmMambaStats("eval       ", reply.tokens, reply.seconds)
 
 function fmRunMamba2(det: FmDetection, opts: FmOptions): bool
@@ -568,10 +585,12 @@ function fmTemplateChatLoop(hooks: FmChatHooks, opts: FmOptions)
         if newIds.len == 0 or ids.len + newIds.len + 1 > capacity:
             fmSay("[formers.n] context full (" & $ids.len & "/" & $capacity & " tok): restart with a larger -c")
             break
+        let setup0 = prefillSetupSeconds()
         let t0 = epochTime()
         var logits = hooks.feed(newIds)
         ids.add(newIds)
         let feedTime = epochTime() - t0
+        let feedSetup = fmSetupSince(setup0)
         var gen: seq[int]
         var printed = ""
         var full2 = false
@@ -600,7 +619,7 @@ function fmTemplateChatLoop(hooks: FmChatHooks, opts: FmOptions)
             fmOut().write(reply[printed.len .. ^1])
         fmOut().write("\n")
         fmOut().flushFile()
-        fmMambaStats("prompt eval", newIds.len, feedTime)
+        fmPromptStats(newIds.len, feedTime, feedSetup)
         fmMambaStats("eval       ", gen.len, epochTime() - t1)
         text = full & reply
         messages.add(%*{"role": "assistant", "content": reply})
