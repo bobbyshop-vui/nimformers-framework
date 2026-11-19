@@ -60,12 +60,10 @@ Kernel reduction không âm thầm dispatch ở width nhỏ hơn width đã comp
 
 ## Merge trong ngân sách bộ nhớ
 
-Inference merge theo mặc định (`BYBY_MERGE_LORA=inplace`). Đặt
-`BYBY_MERGE_LORA=0` khi muốn bảo toàn delta adapter và tránh
-mở rộng model sang FP32. FP4-KM nhìn chung không biểu diễn chính xác mọi
-cập nhật LoRA FP32.
+Inference luôn merge, không có chế độ adapter tách rời; ngân sách bộ nhớ
+thấp chỉ in cảnh báo, merge lỗi thì dừng chạy.
 
-Nếu chọn `BYBY_MERGE_LORA=1`, merge vẫn xử lý từng tensor và kiểm tra sai số
+Merge xử lý từng tensor và kiểm tra sai số
 lượng tử tương đối với delta LoRA. `BYBY_MERGE_SCRATCH_MIB=256` giới hạn
 ước lượng bảo thủ của mảng dense tạm. Tensor quá lớn giữ base và adapter
 gộp trong kernel. Bỏ qua requantize low-bit trừ khi

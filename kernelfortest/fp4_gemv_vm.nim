@@ -632,6 +632,149 @@ proc buildFp4KmGemvSimdProgram*(K, N, tg, rows: int): VmProgram =
   p.emitKmReduceSimd(acc.toOpenArray(0, rows - 1), tg)
   p
 
+const Fp4DecodeTgBase = 16   ## threadgroup floats before the reduction area: the 16 FP4 values
+
+proc fp4KmGemvDecodeTgBytes*(rows, tg: int): int = (Fp4DecodeTgBase + rows * tg) * 4
+
+proc fp4KmGemvDecodeSupported*(K, N, tg, rows: int): bool =
+  tg in [16, 32, 64, 128, 256, 512, 1024] and rows in [1, 2, 4, 8, 16] and
+    K > 0 and K mod (tg * 8) == 0 and N > 0 and N mod rows == 0
+
+proc emitDecodeStore(p: var VmProgram; reg: uint32; r: int; accumulate: bool) =
+  ## out[row + r] = reg, or += when the GEMV accumulates into its output (a fused residual).
+  if accumulate:
+    p.emitULoadF32(1, 2, uint32(r)); p.emitAdd(reg, reg, 1)
+  p.emitUStoreF32(reg, 2, uint32(r))
+
+proc emitDecodeReduceSimd(p: var VmProgram; accum: openArray[uint32]; tg: int; accumulate: bool) =
+  ## emitKmReduceSimd with the reduction area right after the 16 FP4 values.
+  for reg in accum: p.emitSimdSum(reg, reg)
+  p.emitSimdLane(3); p.emitSimdId(4); p.emitSimdW(5)
+  p.emitUToR(7, 1)
+  p.emitUToR(1, 3)
+  p.emitLoadConstF32(8, 1.0'f32)
+  p.emitCmpLt(9, 1, 8)
+  sessionVmIfGpu(p, 9):
+    p.emitUToR(2, 4)
+    for r, reg in accum: p.emitTgStoreF32(reg, 2, uint32(Fp4DecodeTgBase + r * tg))
+  p.emitBarrierTg()
+  p.emitUToR(1, 5)
+  p.emitLoadConstF32(2, float32(tg))
+  p.emitDiv(2, 2, 1)
+  for reg in accum: p.emitLoadConstF32(reg, 0)
+  p.emitLoadConstF32(6, 0)
+  p.emitLoadConstF32(5, float32(max(1, tg div 8)))
+  sessionVmForGpu(p, 5):
+    p.emitCmpLt(9, 6, 2)
+    sessionVmIfGpu(p, 9):
+      for r, reg in accum:
+        p.emitTgLoadF32(1, 6, uint32(Fp4DecodeTgBase + r * tg))
+        p.emitAdd(reg, reg, 1)
+    p.emitAddConst(6, 6, 1.0'f32)
+  p.emitLoadConstF32(8, 1.0'f32)
+  p.emitCmpLt(9, 7, 8)
+  sessionVmIfGpu(p, 9):
+    for r, reg in accum: p.emitDecodeStore(reg, r, accumulate)
+  p.emitHalt()
+
+proc emitDecodeReduceTree(p: var VmProgram; accum: openArray[uint32]; tg: int; accumulate: bool) =
+  ## emitKmReduceDynamic (barrier tree, any subgroup width) with the reduction area right after
+  ## the 16 FP4 values.
+  p.emitUToR(7, 1)
+  for r, reg in accum: p.emitTgStoreF32(reg, 7, uint32(Fp4DecodeTgBase + r * tg))
+  p.emitBarrierTg()
+  p.emitLoadConstF32(5, float32(fastLog2(tg)))
+  p.emitLoadConstF32(8, float32(tg div 2))
+  sessionVmForGpu(p, 5):
+    p.emitCmpLt(9, 7, 8)
+    sessionVmIfGpu(p, 9):
+      p.emitAdd(10, 7, 8)
+      for r in 0 ..< accum.len:
+        p.emitTgLoadF32(1, 7, uint32(Fp4DecodeTgBase + r * tg))
+        p.emitTgLoadF32(2, 10, uint32(Fp4DecodeTgBase + r * tg))
+        p.emitAdd(1, 1, 2); p.emitTgStoreF32(1, 7, uint32(Fp4DecodeTgBase + r * tg))
+    p.emitBarrierTg(); p.emitMulConst(8, 8, 0.5'f32)
+  p.emitLoadConstF32(8, 1); p.emitCmpLt(9, 7, 8)
+  sessionVmIfGpu(p, 9):
+    for r, reg in accum:
+      p.emitTgLoadF32(10, 7, uint32(Fp4DecodeTgBase + r * tg))
+      p.emitDecodeStore(10, r, accumulate)
+  p.emitHalt()
+
+proc buildFp4KmGemvDecodeProgram*(K, N, tg, rows: int; simd: bool;
+                                  accumulate = false; gatedInput = false; unroll = false;
+                                  lutConst = false; fakeLut = false): VmProgram =
+  ## FP4-KM decode GEMV (one input row), out[n] (+)= sum_k W[n,k] * x[k].
+  ## The loads and the per-lane accumulation order are those of buildFp4KmGemvTunedProgram, with
+  ## three changes for the short K of small models, where the per-threadgroup set-up weighs as much
+  ## as the few K iterations:
+  ## - only the 16 FP4 values go to threadgroup memory (one load per lane, no 272-float copy loop);
+  ##   the 256 group scales are read from the constant LUT buffer, once per 32 weights;
+  ## - up to 8 output rows per threadgroup share every activation load;
+  ## - optional epilogue/prologue fusions: `accumulate` adds the result to the output (a residual
+  ##   connection without its own dispatch), `gatedInput` reads x[k] = in[k] * silu(in[k + K])
+  ##   (the SiLU-gated MLP activation without its own dispatch).
+  ## `simd` selects the simdgroup reduction (Metal) or the barrier tree (any backend). `unroll`
+  ## writes the K loop out in full, so every lane issues all of its weight loads up front.
+  doAssert fp4KmGemvDecodeSupported(K, N, tg, rows)
+  var acc, partial: seq[uint32]
+  for r in 0 ..< rows:
+    acc.add uint32(32 + r); partial.add uint32(48 + r)
+  var p: VmProgram
+  p.emitUTgid(0); p.emitULid(1)
+  # FP4 value table: lanes 0..15 copy one entry each (lutConst reads it from the constant buffer).
+  if not lutConst:
+    p.emitUToR(11, 1); p.emitLoadConstF32(12, 16); p.emitCmpLt(13, 11, 12)
+    sessionVmIfGpu(p, 13):
+      p.emitULoadConstF(9, 1, 0); p.emitTgStoreF32(9, 11, 0)
+    p.emitBarrierTg()
+  p.emitUMulK(2, 0, uint32(rows))
+  p.emitUShrK(3, 1, 2); p.emitUAndK(4, 1, 3)
+  p.emitUMulK(5, 2, uint32(K div 2))
+  p.emitUShlK(10, 3, 4); p.emitUAdd(5, 5, 10)
+  p.emitUShlK(10, 4, 2); p.emitUAdd(5, 5, 10)
+  p.emitUMulK(6, 2, uint32(K div 32))
+  p.emitUAddK(6, 6, uint32(N * (K div 2))); p.emitUAdd(6, 6, 3)
+  p.emitUShlK(7, 3, 5); p.emitUAdd(7, 7, 10)
+  for r in 0 ..< rows: p.emitLoadConstF32(acc[r], 0)
+  let iterations = K div (tg * 8)
+  proc body(p: var VmProgram; it: int) =
+    # it < 0: inside the VM loop (addresses advance); it >= 0: unrolled iteration `it`.
+    let wOff = if it < 0: 0 else: it * tg * 4
+    let sOff = if it < 0: 0 else: it * (tg div 4)
+    let xOff = if it < 0: 0 else: it * tg * 8
+    for r in 0 ..< rows:
+      p.emitULoadU32(uint32(32 + r), 5, uint32(r * (K div 2) + wOff))
+      p.emitULoadU8(uint32(48 + r), 6, uint32(r * (K div 32) + sOff))
+      p.emitLoadConstF32(partial[r], 0)
+    for t in 0 ..< 4:
+      for hi in 0 ..< 2:
+        p.emitULoadIn(3, 7, uint32(t + 16 * hi + xOff))
+        if gatedInput:
+          p.emitULoadIn(6, 7, uint32(t + 16 * hi + xOff + K))
+          p.emitSigmoid(7, 6); p.emitMul(6, 6, 7); p.emitMul(3, 3, 6)
+        for r in 0 ..< rows:
+          p.emitUShrK(3, uint32(32 + r), uint32(8 * t + 4 * hi)); p.emitUAndK(3, 3, 15)
+          if fakeLut: p.emitUToR(1, 3)
+          elif lutConst: p.emitULoadConstF(1, 3, 0)
+          else:
+            p.emitUToR(1, 3); p.emitTgLoadF32(1, 1, 0)
+          p.emitFma(partial[r], 1, 3, partial[r])
+    for r in 0 ..< rows:
+      p.emitULoadConstF(2, uint32(48 + r), 16)
+      p.emitFma(acc[r], 2, partial[r], acc[r])
+  if unroll:
+    for it in 0 ..< iterations: p.body(it)
+  else:
+    p.emitLoadConstF32(5, float32(iterations))
+    sessionVmForGpu(p, 5):
+      p.body(-1)
+      p.emitUAddK(5, 5, uint32(tg * 4)); p.emitUAddK(6, 6, uint32(tg div 4))
+      p.emitUAddK(7, 7, uint32(tg * 8))
+  if simd: p.emitDecodeReduceSimd(acc, tg, accumulate)
+  else: p.emitDecodeReduceTree(acc, tg, accumulate)
+  p
+
 proc buildFp4KmGemmTunedProgram*(K, N, tg, batchRows: int): VmProgram =
   ## Batched variant: decode one packed word/scale for all input rows.
   doAssert tg in [32, 64, 128, 256, 512, 1024] and batchRows in [4, 8]
@@ -1072,6 +1215,134 @@ proc buildF32GemmBatchProgram*(K, N, tg, rows: int): VmProgram =
     for i in 0 ..< rows:
       p.emitTgLoadF32(4, 9, uint32(i * tg))
       p.emitUStoreF32(4, 0, uint32(i * N))
+  p.emitHalt()
+  result = p
+
+# ── 2d) FP16-weight GEMV/GEMM (Linear++ sidecar weights stored as IEEE halves) ──
+proc f32ToF16Bits*(v: float32): uint16 =
+  ## IEEE 754 binary32 -> binary16, round to nearest even (overflow -> inf, NaN kept).
+  let bits = cast[uint32](v)
+  let sign = uint16((bits shr 16) and 0x8000'u32)
+  let exp = int((bits shr 23) and 0xFF'u32)
+  var mant = bits and 0x7FFFFF'u32
+  if exp == 0xFF:
+    return sign or 0x7C00'u16 or (if mant != 0: 0x200'u16 else: 0'u16)
+  let e = exp - 127 + 15
+  if e >= 0x1F:
+    return sign or 0x7C00'u16
+  if e <= 0:
+    if e < -10:
+      return sign
+    mant = mant or 0x800000'u32
+    let shift = uint32(14 - e)
+    var half = mant shr shift
+    let rest = mant and ((1'u32 shl shift) - 1)
+    let midpoint = 1'u32 shl (shift - 1)
+    if rest > midpoint or (rest == midpoint and (half and 1) != 0): inc half
+    return sign or uint16(half)
+  var half = (uint32(e) shl 10) or (mant shr 13)
+  let rest = mant and 0x1FFF'u32
+  if rest > 0x1000'u32 or (rest == 0x1000'u32 and (half and 1) != 0): inc half   # may carry into inf
+  sign or uint16(half)
+
+proc f16BitsToF32*(h: uint16): float32 =
+  ## IEEE 754 binary16 -> binary32 (exact).
+  let sign = (uint32(h) and 0x8000'u32) shl 16
+  var exp = (uint32(h) shr 10) and 0x1F'u32
+  var mant = uint32(h) and 0x3FF'u32
+  var bits: uint32
+  if exp == 0:
+    if mant == 0: bits = sign
+    else:
+      exp = 127 - 15 + 1
+      while (mant and 0x400'u32) == 0:
+        mant = mant shl 1
+        dec exp
+      bits = sign or (exp shl 23) or ((mant and 0x3FF'u32) shl 13)
+  elif exp == 31: bits = sign or 0x7F800000'u32 or (mant shl 13)
+  else: bits = sign or ((exp + 127 - 15) shl 23) or (mant shl 13)
+  cast[float32](bits)
+
+proc toF16Bits*(values: openArray[float32]): seq[uint16] =
+  result = newSeq[uint16](values.len)
+  for i, v in values: result[i] = f32ToF16Bits(v)
+
+const F16GemmMaxTileRows* = 16   ## rows one tile of the FP16 GEMM accumulates (R16..R31)
+
+proc f16GemmSupported*(K, N: int): bool =
+  ## One 32-lane threadgroup consumes 128 K values per step (4 halves per lane).
+  K > 0 and K mod (GemvTg * 4) == 0 and N > 0
+
+proc f16GemmTileRows*(M: int): int = min(max(M, 1), F16GemmMaxTileRows)
+
+proc f16GemmTgBytes*(M: int): int = max(f16GemmTileRows(M) * GemvTg * 4, 16)
+
+proc buildF16GemmProgram*(K, N, M: int; vecInput = true): VmProgram =
+  ## out[r*N + n] = sum_k float(W[n*K + k]) * x[r*K + k] for r < M, FP32 accumulation.
+  ## W [N, K] holds IEEE halves in the u8 slot, x the Input slot, out the MemF32 slot.
+  ## Dispatch N*32 threads, threadgroup 32, f16GemmTgBytes(M) bytes of threadgroup memory.
+  ## M = 1 is the decode GEMV. One threadgroup owns output column n; every lane reads four
+  ## consecutive halves (one 8-byte load) and the matching float4 of each row. Rows run in tiles
+  ## of up to 16 (a GPU loop over the full tiles, then the tail tile), so a column's weights come
+  ## from memory once and from cache for the later tiles. Reduction in threadgroup memory: no
+  ## subgroup width assumption. vecInput=false reads the inputs one float at a time (a Metal input
+  ## binding whose start is not 16-byte aligned).
+  doAssert f16GemmSupported(K, N), "buildF16GemmProgram: K must be a positive multiple of 128"
+  doAssert M >= 1, "buildF16GemmProgram: M must be positive"
+  const tg = GemvTg
+  let step = tg * 4
+  let tile = f16GemmTileRows(M)
+  let full = M div tile
+  let tail = M mod tile
+  var p: VmProgram
+  p.emitUTgid(0); p.emitULid(1)
+  p.emitUToR(13, 1)                                  # R13 = lane (TG index)
+  p.emitUMulK(6, 1, 4)                               # U6 = lane*4
+  p.emitUAddK(5, 6, 0)                               # U5 = x tile base (row 0, lane*4)
+  p.emitUMulK(2, 0, uint32(K)); p.emitUAdd(6, 6, 2)  # U6 = n*K + lane*4 (weight row, in halves)
+  p.emitUAddK(4, 0, 0)                               # U4 = out index of (tile row 0, n)
+  proc emitTile(p: var VmProgram; rows: int) =
+    for i in 0 ..< rows: p.emitLoadConstF32(uint32(16 + i), 0)
+    p.emitUAddK(2, 6, 0)                             # U2 = weight pointer
+    p.emitUAddK(3, 5, 0)                             # U3 = x pointer
+    p.emitLoadConstF32(12, float32(K div step))
+    sessionVmForGpu(p, 12):
+      p.emitULoadF16x4(4, 2, 0)                      # R4..R7 = 4 weights
+      for i in 0 ..< rows:
+        if vecInput:
+          p.emitULoadIn4(8, 3, uint32(i * K))        # R8..R11 = 4 inputs of row i
+        else:
+          for j in 0 ..< 4: p.emitULoadIn(uint32(8 + j), 3, uint32(i * K + j))
+        for j in 0 ..< 4:
+          p.emitFma(uint32(16 + i), uint32(4 + j), uint32(8 + j), uint32(16 + i))
+      p.emitUAddK(2, 2, uint32(step)); p.emitUAddK(3, 3, uint32(step))
+    for i in 0 ..< rows: p.emitTgStoreF32(uint32(16 + i), 13, uint32(i * tg))
+    p.emitBarrierTg()
+    p.emitLoadConstF32(2, float32(fastLog2(tg)))
+    p.emitLoadConstF32(14, float32(tg div 2))
+    sessionVmForGpu(p, 2):
+      p.emitCmpLt(15, 13, 14)
+      sessionVmIfGpu(p, 15):
+        p.emitAdd(1, 13, 14)                         # R1 = lane + stride
+        for i in 0 ..< rows:
+          p.emitTgLoadF32(3, 13, uint32(i * tg))
+          p.emitTgLoadF32(4, 1, uint32(i * tg))
+          p.emitAdd(3, 3, 4); p.emitTgStoreF32(3, 13, uint32(i * tg))
+      p.emitBarrierTg(); p.emitMulConst(14, 14, 0.5'f32)
+    p.emitLoadConstF32(14, 1)
+    p.emitCmpLt(15, 13, 14)
+    sessionVmIfGpu(p, 15):
+      for i in 0 ..< rows:
+        p.emitTgLoadF32(3, 13, uint32(i * tg))
+        p.emitUStoreF32(3, 4, uint32(i * N))
+    p.emitBarrierTg()                                # the next tile reuses the threadgroup memory
+    p.emitUAddK(4, 4, uint32(rows * N)); p.emitUAddK(5, 5, uint32(rows * K))
+  if full > 0:
+    p.emitLoadConstF32(0, float32(full))
+    sessionVmForGpu(p, 0):
+      p.emitTile(tile)
+  if tail > 0:
+    p.emitTile(tail)
   p.emitHalt()
   result = p
 

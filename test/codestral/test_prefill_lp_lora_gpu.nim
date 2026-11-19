@@ -1,5 +1,5 @@
-## Linear++ lane scan and LoRA-down on a real GPU (BYBY_INFER_BACKEND=metal|vulkan)
-## against host references, at the Codestral sidecar/LoRA shapes.
+## Linear++ lane scan on a real GPU (BYBY_INFER_BACKEND=metal|vulkan)
+## against host references, at the Codestral sidecar shapes.
 import std/[os, math, strformat]
 import backend, gpu_layers, mamba2_ssm_gpu, mamba2_full_vm, prefill_inference_kernels
 import vendor/bybylang/gpubackend as byby
@@ -48,25 +48,3 @@ for (H, D, T) in [(4, 32, 17), (32, 128, 17), (8, 64, 40)]:
     for i in 0 ..< D*D: err = max(err, abs(got[L.cF+h*D*D+i]-S[i]))
   doAssert err <= max(2e-5'f32, peak*1e-4'f32), &"lp H={H} D={D} T={T} error={err}"
   echo &"PASS gpu lp lanes H={H} D={D} T={T} error={err:.3g}"
-
-for (K, rank, T) in [(4096, 4, 17), (8192, 4, 17), (512, 16, 33)]:
-  var x = newSeq[float32](T*K)
-  var a = newSeq[float32](rank*K)
-  for i in 0 ..< x.len: x[i] = sin(float32(i mod 613)*0.29'f32)
-  for i in 0 ..< a.len: a[i] = cos(float32(i mod 487)*0.41'f32)*0.1'f32
-  let kn = vmKernelForBe(buildPrefixLoraDownProgram(K, rank), "test_lora_down_" & $K & "_" & $rank, be)
-  var hx = byby.sessionUpload(be, x)
-  var ha = byby.sessionUpload(be, a)
-  var hout = byby.sessionAllocScratch(be, T*rank)
-  doAssert byby.sessionBegin(be)
-  encodeVmKernel(kn, T*rank*LoraDownTg, LoraDownTg, LoraDownTg*4, hout, 0, gDummyFor(be), ha, hx, 0)
-  doAssert byby.sessionEnd(be), byby.sessionGetLastError(be)
-  let got = byby.sessionRead(be, hout, T*rank)
-  var err = 0'f64
-  for t in 0 ..< T:
-    for j in 0 ..< rank:
-      var s = 0'f64
-      for k in 0 ..< K: s += float64(x[t*K+k])*float64(a[j*K+k])
-      err = max(err, abs(s - float64(got[t*rank+j])))
-  doAssert err < 2e-3, &"lora K={K} r={rank} T={T} error={err}"
-  echo &"PASS gpu lora down K={K} rank={rank} T={T} error={err:.3g}"

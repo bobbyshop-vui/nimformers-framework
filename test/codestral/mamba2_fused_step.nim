@@ -346,10 +346,7 @@ proc encodeLayerV2*(ctx: Backend; blockIdx: int;
       if not sessionRmsnormEnc(be, hRes, gam, hNorm, 1, l.hidden, l.eps):
         raise newException(CatchableError, "encodeLayerV2: rmsnorm ln1 failed")
 
-  # 2) in_proj -> hWork[0 .. P)   (+ the in_proj LoRA delta BEFORE conv/SSM: W' = W + BA)
-  # NOTE: fp4GemvAt -> encodeLinByName -> encodeLin ALREADY adds the LoRA delta inside
-  # (gpu_layers.encodeLin). Do NOT call encodeLoraDelta again here: lora_b accumulates,
-  # so calling it twice = the LoRA added TWICE (scale x2) - a silent error.
+  # 2) in_proj -> hWork[0 .. P)   (the LoRA is already merged into the FP4-KM weight: W' = W + BA)
   if not fp4GemvAt(ctx, fp4InName, hNorm, 0, l.hWork, 0, 1):
     raise newException(CatchableError, "encodeLayerV2: fp4 in_proj failed")
 

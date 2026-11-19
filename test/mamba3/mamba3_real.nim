@@ -226,7 +226,7 @@ proc executeTraining(ctx:Backend;programs:seq[tuple[p:VmProgram,threads,tg,bytes
   mem=sessionRead(be,h,mem.len)
 
 proc prepareGpu(m:Mamba3Real;proj:Tensor;c:var Mamba3Cache;initial:Mamba3State;ctx:Backend)=
-  let a=arenaLayout(m.hiddenSize,m.intermediateSize,m.numHeads,m.dState,1,c.T,1)
+  let a=arenaLayout(m.hiddenSize,m.intermediateSize,m.numHeads,m.dState,1,c.T)
   let s=stateLayout(a,a.total,0)
   var params:seq[float32]
   template pack(v:seq[float32]):int =
@@ -252,7 +252,7 @@ proc prepareGpu(m:Mamba3Real;proj:Tensor;c:var Mamba3Cache;initial:Mamba3State;c
     c.coeff.blit(b*c.T*a.H*3,mem,a.coeff,c.T*a.H*3)
 
 proc reversePrepareGpu(m:Mamba3Real;c:Mamba3Cache;dp:Tensor;dk,dq,dc:seq[float32];ctx:Backend):Tensor =
-  let a=arenaLayout(m.hiddenSize,m.intermediateSize,m.numHeads,m.dState,1,c.T,1)
+  let a=arenaLayout(m.hiddenSize,m.intermediateSize,m.numHeads,m.dState,1,c.T)
   var params=m.bNorm.data
   let cNorm=params.len;params.add(m.cNorm.data)
   let dtBias=params.len;params.add(m.dtBias.data)

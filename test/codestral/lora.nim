@@ -1109,6 +1109,7 @@ proc graftBlocks*(old: var NimformerModelJamba, newPattern: string, ctx: Backend
 import session_vm_dispatch
 import gpu_layers
 import vendor/bybylang/gpubackend as byby
+from vendor/bybylang/probe import firProbeOn
 
 var gInferStepCount = 0
 var gInferVerbose = existsEnv("BYBY_INFER_VERBOSE")
@@ -1143,7 +1144,6 @@ var gGpuWarmedUp = false
 #   Original HF Mamba2: RMSNorm for ln1 and normF = RMSNorm(norm_f) before lm_head.
 # LoRA checkpoints + A blocks only match the training configuration => preset "train".
 var gUseNormF* = true
-proc setGpuDisableLora*(v: bool) = gDisableLora = v
 var gSkipAttn* = false
   ## diagnostics (bisect): true = skip EVERY A block (the residual passes straight through) -> only Mamba R remains.
 var gNormPresetName* = "hf"
@@ -1197,6 +1197,47 @@ proc normPresetDescription*(m: NimformerModelJamba): string =
     (if gRmsUnitGamma: " gamma=1(unit)" else: "") &
     ", normF=" & (if gUseNormF: "on" else: "off") &
     ", gated-norm-groups=" & (if groups.len == 0: "n/a" else: $groups)
+
+# ── Decode replay (BYBY_DECODE_REPLAY, default on for Vulkan and Metal) ──
+# A decode step encodes the same dispatches with the same buffers every token: only the
+# embedding row differs. The step is therefore encoded once into a kept command buffer
+# (sessionBeginRecording); later tokens write the embedding into a host-visible buffer,
+# resubmit the recording and read the logits from another host-visible buffer, with no
+# host encode. One recording with the head (logits) and one without (prompt tokens fed
+# through decode). Recordings are dropped whenever the buffers or the encoded path can
+# change: GPU model preparation, state reset, LoRA merge, norm/attention toggles.
+type DecodeReplaySlot = object
+  kept: bool
+  id: int
+  signature: string
+
+var gReplaySlots: array[bool, DecodeReplaySlot]
+var gReplayIn, gReplayLogits: SessionHandle
+var gReplayHidden, gReplayVocab = 0
+var gReplayBackend = byby.gbAuto
+var gReplayOff = ""              ## why replay stays off for this process ("" = allowed)
+var gReplayEncodedSinceReset = 0 ## encoded steps since the last invalidation (lazy buffers settle)
+var gReplayAnnounced = false
+var gReplaySteps* = 0            ## steps served by a replay (tests and logs)
+
+proc invalidateDecodeReplay*() =
+  ## Drops the kept decode recordings; the next steps encode again and re-record.
+  for k in [false, true]:
+    if gReplaySlots[k].kept:
+      byby.sessionFreeRecording(gReplayBackend, gReplaySlots[k].id)
+    gReplaySlots[k] = DecodeReplaySlot()
+  gReplayEncodedSinceReset = 0
+
+proc releaseDecodeReplay() =
+  ## Drops the recordings and the host buffers (a new GPU model may change their sizes).
+  invalidateDecodeReplay()
+  if gReplayHidden > 0:
+    byby.sessionFree(gReplayBackend, gReplayIn)
+    byby.sessionFree(gReplayBackend, gReplayLogits)
+  gReplayIn = SessionHandle()
+  gReplayLogits = SessionHandle()
+  gReplayHidden = 0
+  gReplayVocab = 0
 
 when not defined(noOneDispatch):
   var gOdActive* = false
@@ -1302,6 +1343,7 @@ when not defined(noOneDispatch):
 proc prepareGpuModel*(m: var NimformerModelJamba, lora: var JambaLora, ctx: Backend) =
   let be = ctx.kind.toByby()
   let hidden = m.embedDim
+  releaseDecodeReplay()
   when not defined(noOneDispatch):
     # Iris 640 end-to-end A/B: independent kernels in one session are faster.
     # Keep the persistent mega-kernel available as an explicit experiment.
@@ -1513,12 +1555,9 @@ proc warmupGpuKernelsOnce(m: var NimformerModelJamba, ctx: Backend) =
   ## PSO-bound for the first time HERE, completely safe from the watchdog").
   let be = ctx.kind.toByby()
   let svSkip = gSkipAttn
-  let svLora = gDisableLora
   gSkipAttn = false
-  gDisableLora = false
   defer:
     gSkipAttn = svSkip
-    gDisableLora = svLora
   if sessionBegin(be):
     var warmErr = ""
     try:
@@ -1552,6 +1591,115 @@ proc warmupGpuKernelsOnce(m: var NimformerModelJamba, ctx: Backend) =
       stderr.writeLine "[warmup] session state reset error: " & sessionGetLastError(be)
       if not sessionRecoverQueue(be): discard
 
+proc decodeReplayBlocker(be: byby.GpuBackend): string =
+  ## Why a decode step must be encoded instead of replayed ("" = it may be replayed).
+  if gReplayOff.len > 0: return gReplayOff
+  if getEnv("BYBY_DECODE_REPLAY", "1") == "0": return "BYBY_DECODE_REPLAY=0"
+  if not byby.sessionCanRecord(be): return "backend cannot replay a recorded session"
+  if firProbeOn: return "FIR recorder active"
+  if gDecSplitOn: return "BYBY_DECODE_SPLIT"
+  if getEnv("BYBY_G_DIAGNOSTICS", "0") != "0": return "BYBY_G_DIAGNOSTICS"
+  when not defined(noOneDispatch):
+    if gOdActive: return "one-dispatch decode"
+  ""
+
+proc decodeReplaySignature(): string =
+  ## Host switches that change what encodeOneToken records.
+  $gSkipAttn & "/" & $gUseNormF & "/" & $gRmsUnitGamma & "/" & gNormPresetName
+
+proc decodeReplaySay(line: string) =
+  if not gReplayAnnounced or existsEnv("BYBY_DECODE_REPLAY_VERBOSE"):
+    gReplayAnnounced = true
+    stderr.writeLine(line)
+
+proc ensureDecodeReplayBuffers(m: NimformerModelJamba; be: byby.GpuBackend) =
+  let vocab = m.outProj.outF
+  if gReplayHidden == m.embedDim and gReplayVocab == vocab and gReplayBackend == be: return
+  releaseDecodeReplay()
+  gReplayBackend = be
+  gReplayIn = byby.sessionHostBuffer(be, m.embedDim)
+  gReplayLogits = byby.sessionHostBuffer(be, vocab, readback = true)
+  gReplayHidden = m.embedDim
+  gReplayVocab = vocab
+
+proc recordDecodeStep(m: var NimformerModelJamba; ctx: Backend; embedding: seq[float32];
+                      produceLogits: bool; signature: string; ran: var bool): seq[float32] =
+  ## Encodes one decode step into a kept command buffer, runs it and returns its logits
+  ## (empty without the head). Whether the recording was kept or not, the step itself ran
+  ## (`ran`); when recording cannot start, nothing ran and the caller encodes the step.
+  let be = ctx.kind.toByby()
+  let hidden = m.embedDim
+  ran = false
+  ensureDecodeReplayBuffers(m, be)
+  if not byby.sessionHostWrite(be, gReplayIn, embedding) or not byby.sessionBeginRecording(be):
+    gReplayOff = "recording could not start"
+    decodeReplaySay("[infer] decode replay off: " & gReplayOff)
+    return
+  ran = true
+  var ended = false
+  try:
+    if not sessionCopyInto(be, gReplayIn, gHXPersist, 0, 0, hidden):
+      raise newException(CatchableError, "decode replay: embedding copy failed")
+    encodeOneToken(m, ctx, produceLogits = produceLogits)
+    if produceLogits:
+      if not sessionCopyInto(be, gHLogitsPersist, gReplayLogits, 0, 0, gReplayVocab):
+        raise newException(CatchableError, "decode replay: logits copy failed")
+      if not byby.sessionHostReadBarrier(be):
+        raise newException(CatchableError, "decode replay: host read barrier failed")
+    ended = true
+    if not sessionEnd(be):
+      raise newException(CatchableError, "decode replay: GPU command buffer failed (" &
+        sessionGetLastError(be) & ")")
+  except CatchableError:
+    if not ended: discard sessionEnd(be)
+    discard sessionRecoverQueue(be)
+    gGpuGenStatePoisoned = true
+    raise
+  if produceLogits:
+    result = byby.sessionHostRead(be, gReplayLogits, gReplayVocab)
+    if result.len != gReplayVocab:
+      gGpuGenStatePoisoned = true
+      raise newException(CatchableError, "decode replay: logits read length mismatch")
+  let id = byby.sessionLastRecording(be)
+  let note = byby.sessionRecordingNote(be, id)
+  if id < 0:
+    gReplayOff = "the step allocated or staged buffers while recording" &
+      (if note.len > 0: " (" & note & ")" else: "")
+    decodeReplaySay("[infer] decode replay off: " & gReplayOff)
+  else:
+    gReplaySlots[produceLogits] = DecodeReplaySlot(kept: true, id: id, signature: signature)
+    decodeReplaySay("[infer] decode replay on: the decode step is recorded once and resubmitted per token" &
+      (if note.len > 0: " (Metal: " & note & ")" else: ""))
+
+proc replayDecodeStep(m: NimformerModelJamba; be: byby.GpuBackend; embedding: seq[float32];
+                      produceLogits: bool; id: int; profile: bool): seq[float32] =
+  ## One decode step from a kept recording: embedding in, submit and wait, logits out.
+  let t0 = (if profile: monoSecs() else: 0.0)
+  if not byby.sessionHostWrite(be, gReplayIn, embedding):
+    raise newException(CatchableError, "decode replay: embedding host write failed")
+  let t1 = (if profile: monoSecs() else: 0.0)
+  if not byby.sessionReplay(be, id):
+    # Recurrent state may be partially advanced: same contract as a failed sessionEnd.
+    gGpuGenStatePoisoned = true
+    invalidateDecodeReplay()
+    discard sessionRecoverQueue(be)
+    raise newException(CatchableError, "forwardStepJambaGpu: decode replay failed (" &
+      sessionGetLastError(be) & "); state invalidated, reset required")
+  let t2 = (if profile: monoSecs() else: 0.0)
+  if produceLogits:
+    result = byby.sessionHostRead(be, gReplayLogits, gReplayVocab)
+    if result.len != gReplayVocab:
+      gGpuGenStatePoisoned = true
+      raise newException(CatchableError, "decode replay: logits read length mismatch")
+  inc gReplaySteps
+  if profile:
+    let t3 = monoSecs()
+    if gProfTokens > 0:
+      gProfEncode += t1 - t0
+      gProfEnd += t2 - t1
+      gProfRead += t3 - t2
+    inc gProfTokens
+
 proc forwardStepJambaGpu*(m: var NimformerModelJamba, tokenId: int, ctx: Backend;
                           produceLogits: bool = true): Tensor =
   ## ONE session / token for the WHOLE model (R + A interleaved following the pattern),
@@ -1573,6 +1721,30 @@ proc forwardStepJambaGpu*(m: var NimformerModelJamba, tokenId: int, ctx: Backend
     gGpuWarmedUp = true
 
   var xTensor = m.embed.lookupBatch(@[@[tokenId]], ctx)
+  # Decode replay: resubmit the kept recording, or record this step once the buffers have
+  # settled (one encoded step since the last invalidation).
+  if decodeReplayBlocker(be).len == 0:
+    let signature = decodeReplaySignature()
+    if gReplaySlots[produceLogits].kept and gReplaySlots[produceLogits].signature != signature:
+      invalidateDecodeReplay()
+    var logits: seq[float32]
+    var replayed = false
+    if gReplaySlots[produceLogits].kept:
+      logits = replayDecodeStep(m, be, xTensor.data, produceLogits,
+                                gReplaySlots[produceLogits].id, profDecode)
+      replayed = true
+    elif gReplayEncodedSinceReset > 0:
+      logits = recordDecodeStep(m, ctx, xTensor.data, produceLogits, signature, replayed)
+    if replayed:
+      inc gReplayEncodedSinceReset
+      inc gInferStepCount
+      if produceLogits:
+        result = newTensor(@[1, 1, m.outProj.outF])
+        result.data = logits
+      else:
+        result = Tensor(shape: @[1, 1, 0], data: @[])
+      return
+
   var hEmb = sessionUpload(be, xTensor.data)
   var statefulDispatchStarted = false
   var stepComplete = false
@@ -1717,6 +1889,7 @@ proc forwardStepJambaGpu*(m: var NimformerModelJamba, tokenId: int, ctx: Backend
     else:
       result = Tensor(shape: @[1, 1, 0], data: @[])
     inc gInferStepCount
+    inc gReplayEncodedSinceReset
     stepComplete = true
   except CatchableError:
     # Includes failures during the final logits read. Once any stateful
@@ -1860,6 +2033,8 @@ proc resetGpuGenState*(m: var NimformerModelJamba, ctx: Backend) =
   ## NEW sequence (unlike the warmup: this is for when generate() really starts,
   ## after the warmup has run at least once).
   let be = ctx.kind.toByby()
+  # A new sequence re-records its decode step after one encoded step.
+  invalidateDecodeReplay()
   # Reset is idempotent (writes zeros), so retrying the entire reset after a
   # failed command buffer cannot double-advance recurrent state.
   var lastErr = "sessionBegin failed"

@@ -73,7 +73,7 @@ when isMainModule:
     stderr.writeLine "[merge] SAFE STOP: this tool only supports legacy .lora.json, " &
       "it does not read current NIMBIN4 .bin checkpoints, and it would requantize Mamba to FP4."
     stderr.writeLine "[merge] NOT creating a merged .nimq because the LoRA delta could be lost " &
-      "and the model would generate wrong tokens. BYBY_MERGE_LORA=1 in infer_lora.nim " &
+      "and the model would generate wrong tokens. the in-place merge in infer_lora.nim " &
       "has a quality guard and falls back to the fused adapter."
     stderr.writeLine "[merge] If you must run the old JSON tool, " &
       "use --unsafe-legacy-requant (NOT with current .bin files)."

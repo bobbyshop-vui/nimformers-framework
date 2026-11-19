@@ -3,7 +3,6 @@
 ## Every kernel here is micro-VM BYTECODE (fp4_gemv_vm.nim) going through jit_vm
 ## (lower -> JIT compile once / shape -> cache). NO MSL embedded in Nim.
 ##
-##   * GpuLora        : LoRA delta  y += scale * B (A x)   (2 small fp32 gemvs)
 ##   * GpuLin         : a block-A Linear (resident fp4 or fp32) + bias + LoRA
 ##   * GpuAttnLayer   : block A = LN1 -> QKV -> Linear++ step -> out -> +res
 ##                                -> LN2 -> FC1+APFLU -> FC2 -> +res
@@ -52,6 +51,18 @@ proc vmKernelForBe*(p: VmProgram; tag: string; be: byby.GpuBackend): string =
     result = jit_vm.dispatchProgramNoSession(gJitV2, p, tag)
   if result.len == 0 or result == "micro_vm_kernel":
     raise newException(CatchableError, "vmKernelForBe[" & tag & "]: JIT failed")
+
+var gVkPrewarmedEntries = 0
+proc prewarmVulkanJit*(be: byby.GpuBackend) =
+  ## Vulkan: compiles every micro-VM shader built so far (kernelNameFor) that has no SPIR-V on
+  ## disk yet, several glslc processes at a time, so a cold cache does not compile them one by one
+  ## inside the first dispatches. Call after building the kernels of a phase, inside its setup time.
+  if be != byby.gbVulkan or gJitV2.entries.len == gVkPrewarmedEntries: return
+  var jobs: seq[tuple[name, source: string]]
+  for e in gJitV2.entries.values:
+    if e.glslSource.len > 0 and e.kernelName.len > 0: jobs.add (e.kernelName, e.glslSource)
+  byby.sessionJitPrewarm(be, jobs)
+  gVkPrewarmedEntries = gJitV2.entries.len
 
 # ── dummy buffers: JIT kernels always declare buffer(1..3) -> bind the empty slots ─
 # Per backend: a single global gDummy gave nil handles when the process switched Metal↔Vulkan
@@ -167,77 +178,7 @@ proc encodeEluPlus1Backward*(ctx: Backend; hInput, hOutput: byby.SessionHandle; 
   encodeVmKernel(gEluPlus1BackwardKn, n, min(n, 256), 16,
                  hOutput, 0, gDummy, gDummy, hInput, 0)
 
-# ── LoRA on the GPU ──────────────────────────────────────────────────────
-type
-  GpuLora* = object
-    aBuf*, bBuf*: byby.SessionHandle
-    hT*: byby.SessionHandle          ## scratch [r]
-    r*, inF*, outF*: int
-    scale*: float32
-    knA*, knB*: string
-    bSmallK*: bool                   ## knB uses the 1-thread/row kernel (r <= 32)
-    ready*: bool
-
-var gLoraGpu* = initTable[string, GpuLora]()
-
-proc prepareLoraGpu*(ctx: Backend; name: string; loraA, loraB: openArray[float32];
-                     r, inF, outF: int; scale: float32): bool =
-  ## Uploads A [r,inF] and B [outF,r] (fp32, small) once. Kernels = 2 bytecode gemvs.
-  if r <= 0 or loraA.len != r * inF or loraB.len != outF * r: return false
-  if name in gLoraGpu and gLoraGpu[name].ready: return true
-  let be = ctx.kind.toByby()
-  ensureDummy(be)
-  var g: GpuLora
-  g.r = r; g.inF = inF; g.outF = outF
-  g.scale = scale
-  g.aBuf = byby.sessionUploadPrivate(be, @(loraA))
-  g.bBuf = byby.sessionUploadPrivate(be, @(loraB))
-  g.hT = byby.sessionUploadPrivate(be, newSeq[float32](max(r, 64)))   # writable: the kernel writes into memF32
-  # Vulkan: kernelNameFor + GLSL cache (encodeVmKernel needs cachedGlslSource).
-  # Metal: vmKernel / MSL dispatch. It always used vmKernel(Metal) before -> the Vulkan warmup failed.
-  let progA = buildF32GemvProgram(inF, r, 1.0'f32, false)
-  g.knA = vmKernelForBe(progA, "lora_a", be)
-  # B is [outF, r]: K = r (small) and N = outF. With r <= 32 the 32-lane kernel
-  # above spends 5 barriers on a 4..16-element dot product; the
-  # 1-thread-per-row kernel (no reduction) is much cheaper.
-  if r <= 32:
-    let progB = buildF32GemvSmallKProgram(r, outF, scale, true)
-    g.knB = vmKernelForBe(progB, "lora_b_sk", be)
-    g.bSmallK = true
-  else:
-    let progB = buildF32GemvProgram(r, outF, scale, true)
-    g.knB = vmKernelForBe(progB, "lora_b", be)
-    g.bSmallK = false
-  g.ready = true
-  gLoraGpu[name] = g
-  true
-
-var gDisableLora* = false
-  ## diagnostics (bisect): true = skip EVERY LoRA delta while encoding -> the base model.
-
-proc encodeLoraDelta*(name: string; hIn: byby.SessionHandle; inOff: int;
-                      hOut: byby.SessionHandle; outOff: int): bool =
-  ## hOut[outOff ..< +outF] += scale * B (A hIn[inOff ..< +inF])
-  if gDisableLora: return false
-  if name notin gLoraGpu:
-    # It used to return false silently → the LoRA was dropped and the logits drifted without a log.
-    if getEnv("BYBY_LORA_VERBOSE", "0") != "0":
-      stderr.writeLine "[encodeLoraDelta] name missing in gLoraGpu: " & name
-    return false
-  let g = gLoraGpu[name]
-  encodeVmKernel(g.knA, g.r * GemvTg, GemvTg, f32GemvTgBytes(),
-                 g.hT, 0, gDummy, g.aBuf, hIn, inOff)
-  # sessionDispatch inserts the Metal buffer barrier after each VM dispatch;
-  # knB therefore sees the hT values written by knA on Intel as well.
-  if g.bSmallK:
-    encodeVmKernel(g.knB, g.outF, 64, f32GemvSmallKTgBytes(),
-                   hOut, outOff, gDummy, g.bBuf, g.hT, 0)
-  else:
-    encodeVmKernel(g.knB, g.outF * GemvTg, GemvTg, f32GemvTgBytes(),
-                   hOut, outOff, gDummy, g.bBuf, g.hT, 0)
-  true
-
-# ── Linear GPU (fp4 resident | fp32) + bias + LoRA ──────────────────────
+# ── Linear GPU (fp4 resident | fp32) + bias (LoRA is merged into the base) ──────────────────────
 type
   GpuLin* = object
     name*: string
@@ -250,6 +191,9 @@ type
     hasLora*: bool
     isInt4*: bool
     int4WBuf*: byby.SessionHandle
+    isF16*: bool                       ## FP32 master stored as IEEE halves on the GPU (BYBY_LINEARPP_DTYPE=fp16)
+    wF16*: byby.SessionHandle          ## [N, K] halves, read through the u8 slot
+    knF16Scalar*: string               ## decode kernel for an input offset that is not 16-byte aligned (built lazily)
     ready*: bool
 
 type
@@ -288,6 +232,7 @@ var gLinCache* = initTable[string, GpuLin]()   ## the single source of truth: EV
 type Fp4Plan = object
   kn, label: string
   tg, rows, bytes: int
+  simd: bool
 
 var gFp4Plans = initTable[string, Fp4Plan]()
 
@@ -340,32 +285,59 @@ proc tuneFp4Plan(ctx: Backend; c: Fp4LinCacheGpu; batch: int): Fp4Plan =
         let kn = vmKernelForBe(buildFp4KmGemvSimdProgram(c.cols, c.rows, tg, rows),
           "fp4_" & label & "_" & key, be)
         candidates.add Fp4Plan(kn: kn, label: label, tg: tg, rows: rows,
-          bytes: (Fp4KmLutLen + rows * tg) * 4)
+          bytes: (Fp4KmLutLen + rows * tg) * 4, simd: true)
       except CatchableError as e:
         stderr.writeLine "[gpu-tune] skip " & label & ": " & e.msg
+  if batch == 1 and getEnv("BYBY_GEMV_DECODE", "1") != "0":
+    # Decode kernels for short K (small models): no LUT copy loop, up to 16 rows per threadgroup,
+    # narrow threadgroups. Measured on Iris Plus 640 at 1.6-2x the tuned kernel on K = 768/1536.
+    let simdModes = if be == byby.gbVulkan: @[false] else: @[true]
+    for tg in [16, 32, 64]:
+      if tg > maxThreads: continue
+      for dRows in [4, 8, 16]:
+        if not fp4KmGemvDecodeSupported(c.cols, c.rows, tg, dRows) or
+           fp4KmGemvDecodeTgBytes(dRows, tg) > maxShared: continue
+        for simd in simdModes:
+          let label = "dec" & $dRows & (if simd: "s" else: "t") & "-tg" & $tg
+          try:
+            let kn = vmKernelForBe(buildFp4KmGemvDecodeProgram(c.cols, c.rows, tg, dRows, simd),
+              "fp4_" & label & "_" & key, be)
+            candidates.add Fp4Plan(kn: kn, label: label, tg: tg, rows: dRows,
+              bytes: fp4KmGemvDecodeTgBytes(dRows, tg), simd: simd)
+          except CatchableError as e:
+            stderr.writeLine "[gpu-tune] skip " & label & ": " & e.msg
   if candidates.len == 1: return baseline
   if getEnv("BYBY_GPU_AUTOTUNE", "1") == "0":
     return baseline
+  prewarmVulkanJit(be)
   var data = newSeq[float32](batch * c.cols)
   for i in 0 ..< data.len: data[i] = float32((i * 17 mod 101) - 50) / 64
   var hX = byby.sessionUpload(be, data)
   var hY = byby.sessionAllocScratch(be, batch * c.rows)
   defer:
     byby.sessionFree(be, hX); byby.sessionFree(be, hY)
-  proc dispatch(plan: Fp4Plan): float =
+  # Several dispatches per command buffer, so the per-kernel time is not buried under the submit
+  # latency; the GPU time of the command buffer is used where the backend reports it.
+  let weightBytes = c.rows * (c.cols div 2 + c.cols div 32)
+  let reps = if batch == 1: clamp(16 * 1024 * 1024 div max(weightBytes, 1), 1, 16) else: 1
+  proc dispatch(plan: Fp4Plan; n = 1): float =
     let start = getMonoTime()
+    let g0 = byby.sessionGpuSeconds(be)
     if not byby.sessionBegin(be): raise newException(CatchableError, "FP4 tuning sessionBegin failed")
     try:
       let groups = if batch == 1: c.rows div plan.rows else: c.rows
-      encodeVmKernel(plan.kn, groups * plan.tg, plan.tg, plan.bytes,
-        hY, 0, c.wBuf, c.lutBuf, hX, 0)
+      for _ in 0 ..< n:
+        encodeVmKernel(plan.kn, groups * plan.tg, plan.tg, plan.bytes,
+          hY, 0, c.wBuf, c.lutBuf, hX, 0)
       if not byby.sessionEnd(be):
         raise newException(CatchableError, "FP4 tuning GPU failed: " & byby.sessionGetLastError(be))
     except CatchableError:
       discard byby.sessionEnd(be)
       discard byby.sessionRecoverQueue(be)
       raise
-    float((getMonoTime() - start).inNanoseconds) / 1e6
+    let gpu = byby.sessionGpuSeconds(be) - g0
+    if gpu > 0: gpu * 1e3 / float(n)
+    else: float((getMonoTime() - start).inNanoseconds) / 1e6 / float(n)
   var reference: seq[float32]
   var valid = newSeq[bool](candidates.len)
   var timings = newSeq[seq[float]](candidates.len)
@@ -391,7 +363,7 @@ proc tuneFp4Plan(ctx: Backend; c: Fp4LinCacheGpu; batch: int): Fp4Plan =
   for round in 0 ..< 3:
     for j in 0 ..< candidates.len:
       let i = if round mod 2 == 0: j else: candidates.high - j
-      if valid[i]: timings[i].add dispatch(candidates[i])
+      if valid[i]: timings[i].add dispatch(candidates[i], reps)
   var best = 0
   var bestMs = high(float)
   for i in 0 ..< candidates.len:
@@ -405,7 +377,17 @@ proc tuneFp4Plan(ctx: Backend; c: Fp4LinCacheGpu; batch: int): Fp4Plan =
       best = i; bestMs = timings[i][1]
   result = candidates[best]
   gFp4Plans[key] = result
-  echo &"[gpu-tune] FP4 {c.cols}x{c.rows} M={batch}: {result.label}, {bestMs:.3f}ms (GPU parity checked)"
+  echo &"[gpu-tune] FP4 {c.cols}x{c.rows} M={batch}: {result.label}, {bestMs:.3f}ms (GPU parity checked, {candidates.len} candidates)"
+
+proc linearPpHalf*(): bool =
+  ## BYBY_LINEARPP_DTYPE = fp16 (default) | fp32: GPU storage of the FP32 Linear++ sidecar weights
+  ## (block G qkvProj/outProj/fuseGate). fp16 halves their memory; every kernel that reads them
+  ## widens to FP32 and accumulates in FP32.
+  let v = getEnv("BYBY_LINEARPP_DTYPE", "fp16").toLowerAscii()
+  case v
+  of "fp16", "f16", "half": true
+  of "fp32", "f32", "float": false
+  else: raise newException(ValueError, "BYBY_LINEARPP_DTYPE must be fp16 or fp32 (got '" & v & "')")
 
 proc prepareGpuLinForLinear*(ctx: Backend; name: string; lin: var Linear): GpuLin =
   ## Prepares a GPU Linear for EVERY weight form (R and A: resident fp4-KM,
@@ -467,7 +449,7 @@ proc prepareGpuLinForLinear*(ctx: Backend; name: string; lin: var Linear): GpuLi
         if variantSetting == "auto" and K mod 256 == 0 and N mod 4 == 0:
           let plan = tuneFp4Plan(ctx, c, 1)
           c.jitName = plan.kn; c.rowsPerTg = plan.rows
-          c.tgSize = plan.tg; c.tgBytes = plan.bytes
+          c.tgSize = plan.tg; c.tgBytes = plan.bytes; c.decSimd = plan.simd
           if be == byby.gbVulkan: c.glslSrc = jit_vm.cachedGlslSource(gJitV2, plan.kn)
         if getEnv("BYBY_PREFILL_FP4_KERNEL", "auto") == "auto" and K mod 256 == 0:
           let plan = tuneFp4Plan(ctx, c, 8)
@@ -501,6 +483,28 @@ proc prepareGpuLinForLinear*(ctx: Backend; name: string; lin: var Linear): GpuLi
         (if lin.useQuant: " weightQ.kind=" & $lin.weightQ.kind else: "") &
         " weight.len=" & $lin.weight.floatValues.len & " expected=" & $expected &
         " - no valid quantization and no FP32 master.")
+    let sidecar = ".attn." in name or ".fuseGate." in name   # block G (Linear++) weights only
+    if sidecar and linearPpHalf() and f16GemmSupported(K, N) and be in {byby.gbMetal, byby.gbVulkan}:
+      # Halves on the GPU, FP32 accumulation. The decode GEMV is the FP16 GEMM with M = 1.
+      let halves = toF16Bits(lin.weight.floatValues)
+      result.name = name; result.K = K; result.N = N
+      result.knF32 = vmKernelForBe(buildF16GemmProgram(K, N, 1), "f16_gemv_" & $K & "x" & $N, be)
+      result.wF16 = byby.sessionUploadPrivatePtr(be, unsafeAddr halves[0], halves.len * sizeof(uint16))
+      if (be == byby.gbMetal and result.wF16.metalHandle == nil) or
+         (be == byby.gbVulkan and result.wF16.vulkanHandle.buf == nil):
+        raise newException(CatchableError, "prepareGpuLinForLinear: FP16 GPU upload failed: " & name)
+      result.isF16 = true
+      # No FP32 resident copy: the host copy is released and the sequence (non-resident) prefill
+      # reports these weights unavailable, so prefill stays on the resident path.
+      lin.weight.data = @[]
+      lin.weight.mappedData = default(MappedView[float32])
+      result.biasH = byby.sessionUploadPrivate(be, uploadBiasOrRaise(name, lin.bias.data, N))
+      result.hasBias = true
+      result.ready = true
+      result.isFp4 = false
+      result.isInt4 = false
+      gLinCache[name] = result
+      return
     let prog = buildF32GemvProgram(K, N, 1.0'f32, false)
     let kn = vmKernelForBe(prog, "f32_gemv_" & $K & "x" & $N, be)
     result.name = name; result.K = K; result.N = N
@@ -523,7 +527,6 @@ proc prepareGpuLinForLinear*(ctx: Backend; name: string; lin: var Linear): GpuLi
     result.ready = true
     result.isFp4 = false
     result.isInt4 = false
-  discard prepareLoraGpu(ctx, name, lin.loraAValues, lin.loraBValues, lin.loraR, K, N, lin.loraScale)
   gLinCache[name] = result
 
 proc uploadBiasOrRaise(name: string; bias: seq[float32]; N: int): seq[float32] =
@@ -550,7 +553,14 @@ proc markFp4Lin*(ctx: Backend; name: string; bias: seq[float32]; K, N: int): Gpu
   ensureGpuKernels(be)
   result.name = name; result.K = K; result.N = N; result.isFp4 = true
   result.biasH = byby.sessionUploadPrivate(be, uploadBiasOrRaise(name, bias, N))
-  result.hasBias = true
+  # A bias-less or all-zero bias costs a dispatch per call for nothing (FP4 base projections
+  # of Mamba/Codestral have none), so only a real bias is encoded.
+  var nonZero = false
+  for v in bias:
+    if v != 0'f32:
+      nonZero = true
+      break
+  result.hasBias = nonZero
   result.ready = true
 
 proc encodeLin*(l: GpuLin; hIn: byby.SessionHandle; inOff: int;
@@ -578,14 +588,52 @@ proc encodeLin*(l: GpuLin; hIn: byby.SessionHandle; inOff: int;
   elif l.isInt4:
     encodeVmKernel(l.knF32, l.N * GemvTg, GemvTg, int4GemvTgBytes(),
                    hOut, outOff, l.int4WBuf, l.wF32, hIn, inOff)
+  elif l.isF16:
+    var kn = l.knF32
+    if inOff mod 4 != 0 and hIn.kind == byby.gbMetal:
+      # The float4 input loads need a 16-byte aligned start on Metal.
+      if l.knF16Scalar.len == 0:
+        gLinCache[l.name].knF16Scalar = vmKernelForBe(buildF16GemmProgram(l.K, l.N, 1, vecInput = false),
+          "f16_gemv_s_" & $l.K & "x" & $l.N, hIn.kind)
+      kn = gLinCache[l.name].knF16Scalar
+    encodeVmKernel(kn, l.N * GemvTg, GemvTg, f16GemmTgBytes(1),
+                   hOut, outOff, l.wF16, gDummy, hIn, inOff)
   else:
     encodeVmKernel(l.knF32, l.N * GemvTg, GemvTg, f32GemvTgBytes(),
                    hOut, outOff, gDummy, l.wF32, hIn, inOff)
-  discard encodeLoraDelta(l.name, hIn, inOff, hOut, outOff)
   if bias and l.hasBias:
     encodeBias(hOut, outOff, l.biasH, l.N, apflu)
   elif apflu:
     raise newException(CatchableError, "encodeLin: apflu needs the bias kernel (" & l.name & " has no bias)")
+
+type Fp4FusedGemv* = object
+  ## A decode GEMV with its neighbours fused in (see fp4DecodeFused); kn is empty when the
+  ## projection has no decode form.
+  kn*: string
+  threads*, tg*, bytes*: int
+
+var gFp4Fused = initTable[string, Fp4FusedGemv]()
+
+proc fp4DecodeFused*(name: string; accumulate, gatedInput: bool): Fp4FusedGemv =
+  ## The decode GEMV of the FP4-KM projection `name`, built with the geometry the autotune chose
+  ## (rows and threadgroup width, simdgroup or tree reduction), plus `accumulate` (out += W x: the
+  ## residual add without its own dispatch) and/or `gatedInput` (x[k] = in[k] * silu(in[k + K]):
+  ## the SiLU-gated MLP activation without its own dispatch). Built once per projection and flags.
+  let key = name & "|" & $accumulate & "|" & $gatedInput
+  if key in gFp4Fused: return gFp4Fused[key]
+  if name in gFp4CacheGpu:
+    let c = gFp4CacheGpu[name]
+    let tg = if c.tgSize > 0: c.tgSize else: GemvTg
+    let rows = max(1, c.rowsPerTg)
+    if fp4KmGemvDecodeSupported(c.cols, c.rows, tg, rows):
+      let tag = "fp4_dec" & $rows & (if c.decSimd: "s" else: "t") & "_tg" & $tg &
+        (if accumulate: "_acc" else: "") & (if gatedInput: "_gated" else: "") & "_" & $c.cols & "x" & $c.rows
+      result.kn = vmKernelForBe(buildFp4KmGemvDecodeProgram(c.cols, c.rows, tg, rows, c.decSimd,
+        accumulate, gatedInput), tag, c.wBuf.kind)
+      result.threads = (c.rows div rows) * tg
+      result.tg = tg
+      result.bytes = fp4KmGemvDecodeTgBytes(rows, tg)
+  gFp4Fused[key] = result
 
 # ── Scratch shared by every A block ──────────────────────────────────────
 type

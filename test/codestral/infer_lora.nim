@@ -32,7 +32,6 @@ import test_nimformer   # BPETokenizer: loadBPE/encodeBPE/decodeBPEStr
 import load_codestral_into_jamba   # loadCodestralQuantResidentFromNimq - rebuilds the base from .nimq
 import quantize_lora_bin_4bit
 
-var gMergeLoraExplicit = false   ## BYBY_MERGE_LORA set by hand: a failed merge is then fatal.
 
 proc configureInferenceDefaults*() =
   ## Apply before GPU initialization/autotuning; explicit environment wins.
@@ -46,29 +45,11 @@ proc configureInferenceDefaults*() =
       ("BYBY_PREFILL_FP4_KERNEL", "auto"),
       ("BYBY_PREFILL_RESIDENT", "1")]:
     if not existsEnv(name): putEnv(name, value)
-  # Merging LoRA into the resident base is the default: the decode kernels drop
-  # the A/B fusion and the answers match a merged checkpoint. BYBY_MERGE_LORA=0
-  # (formers.n: --no-merge-lora) keeps the adapters separate.
-  gMergeLoraExplicit = existsEnv("BYBY_MERGE_LORA")
-  var mergeMode=getEnv("BYBY_MERGE_LORA","inplace")
-  if mergeMode notin ["0","1","inplace"]:
-    raise newException(ValueError,"BYBY_MERGE_LORA must be 0, 1 or inplace (GPU); use 0 to retain separate LoRA")
-  # The merge rewrites the packed weight the GPU already holds, so it needs the
-  # mapped checkpoint and the per-parameter dispatch. Asked for explicitly, a
-  # conflict is an error; on by default it simply steps aside.
-  if mergeMode!="0" and getEnv("BYBY_MODEL_MMAP","1")=="0":
-    if gMergeLoraExplicit:
-      raise newException(ValueError,"bounded in-place merge requires BYBY_MODEL_MMAP=1")
-    mergeMode="0"
-    echo "[infer] BYBY_MODEL_MMAP=0 keeps the LoRA adapters separate (no in-place merge)."
-  if mergeMode!="0" and getEnv("BYBY_ONE_DISPATCH","0")!="0":
-    if gMergeLoraExplicit:
-      echo "[infer] In-place merge selects BYBY_ONE_DISPATCH=0 to reuse packed weight buffers."
-      putEnv("BYBY_ONE_DISPATCH","0")
-    else:
-      mergeMode="0"
-      echo "[infer] BYBY_ONE_DISPATCH=1 keeps the LoRA adapters separate (BYBY_MERGE_LORA=1 merges anyway)."
-  putEnv("BYBY_MERGE_LORA",mergeMode)
+  # LoRA is always merged into the resident FP4-KM base (there is no separate-adapter
+  # mode). The merge rewrites the packed weights the GPU holds, so it needs the mapped
+  # checkpoint and the per-parameter dispatch.
+  putEnv("BYBY_MODEL_MMAP","1")
+  putEnv("BYBY_ONE_DISPATCH","0")
 when defined(macosx):
   # QOS_CLASS_USER_INITIATED (0x19): CLI inference directly serves a
   # user request. This is a CPU thread priority; Metal has no equivalent
@@ -1308,7 +1289,7 @@ proc teacherForced(m: var NimformerModelJamba, tok: AnyTokenizer, promptText, fu
 
 type SweepMode = object
   name: string
-  skipA, noLora: bool
+  skipA: bool
   preset: string
 
 proc runBisect(m: var NimformerModelJamba, tok: AnyTokenizer, vocab: int,
@@ -1316,7 +1297,6 @@ proc runBisect(m: var NimformerModelJamba, tok: AnyTokenizer, vocab: int,
   ## BYBY_NORM_SWEEP (opt-in): bisects to find what is broken, WITHIN 1
   ## run (loading the model takes long). Each mode: (1) teacher-forcing NLL on a sample sentence
   ## in the training format, (2) greedy generation from a clear question, (3) residuals.
-  ##   base-hf        : drop A blocks + disable LoRA = the ORIGINAL Mamba-Codestral  (must produce text)
   ##   base+lora-*    : drop A blocks, keep LoRA
   ##   hybrid-*       : full R + A + LoRA
   ## Mode suffix = the norm of the trainer that produced the checkpoint:
@@ -1329,15 +1309,14 @@ proc runBisect(m: var NimformerModelJamba, tok: AnyTokenizer, vocab: int,
   ## ONLY when it is clearly better (NLL < 6 and at least 1 nat below the default preset) - so old checkpoints
   ## still produce text without rerunning the sweep just to read the result.
   let allModes = @[
-    SweepMode(name: "base-hf", skipA: true, noLora: true, preset: "hf"),
-    SweepMode(name: "base+lora-train", skipA: true, noLora: false, preset: "rms-fin-g1"),
-    SweepMode(name: "base+lora-gn", skipA: true, noLora: false, preset: "rms-fin-gn"),
-    SweepMode(name: "base+lora-unit", skipA: true, noLora: false, preset: "rms-fin-g1-unit"),
-    SweepMode(name: "base+lora-ln", skipA: true, noLora: false, preset: "ln-nof-g1"),
-    SweepMode(name: "hybrid-train", skipA: false, noLora: false, preset: "rms-fin-g1"),
-    SweepMode(name: "hybrid-gn", skipA: false, noLora: false, preset: "rms-fin-gn"),
-    SweepMode(name: "hybrid-unit", skipA: false, noLora: false, preset: "rms-fin-g1-unit"),
-    SweepMode(name: "hybrid-ln", skipA: false, noLora: false, preset: "ln-nof-g1")]
+    SweepMode(name: "base+lora-train", skipA: true, preset: "rms-fin-g1"),
+    SweepMode(name: "base+lora-gn", skipA: true, preset: "rms-fin-gn"),
+    SweepMode(name: "base+lora-unit", skipA: true, preset: "rms-fin-g1-unit"),
+    SweepMode(name: "base+lora-ln", skipA: true, preset: "ln-nof-g1"),
+    SweepMode(name: "hybrid-train", skipA: false, preset: "rms-fin-g1"),
+    SweepMode(name: "hybrid-gn", skipA: false, preset: "rms-fin-gn"),
+    SweepMode(name: "hybrid-unit", skipA: false, preset: "rms-fin-g1-unit"),
+    SweepMode(name: "hybrid-ln", skipA: false, preset: "ln-nof-g1")]
   var hasAttention = false
   var hasLora = false
   for blk in m.blocks:
@@ -1356,7 +1335,7 @@ proc runBisect(m: var NimformerModelJamba, tok: AnyTokenizer, vocab: int,
   # Default: ALL modes = original model + (LoRA | LoRA+sidecar) x 3 trainer norm kinds
   # (current / old gamma=1 / old LayerNorm). Each mode ~2 minutes (loading the model is the slow part):
   # base+lora-* shows which norm kind LoRA (the R branch) matches, hybrid-* adds the Linear++ sidecar.
-  # Narrow it down: BYBY_NORM_SWEEP_LIST=base-hf,hybrid-train
+  # Narrow it down: BYBY_NORM_SWEEP_LIST=base+lora-gn,hybrid-train
   var modes = allModes
   let only = getEnv("BYBY_NORM_SWEEP_LIST", "")
   if only == "all":
@@ -1382,7 +1361,6 @@ proc runBisect(m: var NimformerModelJamba, tok: AnyTokenizer, vocab: int,
   var defaultNll = 1.0e30     # hybrid with the default preset rms-fin-gn
   for md in modes:
     gSkipAttn = md.skipA
-    setGpuDisableLora(md.noLora)
     discard setGpuNormPreset(md.preset)
     let attnMode =
       if not hasAttention: "no A/P (toggle no-op)"
@@ -1390,7 +1368,6 @@ proc runBisect(m: var NimformerModelJamba, tok: AnyTokenizer, vocab: int,
       else: "co A/P"
     let loraMode =
       if not hasLora: "no LoRA (toggle no-op)"
-      elif md.noLora: "LoRA off"
       else: "co LoRA"
     stderr.writeLine "── che do=" & md.name & "  (" & attnMode & ", " & loraMode &
                      ", norm=" & gNormPresetName & ")"
@@ -1398,7 +1375,7 @@ proc runBisect(m: var NimformerModelJamba, tok: AnyTokenizer, vocab: int,
     try:
       let nl = teacherForced(m, tok, qText, fullText, vocab, ctx)
       summary.add &"{md.name}={nl.nllAnswer:.2f}"
-      if not md.skipA and not md.noLora and hasAttention and hasLora:
+      if not md.skipA and hasAttention and hasLora:
         if md.preset == "rms-fin-gn": defaultNll = nl.nllAnswer
         if nl.nllAnswer == nl.nllAnswer and nl.nllAnswer < bestNll:   # (chan NaN)
           bestNll = nl.nllAnswer
@@ -1441,9 +1418,8 @@ proc runBisect(m: var NimformerModelJamba, tok: AnyTokenizer, vocab: int,
       stderr.writeLine "      [bisect] ERROR in this mode: " & e.msg
     stderr.writeLine &"      ({monoSecs() - t0:.0f}s)"
   gSkipAttn = false
-  setGpuDisableLora(false)
   if summary.len > 0:
-    stderr.writeLine "[bisect] SUMMARY of answer NLL (low = good; random=10.4; base-hf = original model): " &
+    stderr.writeLine "[bisect] SUMMARY of answer NLL (low = good; random=10.4): " &
                      summary.join("  ")
   if bestPreset.len > 0 and bestPreset != "rms-fin-gn" and bestNll < 6.0 and
      defaultNll - bestNll >= 1.0:
@@ -1466,21 +1442,16 @@ proc runBisect(m: var NimformerModelJamba, tok: AnyTokenizer, vocab: int,
 
 proc mergeResidentLoraIfEnabled*(m: var NimformerModelJamba; lora: var JambaLora;
                                  ctx: Backend): int =
-  ## Folds B@A into the resident FP4-KM base when BYBY_MERGE_LORA is on (the
-  ## default). Call it after prepareGpuModel, once the packed weights are on the
-  ## GPU. Requested by hand, a failure is fatal; on by default (a machine short
-  ## of memory, a parameter the merge cannot encode) it falls back to the
-  ## separate adapters, which are still attached to the Linears.
-  ## Run configureInferenceDefaults() first: it resolves the mode.
-  if getEnv("BYBY_MERGE_LORA","0")=="0" or lora.adapters.len==0:
+  ## Folds every LoRA adapter (B@A) into the resident FP4-KM base. Always on: call it
+  ## after prepareGpuModel, once the packed weights are on the GPU. Any failure, or an
+  ## adapter left unmerged, is fatal; there is no separate-adapter fallback.
+  if lora.adapters.len==0:
     return 0
-  if gMergeLoraExplicit:
-    return mergeResidentLoraInplace(m,lora,ctx)
-  try:
-    result = mergeResidentLoraInplace(m,lora,ctx)
-  except CatchableError as e:
-    echo "[lora-merge] skipped, keeping the separate adapters: " & e.msg
-    result = 0
+  result = mergeResidentLoraInplace(m,lora,ctx)
+  if lora.adapters.len>0:
+    var left: seq[string]
+    for name in lora.adapters.keys: left.add name
+    raise newException(ValueError,"[lora-merge] " & $left.len & " adapters could not be merged into the FP4-KM base: " & left.join(", "))
 
 proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenizer, prompt: string,
                maxNewTokens: int, ctx: Backend, temperature: float32 = 0'f32,
@@ -1546,7 +1517,6 @@ proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenize
       sweepPreset = runBisect(m, tok, vocabModel, banned, noPenalty, cfg, ctx)
     except Exception as e:
       stderr.writeLine "[bisect] ERROR: " & e.msg & " - skipped, running normally."
-    setGpuDisableLora(false)
     gSkipAttn = false
 
   # ── norm configuration for the real generation ───────────────────────────────

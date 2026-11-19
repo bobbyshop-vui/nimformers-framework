@@ -62,20 +62,6 @@ proc biasRows(cols: int): VmProgram =
   p.emitAdd(4, 4, 5); p.emitUStoreF32(4, 0); p.emitHalt()
   p
 
-proc loraRows(cols, rank: int; scale: float32): VmProgram =
-  # mem += scale * (X A^T) B^T, one thread per (token, output).
-  var p: VmProgram
-  p.rowIndex(cols)
-  p.emitUMulK(3, 1, uint32(rank)); p.emitUMulK(4, 2, uint32(rank))
-  p.emitLoadConstF32(4, 0); p.emitLoadConstF32(8, float32(rank))
-  sessionVmForGpu(p, 8):
-    p.emitULoadIn(5, 3); p.emitULoadConstF(6, 4)
-    p.emitFma(4, 5, 6, 4)
-    p.emitUAddK(3, 3, 1); p.emitUAddK(4, 4, 1)
-  p.emitMulConst(4, 4, scale); p.emitULoadF32(5, 0)
-  p.emitAdd(4, 4, 5); p.emitUStoreF32(4, 0); p.emitHalt()
-  p
-
 proc convHistory(L: M2Lay; previousOffset = -1): VmProgram =
   # Projection is input; output is [channel, oldest..newest raw xBC].
   var p: VmProgram
@@ -588,8 +574,6 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
   let terminalOff = L.states +
     (if ssd: 1 elif coalesced: 0 elif parallel: T else: 1)*L.HD*L.N
   checkVmScratchCapacity(ctx, arenaSize, "resident prefill")
-  var maxRank = 1
-  for _, adapter in gLoraGpu: maxRank = max(maxRank, adapter.r)
   var maxState = 1
   var shape = $be & "_" & m2Tag(L) & "_" & $hidden & "_" & m.pattern
   for i, blk in m.blocks:
@@ -597,7 +581,6 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
       let al = gAttnLayers[i]
       maxState = max(maxState, al.lay.H * al.lay.D * al.lay.D)
       shape.add "_lp" & $al.lay.H & "x" & $al.lay.D
-  shape.add "_r" & $maxRank
   require(not gPrefixBusy, "scratch arena is already in use")
   if gPrefixShape != shape:
     clearPrefixBuffers()
@@ -667,7 +650,6 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
   var hMix = alloc(padded * hidden)
   var hMamba = alloc(arenaSize)
   var hConv = alloc(L.cDim * (L.K - 1))
-  var hLora = alloc(T * maxRank)
   let zeroLen = max(L.HD * L.N, max(T * hidden, maxState))
   let hZero = alloc(zeroLen, true)
   let gemmMode = getEnv("BYBY_PREFILL_GEMM","auto")
@@ -683,8 +665,7 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
       if name.startsWith("block") and lin.isFp4:
         expandedSize = max(expandedSize,lin.K*min(lin.N,4096))
   var hExpanded,hTile: SessionHandle
-  let tileLoraOff=T*4096
-  let tileBiasOff=tileLoraOff+T*maxRank
+  let tileBiasOff=T*4096
   if expandedSize > 0:
     checkVmScratchCapacity(ctx,expandedSize,"prefill GPU weight tile")
     hExpanded=alloc(expandedSize)
@@ -733,13 +714,12 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
   var stepNames: seq[string]
   for st in steps: stepNames.add kernelNameFor(ctx, st.prog, st.tag)
   var biasKns = initTable[int, string]()
-  var loraKns = initTable[string, string]()
-  var loraDownKns = initTable[string, string]()
   var m8Kns = initTable[string, string]()
   var m4Kns = initTable[string, string]()
   var m8x2Kns = initTable[string, string]()
   var m4x2Kns = initTable[string, string]()
   var f32Kns = initTable[string, string]()
+  var f16Kns = initTable[string, string]()
   var expandKns=initTable[string,seq[tuple[kn,scatter: string,row,count,tg: int]]]()
   let useM8 = T >= 8 and getEnv("BYBY_PREFILL_FP4_KERNEL", "auto") != "m4"
   # Vulkan dGPU with tensor cores: every GEMM from 2 rows up stays on them
@@ -759,17 +739,7 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
     if not name.startsWith("block"): continue
     if lin.N in biasCols and lin.N notin biasKns:
       biasKns[lin.N] = vmKernelForBe(biasRows(lin.N), "prefix_bias_" & $lin.N, be)
-    if name in gLoraGpu:
-      let ad = gLoraGpu[name]
-      loraKns[name] = vmKernelForBe(loraRows(lin.N, ad.r, ad.scale),
-        "prefix_lora_" & $lin.N & "_" & $ad.r & "_" & $ad.scale, be)
-      if lin.K mod LoraDownTg == 0 and LoraDownTg <= gTgCap and
-          getEnv("BYBY_PREFILL_LORA_DOWN", "1") != "0":
-        loraDownKns[name] = vmKernelForBe(buildPrefixLoraDownProgram(lin.K, ad.r),
-          "prefix_lora_down_" & $lin.K & "_" & $ad.r, be)
     if lin.isFp4 and expandFp4:
-      let rank=if name in gLoraGpu and not gDisableLora:gLoraGpu[name].r else:0
-      let scale=if rank>0:gLoraGpu[name].scale else:1'f32
       require(lin.K mod 32 == 0 and (lin.K*lin.N div 2) mod 256 == 0,"unsupported FP4 tile shape")
       for row in countup(0,lin.N-1,4096):
         let count=min(4096,lin.N-row)
@@ -777,10 +747,10 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
         while count mod tg != 0: tg=tg div 2
         let kn=vmKernelForBe(buildPrefixExpandFp4(lin.K,lin.N,row),
           "prefix_expand_" & $lin.K & "_" & $lin.N & "_" & $row,be)
-        let scatter=vmKernelForBe(buildPrefixScatter(lin.N,count,row,tg,rank,scale,
-          tileLoraOff,if lin.hasBias:tileBiasOff else: -1),
+        let scatter=vmKernelForBe(buildPrefixScatter(lin.N,count,row,tg,
+          if lin.hasBias:tileBiasOff else: -1),
           "prefix_scatter_fused_" & $T & "_" & $lin.N & "_" & $count & "_" & $row &
-          "_" & $rank & "_" & $scale & "_" & $lin.hasBias,be)
+          "_" & $lin.hasBias,be)
         expandKns.mgetOrPut(name,@[]).add((kn,scatter,row,count,tg))
     if lin.isFp4 and useM8 and not expandFp4:
       # Keep the autotuned threadgroup width but use the two-words-in-flight
@@ -822,6 +792,12 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
           m4x2Kns[name] = vmKernelForBe(
             buildFp4KmGemm2ColProgram(lin.K, lin.N, GemvTg, 4),
             "fp4km2c_m4_" & $lin.K & "x" & $lin.N, be)
+    elif lin.isF16:
+      # FP16 sidecar weights (BYBY_LINEARPP_DTYPE=fp16): one dispatch for all T rows, the rows in
+      # tiles of up to 16 so each weight column comes from memory once. MPS and the cooperative
+      # FP32-weight routes cannot read halves, so this kernel serves every prefix length.
+      f16Kns[name] = vmKernelForBe(buildF16GemmProgram(lin.K, lin.N, T),
+        "prefix_f16gemm_" & $lin.K & "x" & $lin.N & "_r" & $T, be)
     elif not lin.isFp4 and T <= 12 and lin.K mod GemvTg == 0:
       # FP32 sidecar (block G: qkvProj/outProj/fuseGate). MPS runs these at
       # ~1.7 GFLOP/s for an 11-row prompt (654 ms for one qkvProj), so batch
@@ -830,9 +806,9 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
         buildF32GemmBatchProgram(lin.K, lin.N, GemvTg, T),
         "prefix_f32gemm_" & $lin.K & "x" & $lin.N & "_r" & $T, be)
   var f32Mps, f32Fallback, f32Batch: int
-  # ---- native FP4 GEMM (register-blocked on every Metal GPU, simdgroup_matrix on Apple GPUs) ----
-  # BYBY_PREFILL_FP4_GEMM = auto | rb | sg | off. The simdgroup kernel is admitted only after it
-  # reproduces the register-blocked kernel on a real projection; otherwise the portable kernel runs.
+  # ---- FP4 tile GEMM micro-kernel (register tiles on every Metal GPU, simdgroup_matrix on Apple GPUs) ----
+  # BYBY_PREFILL_FP4_GEMM = auto | rb | sg | off. The simdgroup_matrix lowering is admitted only after
+  # it reproduces the register-tiled lowering on a real projection; otherwise the register tiles run.
   let fp4GemmMode = getEnv("BYBY_PREFILL_FP4_GEMM", "auto")
   # Below ~32 rows the 8-row packed micro-VM tiles are as fast on a GPU without matrix hardware.
   let fp4GemmMinRows = max(1, (try: parseInt(getEnv("BYBY_PREFILL_FP4_GEMM_MIN_ROWS",
@@ -846,9 +822,15 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
   proc fp4SimdgroupParity(c: Fp4LinCacheGpu): bool =
     ## Runs both kernels on 16 pseudo-random rows of a real packed projection.
     if c.cols mod 32 != 0 or c.rows < 64: return false
+    let wasOpen = sessionOpen
     if sessionOpen:
       require(sessionEnd(be), "FP4 GEMM parity preflush failed")
       sessionOpen = false
+    defer:
+      # The caller encodes into the prefill session next: reopen it whatever the outcome.
+      if wasOpen and not sessionOpen:
+        require(sessionBegin(be), "could not reopen prefill session after FP4 GEMM parity")
+        sessionOpen = true
     let rows = 16
     var x = newSeq[float32](rows * c.cols)
     var seed = 12345'u32
@@ -977,15 +959,6 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
       echo &"[pf] {name} K={lin.K} N={lin.N} fp4={lin.isFp4} m8={name in m8Kns} " &
         &"m4={name in m4Kns} bias={lin.hasBias}"
     let fusedEpilogue=name in expandKns
-    let hasLora=name in gLoraGpu and not gDisableLora
-    if hasLora:
-      let ad=gLoraGpu[name]
-      if name in loraDownKns:
-        # One 256-lane reduction group per (token, rank) output.
-        encodeVmKernel(loraDownKns[name], T * ad.r * LoraDownTg, LoraDownTg,
-          LoraDownTg * 4, hLora, 0, gDummyFor(be), ad.aBuf, input, 0)
-      else:
-        require(matmul(input,ad.aBuf,hLora,T,lin.K,ad.r),"LoRA A " & name)
     if name in expandKns:
       let c=gFp4CacheGpu[name]
       for tile in expandKns[name]:
@@ -994,12 +967,11 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
           require(metalBackend.metalSessionMatmulMpsNTEnc(input.metalHandle,hExpanded.metalHandle,
             hTile.metalHandle,T,lin.K,tile.count,tile.count,0),"prefill MPS " & name)
           inc gPrefixMps
-        if hasLora:copy(hLora,hTile,0,tileLoraOff,T*gLoraGpu[name].r)
         if lin.hasBias and bias:copy(lin.biasH,hTile,tile.row,tileBiasOff,tile.count)
         # mamba in/out projections have no bias; only sidecar calls enable it.
         elif lin.hasBias:copy(hZero,hTile,0,tileBiasOff,tile.count)
         encodeVmKernel(tile.scatter,T*tile.count,tile.tg,4,output,0,c.wBuf,
-          if hasLora:gLoraGpu[name].bBuf else:gDummyFor(be),hTile,0)
+          gDummyFor(be),hTile,0)
         inc gPrefixFusedEpilogues
     # Vulkan's 8x2 packed microkernel is a useful fallback, but it currently
     # gets selected before the FP4 cooperative-matrix GEMM below. On GPUs such
@@ -1079,6 +1051,12 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
     elif lin.isFp4:
       inc gPrefixPackedTiles
       require(encodeFp4GemmRows(gFp4CacheGpu[name], input, output, T), "FP4 GEMM " & name)
+    elif name in f16Kns:
+      inc f32Batch
+      encodeVmKernel(f16Kns[name], lin.N * GemvTg, GemvTg, f16GemmTgBytes(T),
+        output, 0, lin.wF16, gDummyFor(be), input, 0)
+    elif lin.isF16:
+      raise newException(CatchableError, "FP16 prefill GEMM was not prepared for " & name)
     elif name in f32Kns:
       if mpsMslWins(name, input, lin.wF32, output, T, lin.K, lin.N, true):
         when defined(macosx):
@@ -1107,10 +1085,6 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
           flushStage("f32.second_" & $lin.N & "x" & $lin.K)
     else:
       require(matmul(input, lin.wF32, output, T, lin.K, lin.N), "FP32 GEMM " & name)
-    if hasLora and not fusedEpilogue:
-      let ad = gLoraGpu[name]
-      encodeVmKernel(loraKns[name], T * lin.N, 64, 4,
-        output, 0, gDummyFor(be), ad.bBuf, hLora, 0)
     if bias and lin.hasBias and not fusedEpilogue:
       encodeVmKernel(biasKns[lin.N], T * lin.N, 64, 4,
         output, 0, gDummyFor(be), lin.biasH, gDummyFor(be), 0)
@@ -1195,19 +1169,19 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
       for _, kn in m8x2Kns: addNamed(kn)
       for _, kn in m4x2Kns: addNamed(kn)
     for _, kn in biasKns: addNamed(kn)
-    for _, kn in loraKns: addNamed(kn)
-    for _, kn in loraDownKns: addNamed(kn)
+    for _, kn in f16Kns: addNamed(kn)
     let prewarmStart = getMonoTimeIfPf()
     byby.sessionJitPrewarm(be, jobs)
     pfAddIf("vulkan.prewarm", prewarmStart)
 
-  # Tiled cooperative GEMMs (FP4-KM Mamba projections, FP32 Linear++ sidecar):
-  # check once per (format, K, N) against the generic cooperative kernel, then
-  # let the session GEMM entry points prefer them.
+  # Tiled cooperative GEMM of the FP32 Linear++ sidecar: check once per (K, N)
+  # against the generic cooperative kernel, then let the session GEMM entry
+  # points prefer it. FP4-KM projections have a single Tensor Core route, the
+  # tile GEMM micro-kernel (sessionFp4GemmTensorCore), so they need no check.
   # No cooperative route (MoltenVK, scalar GPUs): neither kernel can run, so
   # there is nothing to check.
   if be == gbVulkan and T >= coopMinT and byby.sessionCooperativeGemmEnabled(be):
-    for fp4 in [true, false]:
+    for fp4 in [false]:
       let kind = if fp4: "FP4" else: "FP32"
       if getEnv("BYBY_PREFILL_" & kind & "_TILED", "1") == "0": continue
       var shapes: seq[tuple[name: string, K, N: int]]
@@ -1228,7 +1202,7 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
         if key notin gTiledGemmChecked: pending = true
         elif not gTiledGemmChecked[key]: allOk = false
       proc setTiled(on: bool) =
-        if fp4: byby.sessionSetFp4GemmTiled(be, on) else: byby.sessionSetF32GemmTiled(be, on)
+        byby.sessionSetF32GemmTiled(be, on)
       if pending and allOk:
         let verifyStart = getMonoTimeIfPf()
         setTiled(false)   # reference must be the generic kernel

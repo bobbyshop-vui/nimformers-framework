@@ -6,8 +6,7 @@ include infer_lora
 proc formersPrepareChat*(m: var NimformerModelJamba, lora: var JambaLora, ctx: Backend) =
   mergeInUploadStreamingJamba(m, lora, ctx)
   prepareGpuModel(m, lora, ctx)
-  if getEnv("BYBY_MERGE_LORA", "0") != "0" and lora.adapters.len > 0:
-    discard mergeResidentLoraInplace(m, lora, ctx)
+  discard mergeResidentLoraAll(m, lora, ctx)
   let preset = getEnv("BYBY_NORM_PRESET", if gCkptNormPreset.len > 0: gCkptNormPreset else: "rms-fin-gn")
   if not setGpuNormPreset(preset):
     raise newException(ValueError, "[formers.n] invalid norm preset: " & preset)

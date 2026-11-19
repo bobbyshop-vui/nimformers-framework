@@ -9,7 +9,7 @@ import nim "std/[os, strutils]"
 type
   FmOptions* = object
     modelsDir*, modelFile*, loraFile*, configFile*, tokenizerDir*: string
-    noLora*, noMergeLora*: bool
+    noLora*: bool
     prompt*, systemText*: string
     rawPrompt*: bool
     addSpecialTokens*: bool
@@ -57,7 +57,6 @@ function fmUsage(): string
     lines.add("  -m, --model FILE       .nimq or .safetensors file (default: found in --models)")
     lines.add("  --lora FILE            LoRA adapter .bin (NIMBIN1/NIMBIN4) for Mamba-2/3")
     lines.add("  --no-lora              ignore a LoRA found in --models")
-    lines.add("  --no-merge-lora        keep the LoRA adapters separate (default: merged into the weights)")
     lines.add("  --config FILE          config.json (default: found automatically)")
     lines.add("  --tokenizer DIR        tokenizer directory (default: found automatically)")
     lines.add("")
@@ -148,8 +147,6 @@ function fmParseOptions(args: seq[string]): FmOptions
             result.loraFile = fmOptValue(args, i, flag, inlineVal, hasInline, result.errors)
         of "--no-lora":
             result.noLora = true
-        of "--no-merge-lora":
-            result.noMergeLora = true
         of "--config":
             result.configFile = fmOptValue(args, i, flag, inlineVal, hasInline, result.errors)
         of "--tokenizer":

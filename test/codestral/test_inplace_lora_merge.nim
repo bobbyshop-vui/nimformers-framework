@@ -44,11 +44,9 @@ for rank in [1,4,8]:
   let streamed=mergeLegacyFp4Candidate(oldBase,oldAdapter)
   doAssert streamed.accepted and streamed.globalScale==expected.scale[0]
   doAssert streamed.packed==expected.data,"legacy merge packed byte mismatch rank=" & $rank
-echo "PASS original BYBY_MERGE_LORA=1 vs streamed merge: global scale and every packed byte match for ranks 1/4/8"
-refused=false
-try:checkMergeMemory(1,1)
-except ValueError:refused=true
-doAssert refused
+echo "PASS original in-place merge vs streamed merge: global scale and every packed byte match for ranks 1/4/8"
+# The merge is mandatory: a budget below the process size only warns.
+checkMergeMemory(1,1)
 
 let ctx=newBackend(getEnv("BYBY_INFER_BACKEND","metal"))
 let be=ctx.kind.toByby()
@@ -115,6 +113,8 @@ for (name,t) in paramList(m):
       else:sin(float32(i)*0.1'f32)*0.03'f32
 var lo:JambaLora
 const targetName="block0.mambaReal.outProj.weight"
+var targetBase:QuantTensor
+var targetAdapter:LoraAdapter
 for name,lin in paramLinears(m):
   if lin[].weight.shape.len!=2:continue
   var qt=quantizeFp4KM(lin[].weight.data,lin[].weight.shape)
@@ -127,19 +127,36 @@ for name,lin in paramLinears(m):
     lo.quantBase[name]=qt;lo.adapters[name]=adapter
     lin[].loraR=1;lin[].loraScale=1
     lin[].loraA=adapter.A.data;lin[].loraB=adapter.B.data
+    targetBase=qt;targetAdapter=adapter
   setQuantWeight(lin[],qt)
 discard setGpuNormPreset("mamba-ssm")
 prepareGpuModel(m,lo,ctx)
-var expected:seq[float32]
-for id in [3,10,17]:expected=forwardStepJambaGpu(m,id,ctx).data
+# Decode before the merge too: a kept decode recording must not survive the merge.
+for id in [3,10,17]:discard forwardStepJambaGpu(m,id,ctx)
 let originalHandle=gFp4CacheGpu[targetName].wBuf
 doAssert mergeResidentLoraInplace(m,lo,ctx)==1
-doAssert lo.adapters.len==0 and targetName notin gLoraGpu
+doAssert lo.adapters.len==0
 doAssert originalHandle.metalHandle==gFp4CacheGpu[targetName].wBuf.metalHandle
 doAssert originalHandle.vulkanHandle.buf==gFp4CacheGpu[targetName].wBuf.vulkanHandle.buf
 resetGpuGenState(m,ctx)
 var actual:seq[float32]
 for id in [3,10,17]:actual=forwardStepJambaGpu(m,id,ctx).data
+# Reference: the same model with the target weight merged on the CPU (byte-identical to the GPU
+# merge, checked above) and no adapters.
+let cpuMerged=mergeLegacyFp4Candidate(targetBase,targetAdapter)
+doAssert cpuMerged.accepted
+var lo2:JambaLora
+for name,lin in paramLinears(m):
+  if name==targetName:
+    var qt=targetBase
+    qt.data=cpuMerged.packed;qt.scale= @[cpuMerged.globalScale]
+    lin[].loraR=0;lin[].loraA= @[];lin[].loraB= @[]
+    setQuantWeight(lin[],qt)
+prepareGpuModel(m,lo2,ctx)
+resetGpuGenState(m,ctx)
+var expected:seq[float32]
+for id in [3,10,17]:expected=forwardStepJambaGpu(m,id,ctx).data
+doAssert actual.len==expected.len and actual.len>0
 for i in 0..<actual.len:doAssert abs(actual[i]-expected[i])<1e-5'f32
-echo "PASS real model decode after accepted in-place merge: adapter removed once, GPU weight buffer reused, logits match separate LoRA"
+echo "PASS real model decode after accepted in-place merge: adapter removed once, GPU weight buffer reused, logits match the CPU-merged checkpoint"
 echo "PASS guarded FP4 merge, unsafe-delta rejection, budget rejection, in-place GPU buffer and packed-bit preservation"

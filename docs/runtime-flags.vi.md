@@ -53,7 +53,7 @@ chờ (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_FIR_RELOC` | `1` | Graph arena trên Metal: một pipeline mỗi kernel. `0`: một pipeline mỗi node. |
 | `BYBY_FIR_PROFILE` | `0` | `1`: trung bình encode trên host / chờ GPU / đọc logits mỗi bước decode. `2`: kết thúc session sau mỗi node và báo thời gian từng kernel (chậm; chỉ để chẩn đoán). |
 | `BYBY_UBATCH` | `512` | Giới hạn số hàng một lần chạy phase prompt (trừ phase có logits mỗi hàng). `0`: không giới hạn. |
-| `BYBY_PREFILL_MIN_ROWS` | `5` | Codestral (native và FIR): prompt hoặc phần đuôi prompt có từ chừng này token trở lên chạy một lần prefill nhiều hàng; ít hơn thì chạy từng token. `1`: gộp mọi phần đuôi từ 2 token; `128` trở lên: chỉ các đoạn 128 hàng (hành vi cũ). Native và FIR phải dùng cùng giá trị, và FIR graph phải được lift với giá trị đó (graph có một phase cho mỗi cỡ đuôi). |
+| `BYBY_PREFILL_MIN_ROWS` | `5` | Codestral (native và FIR, kể cả GPU có Tensor Core): prompt hoặc phần đuôi prompt có từ chừng này token trở lên chạy một lần prefill nhiều hàng; ít hơn thì chạy từng token. `1`: gộp mọi phần đuôi từ 2 token; `128` trở lên: chỉ các đoạn 128 hàng (hành vi cũ). Native và FIR phải dùng cùng giá trị, và FIR graph phải được lift với giá trị đó (graph có một phase cho mỗi cỡ đuôi). |
 
 ## Inference native (`nim_inference`, route native của `formers-cli`)
 
@@ -72,6 +72,7 @@ chờ (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_DECODE_CB_MS` | `1500` | Thời gian GPU đích của một command buffer decode. |
 | `BYBY_DECODE_LAYERS_PER_CB` | tự động | Số layer mỗi command buffer decode (`0`: một buffer mỗi token). |
 | `BYBY_DECODE_FIRST_CB` | `0` | Commit sau chừng này layer đầu để GPU bắt đầu sớm. |
+| `BYBY_DECODE_REPLAY` | `1` | Codestral (`infer_lora`, `formers-cli`), Vulkan và Metal: sau một bước encode, bước decode được ghi lại một lần (có và không có head) rồi submit lại mỗi token; host chỉ ghi hàng embedding và đọc logits. Bản ghi bị bỏ khi chuẩn bị model GPU, reset state và merge LoRA. Tắt khi bật FIR recorder, `BYBY_DECODE_SPLIT`, `BYBY_G_DIAGNOSTICS` và one-dispatch. `0`: encode mỗi bước. `BYBY_DECODE_REPLAY_VERBOSE=1` in lại dòng bật/tắt. |
 | `BYBY_MERGE_QKV_ATTN_SESSION` | `1` | Gộp QKV và attention vào một session. |
 | `BYBY_MERGE_ALL_LAYERS_SESSION` | `1` | Giữ mọi layer của một token trong một session. |
 | `BYBY_HEAD_IN_SESSION` | `1` | Chạy norm cuối và `lm_head` trong session decode. |
@@ -91,6 +92,17 @@ chờ (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_LEGACY_DECODE_GC` | không đặt | GC định kỳ kiểu cũ trong decode. |
 | `BYBY_GPU_SAMPLE`, `BYBY_GPU_SAMPLE_AHEAD`, `BYBY_GRAPH` | chỉ Metal | Pipe lấy mẫu trên GPU và phát lại graph decode trên Metal. |
 
+## Decode Mamba-3 (route mamba3 của `formers-cli`)
+
+| Flag | Mặc định | Tác dụng |
+| --- | --- | --- |
+| `BYBY_M3_GPU_SAMPLE` | `1` | Decode greedy (`--temp 0`, không repeat penalty) chọn token trên GPU: gather embedding, stack, `lm_head`, mask token cấm và argmax mỗi bước, id nằm trong ring trên GPU. `0`: sampler trên host. |
+| `BYBY_DECODE_AHEAD` | `16` | Số bước decode mỗi batch command buffer của sampler GPU (1..62). Các bước sau token dừng vẫn chạy rồi bị bỏ. |
+| `BYBY_M3_DECODE_ASYNC` | `1` | Metal: hai batch chạy gối nhau, batch sau được encode trong lúc GPU chạy batch trước. `0`: chờ từng batch. |
+| `BYBY_M3_FUSE` | `1` | Một hàng decode: output projection cộng thẳng vào residual, down projection tự làm cổng SiLU và residual. `0`: dispatch riêng. |
+| `BYBY_GEMV_DECODE` | `1` | Autotune thử thêm các GEMV decode cho K ngắn (không có vòng copy LUT, 4-16 hàng mỗi threadgroup). `0`: chỉ kernel cũ. |
+| `BYBY_M3_PROFILE` | không đặt | `1`: in ms GPU mỗi token của từng batch sampler GPU và thời gian từng bước của đường host. |
+
 ## Driver Vulkan (`vendor/bybylang/backends/vulkan`)
 
 | Flag | Mặc định | Tác dụng |
@@ -99,7 +111,7 @@ chờ (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_VULKAN_DEVICE_LOCAL` | `auto` | Weight resident ở VRAM trên dGPU (`auto` hoặc `1`); không bao giờ trên iGPU. Giá trị khác giữ bộ nhớ host-visible. |
 | `BYBY_VULKAN_SCRATCH` | `auto` | Scratch ở VRAM: `auto` (dGPU), `device` (luôn), `host` (không). |
 | `BYBY_VULKAN_TENSOR_CORES` | `1` | GEMM cooperative matrix. Trên dGPU mọi GEMM prefill phải dùng; `force` làm vậy trên mọi thiết bị; `tune` đo so với kernel scalar; `0` tắt. |
-| `BYBY_VULKAN_SPLIT_K` | `auto` | Số lát split-K của GEMM Tensor Core dạng tile (`1`: tắt, `<n>`: cố định). |
+| `BYBY_VULKAN_SPLIT_K` | `auto` | Số lát split-K của GEMM Tensor Core FP32/Q4 dạng tile (`1`: tắt, `<n>`: cố định). Micro-kernel tile GEMM FP4-KM không chia K. |
 | `BYBY_VULKAN_SPLIT_K_VERBOSE` | `0` | Log mọi lựa chọn split-K. |
 | `BYBY_VULKAN_MMAP_IMPORT` | `1` | Import weight đã mmap làm bộ nhớ host trên iGPU. |
 | `BYBY_VULKAN_POOL_MB` | `2048` | Trần pool buffer dùng lại. |
@@ -141,9 +153,19 @@ chờ (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_FIR_PROBE_STEPS` | mọi bước | Các bước recorder giữ, ví dụ `prefill:2,decode:1`. |
 | `BYBY_FIR_PROBE_DATA` | `1` dưới `--run` | Gửi dữ liệu upload chính xác qua pipe dữ liệu (cần cho upload không tên như LUT). `0` khi mọi weight đều có tên trong `model.nimq`. |
 
-Để lift Codestral cần `BYBY_MERGE_LORA=1` và `BYBY_MEMORY_LIMIT_MB=10000`.
+Để lift Codestral cần `BYBY_MEMORY_LIMIT_MB=10000` (merge LoRA luôn bật).
 
 Header trace ghi `device="coopmatrix"` cho cooperative matrix của Vulkan, `device="simdmatrix"` cho simdgroup matrix của Metal, hoặc `device="plain"` nếu không có. Micro-kernel Tensor Core được tự động chọn cho Vulkan có cooperative matrix hoặc Metal trên Apple GPU family 7+; các thiết bị khác dùng kernel generic.
 
 Trace ghi backend và tính năng thiết bị của lần chạy, nên graph lift trên T4 nhắm
 tới Tensor Core còn graph lift trên thiết bị không có cooperative matrix thì không.
+
+GEMM prefill FP4-KM (Codestral và Mamba 3) luôn chạy micro-kernel tile GEMM
+(`OP_TILE_GEMM`, `vendor/bybylang/micro_kernel/tile_gemm.nim`); không còn shader FP4-KM
+viết tay và không có flag để chọn shader đó. JIT hạ cùng một chương trình thành
+cooperative matrix của Vulkan, simdgroup matrix của Metal (Apple GPU family 7+), hoặc
+tile thanh ghi trên GPU khác, còn CPU VM chạy trực tiếp. Node FP4 Tensor Core của FIR đã
+lift tự lùi về bản hạ tile thanh ghi lúc nạp khi thiết bị không có đơn vị ma trận, và
+node `sessionFp4GemmMetal` / `sessionFp4GemmTensorCore` của graph cũ phát lại qua cùng
+micro-kernel đó. Đường FP4-KM bằng FP8 (E4M3), công tắc `BYBY_PREFILL_FP4_TILED` và
+`BYBY_FP4_SG_COMPILE_CHECK` đã bị bỏ.

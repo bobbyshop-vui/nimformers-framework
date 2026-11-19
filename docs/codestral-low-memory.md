@@ -63,11 +63,9 @@ smaller width than it was compiled for.
 
 ## Merge within the memory budget
 
-Inference merges by default (`BYBY_MERGE_LORA=inplace`), because the merged
-weights match a merged checkpoint and the decode kernels drop the adapter
-fusion. `BYBY_MERGE_LORA=0` keeps the original adapter delta, which FP4-KM
-cannot generally represent exactly, and skips the merge pass entirely; the
-merge also steps aside by itself when the process has no memory headroom.
+Inference always merges: the merged weights match a merged checkpoint and the
+decode kernels drop the adapter fusion. There is no separate-adapter mode; a
+tight memory budget only prints a warning and a failed merge stops the run.
 
 Merging still handles one tensor at a time
 and requires a quantization-error check relative to the LoRA delta.
