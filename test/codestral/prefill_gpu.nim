@@ -1,7 +1,7 @@
 ## Resident R/P/G prefix: reuse device scratch and import terminal states by
 ## device-to-device copies. No host activations, transposed FP32 weights, or
 ## backward caches between layers. The caller owns state reset/recovery.
-import std/[tables, strformat, os, strutils, algorithm, times, math]
+import std/[tables, strformat, os, strutils, algorithm, times, math, monotimes]
 import backend, nimformer, jamba_hybrid, mamba2_full_vm, mamba2_ssm_gpu
 import mamba2_fused_step, gpu_layers, fp4_gemv_gpu, session_vm, jit_vm
 import fp4_gemv_vm
@@ -510,6 +510,28 @@ const
     ## Default micro-batch (BYBY_UBATCH): a prompt up to this length runs as one pass, so its
     ## shaders are compiled once and no chunk carries state into the next.
 
+var gPrefillTuneSeconds* = 0.0
+  ## Wall seconds of the one-time prefill autotune and parity checks so far, minus the shader
+  ## compiles inside them (sessionCompileSeconds counts those). Subtract both from a prefill's
+  ## wall time to get its compute-only throughput.
+
+proc addTuneSeconds(start: MonoTime; compileBefore: float) =
+  let wall = float((getMonoTime() - start).inNanoseconds) / 1e9
+  gPrefillTuneSeconds += max(0.0, wall - (sessionCompileSeconds() - compileBefore))
+
+proc prefillSetupSeconds*(): tuple[compile, tune: float] =
+  ## Running totals of shader compile seconds (every GPU backend) and of gPrefillTuneSeconds;
+  ## take the difference around a prefill.
+  (sessionCompileSeconds(), gPrefillTuneSeconds)
+
+template tuneTimed(body: untyped) =
+  let tuneStart = getMonoTime()
+  let tuneCompileBefore = sessionCompileSeconds()
+  try:
+    body
+  finally:
+    addTuneSeconds(tuneStart, tuneCompileBefore)
+
 proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Backend; continuation = false) =
   ensureTgCap(ctx)
   require(ids.len >= 2 and ids.len <= ResidentPrefillMaxT,
@@ -558,16 +580,17 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
       ((T + q - 1) div q) * mr.numHeads * mr.dState * mr.headDim * 4
     while ssdQ < 256 and ssdScratchBytes(ssdQ) > budget: ssdQ *= 2
     if ssdScratchBytes(ssdQ) <= budget:
-      ssd = sessionMamba2SsdPrepare(be, mr.dState, mr.headDim, ssdQ).len > 0
+      tuneTimed:
+        ssd = sessionMamba2SsdPrepare(be, mr.dState, mr.headDim, ssdQ).len > 0
   # The SSD pass replaces the scan step, so the scan autotune (lane parity, serial/parallel
   # timing) only runs when a scan kernel will actually be encoded. A forced BYBY_PREFILL_SCAN
   # keeps its meaning for the fallback path.
-  let scanMode =
-    if ssd: "ssd"
-    elif requestedScan == "auto":
-      chooseScanMode(ctx,T,mr.numHeads,mr.headDim,mr.dState,mr.nGroups,
+  var scanMode = requestedScan
+  if ssd: scanMode = "ssd"
+  elif requestedScan == "auto":
+    tuneTimed:
+      scanMode = chooseScanMode(ctx,T,mr.numHeads,mr.headDim,mr.dState,mr.nGroups,
         mr.convKernel,mr.intermediateSize,mr.normEps,mr.nGroups,continuation)
-    else: requestedScan
   let parallel = scanMode.startsWith("parallel")
   let parallelStateLanes =
     if scanMode.startsWith("parallel_n"): parseInt(scanMode["parallel_n".len .. ^1])
@@ -875,7 +898,10 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
     if not fp4GemmOk: return false
     if fp4GemmSimdgroup and not fp4SgChecked:
       fp4SgChecked = true
-      if not fp4SimdgroupParity(c): fp4GemmSimdgroup = false
+      var passed = false
+      tuneTimed:
+        passed = fp4SimdgroupParity(c)
+      if not passed: fp4GemmSimdgroup = false
     true
 
   proc mpsMslWins(name: string; input, weight: SessionHandle;
@@ -893,6 +919,8 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
         output.metalHandle = metalBackend.metalSessionAllocScratch(rows * cols)
       let outputHandle = output
       let tuneStart = getMonoTimeIfPf()
+      let tuneWall = getMonoTime()
+      let tuneCompileBefore = sessionCompileSeconds()
       proc run(mps: bool): float64 =
         require(sessionBegin(be), "MPS autotune sessionBegin failed")
         sessionOpen = true
@@ -946,6 +974,7 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
           require(sessionBegin(be), "could not reopen prefill session after MPS autotune")
           sessionOpen = true
         pfAddIf("matrix.autotune", tuneStart)
+        addTuneSeconds(tuneWall, tuneCompileBefore)
     else:
       discard name; discard input; discard weight; discard output
       discard rows; discard k; discard cols; discard batchKernel
@@ -1222,6 +1251,8 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
         byby.sessionSetF32GemmTiled(be, on)
       if pending and allOk:
         let verifyStart = getMonoTimeIfPf()
+        let verifyWall = getMonoTime()
+        let verifyCompileBefore = sessionCompileSeconds()
         setTiled(false)   # reference must be the generic kernel
         for sh in shapes:
           let key = kind & "_" & $sh.K & "x" & $sh.N
@@ -1240,6 +1271,7 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
             allOk = false
             break
         pfAddIf("gemm.verify", verifyStart)
+        addTuneSeconds(verifyWall, verifyCompileBefore)
       setTiled(allOk)
 
   var groupStart = getMonoTimeIfPf()

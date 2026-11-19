@@ -139,6 +139,25 @@ prefill on a T4/M-series GPU, where the whole GEMM is a few hundred ms.
 - `BYBY_VULKAN_DISPATCH_CACHE=1` (default) keeps the cache enabled; `0` forces
   a recompile on every dispatch and is only for diagnostics.
 
+## Prefill tok/s without compile time
+
+The `Prefill:` line of the speed stats is compute only. Two one-time costs are subtracted from
+the prefill wall time and printed next to it:
+
+- shader compiles: `glslc` runs and Vulkan pipeline creation, Metal library and pipeline-state
+  builds, cache misses only. The drivers keep a running total (`sessionCompileSeconds`).
+- prefill autotune and parity checks: the scan autotune, the SSD parity check, the MPS-vs-MSL
+  timing, the simdgroup GEMM parity and the tiled GEMM check (`gPrefillTuneSeconds`), without
+  the compiles they trigger, so nothing is subtracted twice.
+
+```
+Prefill: <N> tokens in <compute>s -> <rate> tok/s (excluding <c>s shader compile + <t>s autotune; wall <w>s -> <rate> tok/s)
+```
+
+A warm run, where every kernel is cached and every tune decision is reused, prints the plain
+`Prefill: <N> tokens in <w>s -> <rate> tok/s` line. formers.n prints its `prompt eval` line the
+same way.
+
 
 ## Decode replay
 
@@ -210,7 +229,8 @@ the scan only, including state transpose overhead, not whole-model tokens/s.
 
 `test_resident_prefill_integration.nim` covers R/P/G with nonzero LoRA, bias,
 serial/coalesced/parallel scans, MPS/packed GEMMs, state carry, 257 tokens in 128-token chunks
-and 300 tokens as one micro-batch. `test_prefill_lane_scan_gpu.nim` checks the lane scan up to
-512 timesteps.
+and 300 tokens as one micro-batch. It also checks that the first prefill of the process counts
+its shader compiles and that a repeated prefill of the same shape excludes almost nothing (only
+cache lookups). `test_prefill_lane_scan_gpu.nim` checks the lane scan up to 512 timesteps.
 `test_inplace_lora_merge.nim` covers error and memory guards, packed-bit
 preservation, buffer identity and decode logits after an accepted merge.

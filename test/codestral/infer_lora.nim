@@ -1588,6 +1588,9 @@ proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenize
   let traceBlocks = getEnv("BYBY_TRACE_BLOCKS", "0") != "0"
 
   resetGpuGenState(m, ctx)
+  # Shader compiles and the one-time autotune/parity checks are counted apart, so the
+  # reported prefill throughput is compute only (the wall time is printed next to it).
+  let setupBefore = prefillSetupSeconds()
   let prefillStart = monoSecs()
   if ids.len > 1:
     echo &"[infer] Prefill batch qua {ids.len - 1} token prompt ..."
@@ -1599,6 +1602,10 @@ proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenize
     if released > 0:
       echo "[infer] Released " & $(released div (1024*1024)) & " MiB prefill scratch before native decode (MPS disabled for M=1)."
   let prefillTime = monoSecs() - prefillStart
+  let setupAfter = prefillSetupSeconds()
+  let prefillCompile = setupAfter.compile - setupBefore.compile
+  let prefillTune = setupAfter.tune - setupBefore.tune
+  let prefillCompute = max(prefillTime - prefillCompile - prefillTune, 1e-9)
   echo "[infer] Prefill done - starting decode."
   echo &"[infer] RSS after prefill: {rssMB()}"
 
@@ -1703,8 +1710,15 @@ proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenize
   stderr.writeLine &"[infer] tong ket: sinh {genIds.len} token, {distinctGen.len} id khac nhau, " &
                    &"{sd.emitted.len} byte van ban in ra (prompt {promptLen} token)."
   stderr.writeLine "\n== Speed stats =="
-  stderr.writeLine &"Prefill: {max(0, promptLen - 1)} tokens in {prefillTime:.3f}s -> " &
-                   &"{(max(0, promptLen - 1).float / max(prefillTime, 1e-9)):.2f} tok/s"
+  let prefillTokens = max(0, promptLen - 1)
+  if prefillCompile + prefillTune >= 0.0005:
+    stderr.writeLine &"Prefill: {prefillTokens} tokens in {prefillCompute:.3f}s -> " &
+                     &"{(prefillTokens.float / prefillCompute):.2f} tok/s " &
+                     &"(excluding {prefillCompile:.3f}s shader compile + {prefillTune:.3f}s autotune; " &
+                     &"wall {prefillTime:.3f}s -> {(prefillTokens.float / max(prefillTime, 1e-9)):.2f} tok/s)"
+  else:
+    stderr.writeLine &"Prefill: {prefillTokens} tokens in {prefillTime:.3f}s -> " &
+                     &"{(prefillTokens.float / max(prefillTime, 1e-9)):.2f} tok/s"
   if genIds.len > 0 and decodeTime > 0:
     stderr.writeLine &"Decode:  {genIds.len} tokens in {decodeTime:.3f}s -> " &
                      &"{(genIds.len.float / decodeTime):.2f} tok/s " &
