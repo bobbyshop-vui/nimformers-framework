@@ -8,6 +8,9 @@ setForbidCpuFallback(true)
 let ctx=newBackend(getEnv("BYBY_INFER_BACKEND","metal"))
 initMicroVmJit("resident-prefill-integration",ctx.kind.toByby())
 let pattern=if paramCount()>0: paramStr(1) else: "RPG"
+# Second argument "f16": the Linear++ sidecars stay dense like Codestral's, so the GPU keeps them in
+# FP16 (BYBY_LINEARPP_DTYPE=fp16) and the prefill runs its FP16 sidecar GEMM route.
+let denseSidecars=paramCount()>1 and paramStr(2)=="f16"
 var m=newNimformerModelJamba(128,64,8,2,pattern,mambaRealDState=8,
   mambaRealNGroups=2,mambaRealExpand=2,initializeWeights=false)
 for (name,t) in paramList(m):
@@ -22,6 +25,9 @@ for (name,t) in paramList(m):
       else: sin(float32(i+name.len)*0.13'f32)*0.07'f32
 for name,lin in paramLinears(m):
   if lin[].weight.shape.len != 2: continue
+  if denseSidecars and (".attn." in name or ".fuseGate." in name):
+    for i in 0..<lin[].bias.data.len: lin[].bias.data[i]=0.03'f32
+    continue
   let qt=quantizeFp4KM(lin[].weight.data,lin[].weight.shape)
   setQuantWeight(lin[],qt)
   if name.startsWith("block"):
