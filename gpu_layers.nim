@@ -12,6 +12,7 @@
 import std/[tables, os, strutils, math, monotimes, times, algorithm, strformat]
 import backend
 import vendor/bybylang/gpubackend as byby
+from vendor/bybylang/probe import firProbeOn, probeUploaded
 import session_vm
 import session_vm_dispatch
 import jit_vm
@@ -543,6 +544,15 @@ proc prepareGpuLinForLinear*(ctx: Backend; name: string; lin: var Linear): GpuLi
       if (be == byby.gbMetal and result.wF16.metalHandle == nil) or
          (be == byby.gbVulkan and result.wF16.vulkanHandle.buf == nil):
         raise newException(CatchableError, "prepareGpuLinForLinear: FP16 GPU upload failed: " & name)
+      if firProbeOn and getEnv("BYBY_FIR_PROBE_DATA", "0") == "1":
+        # These are host-converted FP16 copies of checkpoint FP32 sidecars. Their fingerprints
+        # cannot match the source tensors, so preserve the exact bytes even when the recorder's
+        # general payload cap excludes large uploads.
+        let raw = if be == byby.gbVulkan:
+                    cast[pointer](result.wF16.vulkanHandle.buf)
+                  else:
+                    cast[pointer](result.wF16.metalHandle)
+        probeUploaded(raw, unsafeAddr halves[0], halves.len * sizeof(uint16), always = true)
       result.isF16 = true
       # No FP32 resident copy: the host copy is released and the sequence (non-resident) prefill
       # reports these weights unavailable, so prefill stays on the resident path.

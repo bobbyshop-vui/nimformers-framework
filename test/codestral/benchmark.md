@@ -9,8 +9,13 @@ LoRA adapters), weights mmap'ed, resident GPU prefill and native decode.
 
 | Runner | Prefill | Decode |
 | --- | ---: | ---: |
+| formers.n native, 247 prompt / 200 generated tokens | **223 tok/s** | **26 tok/s** |
 | formers.n, 22 tokens | 0.533 s · **41.24 tok/s** | 129 tokens, 7.525 s · **17.14 tok/s** · 58.3 ms/token |
 | `infer_lora`, 17 tokens | 3.041 s · 41.59 tok/s | 14.44 tok/s · 7.3 ms/token |
+
+The latest native T4 run used Vulkan, mmap'ed FP4-KM weights, merged LoRA,
+resident SSD prefill (`ssd_q64`) and decode replay. Prefill throughput excludes
+shader compile/autotune time.
 
 formers.n compiles every pipeline in its warmup (2.2 s, not part of the prefill
 time above), so its prefill is GPU work only. The `infer_lora` prefill includes
