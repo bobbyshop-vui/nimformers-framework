@@ -71,6 +71,31 @@ Kernel times on the same GPU with synthetic data (T=11, one dispatch each):
 | FP32 batch, 4096x12288 | 27.1 ms | 17.0 ms |
 | Lane scan, 128 heads x 64 x 128 | 2.9 ms | 1.4 ms |
 
+## MacBook Pro (Intel Iris Plus 640): FIR graph vs native
+
+The lifted FIR graph of the same model (`models/codestral/lifted` for Vulkan,
+`models/codestral/lifted-metal` for Metal, `formers-cli --fir`) against the
+native route, greedy, 8 generated tokens, merged LoRA. Both routes print the
+same token ids. Prompt tails of 5 tokens or more run as batched prefill
+phases (`BYBY_PREFILL_MIN_ROWS`). Decode is milliseconds per step; the
+native `eval` line divides 8 tokens by 7 steps, so it is converted to
+ms/step here.
+
+| Backend | Prompt | Prefill FIR / native (tok/s) | Decode FIR / native (ms/step) |
+| --- | ---: | ---: | ---: |
+| Vulkan (MoltenVK) | 13 tokens | 2.79 / 2.41 | 485 / 497 |
+| Vulkan (MoltenVK) | 22 tokens | 2.40 / 2.36 | 602 / 530 |
+| Vulkan (MoltenVK) | 139 tokens | 3.07 / 3.09 | 587 / 582 |
+| Metal | 13 tokens | 3.23 / 2.66 | 589 / 622 |
+| Metal | 22 tokens | 3.16 / 2.62 | 591 / 577 |
+| Metal | 139 tokens | 5.17 / 4.98 | 588 / 564 |
+
+Run-to-run noise is about ±30 ms/step; the machine heats up during the
+sequence, so later rows are slower for both routes. Metal decode replays the
+recorded step on a plain encoder on this GPU (an indirect command buffer was
+about 25% slower: 488 vs 390 ms/step); the FP4 decode GEMV variant is picked at
+load by `BYBY_FIR_FP4_GEMV_TUNE`.
+
 ## Test machines
 
 Tesla T4 (Google Colab):
@@ -106,6 +131,16 @@ MacBook, formers.n:
 ```sh
 other/formers.n/formers-cli --models test/codestral/models --backend metal
 other/formers.n/formers-cli --models test/codestral/models --backend vulkan
+```
+
+MacBook, FIR graph (22-token prompt ids, greedy):
+
+```sh
+other/formers.n/formers-cli --models test/codestral/models --no-lora \
+  -m test/codestral/models/codestral_mamba_only.nimq \
+  --config models/codestral/lifted-metal/config.json \
+  --tokenizer test/codestral/models/hf --fir models/codestral/lifted-metal/model.fir \
+  --prompt-ids "<ids>" --backend metal -n 8 --temp 0 --repeat-penalty 1.0 --no-progress
 ```
 
 MacBook, `infer_lora` (prompt `[INST] Xin chao[/INST]`, temperature 0.7):

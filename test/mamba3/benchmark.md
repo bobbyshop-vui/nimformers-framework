@@ -9,44 +9,49 @@ Model-specific results: [187M](#mamba-3-siso-187m) ·
 
 ### Intel Iris Plus Graphics 640
 
-Measured on the Metal backend using the Mamba-3 SISO 187M model and the
-`RRRRRRRRRRRG` fine-tuned checkpoint (`lora.bin`). Every speed on this page
-leaves out the one-off kernel setup/JIT of the process (the cold start), which
-the tools time and print separately.
+Measured with `formers-cli` on the Mamba-3 SISO 187M model and the
+`RRRRRRRRRRRG` fine-tuned checkpoint (`lora.bin`), the LoRA adapters merged in
+place into the quantized base (the default). Every speed on this page leaves out
+the one-off kernel setup/JIT of the process (the cold start), which the tools
+time and print separately.
 
-| Metric | Measurement |
-|---|---:|
-| Prompt | `What is the capital of France?` |
-| Prompt tokens | 13 |
-| Generated tokens | 32 |
-| Prefill | 0.159 s, 81.78 tok/s |
-| Decode | 0.764 s, 41.88 tok/s (23.9 ms/token) |
-| Decode, tokens 2-32 | 42.34 tok/s (23.6 ms/token) |
-| Prefill + decode | 0.923 s for 45 tokens |
-| Backend / GPU | Metal / Intel(R) Iris(TM) Plus Graphics 640 |
+| Metric | Metal | Vulkan (MoltenVK) |
+|---|---:|---:|
+| Prompt | `What is the capital of France?` | same |
+| Prompt tokens | 13 | 13 |
+| Generated tokens | 128 | 128 |
+| Prefill | 0.117 s, 111.06 tok/s | 0.102 s, 127.16 tok/s |
+| Decode | 1.883 s, 67.96 tok/s (14.7 ms/token) | 1.800 s, 71.09 tok/s (14.1 ms/token) |
+| Decode, tokens 2-128 | 69.66 tok/s (14.4 ms/token) | 72.23 tok/s (13.8 ms/token) |
+| Kernel setup/JIT (not counted above) | 0.009 s prefill, 0.219 s first token | 0.008 s prefill, 0.451 s first token |
+| Backend / GPU | Metal / Intel(R) Iris(TM) Plus Graphics 640 | Vulkan / Intel(R) Iris(TM) Plus Graphics 640 |
 
-The run used greedy decoding (`temperature=0`) with the LoRA adapters merged in
-place into the quantized base (the default). One run, not an average. The
-kernel setup/JIT that `infer_lora_bin` prints on its own lines is a cold-start
-cost of about 0.6-1.0 s for this prompt and differs from run to run; a prompt of
-a new length compiles its own prefill kernels, so longer prompts pay more (about
-2-3 s for the long prompts tried). With `BYBY_M3_PROFILE=1` each decode step is
-split into host encode (about 1 ms), GPU wait (mean 21.9 ms, range 17.3-31.9 ms)
-and logits read (about 0.2 ms), so decode on this GPU is bound by the GPU, not by
-the host.
+Greedy decoding (`--temp 0`). The median of three runs per backend (by the speed
+of tokens 2-128); the three runs gave 66.31-70.53 tok/s on Metal and
+68.86-72.53 tok/s on Vulkan for tokens 2-128. Both backends print the same text,
+which is also identical to the host sampler (`BYBY_M3_GPU_SAMPLE=0`).
+
+Greedy decode picks the tokens on the GPU: every step gathers the embedding of the
+previous token, runs the stack and `lm_head`, masks the banned control tokens and
+takes the argmax into a token ring, and the host only reads the ids back, 16 steps
+per batch (`BYBY_DECODE_AHEAD`). On Metal two batches are in flight. Decode on this
+GPU is bound by GPU time (about 14-15 ms per token with `BYBY_M3_PROFILE=1`).
+
+The Vulkan setup assumes a warm shader cache (`$TMPDIR/nimformers-vulkan-jit`).
+With an empty cache the shaders of each phase are compiled before it runs, in
+parallel, and counted as setup: 1.85 s before prefill and 1.70 s before the first
+token on this machine, 4.8 s of wall time for the whole run.
 
 ```sh
-BYBY_MAX_NEW_TOKENS=32 \
-BYBY_METAL_JIT_ARCHIVE_SAVE=0 \
-./test/mamba3/infer_lora_bin \
-  test/mamba3/models/runs/mamba3-siso-187m-gated/lora.bin \
-  'What is the capital of France?' \
-  0
+BYBY_METAL_JIT_ARCHIVE_SAVE=0 BYBY_METAL_JIT_LOG=0 \
+other/formers.n/formers-cli --models test/mamba3/models \
+  -m test/mamba3/models/mamba3_siso_187m.nimq \
+  --config test/mamba3/models/mamba3-siso-187m/config.json \
+  --tokenizer test/mamba3/models/mamba3-siso-187m \
+  --lora test/mamba3/models/runs/mamba3-siso-187m-gated/lora.bin \
+  -p 'What is the capital of France?' -n 128 --temp 0 \
+  --backend metal --no-progress -v     # or --backend vulkan
 ```
-
-`BYBY_METAL_JIT_ARCHIVE_SAVE=0` skips saving the JIT archive at exit, which can
-take minutes on Intel. The binary reported 48 LoRA adapters and the
-`RRRRRRRRRRRG` topology.
 
 #### Prefill scheduler
 
@@ -80,22 +85,20 @@ BYBY_METAL_JIT_ARCHIVE_SAVE=0 \
 
 #### Chat (`formers-cli -cnv`)
 
-Measured on the same GPU and backend in formers.n conversation mode: three turns
-in one session, up to 512 generated tokens per reply, `--temp 0.7`, chat template
-from the model folder. `ready: warmup` compiled the prefill and decode kernels
-before the first prompt (3.8 s in this run), so these speeds contain no kernel
-setup/JIT. Each turn feeds its prompt through the prefill scheduler.
+Measured on the same GPU in formers.n conversation mode on Metal: three turns in
+one session, up to 512 generated tokens per reply, `--temp 0.7` (sampled on the
+host), chat template from the model folder. `ready: warmup` compiled the prefill
+and decode kernels before the first prompt (3.6 s in this run), so these speeds
+contain no kernel setup/JIT. Each turn feeds its prompt through the prefill
+scheduler.
 
 | Turn | Prompt tokens | Prompt eval | Generated tokens | Decode |
 |---:|---:|---:|---:|---:|
-| 1 | 27 | 0.216 s, 125.07 tok/s | 512 | 12.138 s, 42.18 tok/s |
-| 2 | 19 | 0.157 s, 121.16 tok/s | 512 | 12.204 s, 41.95 tok/s |
-| 3 | 19 | 0.157 s, 121.13 tok/s | 512 | 12.296 s, 41.64 tok/s |
+| 1 | 27 | 0.209 s, 129.10 tok/s | 512 | 9.972 s, 51.35 tok/s |
+| 2 | 19 | 0.152 s, 124.76 tok/s | 512 | 10.213 s, 50.13 tok/s |
+| 3 | 19 | 0.150 s, 126.69 tok/s | 512 | 9.990 s, 51.25 tok/s |
 
-In another run (`--temp 0`, 96 tokens per reply) a turn of 179 prompt tokens took
-1.383 s, 129.42 tok/s. Backend / GPU: Metal / Intel(R) Iris(TM) Plus Graphics 640.
-One run each, not averages; decode speed varied between 31 and 43 tok/s across the
-runs made for this page.
+Backend / GPU: Metal / Intel(R) Iris(TM) Plus Graphics 640. One run.
 
 ```sh
 printf '%s\n%s\n%s\n/exit\n' \
@@ -170,46 +173,59 @@ other/formers.n/formers-cli --models test/mamba3/models/mamba3-siso-187m \
 `-v` makes the native run print its `== Speed stats ==` block; the graph run
 prints its own speed lines without it.
 
+### Apple M1 (MacBook Air)
+
+| Metric | Metal |
+|---|---:|
+| Decode, 127 later tokens | 255.5 tok/s (3.9 ms/token) |
+| Prefill (12 tokens) | 410 tok/s |
+
 ### Tiếng Việt
 
 #### Intel Iris Plus Graphics 640
 
-Đo trên backend Metal với Mamba-3 SISO 187M và checkpoint đã finetune
-`RRRRRRRRRRRG` (`lora.bin`). Mọi tốc độ trên trang này không tính setup/JIT kernel
-một lần của process (khởi động lạnh); các công cụ đo và in riêng phần đó.
+Đo bằng `formers-cli` với Mamba-3 SISO 187M và checkpoint đã finetune
+`RRRRRRRRRRRG` (`lora.bin`), các adapter LoRA được gộp tại chỗ vào base đã lượng tử
+hóa (mặc định). Mọi tốc độ trên trang này không tính setup/JIT kernel một lần của
+process (khởi động lạnh); các công cụ đo và in riêng phần đó.
 
-| Chỉ số | Kết quả |
-|---|---:|
-| Prompt | `What is the capital of France?` |
-| Số token prompt | 13 |
-| Số token sinh | 32 |
-| Prefill | 0.159 giây, 81.78 tok/s |
-| Decode | 0.764 giây, 41.88 tok/s (23.9 ms/token) |
-| Decode, token 2-32 | 42.34 tok/s (23.6 ms/token) |
-| Prefill + decode | 0.923 giây cho 45 token |
-| Backend / GPU | Metal / Intel(R) Iris(TM) Plus Graphics 640 |
+| Chỉ số | Metal | Vulkan (MoltenVK) |
+|---|---:|---:|
+| Prompt | `What is the capital of France?` | như bên trái |
+| Số token prompt | 13 | 13 |
+| Số token sinh | 128 | 128 |
+| Prefill | 0.117 giây, 111.06 tok/s | 0.102 giây, 127.16 tok/s |
+| Decode | 1.883 giây, 67.96 tok/s (14.7 ms/token) | 1.800 giây, 71.09 tok/s (14.1 ms/token) |
+| Decode, token 2-128 | 69.66 tok/s (14.4 ms/token) | 72.23 tok/s (13.8 ms/token) |
+| Setup/JIT kernel (không tính ở trên) | prefill 0.009 giây, token đầu 0.219 giây | prefill 0.008 giây, token đầu 0.451 giây |
+| Backend / GPU | Metal / Intel(R) Iris(TM) Plus Graphics 640 | Vulkan / Intel(R) Iris(TM) Plus Graphics 640 |
 
-Lượt chạy dùng greedy decoding (`temperature=0`), các adapter LoRA được gộp tại
-chỗ vào base đã lượng tử hóa (mặc định). Một lượt, không lấy trung bình. Setup/JIT
-kernel mà `infer_lora_bin` in ở dòng riêng là chi phí khởi động lạnh, khoảng
-0.6-1.0 giây với prompt này và thay đổi giữa các lượt; prompt có độ dài mới phải
-biên dịch bộ kernel prefill riêng nên prompt dài tốn hơn (khoảng 2-3 giây với các
-prompt dài đã thử). Với `BYBY_M3_PROFILE=1`, mỗi bước decode được tách thành host
-encode (khoảng 1 ms), chờ GPU (trung bình 21.9 ms, khoảng 17.3-31.9 ms) và đọc
-logits (khoảng 0.2 ms): decode trên GPU này bị GPU chặn, không phải host.
+Greedy decoding (`--temp 0`). Lấy lượt trung vị trong ba lượt mỗi backend (theo tốc
+độ token 2-128); ba lượt cho 66.31-70.53 tok/s trên Metal và 68.86-72.53 tok/s trên
+Vulkan ở token 2-128. Hai backend in cùng một đoạn văn bản, cũng giống hệt sampler
+trên host (`BYBY_M3_GPU_SAMPLE=0`).
+
+Decode greedy chọn token trên GPU: mỗi bước gather embedding của token trước, chạy
+stack và `lm_head`, mask các token điều khiển bị cấm và lấy argmax vào một ring token;
+host chỉ đọc lại id, 16 bước mỗi batch (`BYBY_DECODE_AHEAD`). Trên Metal có hai batch
+chạy gối nhau. Decode trên GPU này bị chặn bởi thời gian GPU (khoảng 14-15 ms mỗi
+token với `BYBY_M3_PROFILE=1`).
+
+Setup của Vulkan ở trên là khi cache shader đã ấm (`$TMPDIR/nimformers-vulkan-jit`).
+Với cache trống, shader của mỗi phase được biên dịch song song trước khi phase đó
+chạy và tính vào setup: 1.85 giây trước prefill và 1.70 giây trước token đầu trên máy
+này, cả lượt chạy mất 4.8 giây wall time.
 
 ```sh
-BYBY_MAX_NEW_TOKENS=32 \
-BYBY_METAL_JIT_ARCHIVE_SAVE=0 \
-./test/mamba3/infer_lora_bin \
-  test/mamba3/models/runs/mamba3-siso-187m-gated/lora.bin \
-  'What is the capital of France?' \
-  0
+BYBY_METAL_JIT_ARCHIVE_SAVE=0 BYBY_METAL_JIT_LOG=0 \
+other/formers.n/formers-cli --models test/mamba3/models \
+  -m test/mamba3/models/mamba3_siso_187m.nimq \
+  --config test/mamba3/models/mamba3-siso-187m/config.json \
+  --tokenizer test/mamba3/models/mamba3-siso-187m \
+  --lora test/mamba3/models/runs/mamba3-siso-187m-gated/lora.bin \
+  -p 'What is the capital of France?' -n 128 --temp 0 \
+  --backend metal --no-progress -v     # or --backend vulkan
 ```
-
-`BYBY_METAL_JIT_ARCHIVE_SAVE=0` bỏ bước lưu JIT archive lúc thoát, bước này có thể
-mất hàng phút trên Intel. Binary ghi nhận 48 LoRA adapter và topology
-`RRRRRRRRRRRG`.
 
 #### Bộ lập lịch prefill
 
@@ -243,22 +259,19 @@ BYBY_METAL_JIT_ARCHIVE_SAVE=0 \
 
 #### Chat (`formers-cli -cnv`)
 
-Đo trên cùng GPU và backend ở chế độ conversation của formers.n: ba lượt trong một
-phiên, tối đa 512 token mỗi câu trả lời, `--temp 0.7`, chat template lấy từ thư mục
-model. `ready: warmup` đã biên dịch kernel prefill và decode trước prompt đầu tiên
-(3.8 giây ở lượt này), nên các tốc độ này không có setup/JIT kernel. Mỗi lượt nạp
-prompt qua bộ lập lịch prefill.
+Đo trên cùng GPU ở chế độ conversation của formers.n với backend Metal: ba lượt trong
+một phiên, tối đa 512 token mỗi câu trả lời, `--temp 0.7` (lấy mẫu trên host), chat
+template lấy từ thư mục model. `ready: warmup` đã biên dịch kernel prefill và decode
+trước prompt đầu tiên (3.6 giây ở lượt này), nên các tốc độ này không có setup/JIT
+kernel. Mỗi lượt nạp prompt qua bộ lập lịch prefill.
 
 | Lượt | Token prompt | Prompt eval | Token sinh | Decode |
 |---:|---:|---:|---:|---:|
-| 1 | 27 | 0.216 giây, 125.07 tok/s | 512 | 12.138 giây, 42.18 tok/s |
-| 2 | 19 | 0.157 giây, 121.16 tok/s | 512 | 12.204 giây, 41.95 tok/s |
-| 3 | 19 | 0.157 giây, 121.13 tok/s | 512 | 12.296 giây, 41.64 tok/s |
+| 1 | 27 | 0.209 giây, 129.10 tok/s | 512 | 9.972 giây, 51.35 tok/s |
+| 2 | 19 | 0.152 giây, 124.76 tok/s | 512 | 10.213 giây, 50.13 tok/s |
+| 3 | 19 | 0.150 giây, 126.69 tok/s | 512 | 9.990 giây, 51.25 tok/s |
 
-Ở một lượt khác (`--temp 0`, 96 token mỗi câu trả lời), một lượt có 179 token
-prompt mất 1.383 giây, 129.42 tok/s. Backend / GPU: Metal / Intel(R) Iris(TM) Plus
-Graphics 640. Mỗi mục là một lượt, không lấy trung bình; tốc độ decode dao động
-31-43 tok/s giữa các lượt chạy làm cho trang này.
+Backend / GPU: Metal / Intel(R) Iris(TM) Plus Graphics 640. Một lượt.
 
 ```sh
 printf '%s\n%s\n%s\n/exit\n' \
@@ -330,6 +343,13 @@ other/formers.n/formers-cli --models test/mamba3/models/mamba3-siso-187m \
 
 `-v` làm lượt native in khối `== Speed stats ==`; lượt graph tự in các dòng tốc độ
 của nó mà không cần `-v`.
+
+#### Apple M1 (MacBook Air)
+
+| Chỉ số | Metal |
+|---|---:|
+| Decode, 127 token sau | 255.5 tok/s (3.9 ms/token) |
+| Prefill (12 token) | 410 tok/s |
 
 ## Mamba-3 SISO 1.5B
 
