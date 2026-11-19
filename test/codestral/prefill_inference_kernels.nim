@@ -418,8 +418,7 @@ proc buildPrefixExpandFp4*(K,N,firstRow: int; tg=256): VmProgram =
   p.emitUStoreF32(3,0); p.emitUStoreF32(4,0,16); p.emitHalt()
   result=p
 
-proc buildPrefixScatter*(N,tileN,firstCol,tg: int; rank=0; scale=1'f32;
-    loraOffset=0; biasOffset = -1): VmProgram =
+proc buildPrefixScatter*(N,tileN,firstCol,tg: int; biasOffset = -1): VmProgram =
   var p: VmProgram
   p.emitUTgid(0); p.emitULid(1)
   p.emitUMulK(0,0,uint32(tg)); p.emitUAdd(0,0,1)
@@ -429,55 +428,11 @@ proc buildPrefixScatter*(N,tileN,firstCol,tg: int; rank=0; scale=1'f32;
   p.emitUMulK(2,1,uint32(tileN)); p.emitUMulK(2,2,0xFFFFFFFF'u32)
   p.emitUAdd(2,0,2); p.emitUMulK(1,1,uint32(N)); p.emitUAdd(1,1,2)
   p.emitULoadIn(2,0)
-  if rank>0:
-    p.emitUMulK(4,3,uint32(rank));p.emitUAddK(4,4,uint32(loraOffset))
-    p.emitUAddK(5,2,uint32(firstCol));p.emitUMulK(5,5,uint32(rank))
-    p.emitLoadConstF32(4,0);p.emitLoadConstF32(8,float32(rank))
-    sessionVmForGpu(p,8):
-      p.emitULoadIn(5,4);p.emitULoadConstF(6,5);p.emitFma(4,5,6,4)
-      p.emitUAddK(4,4,1);p.emitUAddK(5,5,1)
-    p.emitMulConst(4,4,scale);p.emitAdd(2,2,4)
   if biasOffset>=0:
     p.emitULoadIn(5,2,uint32(biasOffset));p.emitAdd(2,2,5)
   p.emitUStoreF32(2,1,uint32(firstCol)); p.emitHalt()
   result=p
 
-const LoraDownTg* = 256
-
-proc buildPrefixLoraDownProgram*(K, rank: int): VmProgram =
-  ## mem[t*rank + j] = sum_k in[t*K + k] * A[j*K + k] (A in the const buffer).
-  ## One 256-lane group per (t, j) with a shared tree reduction; the generic
-  ## 16x16 NT matmul ran this rank-4 product on ceil(T/16) workgroups.
-  doAssert K mod LoraDownTg == 0 and rank > 0
-  var p: VmProgram
-  p.emitUTgid(0); p.emitULid(1)
-  p.emitUToR(0, 0); p.emitLoadConstF32(1, float32(rank)); p.emitDiv(2, 0, 1)
-  p.emitRToU(2, 2)                                           # U2 = t
-  p.emitUMulK(3, 2, uint32(rank)); p.emitUToR(3, 3); p.emitSub(3, 0, 3)
-  p.emitRToU(3, 3)                                           # U3 = j
-  p.emitUMulK(5, 2, uint32(K)); p.emitUAdd(5, 5, 1)          # x[t, lane]
-  p.emitUMulK(6, 3, uint32(K)); p.emitUAdd(6, 6, 1)          # A[j, lane]
-  p.emitLoadConstF32(4, 0'f32)
-  p.emitLoadConstF32(7, float32(K div LoraDownTg))
-  sessionVmForGpu(p, 7):
-    p.emitULoadIn(5, 5); p.emitULoadConstF(6, 6); p.emitFma(4, 5, 6, 4)
-    p.emitUAddK(5, 5, uint32(LoraDownTg)); p.emitUAddK(6, 6, uint32(LoraDownTg))
-  p.emitUToR(10, 1)                                          # R10 = lane
-  p.emitTgStoreF32(4, 10, 0)
-  p.emitBarrierTg()
-  var stride = LoraDownTg div 2
-  while stride > 0:
-    p.emitLoadConstF32(8, float32(stride)); p.emitCmpLt(11, 10, 8)
-    sessionVmIfGpu(p, 11):
-      p.emitTgLoadF32(5, 10, uint32(stride)); p.emitTgLoadF32(6, 10, 0)
-      p.emitAdd(6, 6, 5); p.emitTgStoreF32(6, 10, 0)
-    p.emitBarrierTg()
-    stride = stride div 2
-  p.emitLoadConstF32(8, 1'f32); p.emitCmpLt(11, 10, 8)
-  sessionVmIfGpu(p, 11):
-    p.emitTgLoadF32(5, 10, 0); p.emitUStoreF32(5, 0)
-  p.emitHalt()
-  result = p
 
 proc lpLaneStates*(D: int): int =
   ## Registers per lane for the Linear++ lane scan (S column and z), 0 when

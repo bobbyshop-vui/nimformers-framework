@@ -7,7 +7,7 @@ type
     hidden*, C*, H*, D*, N*, R*, P*, F*, capacity*: int
     x*, norm*, proj*, k*, q*, coeff*, inner*, mix*, mlp*, gated*: int
     angles*:int
-    attnProj*, attnInner*, attnOut*, gateIn*, gate*, lora*, logits*, total*: int
+    attnProj*, attnInner*, attnOut*, gateIn*, gate*, logits*, total*: int
   M3DeviceState* = object
     phase*, prevK*, prevV*, ssm*, lpS*, lpZ*, lpZNext*, total*: int
   M3Params* = object
@@ -41,7 +41,7 @@ proc paramLoad(p:var VmProgram; rd,ub:uint32; offset,dynamicReg:int;delta=0) =
     p.emitUAdd(31,ub,uint32(dynamicReg))
     p.emitULoadConstF(rd,31,uint32(delta))
 
-proc arenaLayout*(hidden,C,H,N,vocab,capacity,maxRank:int):M3Arena =
+proc arenaLayout*(hidden,C,H,N,vocab,capacity:int):M3Arena =
   result.hidden=hidden;result.C=C;result.H=H;result.N=N
   result.D=C div H;result.R=N div 4
   result.P=2*C+2*N+3*H+result.R;result.F=2*hidden;result.capacity=capacity
@@ -56,7 +56,7 @@ proc arenaLayout*(hidden,C,H,N,vocab,capacity,maxRank:int):M3Arena =
   take(result.mlp,capacity*4*hidden);take(result.gated,capacity*2*hidden)
   take(result.attnProj,capacity*3*hidden);take(result.attnInner,capacity*hidden)
   take(result.attnOut,capacity*hidden);take(result.gateIn,capacity*2*hidden)
-  take(result.gate,capacity*hidden);take(result.lora,capacity*max(32,maxRank))
+  take(result.gate,capacity*hidden)
   take(result.logits,vocab)
   result.total=o
 
@@ -312,16 +312,6 @@ proc biasRows*(cols,output:int):VmProgram =
   p.rowIndex(cols);p.emitULoadF32(4,0,uint32(output));p.emitULoadConstF(5,2)
   p.emitAdd(4,4,5);p.emitUStoreF32(4,0,uint32(output));p.emitHalt();p
 
-proc loraRows*(cols,rank,output,scratch:int;scale:float32):VmProgram =
-  var p:VmProgram
-  p.rowIndex(cols);p.emitUMulK(3,1,uint32(rank));p.emitUMulK(4,2,uint32(rank))
-  p.emitLoadConstF32(4,0);p.emitLoadConstF32(8,float32(rank))
-  sessionVmForGpu(p,8):
-    p.emitULoadIn(5,3,uint32(scratch));p.emitULoadConstF(6,4)
-    p.emitFma(4,5,6,4);p.emitUAddK(3,3,1);p.emitUAddK(4,4,1)
-  p.emitMulConst(4,4,scale);p.emitULoadF32(5,0,uint32(output));p.emitAdd(4,4,5)
-  p.emitUStoreF32(4,0,uint32(output));p.emitHalt();p
-
 proc linearPlusScan*(a:M3Arena;s:M3DeviceState;heads,T:int;dynamicOffsets=false):VmProgram =
   let D=a.hidden div heads
   let S=(D+31) div 32
@@ -376,42 +366,6 @@ proc linearPlusScan*(a:M3Arena;s:M3DeviceState;heads,T:int;dynamicOffsets=false)
       p.emitUToR(6,5);p.emitLoadConstF32(7,1);p.emitCmpLt(6,6,7)
       sessionVmIfGpu(p,6):p.stateStore(uint32(24+j),3,s.lpZNext+j*32,zNextReg,j*32)
   p.emitHalt();p
-
-proc loraDown*(K, rank: int): VmProgram =
-  ## mem[t*rank + j] = sum_k in[t*K + k] * A[j*K + k] (A in the const buffer).
-  ## One 256-lane group per (t, j) with a shared tree reduction; the generic
-  ## 16x16 NT matmul ran this rank-4 product on ceil(T/16) workgroups.
-  doAssert K mod 32 == 0 and rank > 0
-  var p: VmProgram
-  p.emitUTgid(0); p.emitULid(1)
-  p.emitUToR(0, 0); p.emitLoadConstF32(1, float32(rank)); p.emitDiv(2, 0, 1)
-  p.emitRToU(2, 2)                                           # U2 = t
-  p.emitUMulK(3, 2, uint32(rank)); p.emitUToR(3, 3); p.emitSub(3, 0, 3)
-  p.emitRToU(3, 3)                                           # U3 = j
-  p.emitUMulK(5, 2, uint32(K)); p.emitUAdd(5, 5, 1)          # x[t, lane]
-  p.emitUMulK(6, 3, uint32(K)); p.emitUAdd(6, 6, 1)          # A[j, lane]
-  p.emitLoadConstF32(4, 0'f32)
-  p.emitLoadConstF32(7, float32(K div 32))
-  sessionVmForGpu(p, 7):
-    p.emitULoadIn(5, 5); p.emitULoadConstF(6, 6); p.emitFma(4, 5, 6, 4)
-    p.emitUAddK(5, 5, uint32(32)); p.emitUAddK(6, 6, uint32(32))
-  p.emitUToR(10, 1)                                          # R10 = lane
-  p.emitTgStoreF32(4, 10, 0)
-  p.emitBarrierTg()
-  var stride = 32 div 2
-  while stride > 0:
-    p.emitLoadConstF32(8, float32(stride)); p.emitCmpLt(11, 10, 8)
-    sessionVmIfGpu(p, 11):
-      p.emitTgLoadF32(5, 10, uint32(stride)); p.emitTgLoadF32(6, 10, 0)
-      p.emitAdd(6, 6, 5); p.emitTgStoreF32(6, 10, 0)
-    p.emitBarrierTg()
-    stride = stride div 2
-  p.emitLoadConstF32(8, 1'f32); p.emitCmpLt(11, 10, 8)
-  sessionVmIfGpu(p, 11):
-    p.emitTgLoadF32(5, 10, 0); p.emitUStoreF32(5, 0)
-  p.emitHalt()
-  result = p
-
 
 proc carryLinearPlus*(a:M3Arena;s:M3DeviceState;dynamicOffsets=false):VmProgram =
   var p:VmProgram

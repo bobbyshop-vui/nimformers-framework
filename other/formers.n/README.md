@@ -233,12 +233,10 @@ shows everything, as before. An error in quiet mode prints its message and sugge
 
 A Mamba-2 LoRA is merged into the resident FP4-KM weights at startup
 (`infer_lora.mergeResidentLoraIfEnabled`, ~35 s on Codestral 7B): the decode kernels then
-drop the A/B fusion and the answers match a merged checkpoint. `--no-merge-lora`
-(or `BYBY_MERGE_LORA=0`) keeps the adapters separate and fused in the kernels; the merge
-also steps aside by itself when `BYBY_ONE_DISPATCH=1`, `BYBY_MODEL_MMAP=0` or the process
-has no memory headroom for it.
+drop the A/B fusion and the answers match a merged checkpoint. The merge is mandatory:
+there is no separate-adapter mode, and a failed or partial merge stops the run.
 
-Flags: `--models`, `-m/--model`, `--lora`, `--no-lora`, `--no-merge-lora`, `--config`, `--tokenizer`,
+Flags: `--models`, `-m/--model`, `--lora`, `--no-lora`, `--config`, `--tokenizer`,
 `-p/--prompt`, `-f/--file`, `--system`, `--raw-prompt`, `-n/--n-predict`, `--temp`,
 `--top-p`, `--min-p`, `--repeat-penalty`, `--repeat-last-n`, `-s/--seed`, `--backend`,
 `-ngl/--ngl/--n-gpu-layers`, `-cnv/--conversation`, `-i/--interactive`, `-c/--ctx-size`,

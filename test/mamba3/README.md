@@ -202,6 +202,30 @@ tăng theo số layer. Đặt
 `BYBY_METAL_JIT_LOG=1` hoặc không đặt biến sẽ bật lại. Warning và error vẫn được
 in.
 
+### Greedy decode on the GPU
+
+Greedy decode (`--temp 0`, no repeat penalty) runs the way the DeepSeek and
+Codestral paths do: the GPU gathers the embedding of the previous token, runs the
+stack and `lm_head`, masks the banned control tokens and takes the argmax, writing
+the id into a token ring on the GPU. The host encodes `BYBY_DECODE_AHEAD` steps
+(default 16) per batch and only reads the ids back; on Metal two batches are in
+flight, so the GPU does not wait while the host encodes. The output is identical
+to the host sampler (`BYBY_M3_GPU_SAMPLE=0`). For a decode row, the output
+projection of an R block adds itself into the residual and the MLP down projection
+applies the SiLU gate and the residual (`BYBY_M3_FUSE=0` keeps them separate).
+
+The FP4 autotuner also measures short-K decode GEMVs (`dec{rows}{s|t}-tg{N}`:
+simdgroup reduction on Metal, barrier tree on Vulkan). The prefill M4 tile now
+uses its own threadgroup size: it used to take the tuned GEMV's, which the
+smaller decode kernels shrank below what the tile needs, corrupting prompts with
+a 4-row remainder.
+
+On Vulkan the micro-VM shaders built for a phase are compiled with several glslc
+processes at once before it runs, inside the reported kernel setup, instead of
+one by one inside the first dispatches. A cold shader cache was what made the
+first Vulkan run look slow (prefill 3.5 tok/s, first token 2.7 s); with the cache
+warm, prefill and decode run at full speed.
+
 ### Decode graph, profiling and opt-in switches
 
 All of these are off by default. The default decode path is the resident
@@ -224,7 +248,8 @@ multi-dispatch path with the LoRA adapters merged in place.
   has been checked on an Apple GPU.
 - `BYBY_M3_PROFILE=1` prints one `[m3-profile]` line per decode step with the
   host encode time, the GPU wait time and the logits read time, to tell
-  GPU-bound steps from host-bound ones.
+  GPU-bound steps from host-bound ones; with the GPU sampler it prints the GPU
+  milliseconds per token of each batch.
 - `BYBY_SIMD_REDUCE=1` replaces the barrier-tree threadgroup reduction
   (RMSNorm sums and similar) with a simdgroup reduction. It was slower on Intel
   Iris Plus 640 and has not been measured on an Apple GPU, so the barrier tree
@@ -306,9 +331,8 @@ BYBY_ONE_DISPATCH=1 BYBY_OD_TG=1 test/mamba3/infer_lora_bin \
 ```
 
 Mặc định `BYBY_ONE_DISPATCH=0` dùng resident multi-dispatch; `BYBY_OD_TG` mặc
-định là 1. Merge LoRA có thể đặt `BYBY_MERGE_LORA=0` để giữ A/B tách riêng,
-hoặc `BYBY_MERGE_LORA=inplace` (mặc định) / `BYBY_MERGE_LORA=1` để yêu cầu
-bounded GPU merge. Smoke mở rộng xác nhận merge 17/17 adapter và kết quả decode
+định là 1. Merge LoRA (bounded GPU merge) luôn bật, không có chế độ giữ A/B
+tách riêng; merge lỗi hoặc còn adapter chưa merge thì dừng chạy. Smoke mở rộng xác nhận merge 17/17 adapter và kết quả decode
 merged với persistent stack.
 
 Smoke mở rộng cũng xác nhận GPU block trace giữ nguyên logits và `LPcheck`

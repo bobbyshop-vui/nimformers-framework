@@ -33,15 +33,20 @@ proc peakResidentBytes*(): int64 =
   when defined(macosx): int64(usage.ru_maxrss)
   else: int64(usage.ru_maxrss)*1024
 
+var gMergeBudgetWarned = false
+
 proc checkMergeMemory*(scratchBytes: int64; limitBytes = 7_000_000_000'i64) =
   # Reserve driver/allocator overhead as well as all planned merge buffers.
   # `peakResidentBytes` is the historical PEAK (ru_maxrss), so a machine under
   # memory pressure fails here even when the live footprint is far smaller.
   # Report the number so the failure is diagnosable, and let
   # BYBY_MEMORY_LIMIT_MB raise the cap on a machine with headroom.
+  # The merge is mandatory: a tight budget is reported, never a reason to skip it.
   if scratchBytes < 0 or limitBytes <= 0 or limitBytes > 12_000_000_000'i64 or
       peakResidentBytes() > limitBytes - scratchBytes - 256*1024*1024:
-    raise newException(ValueError, "in-place merge cannot fit the " &
+    if gMergeBudgetWarned: return
+    gMergeBudgetWarned = true
+    stderr.writeLine("[lora-merge] warning: merge runs above the " &
       $(limitBytes div 1_000_000_000) & " GB process budget (peak RSS=" &
       $(peakResidentBytes() div (1024*1024)) & " MiB, scratch=" &
       $(scratchBytes div (1024*1024)) & " MiB)")
@@ -52,7 +57,7 @@ proc magIndex(v: float32): uint8 {.inline.} =
 
 proc mergeLegacyFp4Candidate*(base: QuantTensor; ad: LoraAdapter;
     scratchBytes = 64*1024*1024): MergeCandidate =
-  ## Same arithmetic/codec as BYBY_MERGE_LORA=1 in commit 24111a9.
+  ## Same arithmetic/codec as the in-place merge of commit 24111a9.
   ## Recompute one group per pass instead of storing a dense matrix.
   if base.kind!=qkFp4KM or base.shape.len!=2 or base.groupSize notin [0,32]:
     raise newException(ValueError,"legacy in-place merge requires FP4-KM group32")
@@ -275,17 +280,11 @@ proc mergeResidentLoraInplace*(m: var NimformerModelJamba; lo: var JambaLora; ct
     let base=lo.quantBase[name]
     if base.kind!=qkFp4KM:continue
     checkMergeMemory(scratchBytes.int64,limitBytes)
-    echo &"[lora-merge] begin {name}; mode=GPU legacy/in-place; scratch<=8 MiB"
+    echo &"[lora-merge] begin {name}; mode=GPU in-place; scratch<=8 MiB"
     let mergeStart=getMonoTime()
     let globalScale=mergeFp4ResidentGpu(ctx,gFp4CacheGpu[name],lo.adapters[name],scratchBytes)
     recordMergedFp4Weights(ctx,gFp4CacheGpu[name])
     lo.quantBase[name].scale= @[globalScale]
-    if name in gLoraGpu:
-      var ad=gLoraGpu[name]
-      sessionFree(ctx.kind.toByby(),ad.aBuf)
-      sessionFree(ctx.kind.toByby(),ad.bBuf)
-      sessionFree(ctx.kind.toByby(),ad.hT)
-      gLoraGpu.del(name)
     lo.adapters.del(name)
     for linearName,lin in paramLinears(m):
       if linearName==name:
@@ -297,3 +296,13 @@ proc mergeResidentLoraInplace*(m: var NimformerModelJamba; lo: var JambaLora; ct
     let seconds=float64((getMonoTime()-mergeStart).inNanoseconds)/1e9
     echo &"[lora-merge] GPU in-place {name}: {seconds:.3f}s; buffer and LUT reused"
   echo &"[lora-merge] {result}/{names.len} merged; peak RSS={peakResidentBytes() div 1_000_000} MB; limit=7000 MB"
+
+proc mergeResidentLoraAll*(m: var NimformerModelJamba; lo: var JambaLora; ctx: Backend): int =
+  ## Merges every LoRA adapter into the resident FP4-KM base. There is no
+  ## separate-adapter mode: an adapter left unmerged is fatal.
+  if lo.adapters.len==0: return 0
+  result=mergeResidentLoraInplace(m,lo,ctx)
+  if lo.adapters.len>0:
+    var left:seq[string]
+    for name in lo.adapters.keys: left.add name
+    raise newException(ValueError,"[lora-merge] " & $left.len & " adapters could not be merged into the FP4-KM base: " & left.join(", "))

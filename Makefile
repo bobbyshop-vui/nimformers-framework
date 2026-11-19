@@ -259,11 +259,10 @@ hf-train: build-hf-train
 # BYBY_PREFILL_RESIDENT=0 /
 # BYBY_GEMV_VARIANT=0 / BYBY_PREFILL_PARALLEL=0 / BYBY_MAMBA_SCAN_PARALLEL=0 /
 # BYBY_LP_SCAN_SERIAL=1 / BYBY_FP4_PAD_M=0.
-# Optional bounded in-place FP4 merge validates delta before overwriting.
+# LoRA is always merged into the resident FP4-KM base (bounded in-place merge).
 export BYBY_MODEL_MMAP ?= 1
 export BYBY_MERGE_SCRATCH_MIB ?= 64
 export BYBY_GEMV_TG ?= auto
-export BYBY_MERGE_LORA ?= 0
 export BYBY_ONE_DISPATCH ?= 0
 # Auto selects the available backend; request Vulkan explicitly when needed.
 export BYBY_INFER_BACKEND ?= auto

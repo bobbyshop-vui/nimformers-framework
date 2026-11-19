@@ -20,7 +20,7 @@ proc linearPlusSelfCheck*(ctx: Backend): string =
   const HEADS = 2
   const T = 2
   const D = HIDDEN div HEADS
-  let a = arenaLayout(HIDDEN, HIDDEN, HEADS, 8, 16, T, 1)
+  let a = arenaLayout(HIDDEN, HIDDEN, HEADS, 8, 16, T)
   let s = stateLayout(a, a.total, HEADS)
   var host = newSeq[float32](s.total)
   # Distinct, bounded nonzero initial S/Z values and Q/K/gate values.

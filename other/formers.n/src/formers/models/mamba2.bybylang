@@ -228,7 +228,7 @@ function fmMambaPrepareGpu(mm: var FmMambaModel, ctx: Backend)
     GC_fullCollect()
     # The physical merge, as infer_lora.generate does it: the packed FP4-KM
     # weight resident on the GPU absorbs B@A, so the decode kernels drop the
-    # LoRA fusion. On by default; --no-merge-lora keeps the adapters separate.
+    # LoRA fusion. Always on; a failed or partial merge is fatal.
     let merged = m2infer.mergeResidentLoraIfEnabled(mm.model, mm.lora, ctx)
     if merged > 0:
         stderr.writeLine("[formers.n] merged " & $merged & " LoRA adapters into the resident base")
@@ -266,9 +266,6 @@ function fmMambaPrefillChunk(): int
         discard
     result = max(2, min(result, 128))
 
-const FmMambaTensorCoreChunk = 16
-    ## Short prefill chunk on tensor-core GPUs: one 16-row MMA tile.
-
 function fmMambaTensorCores(ctx: Backend): bool
     ## Vulkan dGPU with KHR_cooperative_matrix: prefill GEMMs run on the tensor
     ## cores, so even a short prompt prefills far faster than it decodes.
@@ -301,25 +298,29 @@ function fmMambaTailSizes(chunk, minRows: int): seq[int]
     if rows < chunk and rows notin result:
         result.add(rows)
 
-function fmMambaPrefillPieces(n: int, tensorCores: bool): seq[int]
+function fmMambaPrefillPieces(n: int): seq[int]
     ## Splits n prefill tokens into whole chunks: BYBY_PREFILL_BATCH_SIZE ones,
-    ## then (tensor cores) 16-token ones, or else the tail sizes of
-    ## fmMambaTailSizes, largest first. The scan kernels are JIT-compiled per
-    ## chunk length, so only these lengths ever compile; the remainder
-    ## (under the smallest size) goes through decode.
+    ## then the tail sizes of fmMambaTailSizes, largest first (tensor-core GEMMs
+    ## take any row count from 2 up, so every GPU uses the same sizes). The scan
+    ## kernels are JIT-compiled per chunk length, so only these lengths ever
+    ## compile; the remainder (under the smallest size) goes through decode.
     let chunk = fmMambaPrefillChunk()
     var left = n
     if left >= chunk:
         result.add((left div chunk) * chunk)
         left = left mod chunk
-    if tensorCores and chunk > FmMambaTensorCoreChunk:
-        for i in 0 ..< left div FmMambaTensorCoreChunk:
-            result.add(FmMambaTensorCoreChunk)
-    elif not tensorCores:
-        for size in fmMambaTailSizes(chunk, fmMambaPrefillMinRows()):
-            while left >= size:
-                result.add(size)
-                left -= size
+    for size in fmMambaTailSizes(chunk, fmMambaPrefillMinRows()):
+        while left >= size:
+            result.add(size)
+            left -= size
+
+function fmMambaWarmupPromptLen(): int
+    ## Prompt length that runs every prefill chunk length once: a full chunk, each tail
+    ## size, then the last token through decode.
+    let chunk = fmMambaPrefillChunk()
+    result = chunk + 1
+    for size in fmMambaTailSizes(chunk, fmMambaPrefillMinRows()):
+        result += size
 
 function fmMambaFeed(mm: var FmMambaModel, ctx: Backend, chat: var FmMambaChat, newIds: seq[int]): seq[float32]
     ## Consumes pending + newIds; returns the logits after the last one.
@@ -346,7 +347,7 @@ function fmMambaFeed(mm: var FmMambaModel, ctx: Backend, chat: var FmMambaChat, 
     # a FIR graph lifted from these pieces runs any prompt the same way.
     let carryAll = residentPrefillReason(mm.model, ctx).len == 0
     if first or tensorCores:
-        for piece in fmMambaPrefillPieces(input.len - 1, tensorCores):
+        for piece in fmMambaPrefillPieces(input.len - 1):
             m2infer.forwardPrefillBatch(mm.model, mm.lora, input[start ..< start + piece], ctx, continued = carryAll or not first or start > 0)
             chat.ids.add(input[start ..< start + piece])
             start += piece
@@ -363,18 +364,21 @@ function fmMambaWarmup(mm: var FmMambaModel, tok: hf_tokenizer.HfTokenizer, ctx:
     ## Before the first prompt: decode steps until the step time settles
     ## (kernel JIT, autotuning, first-use buffers). Prompts shorter than a
     ## prefill chunk run on these same kernels, so nothing is compiled after
-    ## the "ready" line (on tensor-core GPUs a 16-token prefill compiles the
-    ## short-chunk kernels too). The next real input starts from a reset state.
+    ## the "ready" line (on tensor-core GPUs one prompt runs every prefill chunk
+    ## length, so those kernels compile too). The next real input starts from a
+    ## reset state.
     if opts.noWarmup:
         return
     var chat: FmMambaChat
     var ids = encodeHf(tok, "[INST] hi[/INST]")
     if fmMambaTensorCores(ctx):
-        # Long enough for one 16-token prefill chunk, so its kernels compile here.
+        # Long enough to run each prefill chunk length once, so their kernels compile here.
         let unit = ids
-        while ids.len <= FmMambaTensorCoreChunk:
+        let want = fmMambaWarmupPromptLen()
+        while ids.len < want:
             ids.add(unit)
-        stderr.writeLine("[formers.n] warmup: one 16-token tensor-core prefill, then decode until steady ...")
+        ids.setLen(want)
+        stderr.writeLine("[formers.n] warmup: one " & $want & "-token tensor-core prefill (every chunk length), then decode until steady ...")
     else:
         stderr.writeLine("[formers.n] warmup: decode until steady ...")
     let t0 = epochTime()
@@ -492,8 +496,6 @@ function fmMambaChatLoop(mm: var FmMambaModel, tok: hf_tokenizer.HfTokenizer, ct
 
 function fmRunMamba2(det: FmDetection, opts: FmOptions): bool
     # Kernel-selection defaults of the Mamba-2 GPU blocks; explicit env wins.
-    if opts.noMergeLora:
-        putEnv("BYBY_MERGE_LORA", "0")
     m2infer.configureInferenceDefaults()
     m2infer.setInferenceThreadPriority()
     stderr.writeLine("[formers.n] tokenizer " & det.files.tokenizerDir)

@@ -19,7 +19,7 @@ function firBindMambaAddresses(bindings: var FirBindings)
 
 function firMambaBindings(model: FirProgram): FirBindings
     let d = model.symbols
-    result.arena = arenaLayout(d["hidden"], d["inter"], d["nheads"], d["dstate"], d["vocab"], 1, 1)
+    result.arena = arenaLayout(d["hidden"], d["inter"], d["nheads"], d["dstate"], d["vocab"], 1)
     result.state = stateLayout(result.arena, result.arena.total, 0)
     let a = result.arena
     var offset = 0

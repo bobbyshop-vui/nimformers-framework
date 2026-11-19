@@ -23,8 +23,8 @@ proc eligible*(m:var NimformerModelJamba;ctx:Backend):string =
     if name notin gLinCache:return "missing GPU projection " & name
     let gpu=gLinCache[name]
     if gpu.isInt4:return "int4 sidecar uses the resident multi-dispatch path"
+    if gpu.isF16:return "FP16 sidecar uses the resident multi-dispatch path"
     if gpu.isFp4 and (gpu.K mod 32!=0 or gpu.N mod 2!=0):return "FP4 projection requires K%32=0 and even N"
-    if name in gLoraGpu and gLoraGpu[name].r>32:return "LoRA rank>32 uses resident multi-dispatch"
 
 proc prepareOneDispatch*(m:var NimformerModelJamba;ctx:Backend;a:M3Arena;
     states:seq[M3DeviceState];params:seq[M3Params];paramData:seq[float32]):M3OneDispatch =
@@ -33,7 +33,7 @@ proc prepareOneDispatch*(m:var NimformerModelJamba;ctx:Backend;a:M3Arena;
   let be=ctx.kind.toByby()
   var data=paramData
   var packedBytes=0
-  var weightOffset,lutOffset,biasOffset,aOffset,bOffset:Table[string,int]
+  var weightOffset,lutOffset,biasOffset:Table[string,int]
   var copies:seq[tuple[source:SessionHandle,src,dst,count:int,packed:bool]]
   template add(v:seq[float32]):int =
     block:
@@ -56,12 +56,6 @@ proc prepareOneDispatch*(m:var NimformerModelJamba;ctx:Backend;a:M3Arena;
       lutOffset[name]=data.len;data.setLen(data.len+g.K*g.N)
       copies.add((g.wF32,0,lutOffset[name],g.K*g.N,false))
     biasOffset[name]=add(lin[].bias.data)
-    if name in gLoraGpu:
-      let ad=gLoraGpu[name]
-      aOffset[name]=data.len;data.setLen(data.len+ad.r*g.K)
-      copies.add((ad.aBuf,0,aOffset[name],ad.r*g.K,false))
-      bOffset[name]=data.len;data.setLen(data.len+ad.r*g.N)
-      copies.add((ad.bBuf,0,bOffset[name],ad.r*g.N,false))
   var p:VmProgram
   proc bases(mem,input,lut,weight:int)=
     p.emitUConst(31,uint32(mem));p.emitBaseF32(31)
@@ -78,12 +72,6 @@ proc prepareOneDispatch*(m:var NimformerModelJamba;ctx:Backend;a:M3Arena;
     bases(output,input,lutOffset[name],weightOffset.getOrDefault(name))
     if g.isFp4:stage(buildFp4KmGemv2RowProgram(g.K,g.N),1,g.N div 2,336)
     else:stage(buildF32GemvProgram(g.K,g.N,1'f32,false),1,g.N,336)
-    if name in gLoraGpu:
-      let ad=gLoraGpu[name]
-      bases(a.lora,input,aOffset[name],0)
-      stage(buildF32GemvProgram(g.K,ad.r,1'f32,false),1,ad.r,336)
-      bases(output,a.lora,bOffset[name],0)
-      stage(buildF32GemvSmallKProgram(ad.r,g.N,ad.scale,true),2,(g.N+255) div 256,g.N)
     bases(output,0,biasOffset[name],0)
     stage(biasRows(g.N,0),2,(g.N+255) div 256,g.N)
   for i,blk in m.blocks:

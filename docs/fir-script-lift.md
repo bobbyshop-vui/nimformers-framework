@@ -361,7 +361,7 @@ buffer sizes, so every packed weight binding has zero bytes and no fingerprint;
 it cannot become a runnable model. Record again with the updated core:
 
 ```sh
-BYBY_MODEL_MMAP=1 BYBY_MERGE_LORA=0 BYBY_ONE_DISPATCH=0 \
+BYBY_MODEL_MMAP=1 BYBY_ONE_DISPATCH=0 \
 BYBY_FIR_PROBE="$TRACE" BYBY_FIR_PROBE_DATA=1 BYBY_FIR_PROBE_DATA_MAX=16777216 \
   timeout 420 ./infer_lora_bin test/codestral/models/jamba_parallel_lora.bin \
   "hi" 0 test/codestral/models/hf test/codestral/models/codestral_mamba_only.nimq

@@ -54,7 +54,7 @@ without waiting (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_FIR_RELOC` | `1` | Metal arena graphs: share one pipeline per kernel. `0`: one per node. |
 | `BYBY_FIR_PROFILE` | `0` | `1`: mean host encode / GPU wait / logits read per decode step. `2`: ends the session after every node and reports per-kernel wall time (slow; diagnostics only). |
 | `BYBY_UBATCH` | `512` | Caps the rows of a prompt phase run (phases with per-row logits excepted). `0`: no cap. |
-| `BYBY_PREFILL_MIN_ROWS` | `5` | Codestral (native and FIR): a prompt or prompt tail of at least this many tokens runs as one batched multi-row prefill; fewer run as single-token steps. `1`: batch every tail of 2+ tokens; `128` or more: whole 128-row chunks only (old behaviour). Native and FIR must use the same value, and the FIR graph must be lifted with it (it holds a phase per tail size). |
+| `BYBY_PREFILL_MIN_ROWS` | `5` | Codestral (native and FIR, tensor-core GPUs included): a prompt or prompt tail of at least this many tokens runs as one batched multi-row prefill; fewer run as single-token steps. `1`: batch every tail of 2+ tokens; `128` or more: whole 128-row chunks only (old behaviour). Native and FIR must use the same value, and the FIR graph must be lifted with it (it holds a phase per tail size). |
 
 ## Native inference (`nim_inference`, `formers-cli` native route)
 
@@ -73,6 +73,7 @@ without waiting (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_DECODE_CB_MS` | `1500` | Target GPU time of one decode command buffer. |
 | `BYBY_DECODE_LAYERS_PER_CB` | auto | Layers per decode command buffer (`0`: one per token). |
 | `BYBY_DECODE_FIRST_CB` | `0` | Commit after this many layers first so the GPU starts early. |
+| `BYBY_DECODE_REPLAY` | `1` | Codestral (`infer_lora`, `formers-cli`), Vulkan and Metal: after one encoded step the decode step is recorded once (with and without the head) and resubmitted per token; the host only writes the embedding row and reads the logits. Recordings are dropped on GPU model preparation, state reset and LoRA merge. Off under the FIR recorder, `BYBY_DECODE_SPLIT`, `BYBY_G_DIAGNOSTICS` and one-dispatch. `0` encodes every step. `BYBY_DECODE_REPLAY_VERBOSE=1` repeats the on/off line. |
 | `BYBY_MERGE_QKV_ATTN_SESSION` | `1` | Merge QKV and attention into one session. |
 | `BYBY_MERGE_ALL_LAYERS_SESSION` | `1` | Keep all layers of a token in one session. |
 | `BYBY_HEAD_IN_SESSION` | `1` | Run final norm and `lm_head` in the decode session. |
@@ -92,6 +93,17 @@ without waiting (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_LEGACY_DECODE_GC` | unset | Old periodic GC during decode. |
 | `BYBY_GPU_SAMPLE`, `BYBY_GPU_SAMPLE_AHEAD`, `BYBY_GRAPH` | Metal only | GPU sampling pipe and decode graph replay on Metal. |
 
+## Mamba-3 decode (`formers-cli` mamba3 route)
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `BYBY_M3_GPU_SAMPLE` | `1` | Greedy decode (`--temp 0`, no repeat penalty) picks tokens on the GPU: embedding gather, stack, `lm_head`, banned-token mask and argmax per step, with the ids in a GPU ring. `0`: host sampler. |
+| `BYBY_DECODE_AHEAD` | `16` | Decode steps per command-buffer batch of the GPU sampler (1..62). Steps past a stop token are computed and dropped. |
+| `BYBY_M3_DECODE_ASYNC` | `1` | Metal: two batches in flight, the next one encoded while the GPU runs the previous one. `0`: wait for each batch. |
+| `BYBY_M3_FUSE` | `1` | One decode row: the output projection adds into the residual and the down projection applies the SiLU gate and the residual itself. `0`: separate dispatches. |
+| `BYBY_GEMV_DECODE` | `1` | Autotune also tries the short-K decode GEMVs (no LUT copy loop, 4-16 rows per threadgroup). `0`: older kernels only. |
+| `BYBY_M3_PROFILE` | unset | `1`: per-batch GPU ms/token of the GPU sampler and per-step timings of the host path. |
+
 ## Vulkan driver (`vendor/bybylang/backends/vulkan`)
 
 | Flag | Default | Effect |
@@ -100,7 +112,7 @@ without waiting (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_VULKAN_DEVICE_LOCAL` | `auto` | Resident weights in VRAM on a dGPU (`auto` or `1`); never on an iGPU. Anything else keeps host-visible memory. |
 | `BYBY_VULKAN_SCRATCH` | `auto` | Scratch in VRAM: `auto` (dGPU), `device` (always), `host` (never). |
 | `BYBY_VULKAN_TENSOR_CORES` | `1` | Cooperative-matrix GEMMs. On a dGPU every prefill GEMM must use them; `force` does that on any device; `tune` times them against scalar kernels; `0` turns them off. |
-| `BYBY_VULKAN_SPLIT_K` | `auto` | Split-K slices of tiled Tensor Core GEMMs (`1`: off, `<n>`: fixed). |
+| `BYBY_VULKAN_SPLIT_K` | `auto` | Split-K slices of tiled Tensor Core FP32/Q4 GEMMs (`1`: off, `<n>`: fixed). The FP4-KM tile GEMM micro-kernel does not split K. |
 | `BYBY_VULKAN_SPLIT_K_VERBOSE` | `0` | Log every split-K choice. |
 | `BYBY_VULKAN_MMAP_IMPORT` | `1` | Import mmapped weights as host memory on an iGPU. |
 | `BYBY_VULKAN_POOL_MB` | `2048` | Cap of the reusable buffer pool. |
@@ -142,10 +154,20 @@ without waiting (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_FIR_PROBE_STEPS` | every step | Steps the recorder keeps, for example `prefill:2,decode:1`. |
 | `BYBY_FIR_PROBE_DATA` | `1` under `--run` | Send exact upload payloads down the data pipe (needed for unnamed uploads such as LUTs). `0` when every weight is named in `model.nimq`. |
 
-Lifting Codestral requires `BYBY_MERGE_LORA=1` and `BYBY_MEMORY_LIMIT_MB=10000`.
+Lifting Codestral needs `BYBY_MEMORY_LIMIT_MB=10000` (the LoRA merge is always on).
 
 Trace headers record `device="coopmatrix"` for Vulkan cooperative matrix, `device="simdmatrix"` for Metal simdgroup matrix, or `device="plain"` otherwise. Tensor Core micro-kernels are selected automatically for Vulkan with cooperative matrix or Metal on Apple GPU family 7+; other devices use generic kernels.
 
 The trace records the backend and device features of the run, so a graph lifted
 on a T4 targets its Tensor Cores and a graph lifted on a device without
 cooperative matrix does not.
+
+FP4-KM prefill GEMMs (Codestral and Mamba 3) always run the tile GEMM micro-kernel
+(`OP_TILE_GEMM`, `vendor/bybylang/micro_kernel/tile_gemm.nim`); there is no hand-written
+FP4-KM shader and no flag to pick one. The JIT lowers the same program to Vulkan
+cooperative matrix, Metal simdgroup matrix (Apple GPU family 7+), or register tiles
+on other GPUs, and the CPU VM runs it directly. A lifted FIR FP4 Tensor Core node falls
+back to the register-tiled lowering at load when the device has no matrix units, and
+`sessionFp4GemmMetal` / `sessionFp4GemmTensorCore` nodes of existing graphs replay
+through the same micro-kernel. The former FP8 (E4M3) FP4-KM route, the
+`BYBY_PREFILL_FP4_TILED` switch and `BYBY_FP4_SG_COMPILE_CHECK` are gone.

@@ -340,7 +340,6 @@ Backend và bộ nhớ:
 | --- | --- | --- |
 | `BYBY_INFER_BACKEND` | `auto` | `auto`, `metal`, `vulkan` |
 | `BYBY_MODEL_MMAP` | `1` | map `.nimq` thay vì đọc vào RAM (merge in-place cần) |
-| `BYBY_MERGE_LORA` | `inplace` | merge LoRA vào trọng số FP4 trên GPU; `1` = `inplace`, `0` giữ adapter tách rời |
 | `BYBY_MERGE_LORA_TRY_FP4` | `0` | `1` cho merge có guard thử lượng tử lại về 4-bit (chỉ giữ khi sai số delta RMS ≤ 0,1%) |
 | `BYBY_MERGE_SCRATCH_MIB` | `64` | scratch GPU của merge in-place (tối đa 64) |
 | `BYBY_MEMORY_LIMIT_MB` | `7000` | ngưỡng RSS tiến trình của merge in-place |
@@ -392,7 +391,6 @@ Prefill:
 | `BYBY_FP4_PAD_M` | `1` | `0` tắt đệm số hàng lẻ lên tile FP4 |
 | `BYBY_PREFILL_FP4_TILED`, `BYBY_PREFILL_FP32_TILED` | `1` | `0` bỏ GEMM tensor core dạng tile (được kiểm parity trước) |
 | `BYBY_PREFILL_PREWARM_PACKED` | `0` | `1` biên dịch sẵn cả tile FP4 đóng gói khi dùng tensor core |
-| `BYBY_PREFILL_LORA_DOWN` | `1` | `0` tắt kernel fuse phép chiếu xuống LoRA |
 | `BYBY_PREFILL_SPARSE` | `1` | `0` tắt prefill sparse trong hybrid block |
 | `BYBY_PREFILL_KEEP_SCRATCH` | `0` | `1` giữ arena prefill sau prefill (thử nghiệm throughput) |
 | `BYBY_SCAN_NCHUNK` | `16` | số command buffer chia scan backward (tránh watchdog) |
@@ -540,10 +538,9 @@ LoRA của Mamba-2 được merge vào trọng số FP4-KM nằm sẵn trên GPU
 bỏ phần adapter A/B, và output khớp với checkpoint đã merge. Merge thêm một lượt xử lý
 lúc khởi động.
 
-- `--no-merge-lora` (hoặc `BYBY_MERGE_LORA=0`) giữ adapter tách rời, fuse trong kernel.
-- Khi bật mặc định, merge tự bỏ qua nếu `BYBY_ONE_DISPATCH=1`, `BYBY_MODEL_MMAP=0` hoặc
-  tiến trình không đủ RAM (`BYBY_MEMORY_LIMIT_MB`, mặc định 7000), và inference chạy tiếp
-  bằng adapter tách rời. Tự đặt `BYBY_MERGE_LORA=inplace` thì các trường hợp đó thành lỗi.
+- Merge là bắt buộc, không có chế độ adapter tách rời. Inference ép `BYBY_MODEL_MMAP=1`
+  và `BYBY_ONE_DISPATCH=0`; ngân sách bộ nhớ thấp (`BYBY_MEMORY_LIMIT_MB`) chỉ in cảnh
+  báo; merge lỗi hoặc còn adapter chưa merge thì dừng chạy.
 
 #### Log
 

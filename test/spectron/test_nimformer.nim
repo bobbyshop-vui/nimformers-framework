@@ -44,7 +44,10 @@ const
   CFG_BATCH_SIZE* = 32
   CFG_NUM_MERGES* = 500        # final vocab = 256 + merges (stops early when no pairs are left)
   CFG_N_STEPS* = 6_000        # demo training steps
-  CFG_LR* = 3e-4'f32
+  CFG_LR* = 3e-4'f32           # peak learning rate (reached at the end of warmup)
+  CFG_MIN_LR* = 3e-5'f32       # floor of the cosine decay
+  CFG_WARMUP_STEPS* = 300      # linear warmup; also replayed after every resume (Adam restarts)
+  CFG_LR_DECAY_STEPS* = 30_000 # global step where the cosine decay reaches CFG_MIN_LR
   CFG_REQUANTIZE_EVERY* = 50   # see the explanation in trainStep below
   CFG_LOG_EVERY* = 100         # log the loss every N steps
   CFG_BPE_TRAIN_CHARS* = 300_000  # number of leading corpus chars used to train BPE
@@ -1601,6 +1604,18 @@ when isMainModule:
   let corpusIds = encodeBPE(tok, rawCorpus)
   doAssert corpusIds.len > CFG_SEQ_LEN + 1, "The corpus is too short for the training demo"
 
+  proc lrAt(step, startStep: int): float32 =
+    ## Warmup + cosine schedule. The decay follows the global step, so a resumed run continues
+    ## where the checkpoint stopped instead of jumping back to the peak. Adam moments are not
+    ## saved, so every run (fresh or resumed) warms up again from its own first step - a full
+    ## LR step on zeroed moments is what makes the loss spike right after a resume.
+    let progress = clamp(float64(step) / float64(max(1, CFG_LR_DECAY_STEPS)), 0.0, 1.0)
+    let cosine = 0.5 * (1.0 + cos(PI * progress))
+    let decayed = float64(CFG_MIN_LR) + (float64(CFG_LR) - float64(CFG_MIN_LR)) * cosine
+    let local = step - startStep
+    let warm = if CFG_WARMUP_STEPS > 0: min(1.0, float64(local) / float64(CFG_WARMUP_STEPS)) else: 1.0
+    float32(decayed * warm)
+
   proc sampleBatch(ids: seq[int], B, T: int, rng: var Rand):
       tuple[ids, targets: seq[seq[int]]] =
     result.ids = newSeq[seq[int]](B)
@@ -1623,13 +1638,14 @@ when isMainModule:
   var lossCount = 0
   for step in (startStep + 1) .. (startStep + CFG_N_STEPS):
     let (ids, targets) = sampleBatch(corpusIds, CFG_BATCH_SIZE, CFG_SEQ_LEN, rng)
-    let loss = trainStep(model, adam, ids, targets, ctx, lr = CFG_LR,
+    let lr = lrAt(step, startStep)
+    let loss = trainStep(model, adam, ids, targets, ctx, lr = lr,
                           requantizeEvery = CFG_REQUANTIZE_EVERY)
     lossSum += float64(loss)
     inc lossCount
     if step mod CFG_LOG_EVERY == 0 or step == startStep + 1 or step == startStep + CFG_N_STEPS:
       let meanLoss = lossSum / float64(lossCount)
-      echo &"step {step:>5} | loss = {loss:.4f} | mean_loss({lossCount}) = {meanLoss:.4f}"
+      echo &"step {step:>5} | lr = {lr:.2e} | loss = {loss:.4f} | mean_loss({lossCount}) = {meanLoss:.4f}"
       lossSum = 0.0
       lossCount = 0
 

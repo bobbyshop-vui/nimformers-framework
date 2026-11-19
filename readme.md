@@ -341,7 +341,6 @@ Backend and memory:
 | --- | --- | --- |
 | `BYBY_INFER_BACKEND` | `auto` | `auto`, `metal`, `vulkan` |
 | `BYBY_MODEL_MMAP` | `1` | map the `.nimq` instead of reading it into RAM (needed by the in-place merge) |
-| `BYBY_MERGE_LORA` | `inplace` | merge LoRA into the FP4 weights on the GPU; `1` = `inplace`, `0` keeps separate adapters |
 | `BYBY_MERGE_LORA_TRY_FP4` | `0` | `1` lets the guarded merge try requantizing into 4-bit (kept only within 0.1% RMS delta error) |
 | `BYBY_MERGE_SCRATCH_MIB` | `64` | GPU scratch of the in-place merge (at most 64) |
 | `BYBY_MEMORY_LIMIT_MB` | `7000` | process RSS guard of the in-place merge |
@@ -393,7 +392,6 @@ Prefill:
 | `BYBY_FP4_PAD_M` | `1` | `0` turns off padding odd row counts to the FP4 tile |
 | `BYBY_PREFILL_FP4_TILED`, `BYBY_PREFILL_FP32_TILED` | `1` | `0` skips the tiled tensor-core GEMM (parity-checked first) |
 | `BYBY_PREFILL_PREWARM_PACKED` | `0` | `1` also precompiles the packed FP4 tiles when tensor cores are used |
-| `BYBY_PREFILL_LORA_DOWN` | `1` | `0` disables the fused LoRA down-projection kernel |
 | `BYBY_PREFILL_SPARSE` | `1` | `0` disables the sparse prefill in the hybrid block |
 | `BYBY_PREFILL_KEEP_SCRATCH` | `0` | `1` keeps the prefill arena after prefill (throughput experiments) |
 | `BYBY_SCAN_NCHUNK` | `16` | command buffers the backward scan is split into (watchdog) |
@@ -546,12 +544,10 @@ A Mamba-2 LoRA is merged into the resident FP4-KM weights on the GPU at startup
 kernels then skip the A/B adapter work, and the output matches a merged checkpoint. The
 merge adds a one-time pass to startup.
 
-- `--no-merge-lora` (or `BYBY_MERGE_LORA=0`) keeps the adapters separate and fused in the
-  kernels.
-- On by default, the merge steps aside by itself when `BYBY_ONE_DISPATCH=1`,
-  `BYBY_MODEL_MMAP=0` or the process has no memory headroom (`BYBY_MEMORY_LIMIT_MB`,
-  default 7000), and inference continues with the separate adapters. Set
-  `BYBY_MERGE_LORA=inplace` by hand to make those cases errors instead.
+- The merge is mandatory: there is no separate-adapter mode. Inference forces
+  `BYBY_MODEL_MMAP=1` and `BYBY_ONE_DISPATCH=0`, a tight memory budget
+  (`BYBY_MEMORY_LIMIT_MB`) only prints a warning, and a failed or partial merge stops
+  the run.
 
 #### Logs
 

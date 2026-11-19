@@ -784,10 +784,21 @@ proc sessionTests2() =
       doAssert opImmediateWords(OP_FP4_COOP_GEMM) == 5
       let defaultShader = lowerBytecodeToGlsl(program, "fp4_tc_default")
       doAssert ("const uint BM = " & $q4CoopRowTile(sm, sn) & "u;") in defaultShader
-      doAssert ("const uint LUT_BASE = (SCALE_BASE + FP4_N * FP4_N_GROUPS + 3u) / 4u;") in defaultShader
-      # Metal lowers the same op to MSL simdgroup_matrix (Apple GPUs).
+      doAssert ("const uint LUT_BASE = " & $fp4CoopLutWord(sk, sn) & "u;") in defaultShader
+      doAssert ("const uint SCALE_BASE = " & $(sn * (sk div 2)) & "u;") in defaultShader
+      # The legacy shape op expands to the tile GEMM micro-kernel program the lowering walks.
+      doAssert fp4TileProgram(program).words == buildFp4TileGemmProgram(sm, sk, sn, sn * (sk div 2), fp4CoopLutWord(sk, sn)).words
+      # Metal lowers the same op to MSL simdgroup_matrix (Apple GPUs) or register tiles (other GPUs).
       let metalDefault = lowerBytecodeToMetal(program, "fp4_tc_metal")
       doAssert ("constant constexpr uint BM = " & $q4CoopRowTile(sm, sn) & "u;") in metalDefault
+      for tile in Q4CoopRowTiles:
+        let tiledMsl = lowerFp4TiledMetal(program, "fp4_tiled_source_test", tile)
+        let tiledGlsl = lowerFp4TiledGlsl(program, "fp4_tiled_source_test", tile)
+        let tag = "M" & $sm & " K" & $sk & " N" & $sn & " tile " & $tile
+        doAssert "simdgroup" notin tiledMsl and "coopmat" notin tiledGlsl, tag
+        doAssert ("constant constexpr uint TM = " & $(tile div 8) & "u;") in tiledMsl, tag
+        mslCompileCheck(tiledMsl, "FP4 register tiles " & tag)
+        echo "PASS FP4 register-tiled micro shader lowering (MSL) ", tag
       for tile in Q4CoopRowTiles:
         let msl = lowerCoopGemmMetal(program, "fp4_simd_source_test", tile)
         let tag = "M" & $sm & " K" & $sk & " N" & $sn & " tile " & $tile
@@ -796,8 +807,8 @@ proc sessionTests2() =
         doAssert "#include <metal_simdgroup_matrix>" in msl and "simdgroup_float8x8" in msl, tag
         doAssert "simdgroup_load(" in msl and "simdgroup_multiply_accumulate(" in msl and "simdgroup_store(" in msl, tag
         doAssert ("constant constexpr uint BM = " & $tile & "u;") in msl, tag
-        doAssert ("constant constexpr uint FP4_M = " & $sm & "u;") in msl and ("constant constexpr uint FP4_K = " & $sk & "u;") in msl, tag
-        doAssert ("constant constexpr uint FP4_N = " & $sn & "u;") in msl and ("constant constexpr uint FP4_N_GROUPS = " & $(sk div 32) & "u;") in msl, tag
+        doAssert ("constant constexpr uint T_M = " & $sm & "u;") in msl and ("constant constexpr uint T_K = " & $sk & "u;") in msl, tag
+        doAssert ("constant constexpr uint T_N = " & $sn & "u;") in msl and ("constant constexpr uint T_NG = " & $(sk div 32) & "u;") in msl, tag
         doAssert "@" notin msl and "sessionFp4Gemm" notin msl, tag
         mslCompileCheck(msl, "FP4 " & tag)
         echo "PASS FP4 simdgroup_matrix micro shader lowering ", tag
@@ -807,7 +818,7 @@ proc sessionTests2() =
         doAssert shader == lowerFp4CoopGlsl(program, "fp4_tensor_core_source_test", tile, frags), tag
         doAssert ("const uint FRAGS = " & $frags & "u;") in shader, tag
         doAssert ("const uint BM = " & $tile & "u;") in shader, tag
-        doAssert ("const uint FP4_K = " & $sk & "u;") in shader and ("const uint FP4_N = " & $sn & "u;") in shader, tag
+        doAssert ("const uint T_K = " & $sk & "u;") in shader and ("const uint T_N = " & $sn & "u;") in shader, tag
         doAssert "GL_KHR_cooperative_matrix" in shader
         doAssert "coopMatMulAdd" in shader
         doAssert "sessionFp4Gemm" notin shader and "@" notin shader, tag

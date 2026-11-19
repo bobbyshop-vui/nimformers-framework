@@ -29,7 +29,6 @@ import m3_loader   # loadMamba3QuantResidentFromNimq - rebuilds the base from .n
 import m3_config
 import quantize_lora_bin_4bit
 
-var gMergeLoraExplicit = false   ## BYBY_MERGE_LORA set by hand: a failed merge is then fatal.
 
 proc configureInferenceDefaults*() =
   ## Apply before GPU initialization/autotuning; explicit environment wins.
@@ -43,10 +42,9 @@ proc configureInferenceDefaults*() =
       ("BYBY_PREFILL_FP4_KERNEL", "auto"),
       ("BYBY_PREFILL_RESIDENT", "1")]:
     if not existsEnv(name): putEnv(name, value)
-  gMergeLoraExplicit=existsEnv("BYBY_MERGE_LORA")
-  let mode=getEnv("BYBY_MERGE_LORA","inplace")
-  if mode notin ["0","1","inplace"]:raise newException(ValueError,"BYBY_MERGE_LORA must be 0, 1 or inplace")
-  putEnv("BYBY_MERGE_LORA",mode)
+  # LoRA is always merged into the resident FP4-KM base; there is no separate-adapter mode.
+  putEnv("BYBY_MODEL_MMAP","1")
+  putEnv("BYBY_ONE_DISPATCH","0")
 when defined(macosx):
   # QOS_CLASS_USER_INITIATED (0x19): CLI inference directly serves a
   # user request. This is a CPU thread priority; Metal has no equivalent
@@ -909,7 +907,7 @@ proc teacherForced(m: var NimformerModelJamba, tok: AnyTokenizer, promptText, fu
 
 type SweepMode = object
   name: string
-  skipA, noLora: bool
+  skipA: bool
   preset: string
 
 proc runBisect(m: var NimformerModelJamba, tok: AnyTokenizer, vocab: int,
@@ -917,7 +915,6 @@ proc runBisect(m: var NimformerModelJamba, tok: AnyTokenizer, vocab: int,
   ## BYBY_NORM_SWEEP (opt-in): bisects to find what is broken, WITHIN 1
   ## run (loading the model takes long). Each mode: (1) teacher-forcing NLL on a sample sentence
   ## in the training format, (2) greedy generation from a clear question, (3) residuals.
-  ##   base-hf        : drop A blocks + disable LoRA = the ORIGINAL Mamba-Codestral  (must produce text)
   ##   base+lora-*    : drop A blocks, keep LoRA
   ##   hybrid-*       : full R + A + LoRA
   ## Mode suffix = the norm of the trainer that produced the checkpoint:
@@ -930,15 +927,14 @@ proc runBisect(m: var NimformerModelJamba, tok: AnyTokenizer, vocab: int,
   ## ONLY when it is clearly better (NLL < 6 and at least 1 nat below the default preset) - so old checkpoints
   ## still produce text without rerunning the sweep just to read the result.
   let allModes = @[
-    SweepMode(name: "base-hf", skipA: true, noLora: true, preset: "hf"),
-    SweepMode(name: "base+lora-train", skipA: true, noLora: false, preset: "rms-fin-g1"),
-    SweepMode(name: "base+lora-gn", skipA: true, noLora: false, preset: "rms-fin-gn"),
-    SweepMode(name: "base+lora-unit", skipA: true, noLora: false, preset: "rms-fin-g1-unit"),
-    SweepMode(name: "base+lora-ln", skipA: true, noLora: false, preset: "ln-nof-g1"),
-    SweepMode(name: "hybrid-train", skipA: false, noLora: false, preset: "rms-fin-g1"),
-    SweepMode(name: "hybrid-gn", skipA: false, noLora: false, preset: "rms-fin-gn"),
-    SweepMode(name: "hybrid-unit", skipA: false, noLora: false, preset: "rms-fin-g1-unit"),
-    SweepMode(name: "hybrid-ln", skipA: false, noLora: false, preset: "ln-nof-g1")]
+    SweepMode(name: "base+lora-train", skipA: true, preset: "rms-fin-g1"),
+    SweepMode(name: "base+lora-gn", skipA: true, preset: "rms-fin-gn"),
+    SweepMode(name: "base+lora-unit", skipA: true, preset: "rms-fin-g1-unit"),
+    SweepMode(name: "base+lora-ln", skipA: true, preset: "ln-nof-g1"),
+    SweepMode(name: "hybrid-train", skipA: false, preset: "rms-fin-g1"),
+    SweepMode(name: "hybrid-gn", skipA: false, preset: "rms-fin-gn"),
+    SweepMode(name: "hybrid-unit", skipA: false, preset: "rms-fin-g1-unit"),
+    SweepMode(name: "hybrid-ln", skipA: false, preset: "ln-nof-g1")]
   var hasAttention = false
   var hasLora = false
   for blk in m.blocks:
@@ -957,7 +953,7 @@ proc runBisect(m: var NimformerModelJamba, tok: AnyTokenizer, vocab: int,
   # Default: ALL modes = original model + (LoRA | LoRA+sidecar) x 3 trainer norm kinds
   # (current / old gamma=1 / old LayerNorm). Each mode ~2 minutes (loading the model is the slow part):
   # base+lora-* shows which norm kind LoRA (the R branch) matches, hybrid-* adds the Linear++ sidecar.
-  # Narrow it down: BYBY_NORM_SWEEP_LIST=base-hf,hybrid-train
+  # Narrow it down: BYBY_NORM_SWEEP_LIST=base+lora-gn,hybrid-train
   var modes = allModes
   let only = getEnv("BYBY_NORM_SWEEP_LIST", "")
   if only == "all":
@@ -983,7 +979,6 @@ proc runBisect(m: var NimformerModelJamba, tok: AnyTokenizer, vocab: int,
   var defaultNll = 1.0e30     # hybrid with the default preset rms-fin-gn
   for md in modes:
     gSkipAttn = md.skipA
-    setGpuDisableLora(md.noLora)
     discard setGpuNormPreset(md.preset)
     let attnMode =
       if not hasAttention: "no A/P (toggle no-op)"
@@ -991,7 +986,6 @@ proc runBisect(m: var NimformerModelJamba, tok: AnyTokenizer, vocab: int,
       else: "co A/P"
     let loraMode =
       if not hasLora: "no LoRA (toggle no-op)"
-      elif md.noLora: "LoRA off"
       else: "co LoRA"
     stderr.writeLine "── che do=" & md.name & "  (" & attnMode & ", " & loraMode &
                      ", norm=" & gNormPresetName & ")"
@@ -999,7 +993,7 @@ proc runBisect(m: var NimformerModelJamba, tok: AnyTokenizer, vocab: int,
     try:
       let nl = teacherForced(m, tok, qText, fullText, vocab, ctx)
       summary.add &"{md.name}={nl.nllAnswer:.2f}"
-      if not md.skipA and not md.noLora and hasAttention and hasLora:
+      if not md.skipA and hasAttention and hasLora:
         if md.preset == "rms-fin-gn": defaultNll = nl.nllAnswer
         if nl.nllAnswer == nl.nllAnswer and nl.nllAnswer < bestNll:   # (chan NaN)
           bestNll = nl.nllAnswer
@@ -1042,9 +1036,8 @@ proc runBisect(m: var NimformerModelJamba, tok: AnyTokenizer, vocab: int,
       stderr.writeLine "      [bisect] ERROR in this mode: " & e.msg
     stderr.writeLine &"      ({monoSecs() - t0:.0f}s)"
   gSkipAttn = false
-  setGpuDisableLora(false)
   if summary.len > 0:
-    stderr.writeLine "[bisect] SUMMARY of answer NLL (low = good; random=10.4; base-hf = original model): " &
+    stderr.writeLine "[bisect] SUMMARY of answer NLL (low = good; random=10.4): " &
                      summary.join("  ")
   if bestPreset.len > 0 and bestPreset != "rms-fin-gn" and bestNll < 6.0 and
      defaultNll - bestNll >= 1.0:
@@ -1086,10 +1079,9 @@ proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenize
     echo "[infer] Packed GPU cache ready; released " &
       $(freedPackedBytes div (1024 * 1024)) & " MiB duplicate host weights."
   GC_fullCollect()
-  if getEnv("BYBY_MERGE_LORA","0")!="0" and lora.adapters.len>0:
-    # The copied bounded GPU merge changes the same packed buffers used by
-    # resident prefill, decode and the later persistent-stack pack.
-    discard mergeResidentLoraInplace(m,lora,ctx)
+  # The bounded GPU merge changes the same packed buffers used by resident
+  # prefill, decode and the later persistent-stack pack. Always on; fatal on failure.
+  discard mergeResidentLoraAll(m,lora,ctx)
   echo &"[infer] GPU san sang. RSS: {rssMB()}"
 
   let vocabModel = m.vocab
@@ -1132,7 +1124,6 @@ proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenize
       sweepPreset = runBisect(m, tok, vocabModel, banned, noPenalty, cfg, ctx)
     except Exception as e:
       stderr.writeLine "[bisect] ERROR: " & e.msg & " - skipped, running normally."
-    setGpuDisableLora(false)
     gSkipAttn = false
 
   # ── norm configuration for the real generation ───────────────────────────────
@@ -1243,7 +1234,43 @@ proc generate*(m: var NimformerModelJamba, lora: var JambaLora, tok: AnyTokenize
   var firstStepTime = 0.0
   var firstStepSetupTime = 0.0
   let decodeStart = monoSecs()
-  for step in 0 ..< maxNewTokens:
+  # Greedy decoding without a repetition penalty picks every token on the GPU (m3GreedyDecode): the
+  # logits never come back to the host and the GPU runs the next steps without waiting for it.
+  # BYBY_M3_GPU_SAMPLE=0 keeps the host sampler below (the reference path).
+  let gpuGreedy = isGpuCtx(ctx) and m3GpuSampleOn() and cfg.temperature <= 0'f32 and
+    (cfg.repeatPenalty == 1.0'f32 or cfg.repeatWindow <= 0) and not traceBlocks and traceN == 0 and
+    getEnv("BYBY_DEBUG_SAMPLING", "0") != "1" and getEnv("BYBY_DEBUG_TOP5", "0") == "0"
+  if gpuGreedy:
+    var bannedIds: seq[int]
+    for i, b in banned:
+      if b and i < vocabModel: bannedIds.add i
+    let setupStart = gM3Runtime.kernelSetupSeconds
+    var lastTokenAt = decodeStart
+    discard m3GreedyDecode(m, ids[^1], maxNewTokens, bannedIds, proc(nextId: int): bool =
+      let now = monoSecs()
+      if genIds.len == 0:
+        firstStepTime = now - decodeStart
+        firstStepSetupTime = gM3Runtime.kernelSetupSeconds - setupStart
+      if isStopAny(tok, nextId):
+        stoppedBy = "stop token id=" & $nextId
+        stderr.writeLine &"[infer] hit {stoppedBy} at step {genIds.len+1} - STOPPING (as intended)."
+        return false
+      ids.add(nextId)
+      genIds.add(nextId)
+      let delta = streamDelta(sd, tok, genIds)
+      if delta.len > 0:
+        output.write(delta)
+        output.flushFile()
+        printedText.add(delta)
+      if liveProgress:
+        let stepTime = max(now - lastTokenAt, 1e-6)
+        stderr.write("\e7\e[1;1H\e[K")
+        stderr.write(&"[{genIds.len}/{maxNewTokens} tok | {1.0 / stepTime:.2f} tok/s | {(stepTime*1000):.0f} ms/tok]")
+        stderr.write("\e8")
+        stderr.flushFile()
+      lastTokenAt = now
+      true)
+  for step in 0 ..< (if gpuGreedy: 0 else: maxNewTokens):
     let stepStart = monoSecs()
     let stepSetupStart = gM3Runtime.kernelSetupSeconds
     var lastLogits: seq[float32]

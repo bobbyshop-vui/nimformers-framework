@@ -106,10 +106,29 @@ prefill on a T4/M-series GPU, where the whole GEMM is a few hundred ms.
   a recompile on every dispatch and is only for diagnostics.
 
 
+## Decode replay
+
+A decode step encodes the same dispatches on the same buffers for every token; only the
+embedding row changes. On Vulkan and Metal the step is therefore encoded once more after the
+first token into a kept command buffer (`sessionBeginRecording`), and every later token writes
+its embedding row into a host-visible buffer, resubmits the recording and reads the logits from
+another host-visible buffer. The host encode of 64 layers disappears from the per-token time,
+which matters most on a slow host CPU such as a Colab VM. Prompt tokens fed through decode use a
+second recording without the head. The run prints `[infer] decode replay on: ...` once.
+
+The recordings are dropped on GPU model preparation, every state reset and the LoRA merge, and
+re-recorded after one encoded step. `BYBY_DECODE_REPLAY=0` encodes every step.
+`test_decode_replay.nim` checks on a small model that replayed logits equal encoded logits, with
+and without the head, across two resets.
+
+On GPUs with tensor cores the prompt tail now uses the same chunk lengths as elsewhere
+(64, 32, 16, 8 and `BYBY_PREFILL_MIN_ROWS`), not repeated 16-row chunks. The formers.n warmup
+runs one prompt that covers every chunk length, so none compiles during a timed prompt.
+
 ## Bounded in-place merge
 
 ```sh
-make infer-lora BYBY_MERGE_LORA=inplace
+make infer-lora
 ```
 
 `inplace` is the default, `1` is an alias for it, and `0` keeps separate LoRA.
@@ -138,10 +157,10 @@ The process memory guard targets 7,000 MB and reserves 256 MiB for overhead.
 Linux KiB and macOS byte RSS measurements are normalized before checking.
 This is a process RAM guard; discrete GPU VRAM has separate accounting.
 
-The existing FP4 requantization behavior is retained. Use `BYBY_MERGE_LORA=0`
-(formers.n: `--no-merge-lora`) to keep separate LoRA. The former CPU `safe` mode is not accepted by the GPU
-inference path. The log reports each tensor's GPU merge time, the number
-merged and peak RSS. Non-FP4 tensors keep their adapters.
+The existing FP4 requantization behavior is retained. The merge is mandatory: there is
+no separate-adapter mode, the memory guard only warns, and an adapter that cannot be
+merged (for example on a non-FP4 tensor) stops the run. The log reports each tensor's
+GPU merge time, the number merged and peak RSS.
 
 On Iris Plus 640 with actual Codestral tensors (`block0.mambaReal.inProj.weight` and `outProj.weight`):
 - `outProj.weight` (4096x8192, 17 MiB packed FP4): Metal 5.013s / Vulkan 13.888s (including initial pipeline compilation)

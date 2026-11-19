@@ -239,7 +239,7 @@ function checkResident(model: FirProgram, registry: FirRegistry)
         if node.op == "m3.prepare":
             node.op = "test.prepare"
     firInstallMambaProvider(selected, custom)
-    let a = arenaLayout(2048, 4096, 64, 128, 128256, 128, 32)
+    let a = arenaLayout(2048, 4096, 64, 128, 128256, 128)
     for T in [1, 7, 128]:
         for layer in [0, 23]:
             let s = stateLayout(a, a.total+layer*600000, 0)

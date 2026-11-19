@@ -1065,8 +1065,6 @@ var gPreparedLinears: seq[GpuLin]
 var gUseNormF* = true
 var gSkipAttn* = false
 var gNormPresetName* = "rms-fin-gn"
-proc setGpuDisableLora*(v: bool) =
-  gDisableLora = v
 proc setGpuNormPreset*(name: string): bool =
   result=name in ["hf","train","mamba-ssm","rms-fin-g1","rms-fin-gn"]
   if result: gNormPresetName="rms-fin-gn"

@@ -789,7 +789,11 @@ function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): 
                 # keeps one program per node.
                 let relocatable = be == gbMetal and not result.useHandles and not isSlots and getEnv("BYBY_FIR_RELOC", "1") != "0"
                 let kernel = firMicroKernel(node, result.graph, registry, nodeBindings, relocatable)
-                if kernel.program.words.len > 0 and
+                # FP4-KM tile GEMM micro-kernels lower to plain register tiles where the device has no
+                # matrix units; the Q4 Tensor Core micro-kernel needs them.
+                let fp4Tiles = isFp4CoopProgram(kernel.program)
+                let coopTarget = if be == gbVulkan: sessionCooperativeGemmEnabled(be) elif be == gbMetal: sessionSimdgroupMatrixEnabled(be) else: false
+                if kernel.program.words.len > 0 and not fp4Tiles and
                     (kernel.program.words[0] and 0xFF'u32) in [OP_Q4_COOP_GEMM, OP_FP4_COOP_GEMM]:
                     if be == gbVulkan:
                         if not sessionCooperativeGemmEnabled(be):
@@ -810,24 +814,25 @@ function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): 
                         result.metaWrites.add((prepared.metaOffset + 2*i + 1, float32(address mod 4096)))
                     metaFloats += ((2*kernel.relocBuffers.len + 3) div 4)*4
                 if be == gbMetal and isCoopGemmProgram(kernel.program):
-                    # Tensor Core GEMM on an Apple GPU: one simdgroup_matrix pipeline per row tile a
-                    # dispatch of 1..M rows can pick (same tiles and grid as Vulkan, see fgEncodeMicroBody).
+                    # Tile GEMM micro-kernel on Metal: one pipeline per row tile a dispatch of 1..M rows
+                    # can pick (same tiles and grid as Vulkan, see fgEncodeMicroBody), lowered to
+                    # simdgroup_matrix on an Apple GPU and to register tiles (FP4-KM) elsewhere.
                     prepared.name = "jit_" & programKeyNoSession(kernel.program, node.op)
                     let shape = coopGemmShape(kernel.program)
                     for rows in 1 .. shape.M:
                         let tile = fgQ4CoopTile(result, rows, shape.N)
                         if tile notin prepared.coopTiles:
                             let tileName = prepared.name & "_r" & $tile
-                            let source = lowerCoopGemmMetal(kernel.program, tileName, tile)
+                            let source = if fp4Tiles and not coopTarget: lowerFp4TiledMetal(kernel.program, tileName, tile) else: lowerCoopGemmMetal(kernel.program, tileName, tile)
                             if not tryMetalJitCompile(source, tileName):
-                                raise newException(ValueError, "FIR graph Metal JIT compilation failed: " & node.op & " (simdgroup_matrix row tile " & $tile & ")")
+                                raise newException(ValueError, "FIR graph Metal JIT compilation failed: " & node.op & " (tile GEMM row tile " & $tile & ")")
                             prepared.coopTiles.add(tile)
                             prepared.coopNames.add(tileName)
                             prepared.coopSources.add(source)
                     prepared.source = prepared.coopSources[prepared.coopTiles.find(fgQ4CoopTile(result, shape.M, shape.N))]
                     if coopVerbose and not coopLogged.hasKey(node.op):
                         coopLogged[node.op] = true
-                        stderr.writeLine("[fir] " & (if isFp4CoopProgram(kernel.program): "FP4" else: "Q4") & " simdgroup_matrix " & node.op & " K=" & $shape.K & " N=" & $shape.N & " M=" & $shape.M & ": row tiles built " & $prepared.coopTiles)
+                        stderr.writeLine("[fir] " & (if fp4Tiles: "FP4" else: "Q4") & (if coopTarget: " simdgroup_matrix " else: " register-tiled ") & node.op & " K=" & $shape.K & " N=" & $shape.N & " M=" & $shape.M & ": row tiles built " & $prepared.coopTiles)
                 elif be == gbMetal:
                     prepared.name = dispatchProgramNoSession(jit, kernel.program, node.op)
                     if prepared.name == "micro_vm_kernel":
@@ -844,13 +849,13 @@ function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): 
                                 let tileName = prepared.name & "_r" & $tile
                                 prepared.coopTiles.add(tile)
                                 prepared.coopNames.add(tileName)
-                                prepared.coopSources.add(lowerCoopGemmGlsl(kernel.program, tileName, tile, result.coopFragments))
+                                prepared.coopSources.add(if fp4Tiles and not coopTarget: lowerFp4TiledGlsl(kernel.program, tileName, tile) else: lowerCoopGemmGlsl(kernel.program, tileName, tile, result.coopFragments))
                                 jobs.add((tileName, prepared.coopSources[^1]))
                         prepared.source = prepared.coopSources[prepared.coopTiles.find(fgQ4CoopTile(result, shape.M, shape.N))]
                         if coopVerbose and not coopLogged.hasKey(node.op):
                             coopLogged[node.op] = true
                             let fullTile = fgQ4CoopTile(result, shape.M, shape.N)
-                            stderr.writeLine("[fir] " & (if isFp4CoopProgram(kernel.program): "FP4" else: "Q4") & " Tensor Core " & node.op & " K=" & $shape.K & " N=" & $shape.N & " M=" & $shape.M & ": row tile " & $fullTile & " (tiles built " & $prepared.coopTiles & ", " & $result.computeUnits & " SM/CU, " & $result.coopFragments & " fragment(s) per subgroup)")
+                            stderr.writeLine("[fir] " & (if fp4Tiles: "FP4" else: "Q4") & (if coopTarget: " Tensor Core " else: " register-tiled ") & node.op & " K=" & $shape.K & " N=" & $shape.N & " M=" & $shape.M & ": row tile " & $fullTile & " (tiles built " & $prepared.coopTiles & ", " & $result.computeUnits & " SM/CU, " & $result.coopFragments & " fragment(s) per subgroup)")
                     elif isQ4GemvProgram(kernel.program):
                         # Rows per subgroup, workgroup width and the reduction follow the device; the
                         # grid follows from them. The first variant is the default; fgTuneGemv times

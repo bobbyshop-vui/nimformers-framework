@@ -44,6 +44,7 @@ type
     glslSrc*: string       ## cached GLSL for Vulkan multi-buf path
     m4GlslSrc*: string
     tgBytes*: int          ## threadgroup memory (LUT + vung reduce) - xem fp4GemvTgBytes
+    decSimd*: bool         ## the selected decode kernel reduces with simdgroup sums (fused variants follow it)
     residentReady*: bool
 
 var gFp4CacheGpu* = initTable[string, Fp4LinCacheGpu]()
@@ -165,8 +166,11 @@ proc encodeFp4GemmM4*(c: Fp4LinCacheGpu; hIn: byby.SessionHandle; inOffElems: in
       discard sessionBindBuffer(2, c.wBuf.metalHandle)
       discard sessionBindBuffer(3, c.lutBuf.metalHandle)
       discard sessionBindBuffer(4, hIn.metalHandle, inOffElems * 4)
-  discard sessionEncTgBytes(isVk, 0, max(c.tgBytes, 16))
-  result = sessionEncDispatch(isVk, c.rows * GemvTg, GemvTg, c.tgBytes)
+  # The M4 tile has its own threadgroup layout (the LUT plus one 32-lane reduction); c.tgBytes
+  # belongs to the decode GEMV plan, which the autotuner may shrink below that.
+  let tgBytes = (Fp4KmLutLen + GemvTg) * 4
+  discard sessionEncTgBytes(isVk, 0, tgBytes)
+  result = sessionEncDispatch(isVk, c.rows * GemvTg, GemvTg, tgBytes)
 
 var gFp4PadM = -1   ## -1 = BYBY_FP4_PAD_M not read yet
 
