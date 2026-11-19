@@ -307,10 +307,13 @@ proc tuneFp4Plan(ctx: Backend; c: Fp4LinCacheGpu; batch: int): Fp4Plan =
       except CatchableError as e:
         stderr.writeLine "[gpu-tune] skip " & label & ": " & e.msg
   if batch == 1 and getEnv("BYBY_GEMV_DECODE", "1") != "0":
-    # Decode kernels for short K (small models): no LUT copy loop, up to 16 rows per threadgroup,
-    # narrow threadgroups. Measured on Iris Plus 640 at 1.6-2x the tuned kernel on K = 768/1536.
+    # Decode kernels: no LUT copy loop and up to 16 output rows per threadgroup. Include both
+    # narrow and wider workgroups; device timing chooses the best K-loop/occupancy tradeoff.
     let simdModes = if be == byby.gbVulkan: @[false] else: @[true]
-    for tg in [16, 32, 64]:
+    # Let autotune test wider tiles too: fewer serial K-loop iterations can win
+    # for the large Mamba projections, while parity/timing still reject shapes
+    # that hurt occupancy on a given device.
+    for tg in [16, 32, 64, 128, 256]:
       if tg > maxThreads: continue
       for dRows in [4, 8, 16]:
         if not fp4KmGemvDecodeSupported(c.cols, c.rows, tg, dRows) or
@@ -326,7 +329,7 @@ proc tuneFp4Plan(ctx: Backend; c: Fp4LinCacheGpu; batch: int): Fp4Plan =
             stderr.writeLine "[gpu-tune] skip " & label & ": " & e.msg
   if batch == 1 and fp4SubgroupCandidates(be):
     # One 32-lane subgroup per few rows, subgroup sums only (the Llama/DeepSeek decode GEMV).
-    for tg in [64, 128]:
+    for tg in [64, 128, 256]:
       if tg > maxThreads: continue
       for sRows in [2, 4]:
         for lutConst in [false, true]:
