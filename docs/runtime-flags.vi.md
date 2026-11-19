@@ -73,6 +73,7 @@ chờ (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_DECODE_LAYERS_PER_CB` | tự động | Số layer mỗi command buffer decode (`0`: một buffer mỗi token). |
 | `BYBY_DECODE_FIRST_CB` | `0` | Commit sau chừng này layer đầu để GPU bắt đầu sớm. |
 | `BYBY_DECODE_REPLAY` | `1` | Codestral (`infer_lora`, `formers-cli`), Vulkan và Metal: sau một bước encode, bước decode được ghi lại một lần (có và không có head) rồi submit lại mỗi token; host chỉ ghi hàng embedding và đọc logits. Bản ghi bị bỏ khi chuẩn bị model GPU, reset state và merge LoRA. Tắt khi bật FIR recorder, `BYBY_DECODE_SPLIT`, `BYBY_G_DIAGNOSTICS` và one-dispatch. `0`: encode mỗi bước. `BYBY_DECODE_REPLAY_VERBOSE=1` in lại dòng bật/tắt. |
+| `BYBY_PREFILL_F16_TILE` | `1` | Resident prefill Codestral trên Vulkan: các GEMM sidecar Linear++ FP16 (block G: `attn.qkvProj`, `attn.outProj`, `fuseGate`) chạy micro-kernel tile GEMM với weight FP16, trên cooperative matrix nếu thiết bị có (không thì tile thanh ghi), sau khi qua kiểm tra parity một lần mỗi tiến trình. `0`: GEMM FP16 micro-VM. |
 | `BYBY_DECODE_FUSE_RESIDUAL` | `1` | Decode Codestral: GEMV out_proj của block R tự cộng vào residual (bớt một dispatch và một barrier mỗi layer) khi kernel decode FP4-KM đã autotune là kernel subgroup-row (`sg`) hoặc decode (`dec`) và projection không có bias. `0`: GEMV và phép cộng tách riêng. |
 | `BYBY_GEMV_SUBGROUP` | `auto` | Autotune GEMV decode FP4-KM thử thêm các micro-kernel subgroup-row: một subgroup 32 lane cho 1-8 hàng output, mỗi lane giữ hai word weight đang tải, rút gọn bằng `subgroupAdd`/`simd_sum`, LUT ở threadgroup hoặc constant memory. `auto`: Vulkan có subgroup cố định 32 lane mà không phải Intel (NVIDIA T4), và GPU Apple trên Metal. `1`: thử trên mọi GPU (pipeline mà driver chạy hẹp hơn 32 lane sẽ trượt parity và bị loại); `0`: không bao giờ. |
 | `BYBY_MERGE_QKV_ATTN_SESSION` | `1` | Gộp QKV và attention vào một session. |
@@ -169,5 +170,8 @@ cooperative matrix của Vulkan, simdgroup matrix của Metal (Apple GPU family 
 tile thanh ghi trên GPU khác, còn CPU VM chạy trực tiếp. Node FP4 Tensor Core của FIR đã
 lift tự lùi về bản hạ tile thanh ghi lúc nạp khi thiết bị không có đơn vị ma trận, và
 node `sessionFp4GemmMetal` / `sessionFp4GemmTensorCore` của graph cũ phát lại qua cùng
-micro-kernel đó. Đường FP4-KM bằng FP8 (E4M3), công tắc `BYBY_PREFILL_FP4_TILED` và
+micro-kernel đó. Bản hạ cooperative matrix nạp lát K kế tiếp vào thanh ghi trong lúc tensor core
+xử lý lát hiện tại; prefill Codestral chỉ dùng nó sau khi kiểm tra parity trên thiết bị đạt
+(`[vulkan] tile GEMM micro-kernel check ...`). Cùng micro-kernel này còn nhận weight FP16
+(format 1, chỉ Vulkan; xem `BYBY_PREFILL_F16_TILE`). Đường FP4-KM bằng FP8 (E4M3), công tắc `BYBY_PREFILL_FP4_TILED` và
 `BYBY_FP4_SG_COMPILE_CHECK` đã bị bỏ.

@@ -74,6 +74,7 @@ without waiting (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_DECODE_LAYERS_PER_CB` | auto | Layers per decode command buffer (`0`: one per token). |
 | `BYBY_DECODE_FIRST_CB` | `0` | Commit after this many layers first so the GPU starts early. |
 | `BYBY_DECODE_REPLAY` | `1` | Codestral (`infer_lora`, `formers-cli`), Vulkan and Metal: after one encoded step the decode step is recorded once (with and without the head) and resubmitted per token; the host only writes the embedding row and reads the logits. Recordings are dropped on GPU model preparation, state reset and LoRA merge. Off under the FIR recorder, `BYBY_DECODE_SPLIT`, `BYBY_G_DIAGNOSTICS` and one-dispatch. `0` encodes every step. `BYBY_DECODE_REPLAY_VERBOSE=1` repeats the on/off line. |
+| `BYBY_PREFILL_F16_TILE` | `1` | Codestral resident prefill on Vulkan: the FP16 Linear++ sidecar GEMMs (G blocks: `attn.qkvProj`, `attn.outProj`, `fuseGate`) run the tile GEMM micro-kernel with FP16 weights, on cooperative matrices when the device has them (register tiles otherwise), after its once-per-process parity check. `0`: the FP16 micro-VM GEMM. |
 | `BYBY_DECODE_FUSE_RESIDUAL` | `1` | Codestral decode: the out_proj GEMV of an R block adds into the residual itself (one dispatch and one barrier less per layer) when its autotuned FP4-KM decode kernel is a subgroup-row (`sg`) or decode (`dec`) kernel and the projection has no bias. `0`: separate GEMV and add. |
 | `BYBY_GEMV_SUBGROUP` | `auto` | FP4-KM decode GEMV autotune also tries the subgroup-row micro-kernels: one 32-lane subgroup per 1-8 output rows, two weight words per lane in flight, `subgroupAdd`/`simd_sum` reduction, LUT in threadgroup or constant memory. `auto`: Vulkan with fixed 32-lane subgroups that is not Intel (NVIDIA T4), and Apple GPUs on Metal. `1`: try them on any GPU (a pipeline the driver runs narrower than 32 lanes fails the parity check and is dropped); `0`: never. |
 | `BYBY_MERGE_QKV_ATTN_SESSION` | `1` | Merge QKV and attention into one session. |
@@ -171,5 +172,9 @@ cooperative matrix, Metal simdgroup matrix (Apple GPU family 7+), or register ti
 on other GPUs, and the CPU VM runs it directly. A lifted FIR FP4 Tensor Core node falls
 back to the register-tiled lowering at load when the device has no matrix units, and
 `sessionFp4GemmMetal` / `sessionFp4GemmTensorCore` nodes of existing graphs replay
-through the same micro-kernel. The former FP8 (E4M3) FP4-KM route, the
+through the same micro-kernel. The cooperative-matrix lowering loads the next K slice into
+registers while the tensor cores work on the current one; the Codestral prefill uses it only after
+its parity check passes on the device (`[vulkan] tile GEMM micro-kernel check ...`). The same
+micro-kernel also takes FP16 weights (format 1, Vulkan only; see `BYBY_PREFILL_F16_TILE`).
+The former FP8 (E4M3) FP4-KM route, the
 `BYBY_PREFILL_FP4_TILED` switch and `BYBY_FP4_SG_COMPILE_CHECK` are gone.

@@ -765,6 +765,23 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
   # Vulkan dGPU with tensor cores: every GEMM from 2 rows up stays on them
   # (the driver's cooperative routes take M >= 2 there, M >= 8 elsewhere).
   let coopMinT = if byby.sessionTensorCoreRequired(be): 2 else: 8
+  # Tile GEMM micro-kernel on Vulkan: each lowering passes a parity check once per process (it
+  # runs in a session of its own; none is open here) before the prefill uses it.
+  # FP16 sidecar weights (BYBY_LINEARPP_DTYPE=fp16, the linear++ G blocks): tensor cores when the
+  # device has cooperative matrices, else register tiles; BYBY_PREFILL_F16_TILE=0 keeps the
+  # FP16 micro-VM GEMM. FP4-KM: the cooperative lowering must pass before it is preferred.
+  var f16Tile, f16TileCoop = false
+  var fp4TileCoop = true
+  if be == gbVulkan:
+    var hasF16 = false
+    for name, lin in gLinCache:
+      if name.startsWith("block") and lin.isF16: hasF16 = true
+    let coopOk = T >= coopMinT and byby.sessionCooperativeGemmEnabled(be)
+    tuneTimed:
+      if hasF16 and getEnv("BYBY_PREFILL_F16_TILE", "1") != "0":
+        f16TileCoop = coopOk and byby.sessionTileGemmReady(be, true, true)
+        f16Tile = f16TileCoop or byby.sessionTileGemmReady(be, true, false)
+      if coopOk: fp4TileCoop = byby.sessionTileGemmReady(be, false, true)
   # Only the Linear++ sidecar linears pass bias=true; the Mamba in/out
   # projections never do, so their bias kernels are not worth compiling.
   var biasCols: seq[int]
@@ -1026,7 +1043,7 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
     # Try the single-dispatch FP4 cooperative path first on Vulkan; if the
     # shape, shader compiler, or device does not support it, fall through to
     # the existing 8x2 kernel. Keep Metal's tuned 8x2 route unchanged.
-    elif lin.isFp4 and be == gbVulkan and byby.sessionFp4GemmTensorCore(be, input,
+    elif lin.isFp4 and be == gbVulkan and fp4TileCoop and byby.sessionFp4GemmTensorCore(be, input,
         gFp4CacheGpu[name].wBuf, gFp4CacheGpu[name].lutBuf, output, T, lin.K, lin.N):
       inc gPrefixTensorCore
     elif lin.isFp4 and T >= fp4GemmMinRows and fp4GemmReady(gFp4CacheGpu[name]) and
@@ -1064,7 +1081,7 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
             (Fp4KmLutLen + tailRows * 2 * GemvTg) * 4, output, row * lin.N,
             c.wBuf, c.lutBuf, input, row * lin.K)
           flushFine("tile" & $tailRows & "x2tail_" & $lin.N & "x" & $lin.K)
-    elif lin.isFp4 and byby.sessionFp4GemmTensorCore(be, input,
+    elif lin.isFp4 and fp4TileCoop and byby.sessionFp4GemmTensorCore(be, input,
         gFp4CacheGpu[name].wBuf, gFp4CacheGpu[name].lutBuf, output, T, lin.K, lin.N):
       inc gPrefixTensorCore
     elif name in m8Kns:
@@ -1097,6 +1114,10 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
     elif lin.isFp4:
       inc gPrefixPackedTiles
       require(encodeFp4GemmRows(gFp4CacheGpu[name], input, output, T), "FP4 GEMM " & name)
+    elif lin.isF16 and f16Tile and byby.sessionF16GemmTile(be, input, lin.wF16, output,
+        T, lin.K, lin.N, f16TileCoop):
+      # FP16 sidecar on the tile GEMM micro-kernel: one dispatch, 64-row x 64-column tiles.
+      if f16TileCoop: inc gPrefixTensorCore else: inc gPrefixPackedTiles
     elif name in f16Kns:
       inc f32Batch
       encodeVmKernel(f16Kns[name], lin.N * GemvTg, GemvTg, f16GemmTgBytes(T),
@@ -1215,7 +1236,9 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
       for _, kn in m8x2Kns: addNamed(kn)
       for _, kn in m4x2Kns: addNamed(kn)
     for _, kn in biasKns: addNamed(kn)
-    for _, kn in f16Kns: addNamed(kn)
+    # With the FP16 tile GEMM route these are a per-dispatch fallback, compiled lazily if used.
+    if not f16Tile:
+      for _, kn in f16Kns: addNamed(kn)
     let prewarmStart = getMonoTimeIfPf()
     byby.sessionJitPrewarm(be, jobs)
     pfAddIf("vulkan.prewarm", prewarmStart)

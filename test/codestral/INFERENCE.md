@@ -86,6 +86,29 @@ decode work buffer. That buffer aligns every region to 64 floats, so the regions
 when H and cDim*K are multiples of 64 (Codestral); other shapes are copied region by region. (Before
 this, small test models read a shifted `dSkip`/`dtBias` and the integration test failed.)
 
+## Linear++ sidecar GEMMs on the tile GEMM micro-kernel (Vulkan)
+
+The four linear++ G blocks keep their sidecar weights (`attn.qkvProj` 4096x12288, `attn.outProj`
+4096x4096, `fuseGate` 8192x4096) in FP16 (`BYBY_LINEARPP_DTYPE=fp16`, the default). The prefill
+ran those 12 GEMMs on the scalar FP16 micro-VM kernel: on a Colab T4 with 128 rows they took about
+400 ms of a 1035 ms pass (`lp.qkv` 49.6 ms each). They now run on the tile GEMM micro-kernel with
+weight format 1 (`buildF16TileGemmProgram`, op `OP_TILE_LOAD_B_F16`): cooperative matrices (FP16
+16x16 fragments, FP32 accumulation) when the device has them, register tiles otherwise; the halves
+are read straight from the resident `[N, K]` buffer, no converted copy. `BYBY_PREFILL_F16_TILE=0`
+keeps the micro-VM kernel. There is no Metal lowering for format 1 yet; Metal keeps the micro-VM
+kernel.
+
+The cooperative-matrix lowering (FP4-KM and FP16) is register double-buffered: the global loads of
+the next 64-deep K slice are issued before the multiply-adds of the current one, and the FP4-KM
+scale table is staged in threadgroup memory with the 16 FP4 values. Before the prefill uses a
+lowering it must pass a parity check once per process (`vulkanTileGemmReady`: every row tile on a
+37x128x80 product with partial tiles, exact data, host reference); the log prints
+`[vulkan] tile GEMM micro-kernel check <format> <target>: ok`. An FP4-KM cooperative lowering that
+fails sends the FP4 projections back to the packed micro-VM tiles; an FP16 one that fails falls back
+to register tiles, then to the micro-VM kernel. `vendor/bybylang/tests/t_fp4_tile_gemm.nim` covers
+both formats on the CPU VM and Vulkan register tiles and compiles every cooperative-matrix source
+with `glslc`.
+
 ## Decode GEMV: subgroup rows and the fused residual
 
 The FP4 decode GEMV autotune times on the GPU (Vulkan timestamps are turned on for its runs), so
@@ -147,7 +170,8 @@ the prefill wall time and printed next to it:
 - shader compiles: `glslc` runs and Vulkan pipeline creation, Metal library and pipeline-state
   builds, cache misses only. The drivers keep a running total (`sessionCompileSeconds`).
 - prefill autotune and parity checks: the scan autotune, the SSD parity check, the MPS-vs-MSL
-  timing, the simdgroup GEMM parity and the tiled GEMM check (`gPrefillTuneSeconds`), without
+  timing, the simdgroup GEMM parity, the tiled GEMM check and the tile GEMM micro-kernel checks
+  (`gPrefillTuneSeconds`), without
   the compiles they trigger, so nothing is subtracted twice.
 
 ```
@@ -231,6 +255,8 @@ the scan only, including state transpose overhead, not whole-model tokens/s.
 serial/coalesced/parallel scans, MPS/packed GEMMs, state carry, 257 tokens in 128-token chunks
 and 300 tokens as one micro-batch. It also checks that the first prefill of the process counts
 its shader compiles and that a repeated prefill of the same shape excludes almost nothing (only
-cache lookups). `test_prefill_lane_scan_gpu.nim` checks the lane scan up to 512 timesteps.
+cache lookups). A second argument `f16` (`test_resident_prefill_integration RPG f16`) keeps the
+Linear++ sidecars dense, so those the GPU stores in FP16 run the FP16 sidecar GEMM route.
+`test_prefill_lane_scan_gpu.nim` checks the lane scan up to 512 timesteps.
 `test_inplace_lora_merge.nim` covers error and memory guards, packed-bit
 preservation, buffer identity and decode logits after an accepted merge.
