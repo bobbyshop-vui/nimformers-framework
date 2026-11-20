@@ -62,6 +62,7 @@ type
     device*: string      ## device features of the recorded run ("coopmatrix" on Vulkan, "simdmatrix" on Metal, "plain"; "unspecified" for older traces)
     codestralBase*, codestralLora*: string ## checkpoint fingerprints; "-" means no adapter
     codestralTokens*: int
+    codestralStart*: int   ## first trace order after native model setup (0 when unmarked)
     codestralPrefill*: seq[int]
     codestralSsd*: Table[(int, int, int), string] ## (N, D, Q) -> the native SSD implementation
     bufs*: seq[BufferRec]
@@ -253,6 +254,7 @@ proc parseTrace*(text: string): Trace =
       result.codestralBase = w[1]
       result.codestralLora = w[2]
       result.codestralTokens = parseInt(w[3])
+      result.codestralStart = order + 1
     elif raw.startsWith("codestral_prefill "):
       result.codestralPrefill.add parseInt(raw["codestral_prefill ".len .. ^1])
     elif raw.startsWith("codestral_ssd "):
