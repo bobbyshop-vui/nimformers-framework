@@ -274,12 +274,26 @@ function fmMambaSetNorm(mm: FmMambaModel)
 function fmCodestralTrace(): bool
     return firProbeOn and getEnv("BYBY_FIR_CODESTRAL", "0") == "1"
 
+function fmMambaBackend(wanted: string): Backend
+    m2infer.configureInferenceDefaults()
+    # Auto detection can initialize the Vulkan device while choosing a backend.
+    if wanted in ["auto", "vulkan", "cuda"]:
+        for (key, value) in [("BYBY_VULKAN_DEVICE_LOCAL", "auto"), ("BYBY_VULKAN_TENSOR_CORES", "1")]:
+            if not existsEnv(key):
+                putEnv(key, value)
+    result = newBackend(wanted)
+    if result.kind.toByby() == gbVulkan:
+        for (key, value) in [("BYBY_MEMORY_LIMIT_MB", "10000"), ("BYBY_SSD", "auto"), ("BYBY_CODESTRAL_TOKEN_IDS", "1")]:
+            if not existsEnv(key):
+                putEnv(key, value)
+        if not existsEnv("BYBY_UBATCH") and not existsEnv("BYBY_PREFILL_BATCH_SIZE"):
+            putEnv("BYBY_UBATCH", $DefaultPrefillUbatch)
+
 function fmLoadFirForDetection(graph: FirProgram, det: FmDetection, ctx: Backend): FirGraph
     if not firUsesCodestral(graph):
         return firLoadGraph(graph, det.files.nimqPath, ctx)
     if ctx.kind.toByby() != gbVulkan:
         raise newException(ValueError, "Codestral FIR requires the recorded Vulkan backend")
-    m2infer.configureInferenceDefaults()
     var mm: FmMambaModel
     if det.files.loraPath.len > 0:
         mm = fmMambaLoadLora(det.mamba, det.lora, det.files.nimqPath)
@@ -562,15 +576,13 @@ function fmMambaChatLoop(mm: var FmMambaModel, tok: hf_tokenizer.HfTokenizer, ct
         fmMambaStats("eval       ", reply.tokens, reply.seconds)
 
 function fmRunMamba2(det: FmDetection, opts: FmOptions): bool
-    # Kernel-selection defaults of the Mamba-2 GPU blocks; explicit env wins.
-    m2infer.configureInferenceDefaults()
     m2infer.setInferenceThreadPriority()
     stderr.writeLine("[formers.n] tokenizer " & det.files.tokenizerDir)
     let tok = hf_tokenizer.newHfTokenizer(det.files.tokenizerDir)
     if vocabSizeHf(tok) != det.mamba.vocabSize:
         fmSay("[formers.n] error: tokenizer vocab " & $vocabSizeHf(tok) & " differs from vocab_size " & $det.mamba.vocabSize)
         return false
-    let ctx = newBackend(opts.backend)
+    let ctx = fmMambaBackend(opts.backend)
     let codestralTrace = fmCodestralTrace()
     if codestralTrace:
         if ctx.kind.toByby() != gbVulkan or opts.conversation:

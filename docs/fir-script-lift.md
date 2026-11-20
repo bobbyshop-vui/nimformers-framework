@@ -365,7 +365,6 @@ records one 246-row phase. FIR replays the recorded FP4/FP16 tile GEMMs and SSD
 session operations. Decode uses the recorded micro-VM programs.
 
 ```sh
-export BYBY_MEMORY_LIMIT_MB=10000 BYBY_CODESTRAL_TOKEN_IDS=1
 other/formers.n/firlift/firlift --config "$HF_DIR/config.json" \
   --weights "$BASE" --context 512 --out "$OUT" --report \
   --run other/formers.n/formers-cli --models "$MODELS" -m "$BASE" \
@@ -385,9 +384,11 @@ resident buffer sizes. The runner uses the same SentencePiece tokenizer and
 sampler as native. Relift for a different prompt token count because the scan
 and its arena offsets are fixed by the recorded batch widths.
 
-`BYBY_CODESTRAL_TOKEN_IDS=1` prints the exact generated IDs after the text. The
-first four IDs from the long FIR run can be compared with the recording run;
-compare equal-length runs to check the entire generation.
+Codestral Vulkan uses a 10000 MB merge budget, automatic weight placement,
+tensor cores, a 512-row micro-batch, and automatic SSD selection by default.
+It prints the generated IDs after the text; set `BYBY_CODESTRAL_TOKEN_IDS=0`
+to hide them. Compare the first four IDs with the recording run, or compare
+equal-length runs to check the entire generation.
 
 ## Historical Codestral result
 
