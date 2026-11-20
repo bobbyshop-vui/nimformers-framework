@@ -26,6 +26,8 @@ import nim "hf_tokenizer"
 import nim "test/codestral/infer_lora as m2infer"
 import nim "native_hf_tokenizer"
 import nim "vendor/bybylang/probe"
+import nim "vendor/bybylang/probe_data"
+import "../ir/fir_types.bybylang"
 import "../ir/fir_parse.bybylang"
 import "../ir/fir_graph.bybylang"
 import "../cli/options.bybylang"
@@ -47,6 +49,7 @@ type
     sampler*: FmSampler
   FmMambaReply* = object
     text*: string
+    ids*: seq[int]
     tokens*: int
     seconds*: float
     stoppedByEos*: bool
@@ -213,6 +216,15 @@ function fmMambaTurnText(opts: FmOptions, user: string, first: bool): string
         result = "[INST] " & user & "[/INST]"
     result = result.strip(leading = false, trailing = true)
 
+function fmMambaWriteText(text: string, printed: var string, finished: bool = false)
+    if text.len > printed.len and text.startsWith(printed) and (finished or not text.endsWith("\uFFFD")):
+        fmOut().write(text[printed.len .. ^1])
+        printed = text
+
+function fmMambaReportIds(ids: seq[int])
+    if getEnv("BYBY_CODESTRAL_TOKEN_IDS", "0") == "1":
+        fmSay("[codestral-tokens] " & ids.join(" "))
+
 function fmMambaPrepareGpu(mm: var FmMambaModel, ctx: Backend)
     mergeInUploadStreamingJamba(mm.model, mm.lora, ctx)
     prepareGpuModel(mm.model, mm.lora, ctx)
@@ -235,21 +247,23 @@ function fmMambaPrepareGpu(mm: var FmMambaModel, ctx: Backend)
         stderr.writeLine("[formers.n] merged " & $merged & " LoRA adapters into the resident base")
     stderr.writeLine("[formers.n] GPU ready, released " & $(freed div (1024 * 1024)) & " MiB of duplicate host weights")
 
-function fmMambaNewChat(mm: FmMambaModel, tok: hf_tokenizer.HfTokenizer, opts: FmOptions): FmMambaChat
-    let vocab = mm.model.vocab
-    result.sampler = fmNewSampler(opts, vocab)
+function fmMambaSampler(tok: hf_tokenizer.HfTokenizer, opts: FmOptions, vocab: int): FmSampler
+    result = fmNewSampler(opts, vocab)
     # Control/placeholder tokens are noise in lm_head; stop tokens stay allowed.
     if tok.special.len == vocab:
         for i in 0 ..< vocab:
-            result.sampler.banned[i] = tok.special[i]
+            result.banned[i] = tok.special[i]
     for id in tok.stopIds:
         if id >= 0 and id < vocab:
-            result.sampler.banned[id] = false
+            result.banned[id] = false
     for ws in ["\n", "\n\n", " ", "  ", "    ", "\t", "\n    ", "\n\t", "\r\n"]:
         for id in encodeHf(tok, ws, false, false):
             if id >= 0 and id < vocab:
-                result.sampler.noPenalty[id] = true
-    stderr.writeLine("[formers.n] sampler: " & fmSamplerSummary(result.sampler))
+                result.noPenalty[id] = true
+    stderr.writeLine("[formers.n] sampler: " & fmSamplerSummary(result))
+
+function fmMambaNewChat(mm: FmMambaModel, tok: hf_tokenizer.HfTokenizer, opts: FmOptions): FmMambaChat
+    result.sampler = fmMambaSampler(tok, opts, mm.model.vocab)
 
 function fmMambaSetNorm(mm: FmMambaModel)
     let preset = getEnv("BYBY_NORM_PRESET", mm.normPreset)
@@ -257,9 +271,33 @@ function fmMambaSetNorm(mm: FmMambaModel)
         raise newException(ValueError, "[formers.n] invalid norm preset: " & preset)
     stderr.writeLine("[formers.n] norm preset " & preset)
 
+function fmCodestralTrace(): bool
+    return firProbeOn and getEnv("BYBY_FIR_CODESTRAL", "0") == "1"
+
+function fmLoadFirForDetection(graph: FirProgram, det: FmDetection, ctx: Backend): FirGraph
+    if not firUsesCodestral(graph):
+        return firLoadGraph(graph, det.files.nimqPath, ctx)
+    if ctx.kind.toByby() != gbVulkan:
+        raise newException(ValueError, "Codestral FIR requires the recorded Vulkan backend")
+    m2infer.configureInferenceDefaults()
+    var mm: FmMambaModel
+    if det.files.loraPath.len > 0:
+        mm = fmMambaLoadLora(det.mamba, det.lora, det.files.nimqPath)
+    else:
+        mm = fmMambaLoadBase(det.mamba, det.files.nimqPath)
+    fmMambaPrepareGpu(mm, ctx)
+    fmMambaSetNorm(mm)
+    # The graph loads the embedding itself. The borrowed runtime only supplies
+    # resident weights and state, so release the unused host embedding first.
+    mm.model.embed.weight = Tensor(shape: mm.model.embed.weight.shape)
+    result = firLoadGraph(graph, det.files.nimqPath, ctx, codestralFirResources())
+    function resetResident()
+        resetGpuGenState(mm.model, ctx)
+    result.resetNative = resetResident
+
 function fmMambaPrefillChunk(wholePrompt: bool = false): int
-    ## Native resident prefill uses the backend's default ubatch. FIR recording and legacy
-    ## fallbacks keep 128 and fixed tail sizes, matching the phases of existing lifted graphs.
+    ## Resident prefill and the Codestral recorder share the backend's default ubatch.
+    ## The legacy nonresident path uses the fixed chunk and tail sizes.
     let defaultRows = if wholePrompt: DefaultPrefillUbatch else: 128
     result = defaultRows
     try:
@@ -279,7 +317,7 @@ function fmMambaTensorCores(ctx: Backend): bool
 
 function fmMambaPrefillMinRows(): int
     ## BYBY_PREFILL_MIN_ROWS (default 5): minimum prefix/final-tail rows to batch; shorter
-    ## tails decode. Full ubatches always run. FIR recording uses this minimum as a tail phase.
+    ## tails decode. Full ubatches always run.
     result = 5
     try:
         result = parseInt(getEnv("BYBY_PREFILL_MIN_ROWS", "5"))
@@ -290,8 +328,7 @@ function fmMambaPrefillMinRows(): int
 function fmMambaTailSizes(chunk, minRows: int): seq[int]
     ## The tail chunk lengths, largest first: the halvings of the chunk down to 8 rows that
     ## are at least minRows, and minRows itself (at least 2 rows). A fixed set, so the scan
-    ## kernels compile for a bounded number of lengths, and a FIR graph lifted from a prompt
-    ## that runs every size once holds a phase for each.
+    ## kernels compile for a bounded number of lengths on the legacy prefill path.
     let rows = max(2, minRows)
     var size = chunk div 2
     while size >= 8:
@@ -353,7 +390,7 @@ function fmMambaFeed(mm: var FmMambaModel, ctx: Backend, chat: var FmMambaChat, 
     # Resident pieces continue the state, zero after the first reset. Recording keeps one
     # kernel set per fixed chunk length so a lifted FIR graph can replay the same phases.
     let carryAll = fmMambaResidentPrefill(mm, ctx)
-    let wholePrompt = carryAll and not firProbeOn
+    let wholePrompt = carryAll and (not firProbeOn or fmCodestralTrace())
     if first or tensorCores:
         let chunk = fmMambaPrefillChunk(wholePrompt)
         for piece in fmMambaPrefillPieces(input.len - 1, wholePrompt):
@@ -373,7 +410,7 @@ function fmMambaWarmup(mm: var FmMambaModel, tok: hf_tokenizer.HfTokenizer, ctx:
     ## Warm decode until steady; tensor-core GPUs also warm a representative native batch
     ## or every fixed FIR length. A new native prompt length can still compile scan kernels;
     ## compile/autotune time is reported separately from prompt throughput.
-    if opts.noWarmup:
+    if opts.noWarmup or fmCodestralTrace():
         return
     var chat: FmMambaChat
     var ids = encodeHf(tok, "[INST] hi[/INST]")
@@ -422,11 +459,10 @@ function fmMambaReplyTo(mm: var FmMambaModel, tok: hf_tokenizer.HfTokenizer, ctx
             break
         gen.add(id)
         # Print the new text once its UTF-8 is complete.
-        let text = decodeHf(tok, gen)
-        if text.len > printed.len and text.startsWith(printed) and not text.endsWith("\uFFFD"):
-            fmOut().write(text[printed.len .. ^1])
+        let before = printed.len
+        fmMambaWriteText(decodeHf(tok, gen), printed)
+        if printed.len != before:
             fmOut().flushFile()
-            printed = text
         if gen.len >= maxNew:
             chat.pending = @[id]
             break
@@ -439,9 +475,9 @@ function fmMambaReplyTo(mm: var FmMambaModel, tok: hf_tokenizer.HfTokenizer, ctx
     result.seconds = epochTime() - t0
     result.tokens = gen.len
     result.text = decodeHf(tok, gen)
-    if result.text.len > printed.len and result.text.startsWith(printed):
-        fmOut().write(result.text[printed.len .. ^1])
+    fmMambaWriteText(result.text, printed, true)
     fmOut().flushFile()
+    result.ids = move(gen)
 
 function fmMambaStats(label: string, nTok: int, seconds: float)
     if nTok > 0:
@@ -460,7 +496,7 @@ function fmPromptStats(nTok: int, seconds, setup: float)
         let compute = max(seconds - setup, 1e-9)
         fmSay("[formers.n] prompt eval: " & $nTok & " tok / " & formatFloat(compute, ffDecimal, 3) & " s = " & formatFloat(nTok.float / compute, ffDecimal, 2) & " tok/s (excluding " & formatFloat(setup, ffDecimal, 3) & " s shader compile/autotune; wall " & formatFloat(seconds, ffDecimal, 3) & " s)")
 
-function fmMambaGenerate(mm: var FmMambaModel, tok: hf_tokenizer.HfTokenizer, ctx: Backend, opts: FmOptions): string
+function fmMambaGenerate(mm: var FmMambaModel, tok: hf_tokenizer.HfTokenizer, ctx: Backend, opts: FmOptions, det: FmDetection): string
     ## One prompt, one completion (prompt echoed like llama-cli).
     fmMambaSetNorm(mm)
     fmMambaWarmup(mm, tok, ctx, opts)
@@ -468,6 +504,11 @@ function fmMambaGenerate(mm: var FmMambaModel, tok: hf_tokenizer.HfTokenizer, ct
     let ids = encodeHf(tok, fmMambaTurnText(opts, opts.prompt, true))
     if ids.len == 0:
         raise newException(ValueError, "[formers.n] the prompt encodes to 0 tokens")
+    if fmCodestralTrace():
+        let base = det.files.nimqPath
+        let lora = det.files.loraPath
+        let adapterId = if lora.len > 0: fingerprintFile(lora, 0, getFileSize(lora).int) else: "-"
+        probeEvent("codestral_prompt " & fingerprintFile(base, 0, getFileSize(base).int) & " " & adapterId & " " & $ids.len)
     fmOut().write(decodeHf(tok, ids))
     fmOut().flushFile()
     let setup0 = prefillSetupSeconds()
@@ -478,6 +519,7 @@ function fmMambaGenerate(mm: var FmMambaModel, tok: hf_tokenizer.HfTokenizer, ct
     let reply = fmMambaReplyTo(mm, tok, ctx, chat, logits, opts.nPredict, opts)
     fmOut().write("\n")
     fmOut().flushFile()
+    fmMambaReportIds(reply.ids)
     if fmStopRequested():
         fmSay("[formers.n] stopped by Ctrl+C")
     fmPromptStats(ids.len, prefillTime, prefillSetup)
@@ -515,6 +557,7 @@ function fmMambaChatLoop(mm: var FmMambaModel, tok: hf_tokenizer.HfTokenizer, ct
         let reply = fmMambaReplyTo(mm, tok, ctx, chat, logits, opts.nPredict, opts)
         fmOut().write("\n")
         fmOut().flushFile()
+        fmMambaReportIds(reply.ids)
         fmPromptStats(newIds.len, feedTime, feedSetup)
         fmMambaStats("eval       ", reply.tokens, reply.seconds)
 
@@ -528,16 +571,23 @@ function fmRunMamba2(det: FmDetection, opts: FmOptions): bool
         fmSay("[formers.n] error: tokenizer vocab " & $vocabSizeHf(tok) & " differs from vocab_size " & $det.mamba.vocabSize)
         return false
     let ctx = newBackend(opts.backend)
+    let codestralTrace = fmCodestralTrace()
+    if codestralTrace:
+        if ctx.kind.toByby() != gbVulkan or opts.conversation:
+            raise newException(ValueError, "Codestral FIR recording requires a single Vulkan prompt")
+        putEnv("BYBY_FIR_PROBE_DATA", "0")
     var mm: FmMambaModel
     if det.route == frMamba2Lora:
         mm = fmMambaLoadLora(det.mamba, det.lora, det.files.nimqPath)
     else:
         mm = fmMambaLoadBase(det.mamba, det.files.nimqPath)
     fmMambaPrepareGpu(mm, ctx)
+    if codestralTrace:
+        probeCodestralFirResources()
     if opts.conversation:
         fmMambaChatLoop(mm, tok, ctx, opts)
     else:
-        discard fmMambaGenerate(mm, tok, ctx, opts)
+        discard fmMambaGenerate(mm, tok, ctx, opts, det)
     result = true
 
 # ── Shared conversation loop driven by the chat template of the model config ──

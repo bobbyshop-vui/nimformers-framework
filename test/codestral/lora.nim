@@ -1476,6 +1476,53 @@ proc prepareGpuModel*(m: var NimformerModelJamba, lora: var JambaLora, ctx: Back
         ", backend=" & $be & ") - out of GPU/unified memory?")
     gGpuModelReady = true
 
+proc codestralFirResources*(): Table[string, SessionHandle] =
+  ## These buffers already contain the native packed/merged weights and initial
+  ## recurrent arenas. The graph borrows them for the life of this CLI run.
+  var resources = initTable[string, SessionHandle]()
+  template add(key: string; h: SessionHandle) =
+    if byby.probeByteSize(h) > 0: resources[key] = h
+  for name, fp4 in gFp4CacheGpu:
+    if fp4.residentReady:
+      add(name & ".packed", fp4.wBuf)
+      add(name & ".lut", fp4.lutBuf)
+  for name, lin in gLinCache:
+    if lin.ready:
+      if lin.isF16:
+        add(name & ".fp16", lin.wF16)
+      elif not lin.isFp4:
+        add(name & ".values", lin.wF32)
+        if lin.isInt4: add(name & ".packed", lin.int4WBuf)
+      if lin.hasBias: add(name & ".bias", lin.biasH)
+  for i, layer in gLayersV2:
+    let key = "block" & $i & ".mamba."
+    add(key & "work", layer.hWork)
+    add(key & "gamma", layer.hGamma)
+    add(key & "gamma_ones", layer.hGammaOnes)
+    add(key & "beta", layer.hBeta)
+  for i, layer in gAttnLayers:
+    let key = "block" & $i & ".linearpp."
+    add(key & "work", layer.hWork)
+    add(key & "ln1_gamma", layer.ln1G)
+    add(key & "ln1_ones", layer.ln1Ones)
+    add(key & "ln1_beta", layer.ln1B)
+    add(key & "ln2_gamma", layer.ln2G)
+    add(key & "ln2_beta", layer.ln2B)
+    add(key & "gate_ones", layer.hGateOnes)
+  add("final.gamma", gNormFGamma)
+  add("final.gamma_ones", gNormFOnes)
+  add("decode.residual", gHXPersist)
+  result = move(resources)
+
+proc probeCodestralFirResources*() =
+  for name, handle in codestralFirResources():
+    byby.probeName(handle, name, "fir_codestral", [])
+  for layer in gLayersV2.values:
+    byby.probeName(layer.hWork, "zero", "fir_zero", [], layer.off.offConvSt*4, layer.cDim*(layer.K-1)*4)
+    byby.probeName(layer.hWork, "zero", "fir_zero", [], layer.off.offSsm*4, layer.HD*layer.N*4)
+  for layer in gAttnLayers.values:
+    byby.probeName(layer.hWork, "zero", "fir_zero", [])
+
 proc encodeHeadGpu(m: var NimformerModelJamba, ctx: Backend) =
   ## normF (depending on the preset) + lm_head. Shared by encodeOneToken and the trace version.
   let be = ctx.kind.toByby()

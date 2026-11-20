@@ -11,6 +11,8 @@ function firDataGraph(graph: FirProgram): bool
     ## with initial data, recorded slot kernels). A graph whose slot kernels exist to reach resident
     ## Q4 weights keeps one arena for its activations and state: its other kernels then run in
     ## place, and only the Q4 weights live outside the arena.
+    if firUsesCodestral(graph):
+        return true
     var residentQ4 = false
     for name, buffer in graph.buffers:
         if buffer.dtype == "raw" or buffer.initFile.len > 0 or buffer.initialWords.len > 0:

@@ -13,7 +13,7 @@ type Recorded* = object
 proc closeQuietly(fd: cint) =
   if fd >= 0: discard posix.close(fd)
 
-proc recordCommand*(command: seq[string]): Recorded =
+proc recordCommand*(command: seq[string]; codestral = false): Recorded =
   if command.len == 0: raise newException(ValueError, "--run needs a command after it")
   var tracePipe, dataPipe: array[2, cint]
   if pipe(tracePipe) != 0 or pipe(dataPipe) != 0:
@@ -21,9 +21,15 @@ proc recordCommand*(command: seq[string]): Recorded =
   # The command inherits only the write ends; the read ends stay with this process.
   discard fcntl(tracePipe[0], F_SETFD, FD_CLOEXEC)
   discard fcntl(dataPipe[0], F_SETFD, FD_CLOEXEC)
-  putEnv("BYBY_FIR_PROBE", "fd:" & $tracePipe[1] & "," & $dataPipe[1])
-  # The payload sidecar is what makes unnamed uploads (LUTs, merged weights) liftable.
-  if getEnv("BYBY_FIR_PROBE_DATA").len == 0: putEnv("BYBY_FIR_PROBE_DATA", "1")
+  let fd = "fd:" & $tracePipe[1]
+  if codestral:
+    putEnv("BYBY_FIR_CODESTRAL", "1")
+    putEnv("BYBY_FIR_PROBE", fd)
+    putEnv("BYBY_FIR_PROBE_DATA", "0")
+  else:
+    putEnv("BYBY_FIR_PROBE", fd & "," & $dataPipe[1])
+    # Legacy lifts can use captured upload bytes for unnamed inputs.
+    if getEnv("BYBY_FIR_PROBE_DATA").len == 0: putEnv("BYBY_FIR_PROBE_DATA", "1")
   var child: Process
   try:
     child = startProcess(command[0], args = command[1 .. ^1],

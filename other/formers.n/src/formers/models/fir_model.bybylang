@@ -1,14 +1,17 @@
 # Text completion for any self-contained FIR graph model (`runtime graph`) with a native HF tokenizer.
-import nim "std/[os, json, times, tables]"
+import nim "std/[os, json, times, tables, strutils]"
 import nim "backend"
 import nim "native_hf_tokenizer"
+import nim "hf_tokenizer as codestralTokenizer"
 import "../cli/options.bybylang"
 import "../arch/detect.bybylang"
 import "../ir/fir_parse.bybylang"
 import "../ir/fir_graph.bybylang"
+import "../ir/fir_types.bybylang"
 import "../sampling/sampler.bybylang"
 import "../runtime/console.bybylang"
 import "../runtime/signals.bybylang"
+import "mamba2.bybylang"
 
 function fmTailWorth(model: FirGraph, graph: FirProgram, name: string, rest: int): bool
     ## Whether one partial run of phase `name` over `rest` rows beats `rest` decode steps. A partial
@@ -64,6 +67,21 @@ function fmFirFeedPrompt(model: var FirGraph, graph: FirProgram, ids: seq[int]):
     ## `partial` phase that holds it. What is left runs as decode steps, the last token always
     ## producing logits.
     var next = 0
+    if firUsesCodestral(graph):
+        # The SSD and Linear++ arenas encode the exact row count of the native run.
+        for phase in graph.phaseOrder:
+            if fmStopRequested():
+                return @[]
+            let rows = graph.phases[phase]
+            if rows >= ids.len - next:
+                raise newException(ValueError, "Codestral FIR prefill phases exceed the recorded prompt prefix")
+            discard firGraphPhase(model, phase, ids[next ..< next+rows])
+            next += rows
+        for i in next ..< ids.len:
+            if fmStopRequested():
+                return @[]
+            result = firGraphStep(model, ids[i], "prefill")
+        return
     var finished = false
     var ubatch = 0
     # BYBY_PREFILL_MIN_ROWS (default 5): phases shorter than this many rows are not used, so
@@ -157,7 +175,13 @@ function fmRunFir(det: FmDetection, cliOpts: FmOptions): bool
         ubatch = 0
     let path = if opts.firFile.len > 0: opts.firFile else: opts.modelsDir / "model.fir"
     var graph = firParse(path, det.files.configPath)
-    if ubatch > 0:
+    let codestral = firUsesCodestral(graph)
+    if codestral:
+        var widths: seq[int]
+        for phase in graph.phaseOrder:
+            widths.add(graph.phases[phase])
+        fmSay("[formers.n] FIR graph recorded prefill rows: " & widths.join(", "))
+    elif ubatch > 0:
         fmSay("[formers.n] FIR graph micro-batch: up to " & $ubatch & " rows")
     if opts.firF32:
         graph = firF32Weights(graph)
@@ -165,7 +189,7 @@ function fmRunFir(det: FmDetection, cliOpts: FmOptions): bool
     # A model may declare sampler defaults in config.json ("formers_sampler"). They apply only
     # to settings not given on the command line, so command-line flags always win.
     let declared = cfg{"formers_sampler"}
-    if declared != nil and declared.kind == JObject:
+    if not codestral and declared != nil and declared.kind == JObject:
         if "temperature" notin opts.samplerSet and declared.hasKey("temperature"):
             opts.temperature = float32(declared["temperature"].getFloat())
         if "top_p" notin opts.samplerSet and declared.hasKey("top_p"):
@@ -178,10 +202,24 @@ function fmRunFir(det: FmDetection, cliOpts: FmOptions): bool
             opts.repeatLastN = declared["repeat_last_n"].getInt()
     let useIds = opts.promptIds.len > 0
     var tok: native_hf_tokenizer.HFTokenizer
-    if not useIds:
+    var codestralTok: codestralTokenizer.HfTokenizer
+    if codestral:
+        codestralTok = codestralTokenizer.newHfTokenizer(det.files.tokenizerDir)
+        if codestralTokenizer.vocabSizeHf(codestralTok) != graph.symbols["vocab"]:
+            raise newException(ValueError, "Codestral FIR tokenizer vocabulary differs from the graph")
+    elif not useIds:
         tok = native_hf_tokenizer.newHFTokenizer(det.files.tokenizerDir)
-    let eos = if not useIds and opts.addSpecialTokens and tok.eosId >= 0: tok.eosId else: cfg{"eos_token_id"}.getInt(-1)
-    var ids = if useIds: opts.promptIds else: tok.encode(opts.prompt, opts.addSpecialTokens)
+    let eos = if not codestral and not useIds and opts.addSpecialTokens and tok.eosId >= 0: tok.eosId else: cfg{"eos_token_id"}.getInt(-1)
+    var ids = opts.promptIds
+    if not useIds:
+        if codestral:
+            ids = codestralTokenizer.encodeHf(codestralTok, fmMambaTurnText(opts, opts.prompt, true))
+        else:
+            ids = tok.encode(opts.prompt, opts.addSpecialTokens)
+    if codestral:
+        let recordedTokens = cfg{"fir_codestral", "prompt_tokens"}.getInt()
+        if ids.len != recordedTokens:
+            raise newException(ValueError, "Codestral FIR was lifted for " & $recordedTokens & " prompt tokens; relift for the current " & $ids.len)
     if ids.len == 0:
         let bos = cfg{"bos_token_id"}.getInt(eos)
         if bos < 0:
@@ -193,15 +231,15 @@ function fmRunFir(det: FmDetection, cliOpts: FmOptions): bool
         for id in ids:
             if id < 0 or id >= graph.symbols["vocab"]:
                 raise newException(ValueError, "FIR graph: prompt id " & $id & " is outside the model vocabulary")
-    elif tok.totalVocabSize > graph.symbols["vocab"]:
+    elif not codestral and tok.totalVocabSize > graph.symbols["vocab"]:
         raise newException(ValueError, "FIR graph: tokenizer exceeds model vocabulary")
     backend.setForbidCpuFallback(true)
     let ctx = newBackend(opts.backend)
-    var model = firLoadGraph(graph, det.files.nimqPath, ctx)
+    var model = fmLoadFirForDetection(graph, det, ctx)
     defer: firFreeGraph(model)
     firGraphTuneGemv(model)
-    var sampler = fmNewSampler(opts, graph.symbols["vocab"])
-    if not useIds:
+    var sampler = if codestral: fmMambaSampler(codestralTok, opts, graph.symbols["vocab"]) else: fmNewSampler(opts, graph.symbols["vocab"])
+    if not codestral and not useIds:
         for probe in ["\n", "\n\n", " ", "  ", "    ", "\t", "\n    ", "\n\t", "\r\n"]:
             fmExemptFromPenalty(sampler, tok.encode(probe, false))
     var warmed = false
@@ -220,7 +258,7 @@ function fmRunFir(det: FmDetection, cliOpts: FmOptions): bool
         let measuredStep = model.stepSeconds
         let measuredBlocks = model.phaseBlockSeconds
         let measuredRows = model.phaseBlockRows
-        if model.useHandles and getEnv("BYBY_FIR_WARM_RELOAD", "0") == "0":
+        if codestral or (model.useHandles and getEnv("BYBY_FIR_WARM_RELOAD", "0") == "0"):
             # A lifted graph keeps all of its mutable state in buffers that carry their initial data:
             # firGraphReset restores them, so the warm kernels are reused without loading twice.
             firGraphReset(model)
@@ -259,8 +297,10 @@ function fmRunFir(det: FmDetection, cliOpts: FmOptions): bool
     var decodeSeconds = 0.0
     var decodeSteps = 0
     var stream: native_hf_tokenizer.HFTokenStream
-    if not useIds:
+    if not codestral and not useIds:
         stream = initTokenStream(tok)
+    var codestralIds: seq[int]
+    var printed = ""
     var generated = 0
     fmSetGenerating(true)
     try:
@@ -282,21 +322,35 @@ function fmRunFir(det: FmDetection, cliOpts: FmOptions): bool
                     used[best] = true
                     line = line & " " & $best & ":" & $value
                 stderr.writeLine(line)
-            if id == eos:
+            if (if codestral: codestralTokenizer.isStopIdHf(codestralTok, id) else: id == eos):
                 break
             ids.add(id)
             inc generated
-            fmOut().write(if useIds: $id & " " else: stream.pushTokens([id]))
+            if codestral:
+                codestralIds.add(id)
+                if not useIds:
+                    fmMambaWriteText(codestralTokenizer.decodeHf(codestralTok, codestralIds), printed)
+            if useIds:
+                fmOut().write($id & " ")
+            elif not codestral:
+                fmOut().write(stream.pushTokens([id]))
             fmOut().flushFile()
             if i+1 < opts.nPredict:
                 let stepStart = epochTime()
                 logits = firGraphStep(model, id)
                 decodeSeconds += epochTime()-stepStart
                 inc decodeSteps
-        fmOut().write((if useIds: "" else: stream.pushTokens(newSeq[int](), true)) & "\n")
+        if not useIds:
+            if codestral:
+                fmMambaWriteText(codestralTokenizer.decodeHf(codestralTok, codestralIds), printed, true)
+            else:
+                fmOut().write(stream.pushTokens(newSeq[int](), true))
+        fmOut().write("\n")
         fmOut().flushFile()
     finally:
         fmSetGenerating(false)
+    if codestral:
+        fmMambaReportIds(codestralIds)
     let jitNote = if warmed: "without kernel setup/JIT" else: "with kernel setup/JIT, no warmup"
     let promptTokens = ids.len-generated
     fmSay("[formers.n] FIR graph prefill (" & $graph.phaseOrder.len & " multi-row phases): " & $promptTokens & " tokens in " & formatFloat(prefillSeconds, ffDecimal, 3) & " s -> " & formatFloat(float64(promptTokens)/prefillSeconds, ffDecimal, 2) & " tok/s (" & jitNote & ")")

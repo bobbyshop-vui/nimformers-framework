@@ -142,6 +142,10 @@ proc accessOf(op: Op; t: Trace; reads, writes: var seq[int]) =
   else:
     for p in op.ins: reads.add p.buffer
     for p in op.outs: writes.add p.buffer
+    if op.opName == "sessionMamba2SsdPrefillEnc":
+      # The backend writes the arena through a handle passed by value.
+      for p in op.ins:
+        if p.name == "arena": writes.add p.buffer
     if op.impl.startsWith("session:") and not op.isUpload:
       # A session call that writes through a handle it takes by value (an arena) records that
       # handle as an input only. What its own dispatches write is what the call writes, so the
@@ -167,12 +171,18 @@ type Dims* = object
 
 proc captureZeroRange(t: Trace; tr: TransferRec; byteOffset, bytes: int): bool =
   ## True when bytes [byteOffset, byteOffset+bytes) of an upload's recorded payload are present and all zero.
-  if bytes <= 0 or byteOffset < 0 or tr.captureOffset < 0 or tr.captureBytes <= 0 or
-      tr.captureBytes != tr.dst.bytes or byteOffset+bytes > tr.captureBytes: return false
+  if bytes <= 0 or byteOffset < 0 or byteOffset+bytes > tr.dst.bytes: return false
+  if t.codestralTokens > 0:
+    let start = tr.dst.offset + byteOffset
+    for n in t.names:
+      if n.dtype == "fir_zero" and n.buffer == tr.dst.buffer and
+          start >= n.offset and start + bytes <= n.offset + n.bytes:
+        return true
+  if tr.captureOffset < 0 or tr.captureBytes != tr.dst.bytes: return false
   sidecarAllZero(t.sourcePath, tr.captureOffset+byteOffset, bytes)
 
-proc captureZero(t: Trace; tr: TransferRec): bool =
-  t.captureZeroRange(tr, 0, tr.captureBytes)
+proc captureZero*(t: Trace; tr: TransferRec): bool =
+  t.captureZeroRange(tr, 0, tr.dst.bytes)
 
 proc attrNum(op: Op; key: string): int =
   if op.attrs.hasKey(key):
@@ -267,6 +277,12 @@ proc stateResets(t: Trace): seq[ResetCopy] =
       var reset: ResetCopy
       if t.zeroFill(op, reset): found.add reset
       else: clean = false
+    elif t.codestralTokens > 0 and op.isUpload:
+      # Zero buffers used by the first reset may be uploaded inside its session.
+      var zero = false
+      for tr in t.transfers:
+        if tr.kind == "upload" and tr.op == op.id and t.captureZero(tr): zero = true
+      if not zero: clean = false
     elif op.impl.startsWith("session:") and op.opName in ResetNeutralOps:
       discard
     else:

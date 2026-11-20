@@ -210,10 +210,10 @@ compile/autotune time is shown separately and excluded from prompt-eval throughp
 With `BYBY_ONE_DISPATCH=1`, later turns decode because their state lives apart from
 the resident prefill state.
 
-FIR recording (`firlift --run`) and legacy prefill fallbacks retain the fixed sizes:
-128 rows by default, then 64/32/16/8/5-row tails. The recording warmup visits every
-size, preserving the phases needed by existing lifted graphs. Explicit ubatch and
-minimum-tail settings still control those recorded sizes.
+On Vulkan, `firlift --run` records the native Codestral batch widths and SSD
+pipeline with the actual prompt. A new lift writes the graph and config only.
+The FIR runner reopens the original `.nimq` and LoRA, merges LoRA on the GPU,
+and replays the recorded batches. See [Codestral on Vulkan](../../docs/fir-script-lift.md#codestral-on-vulkan).
 
 Mamba-3 chat feeds each turn through the prefill scheduler of `test/mamba3`: every token
 but the last in chunks of 128, 32 and 8 tokens, the fewer than 8 left over as decode steps,

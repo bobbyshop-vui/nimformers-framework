@@ -22,7 +22,7 @@ import ./kernel_asm
 import session_vm
 import ./fuse
 import ./sidecar
-from ./steps import withoutSingleRowUnits, isRopeTableUpload, isUploadedRopeTable, dispatchAccess
+from ./steps import withoutSingleRowUnits, isRopeTableUpload, isUploadedRopeTable, dispatchAccess, captureZero
 import micro_kernel/slot_layout
 import probe_weights
 
@@ -32,9 +32,11 @@ type
     elements: int
     role: string
     base, initFile, tensor, fingerprint: string
+    runtimeSource: string
     offset, initOffset, initBytes: int
     data: seq[uint32]
     rawWeight: bool
+    initZero: bool
 
   SWeight = object
     name, dtype, tensor: string
@@ -77,7 +79,7 @@ type
     coverage: bool                       ## lower every op, tolerate unnamed weights and unread inputs
     okCount: CountTable[string]
     failures: seq[string]
-    raw: bool
+    raw, codestral: bool
     phaseRows: Table[int, int]           ## phase number -> token rows that phase consumes per run
     phaseLogits: Table[int, (string, int)] ## phase number -> (buffer, rows) of vocabulary-sized output rows
     phaseLast: Table[int, string]          ## phase number -> buffer with the logits after the phase's last row
@@ -867,6 +869,7 @@ proc table(l: SessionLift; p: PortRef): seq[int] =
 
 const ExactSessionOps = ["sessionRmsnormEnc", "sessionVecOp", "sessionActivation", "sessionCopyInto",
   "sessionFp4GemmMetal", "sessionF16GemmTile", "sessionMatmulNT", "sessionMatmulNTAccelerated"]
+const CodestralExactOps = ["sessionFp4GemmTensorCore", "sessionFp4GemmTiledEnc", "sessionMamba2SsdPrefillEnc"]
 
 proc lowerSessionExact(l: SessionLift; op: Op) =
   ## Raw replay of a session API call. The runner stages the operands in dedicated
@@ -903,19 +906,29 @@ proc lowerSessionExact(l: SessionLift; op: Op) =
     outs = @[l.rd(op.outs.port("dst"))]
     attrs = "srcOff=" & $srcOff &
       ",dstOff=" & $op.attrInt("dstOffsetElems", 0) & ",n=" & $op.attrInt("n")
-  of "sessionFp4GemmMetal":
-    # The packed FP4-KM prefill GEMM of the Metal backend (a native shader, no micro-VM program):
-    # the runner calls the same op on the graph's buffers.
+  of "sessionFp4GemmMetal", "sessionFp4GemmTensorCore", "sessionFp4GemmTiledEnc":
+    # Keep the two native FP4-KM buffers and the backend's tile selection.
     ins = @[l.rd(op.ins.port("a")), l.rd(op.ins.port("w")), l.rd(op.ins.port("lut"))]
     outs = @[l.rd(op.outs.port("c"))]
-    attrs = "M=" & $op.attrInt("M") & ",K=" & $op.attrInt("K") & ",N=" & $op.attrInt("N") &
-      ",simdgroup=" & (if op.attrStr("simdgroup") == "true": "1" else: "0")
+    attrs = "M=" & $op.attrInt("M") & ",K=" & $op.attrInt("K") & ",N=" & $op.attrInt("N")
+    if op.implName == "sessionFp4GemmMetal":
+      attrs.add ",simdgroup=" & (if op.attrStr("simdgroup") == "true": "1" else: "0")
   of "sessionF16GemmTile":
     # Replay the same FP16 sidecar GEMM, including its cooperative-matrix choice.
     ins = @[l.rd(op.ins.port("a")), l.rd(op.ins.port("w"))]
     outs = @[l.rd(op.outs.port("c"))]
     attrs = "M=" & $op.attrInt("M") & ",K=" & $op.attrInt("K") & ",N=" & $op.attrInt("N") &
       ",tensorCore=" & (if op.attrStr("tensorCore") == "true": "1" else: "0")
+  of "sessionMamba2SsdPrefillEnc":
+    let key = (op.attrInt("N"), op.attrInt("D"), op.attrInt("Q"))
+    let kind = l.trace.codestralSsd.getOrDefault(key)
+    if kind.len == 0: fail("Codestral SSD trace is missing the native pipeline kind")
+    ins = @[l.rd(op.ins.port("arena"))]
+    outs = ins
+    attrs = "kind=" & kind & ",cont=" & (if op.attrStr("cont") == "true": "1" else: "0")
+    for field in ["T", "H", "G", "N", "D", "Q", "C", "cDim", "offConv", "offDt", "offCum",
+        "offALog", "offDSkip", "offYPre", "offStates", "offSloc"]:
+      attrs.add "," & field & "=" & $op.attrInt(field)
   of "sessionMatmulNT", "sessionMatmulNTAccelerated":
     # The FP32 GEMM C = A @ B^T of the backend (a native shader; on an FP16 cooperative-matrix
     # device the accelerated call rounds its inputs to FP16): the runner calls the same op.
@@ -931,7 +944,8 @@ proc lowerSessionExact(l: SessionLift; op: Op) =
     name: "session_" & label & "_" & $(-1-op.id), ins: ins, outs: outs, rmw: true)
 
 proc lowerOp(l: SessionLift; op: Op) =
-  if l.raw and not l.coverage and op.implName in ExactSessionOps:
+  if l.raw and not l.coverage and
+      (op.implName in ExactSessionOps or (l.codestral and op.implName in CodestralExactOps)):
     l.lowerSessionExact(op)
     return
   case op.implName
@@ -1216,7 +1230,7 @@ proc withoutFailedCalls(l: SessionLift; ops: seq[Op]): seq[Op] =
     var fallback: seq[int]
     if op.implName in OptionalGemmOps: fallback = gemmFallback(ops, i)
     if fallback.len == 0 and not op.returnedFalse: continue
-    if op.implName in Fp4GemmOps and fallback.len > 0 and l.fp4UsesTensorCore(op.attrInt("K"), op.attrInt("N")):
+    if not l.codestral and op.implName in Fp4GemmOps and fallback.len > 0 and l.fp4UsesTensorCore(op.attrInt("K"), op.attrInt("N")):
       inc replacedFp4Fallbacks
       for j in fallback: dropped.incl j
       continue
@@ -1340,11 +1354,6 @@ proc tryFuse(l: SessionLift; ops: seq[Op]; i: int; consumed: var HashSet[int]): 
   else:
     return 0
 
-proc captureAllZero(l: SessionLift; tr: TransferRec): bool =
-  ## True when the recorded upload bytes are present and all zero (a host-cleared scratch).
-  if tr.captureOffset < 0 or tr.captureBytes <= 0 or tr.captureBytes != tr.dst.bytes: return false
-  sidecarAllZero(l.trace.sourcePath, tr.captureOffset, tr.captureBytes)
-
 var droppedSingleRowUnits* = 0   ## single-token units left out of the last lift
 var reusedBuffers* = 0           ## temporaries of the last lift that took over an earlier buffer
 
@@ -1433,7 +1442,7 @@ proc prepareRaw(l: SessionLift; ops: seq[Op]; weightsPaths: seq[string]) =
   var phaseCount = initCountTable[int]()
   var embeddingCandidates: seq[string]
   for id, tr in perStep:
-    if not l.coverage and l.captureAllZero(tr): zeroUploads.incl id
+    if not l.coverage and l.trace.captureZero(tr): zeroUploads.incl id
   for id, tr in perStep:
     if not l.coverage and sizes.hasKey(id) and id notin zeroUploads and l.hidden > 0 and
         tr.n >= l.hidden and tr.n mod l.hidden == 0 and
@@ -1468,6 +1477,11 @@ proc prepareRaw(l: SessionLift; ops: seq[Op]; weightsPaths: seq[string]) =
   var ids: seq[int]
   for id in sizes.keys: ids.add id
   ids.sort()
+  var resources = initTable[int, NameRec]()
+  if l.codestral:
+    for n in l.trace.names:
+      if n.dtype == "fir_codestral" and n.offset == 0:
+        resources[n.buffer] = n
   for id in ids:
     if id in l.roleBufs: continue
     var bytes = sizes[id]
@@ -1491,8 +1505,17 @@ proc prepareRaw(l: SessionLift; ops: seq[Op]; weightsPaths: seq[string]) =
     if perStep.hasKey(id): upload = perStep[id]; found = true
     var b = l.bufs[l.bufIdx[name]]
     b.rawWeight = id notin written
-    if found:
-      let match = if index.len > 0 and b.rawWeight:
+    if resources.hasKey(id):
+      let resource = resources[id]
+      if resource.bytes != bytes or perStep.hasKey(id):
+        fail("incompatible Codestral runtime buffer " & resource.name & " (" & name & ")")
+      b.runtimeSource = resource.name
+      b.rawWeight = false
+    elif found and l.codestral and l.trace.captureZero(upload):
+      b.initZero = true
+      b.rawWeight = false
+    elif found:
+      let match = if index.len > 0 and b.rawWeight and (not l.codestral or upload.fingerprint.len > 0):
           matchProbeTensor(index, primary, upload.dst.bytes, upload.fingerprint) else: -1
       if perStep.hasKey(id) and l.trace.selectionSession > 0 and id notin zeroUploads and
           perStep[id].op notin ropeTableUploads:
@@ -1525,7 +1548,7 @@ proc prepareRaw(l: SessionLift; ops: seq[Op]; weightsPaths: seq[string]) =
         for dim in index[match].shape: dims.add $dim
         l.trace.names.add NameRec(buffer: id, bytes: bytes, name: index[match].name,
           shape: "(" & dims.join(" ") & ")", dtype: "raw")
-      elif upload.captureOffset >= 0 and upload.captureBytes == upload.dst.bytes:
+      elif not l.codestral and upload.captureOffset >= 0 and upload.captureBytes == upload.dst.bytes:
         if not sidecarAvailable(l.trace.sourcePath):
           fail("missing upload sidecar " & sidecarPath(l.trace.sourcePath))
         b.tensor = "capture." & upload.fingerprint
@@ -1576,7 +1599,10 @@ proc prepareRaw(l: SessionLift; ops: seq[Op]; weightsPaths: seq[string]) =
     # A never-uploaded scratch buffer starts undefined, and must be written before reads.
     # Do not silently invent contents for externally initialized state.
     l.bufs[l.bufIdx[name]] = b
-  if unknown.len > 0: fail("unresolved raw inputs:\n  " & unknown.join("\n  ") & "\nRe-record with BYBY_FIR_PROBE_DATA=1 (core recorder only)")
+  if unknown.len > 0:
+    let hint = if l.codestral: "\nCodestral buffers must be reproducible from the original checkpoints or recorded as constants"
+               else: "\nRe-record with BYBY_FIR_PROBE_DATA=1 (core recorder only)"
+    fail("unresolved raw inputs:\n  " & unknown.join("\n  ") & hint)
   for id in embeddings:
     let tr = perStep[id]
     var emb = l.embeddingName
@@ -1615,11 +1641,11 @@ proc prepareRaw(l: SessionLift; ops: seq[Op]; weightsPaths: seq[string]) =
 
 proc liftSessionFiles*(trace: Trace; configText, modelName, embeddingName: string;
                        coverage: bool; weightsPaths: seq[string]; fuseDispatches = false;
-                       gridTg = 0; dynamicGrid = false): string =
+                       gridTg = 0; dynamicGrid = false; codestral = false): string =
   ## With `coverage`, every recorded op is lowered on its own (unnamed weights and host inputs
   ## become plain buffers, failures are collected) and the result is a coverage report.
   let l = SessionLift(trace: trace, config: parseJson(configText), modelName: modelName,
-    embeddingName: embeddingName, coverage: coverage, okCount: initCountTable[string]())
+    embeddingName: embeddingName, coverage: coverage, codestral: codestral, okCount: initCountTable[string]())
   l.raw = weightsPaths.len > 0
   l.hidden = cfgInt(l.config, ["hidden_size", "n_embd", "d_model", "dim"])
   l.positions = cfgInt(l.config, ["max_position_embeddings", "n_positions", "n_ctx", "seq_length"])
@@ -1659,6 +1685,12 @@ proc liftSessionFiles*(trace: Trace; configText, modelName, embeddingName: strin
   if not coverage: ops = l.withoutFailedCalls(ops)
   if l.raw and not coverage: ops = withoutSingleRowUnits(trace, ops, l.hidden, droppedSingleRowUnits)
   if l.raw: l.prepareRaw(ops, weightsPaths)
+  if l.codestral:
+    var widths: seq[int]
+    for phase in 1 .. l.phaseRows.len:
+      widths.add l.phaseRows.getOrDefault(phase)
+    if widths != trace.codestralPrefill:
+      fail("lifted Codestral prefill rows " & $widths & " differ from recorded native rows " & $trace.codestralPrefill)
   for k in ["rms_norm_eps", "layer_norm_epsilon", "layer_norm_eps", "norm_eps"]:
     if l.eps == 0.0 and l.config.hasKey(k) and l.config[k].kind in {JFloat, JInt}:
       l.eps = l.config[k].getFloat()
@@ -2217,6 +2249,7 @@ proc liftSessionFiles*(trace: Trace; configText, modelName, embeddingName: strin
   var outText = "fir 1\nmodel " & modelName & "\nconfig config.json\nruntime graph\nlayout script\nscript_abi " &
     (if hasResidentQ4: "2" else: "1") & "\n"
   if hasResidentQ4: outText.add "require feature resident_q4\n"
+  if l.codestral: outText.add "require feature codestral_resident\n"
   let epsKey = l.config.cfgKey(["rms_norm_eps", "layer_norm_epsilon", "layer_norm_eps", "norm_eps"])
   if epsKey.len > 0: outText.add "epsilon " & epsKey & "\n"
   if l.config.hasKey("torch_dtype") and l.config["torch_dtype"].getStr("") in ["bfloat16", "float16"]:
@@ -2243,6 +2276,10 @@ proc liftSessionFiles*(trace: Trace; configText, modelName, embeddingName: strin
       outText.add "init " & b.name & " " & b.initFile & " " & $b.initOffset & " " & $b.initBytes
       if b.fingerprint.len > 0: outText.add " " & b.fingerprint
       outText.add "\n"
+    if b.runtimeSource.len > 0:
+      outText.add "initnative " & b.name & " " & b.runtimeSource & "\n"
+    if b.initZero:
+      outText.add "initzero " & b.name & "\n"
     if b.data.len > 0:
       var data: seq[string]
       for word in b.data: data.add toHex(word, 8).toLowerAscii
@@ -2308,7 +2345,7 @@ proc liftSessionFiles*(trace: Trace; configText, modelName, embeddingName: strin
         if l.phaseLogits.hasKey(n.phase): outText.add " logits=" & l.phaseLogits[n.phase][0]
         else:
           if l.phaseLast.hasKey(n.phase): outText.add " last=" & l.phaseLast[n.phase]
-          if partialPhase(n.phase): outText.add " partial"
+          if not l.codestral and partialPhase(n.phase): outText.add " partial"
         outText.add "\n"
       else:
         outText.add "phase decode\n"

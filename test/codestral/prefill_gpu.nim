@@ -8,6 +8,7 @@ import fp4_gemv_vm
 import prefill_inference_kernels
 import prefill_profile
 import vendor/bybylang/gpubackend as byby
+from vendor/bybylang/probe import probeEvent
 when defined(macosx):
   import vendor/bybylang/backends/metal/metal_backend as metalBackend
 
@@ -544,6 +545,8 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
   let commitLayers = parseInt(getEnv("BYBY_PREFILL_LAYERS_PER_COMMIT", defaultCommitLayers))
   require(commitLayers > 0, "BYBY_PREFILL_LAYERS_PER_COMMIT must be positive")
   let T = ids.len
+  let codestralTrace = byby.firProbeOn and getEnv("BYBY_FIR_CODESTRAL", "0") == "1"
+  if codestralTrace: probeEvent("codestral_prefill " & $T)
   let tileM = if T < 8: 4 else: 8
   let padded = ((T + tileM - 1) div tileM) * tileM
   let hidden = m.embedDim
@@ -569,11 +572,10 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
   # BYBY_SSD_STATE_MB, so the pass never outgrows VRAM.
   var ssdQ = parseInt(getEnv("BYBY_SSD_CHUNK", "64"))
   var ssd = false
-  # While a FIR recording runs (firlift --run), "auto" keeps the micro-VM scan: the SSD pass is
-  # native shaders without a micro-VM program, which a lifted graph cannot replay.
-  # BYBY_SSD=1 forces it anyway.
+  # Native Codestral traces preserve the selected SSD session operation and its pipeline kind.
+  # Older trace consumers only accept the micro-VM scan by default.
   let ssdChoice = getEnv("BYBY_SSD", "auto")
-  if be == gbVulkan and ssdChoice != "0" and not (ssdChoice == "auto" and byby.firProbeOn) and
+  if be == gbVulkan and ssdChoice != "0" and (ssdChoice != "auto" or not byby.firProbeOn or codestralTrace) and
       T >= parseInt(getEnv("BYBY_SSD_MIN_T", "0")):
     let budget = parseInt(getEnv("BYBY_SSD_STATE_MB", "1024")) * 1024 * 1024
     proc ssdScratchBytes(q: int): int =
@@ -581,7 +583,10 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
     while ssdQ < 256 and ssdScratchBytes(ssdQ) > budget: ssdQ *= 2
     if ssdScratchBytes(ssdQ) <= budget:
       tuneTimed:
-        ssd = sessionMamba2SsdPrepare(be, mr.dState, mr.headDim, ssdQ).len > 0
+        let kind = sessionMamba2SsdPrepare(be, mr.dState, mr.headDim, ssdQ)
+        ssd = kind.len > 0
+        if ssd and codestralTrace:
+          probeEvent("codestral_ssd " & $mr.dState & " " & $mr.headDim & " " & $ssdQ & " " & kind)
   # The SSD pass replaces the scan step, so the scan autotune (lane parity, serial/parallel
   # timing) only runs when a scan kernel will actually be encoded. A forced BYBY_PREFILL_SCAN
   # keeps its meaning for the fallback path.
@@ -649,6 +654,8 @@ proc forwardResidentPrefill*(m: var NimformerModelJamba; ids: seq[int]; ctx: Bac
     else: gPrefixBuffers.add PrefixBuffer()
     result = if zero: sessionUpload(be, newSeq[float32](n))
              else: sessionAllocScratch(be, n)
+    if zero and codestralTrace:
+      byby.probeName(result, "zero", "fir_zero", [], bytes = n*4)
     let valid = if be == gbVulkan: result.vulkanHandle.buf != nil
                 else: result.metalHandle != nil
     require(valid, "buffer allocation failed")

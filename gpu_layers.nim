@@ -794,6 +794,8 @@ proc resetAttnLayerState*(ctx: Backend; blockIdx: int): bool =
   if gZeroALen < n:
     gZeroA = byby.sessionUploadPrivate(be, newSeq[float32](n))
     gZeroALen = n
+    if firProbeOn and getEnv("BYBY_FIR_CODESTRAL", "0") == "1":
+      byby.probeName(gZeroA, "zero", "fir_zero", [], bytes = n*4)
   var hw = lp.hWork
   sessionCopyInto(be, gZeroA, hw, 0, lp.lay.offZ, n)
 

@@ -47,6 +47,7 @@ type
     arena*, linearInput*, linearOutput*, logitsReadback*: SessionHandle
     scratchA*, scratchB*, scratchC*: SessionHandle
     handles*: seq[SessionHandle]
+    borrowedHandles*: int             # Prefix of handles owned by the Codestral runtime.
     handleIndex*: Table[string, int]
     useHandles*: bool
     nativeQ4*: bool                 ## BYBY_FIR_Q4_BACKEND=native: resident Q4 nodes dispatch through sessionMatmulQ4 instead of their lifted kernel (a diagnostic switch).
@@ -64,6 +65,7 @@ type
     failed*: bool
     checkpoint*: string
     initialState*: seq[tuple[offset: int, name: string]]
+    resetNative*: proc() {.closure.}
     chunk*: seq[int]                ## token ids of the multi-row phase being encoded
     activeRows*: int                ## > 0: a partial phase run over this many rows (fewer than declared)
     metaWrites*: seq[tuple[offset: int, value: float32]]   ## address tables of the position-independent kernels
@@ -244,7 +246,7 @@ function firFreeGraph(model: var FirGraph)
     for name in model.rawSolo:
         if model.rawWeights.hasKey(name):
             sessionFree(be, model.rawWeights[name])
-    for i in 0 ..< model.handles.len:
+    for i in model.borrowedHandles ..< model.handles.len:
         sessionFree(be, model.handles[i])
     sessionFree(be, model.arena)
     sessionFree(be, model.linearInput)
@@ -267,6 +269,8 @@ function firFreeGraph(model: var FirGraph)
     model.rawSolo.setLen(0)
     model.rawBase.clear()
     model.handles.setLen(0)
+    model.borrowedHandles = 0
+    model.resetNative = nil
     model.handleIndex.clear()
     model.failed = true
 
@@ -678,6 +682,47 @@ function fgFp4GemvVariants(model: FirGraph, jit: var JitCache, kernel: FirKernel
     elif getEnv("BYBY_FIR_Q4_COOP_VERBOSE", "0") != "0":
         stderr.writeLine("[fir] FP4 GEMV " & op & " K=" & $K & " N=" & $n & " lifted " & kind & $rows & "-tg" & $tg & ": " & $(result.len-1) & " other variants built")
 
+function fgAttrTable(text: string): Table[string, string]
+    result = initTable[string, string]()
+    for item in text.split(','):
+        let eq = item.find('=')
+        if eq > 0:
+            result[item[0 ..< eq]] = item[eq+1 .. ^1]
+
+function fgAttrInt(table: Table[string, string], key: string, fallback: int): int
+    if table.hasKey(key):
+        return parseInt(table[key])
+    return fallback
+
+function fgPrepareSsd(be: GpuBackend, graph: FirProgram)
+    let prefix = "sessionMamba2SsdPrefillEnc:"
+    var prepared = initTable[(int, int, int), string]()
+    for node in graph.nodes:
+        if node.kind != "session" or not node.op.startsWith(prefix):
+            continue
+        let attrs = fgAttrTable(node.op[prefix.len .. ^1])
+        let n = fgAttrInt(attrs, "N", 0)
+        let d = fgAttrInt(attrs, "D", 0)
+        let q = fgAttrInt(attrs, "Q", 0)
+        let kind = attrs.getOrDefault("kind")
+        let key = (n, d, q)
+        if be != gbVulkan or min(n, min(d, q)) <= 0 or kind notin ["coop", "scalar"]:
+            raise newException(ValueError, "Invalid recorded Vulkan SSD node: " & node.name)
+        if not prepared.hasKey(key):
+            # The Vulkan driver caches the chosen pipeline by shape.
+            let hadMode = existsEnv("BYBY_SSD")
+            let mode = getEnv("BYBY_SSD")
+            putEnv("BYBY_SSD", if kind == "scalar": "scalar" else: "auto")
+            try:
+                prepared[key] = sessionMamba2SsdPrepare(be, n, d, q)
+            finally:
+                if hadMode:
+                    putEnv("BYBY_SSD", mode)
+                else:
+                    delEnv("BYBY_SSD")
+        if prepared[key] != kind:
+            raise newException(ValueError, "FIR requires the recorded Vulkan SSD pipeline (" & kind & "): " & node.name)
+
 function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): FirGraph
     if graph.runtime != "graph":
         raise newException(ValueError, "FIR graph executor requires 'runtime graph' in the model file")
@@ -707,6 +752,8 @@ function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): 
     let be = backend.kind.toByby()
     if not ensureGpuInit(be):
         raise newException(ValueError, "FIR graph backend initialization failed")
+    if firUsesCodestral(graph):
+        fgPrepareSsd(be, graph)
     result.computeUnits = gpuComputeUnits(be)
     result.coopPerUnit = parseInt(getEnv("BYBY_FIR_Q4_COOP_WG_PER_UNIT", "2"))
     if result.coopPerUnit < 1:
@@ -752,7 +799,7 @@ function fgPrepare(graph: FirProgram, backend: Backend, registry: FirRegistry): 
     var jit = initJitCache(cfg)
     var jobs: seq[tuple[name, source: string]]
     # FP4-KM decode GEMV variants per kernel definition (BYBY_FIR_FP4_GEMV_TUNE=0: keep the lifted kernel).
-    let fp4Tune = be in [gbMetal, gbVulkan] and getEnv("BYBY_FIR_FP4_GEMV_TUNE", "1") != "0"
+    let fp4Tune = not firUsesCodestral(graph) and be in [gbMetal, gbVulkan] and getEnv("BYBY_FIR_FP4_GEMV_TUNE", "1") != "0"
     var fp4Built = initTable[string, seq[tuple[tg, tgBytes: int, name, source: string]]]()
     var cpuUnits: seq[CpuJitUnit]
     var cpuSeen = initTable[string, bool]()
@@ -996,7 +1043,7 @@ function fgAllocate(model: var FirGraph, memory: seq[float32])
             let values = fgInitValues(model, buffer)
             model.handleIndex[name] = model.handles.len
             model.handles.add(sessionUpload(be, values))
-            if buffer.initFile.len > 0 or buffer.initialWords.len > 0:
+            if buffer.initFile.len > 0 or buffer.initialWords.len > 0 or buffer.initZero:
                 model.initialState.add((0, name))
     else:
         model.arena = sessionUpload(be, memory)
@@ -1019,9 +1066,11 @@ function fgAllocate(model: var FirGraph, memory: seq[float32])
                     elif buffer.role.len > 0:
                         probeRole(model.arena, buffer.role, offset, buffer.elements*4)
     var largest = model.graph.symbols["vocab"]
-    for name, buffer in model.graph.buffers:
-        if buffer.kind != "weight" and not buffer.perLayer:
-            largest = max(largest, buffer.elements)
+    let codestral = firUsesCodestral(model.graph)
+    if not codestral:
+        for name, buffer in model.graph.buffers:
+            if buffer.kind != "weight" and not buffer.perLayer:
+                largest = max(largest, buffer.elements)
     model.linearInput = sessionAllocScratch(be, largest)
     model.linearOutput = sessionAllocScratch(be, largest)
     model.logitsReadback = sessionAllocScratch(be, model.graph.symbols["vocab"])
@@ -1040,11 +1089,14 @@ function fgAllocate(model: var FirGraph, memory: seq[float32])
     var scratch = 1
     for node in model.graph.nodes:
         if node.kind == "session":
+            if codestral and (node.op.startsWith("sessionCopyInto:") or node.op.startsWith("sessionMamba2SsdPrefillEnc:")):
+                continue
             for port in (node.inputs & " " & node.outputs).splitWhitespace():
                 # Weights are bound whole (or staged into scratch only as an RMSNorm gamma, which
                 # is no longer than the rows it scales).
-                if model.graph.buffers.hasKey(port) and model.graph.buffers[port].kind != "weight":
-                    scratch = max(scratch, model.graph.buffers[port].elements)
+                let buffer = model.graph.buffers[port]
+                if buffer.kind != "weight" and buffer.runtimeSource.len == 0:
+                    scratch = max(scratch, buffer.elements)
     largest = max(largest, scratch)
     model.scratchA = sessionAllocScratch(be, scratch)
     model.scratchB = sessionAllocScratch(be, scratch)
@@ -1165,13 +1217,28 @@ function fgLoadNative(graph: FirProgram, path: string, backend: Backend): FirGra
         firFreeGraph(result)
         raise
 
-function firLoadGraph(graph: FirProgram, path: string, backend: Backend): FirGraph
+function fgAttachNative(model: var FirGraph, resources: Table[string, SessionHandle])
+    let be = model.backend.kind.toByby()
+    for name, buffer in model.graph.buffers:
+        if buffer.runtimeSource.len == 0:
+            continue
+        if not resources.hasKey(buffer.runtimeSource):
+            raise newException(ValueError, "FIR Codestral native buffer is missing: " & buffer.runtimeSource)
+        let handle = resources[buffer.runtimeSource]
+        if handle.kind != be or probeByteSize(handle) != buffer.elements * 4:
+            raise newException(ValueError, "FIR Codestral native buffer size or backend differs: " & buffer.runtimeSource)
+        model.handleIndex[name] = model.handles.len
+        model.handles.add(handle)
+        inc model.borrowedHandles
+
+function firLoadGraph(graph: FirProgram, path: string, backend: Backend, resources: Table[string, SessionHandle] = default(Table[string, SessionHandle])): FirGraph
     firCheckScriptContract(graph)
     if firDataGraph(graph):
         firCheckDataWeights(graph, path)
         result = fgPrepare(graph, backend, firDefaultRegistry())
         result.checkpoint = path
         try:
+            fgAttachNative(result, resources)
             var memory = if result.useHandles: newSeq[float32]() else: newSeq[float32](result.bindings.memoryFloats)
             let native = path.endsWith(".nimq")
             let index = if native: probeTensorIndex(path) else: newSeq[ProbeTensor]()
@@ -1601,18 +1668,6 @@ function firGraphTuneGemv(model: var FirGraph)
     model.dispatched = savedDispatched
     model.activeRows = savedRows
 
-function fgAttrTable(text: string): Table[string, string]
-    result = initTable[string, string]()
-    for item in text.split(','):
-        let eq = item.find('=')
-        if eq > 0:
-            result[item[0 ..< eq]] = item[eq+1 .. ^1]
-
-function fgAttrInt(table: Table[string, string], key: string, fallback: int): int
-    if table.hasKey(key):
-        return parseInt(table[key])
-    return fallback
-
 function fgAttrBits(table: Table[string, string], key: string, fallback: float32): float32
     if not table.hasKey(key):
         return fallback
@@ -1708,6 +1763,49 @@ function fgDirectDisabled(): bool
         state = if getEnv("BYBY_FIR_SESSION_DIRECT", "1") == "0": 2 else: 1
     result = state == 2
 
+function fgFp4GemmReplay(be: GpuBackend, name: string, a, w, lut: SessionHandle, c: var SessionHandle, m, k, n: int, attrs: Table[string, string]): bool
+    if name == "sessionFp4GemmTensorCore":
+        return sessionFp4GemmTensorCore(be, a, w, lut, c, m, k, n)
+    if name == "sessionFp4GemmTiledEnc":
+        return sessionFp4GemmTiledEnc(be, a, w, lut, c, m, k, n)
+    return sessionFp4GemmMetal(be, a, w, lut, c, m, k, n, fgAttrInt(attrs, "simdgroup", 0) == 1)
+
+function fgSsdReplay(model: var FirGraph, attrs: Table[string, string], ins, outs: seq[string]): bool
+    # The native SSD pass reads and writes subregions of the same float arena.
+    if ins.len != 1 or outs != ins or model.graph.buffers[ins[0]].viewOf.len > 0:
+        return false
+    var index: int
+    var arena: SessionHandle
+    if not fgDirectPort(model, ins[0], index, arena):
+        return false
+    let t = fgAttrInt(attrs, "T", 0)
+    let h = fgAttrInt(attrs, "H", 0)
+    let g = fgAttrInt(attrs, "G", 0)
+    let n = fgAttrInt(attrs, "N", 0)
+    let d = fgAttrInt(attrs, "D", 0)
+    let q = fgAttrInt(attrs, "Q", 0)
+    let c = fgAttrInt(attrs, "C", 0)
+    let cDim = fgAttrInt(attrs, "cDim", 0)
+    for size in [t, h, g, n, d, q, c, cDim]:
+        if size <= 0:
+            return false
+    let conv = fgAttrInt(attrs, "offConv", -1)
+    let dt = fgAttrInt(attrs, "offDt", -1)
+    let cum = fgAttrInt(attrs, "offCum", -1)
+    let aLog = fgAttrInt(attrs, "offALog", -1)
+    let dSkip = fgAttrInt(attrs, "offDSkip", -1)
+    let y = fgAttrInt(attrs, "offYPre", -1)
+    let states = fgAttrInt(attrs, "offStates", -1)
+    let sloc = fgAttrInt(attrs, "offSloc", -1)
+    let capacity = model.graph.buffers[ins[0]].elements
+    let regions = [(conv, t*cDim), (dt, t*h), (cum, t*h), (aLog, h), (dSkip, h), (y, t*c), (states, 2*c*n), (sloc, ((t-1) div q+1)*c*n)]
+    for (offset, count) in regions:
+        if offset < 0 or count <= 0 or offset > capacity - count:
+            return false
+    inc model.sessionOps
+    let carry = fgAttrInt(attrs, "cont", 0) == 1
+    return sessionMamba2SsdPrefillEnc(model.backend.kind.toByby(), arena, t, h, g, n, d, q, c, cDim, conv, dt, cum, aLog, dSkip, y, states, sloc, carry)
+
 function fgMatmulNTReplay(be: GpuBackend, name: string, a, b: SessionHandle, c: var SessionHandle, attrs: Table[string, string]): bool
     ## The recorded FP32 GEMM C(M x N) = A(M x K) @ B(N x K)^T, called as the runtime called it.
     let m = fgAttrInt(attrs, "M", 0)
@@ -1758,14 +1856,14 @@ function fgEncodeSessionDirect(model: var FirGraph, name: string, attrs: Table[s
         done = true
         inc model.sessionOps
         result = sessionActivation(be, attrs["op"], x, y, n, fgAttrBits(attrs, "p", 0'f32))
-    elif name == "sessionFp4GemmMetal":
+    elif name in ["sessionFp4GemmMetal", "sessionFp4GemmTensorCore", "sessionFp4GemmTiledEnc"]:
         var li: int
         var lut: SessionHandle
         if ins.len < 3 or not fgDirectPort(model, ins[1], bi, b) or not fgDirectPort(model, ins[2], li, lut) or yi == xi:
             return false
         done = true
         inc model.sessionOps
-        result = sessionFp4GemmMetal(be, x, b, lut, y, fgAttrInt(attrs, "M", 0), fgAttrInt(attrs, "K", 0), fgAttrInt(attrs, "N", 0), fgAttrInt(attrs, "simdgroup", 0) == 1)
+        result = fgFp4GemmReplay(be, name, x, b, lut, y, fgAttrInt(attrs, "M", 0), fgAttrInt(attrs, "K", 0), fgAttrInt(attrs, "N", 0), attrs)
     elif name == "sessionF16GemmTile":
         if ins.len < 2 or not fgDirectPort(model, ins[1], bi, b) or yi == xi or (bi >= 0 and yi == bi):
             return false
@@ -1797,6 +1895,8 @@ function fgEncodeSessionHandles(model: var FirGraph, node: FirNode, layer: int):
     var attrs = initTable[string, string]()
     if colon >= 0:
         attrs = fgAttrTable(node.op[colon+1 .. ^1])
+    if name == "sessionMamba2SsdPrefillEnc":
+        return fgSsdReplay(model, attrs, ins, outs)
     var direct = false
     let directOk = fgEncodeSessionDirect(model, name, attrs, ins, outs, direct)
     if direct:
@@ -1880,7 +1980,7 @@ function fgEncodeSessionHandles(model: var FirGraph, node: FirNode, layer: int):
         if targetIndex < 0:
             return false
         return sessionCopyInto(be, source, model.handles[targetIndex], sourceOffset, targetOffset, n)
-    if name == "sessionFp4GemmMetal":
+    if name in ["sessionFp4GemmMetal", "sessionFp4GemmTensorCore", "sessionFp4GemmTiledEnc"]:
         # The activation ports are views: stage them; the packed weight and its table are bound whole.
         let m = fgAttrInt(attrs, "M", 0)
         let k = fgAttrInt(attrs, "K", 0)
@@ -1896,7 +1996,7 @@ function fgEncodeSessionHandles(model: var FirGraph, node: FirNode, layer: int):
         if not sessionCopyInto(be, fgPortHandle(model, ins[0]), model.scratchA, fgPortOffset(model, ins[0]), 0, m*k):
             return false
         var c = model.scratchC
-        if not sessionFp4GemmMetal(be, model.scratchA, w, lut, c, m, k, n, fgAttrInt(attrs, "simdgroup", 0) == 1):
+        if not fgFp4GemmReplay(be, name, model.scratchA, w, lut, c, m, k, n, attrs):
             return false
         model.scratchC = c
         return sessionCopyInto(be, model.scratchC, model.handles[targetIndex], 0, fgPortOffset(model, outs[0]), m*n)
@@ -2005,7 +2105,8 @@ function fgEncodeSession(model: var FirGraph, node: FirNode, layer: int): bool
         let dstOffset = memory[outs[0]] + fgAttrInt(attrs, "dstOff", 0)
         var dst = model.arena
         return sessionCopyInto(be, model.arena, dst, srcOffset, dstOffset, n)
-    if name == "sessionFp4GemmMetal" or name == "sessionF16GemmTile" or (name == "sessionMatmulNTAccelerated" and be != gbCpu):
+    let needsHandles = name in ["sessionFp4GemmMetal", "sessionFp4GemmTensorCore", "sessionFp4GemmTiledEnc", "sessionF16GemmTile", "sessionMamba2SsdPrefillEnc"]
+    if needsHandles or (name == "sessionMatmulNTAccelerated" and be != gbCpu):
         # These replays bind packed or FP16 weights at offset 0: only a handle graph has whole
         # weight buffers. Recorded graphs, the only ones with these nodes, always use handles.
         raise newException(ValueError, "FIR graph session replay " & name & " needs a handle graph (raw recorded buffers): " & node.name)
@@ -2195,6 +2296,8 @@ function firGraphReset(model: var FirGraph)
     # Attention overwrites every used KV slot before reading; future slots
     # are unreachable. No cache clear or host transfer is needed.
     let be = model.backend.kind.toByby()
+    if model.resetNative != nil:
+        model.resetNative()
     if model.initialState.len > 0:
         # One session per buffer: the upload may be freed only after the GPU copied it (on Metal a
         # freed upload goes back to a pool and the next upload reuses it while the copy is pending).
@@ -2225,6 +2328,7 @@ function firGraphReset(model: var FirGraph)
     model.position = 0
 
 const FgCommitRowNodes = 512              # row-nodes per command buffer inside a multi-row phase
+const FgCodestralPrefillNodes = 128       # About eight fused Vulkan layers per submission.
 const FgDecodeFirstNodes = 16             # decode: nodes in the first command buffer, so the GPU starts early
 
 function fgDecodeCommitNodes(): int
@@ -2270,9 +2374,10 @@ function fgEncodeGraph(model: var FirGraph, token: int, phase: string)
     # A decode step is split the same way, every fgDecodeCommitNodes() nodes, so the GPU overlaps
     # the host encode (the submissions do not wait; sessionEnd waits on all of them).
     let be = model.backend.kind.toByby()
-    let commitEvery = if phase.len > 0: FgCommitRowNodes else: fgDecodeCommitNodes()
+    let codestralPrefill = phase.len > 0 and be == gbVulkan and firUsesCodestral(model.graph)
+    let commitEvery = if codestralPrefill: FgCodestralPrefillNodes elif phase.len > 0: FgCommitRowNodes else: fgDecodeCommitNodes()
     let paced = commitEvery > 0 and sessionPacesCommandBuffers(be)
-    let runRows = if model.activeRows > 0: model.activeRows elif phase.len > 0: model.graph.phases[phase] else: 1
+    let runRows = if codestralPrefill: 1 elif model.activeRows > 0: model.activeRows elif phase.len > 0: model.graph.phases[phase] else: 1
     var pendingRows = if phase.len == 0 and commitEvery > FgDecodeFirstNodes: commitEvery - FgDecodeFirstNodes else: 0
     var index = 0
     while index < model.graph.nodes.len:
