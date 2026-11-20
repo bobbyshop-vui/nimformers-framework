@@ -1,4 +1,4 @@
-## Marker-free selection uses repeated session signatures, never model/kernel names.
+## Select replay units by their repeated session signatures.
 import std/[strutils, tables, sets, algorithm, os]
 import micro_kernel/slot_layout
 import ./firlift
@@ -483,15 +483,24 @@ proc stateProducers(t: Trace; first, last: int; dims: Dims): HashSet[int] =
     for order in produced: result.incl order
     result.incl op.order
 
-proc selectStep*(t: Trace; step = -1; slice = ""; dims = Dims()): StepSelection =
+proc selectStep*(recorded: Trace; step = -1; slice = ""; dims = Dims()): StepSelection =
+  var t = recorded
+  if t.codestralStart > 0:
+    # The runtime reloads the checkpoint and merges LoRA before borrowing these buffers.
+    # Keep their trace metadata, but only replay ops from the prompt onward.
+    var firstOp = 0
+    while firstOp < t.ops.len and t.ops[firstOp].order < t.codestralStart: inc firstOp
+    t.ops = recorded.ops[firstOp ..< recorded.ops.len]
   result.trace = t
   if t.hasStep and slice.len == 0 and step < 0: return
-  let ss = sessions(t)
-  if ss.len == 0:
+  let ss = sessions(recorded)
+  var firstSession = 0
+  while firstSession < ss.len and ss[firstSession].first < t.codestralStart: inc firstSession
+  if firstSession == ss.len:
     if slice.len > 0 or step >= 0: raise newException(ValueError, "step selection needs complete sessions")
     return
-  var start = 0
-  var width = ss.len
+  var start = firstSession
+  var width = ss.len - firstSession
   if slice.len > 0:
     let parts = slice.split(':')
     if parts.len != 2: raise newException(ValueError, "--slice expects session indices A:B (zero-based, B exclusive)")
@@ -504,7 +513,7 @@ proc selectStep*(t: Trace; step = -1; slice = ""; dims = Dims()): StepSelection 
     var logits = newSeq[bool](ss.len)
     var anyLogits = false
     if dims.vocab > 0:
-      var k = 0
+      var k = firstSession
       for op in t.ops:
         while k < ss.len and k+1 < ss.len and op.order >= ss[k+1].first: inc k
         if k >= ss.len or op.order < ss[k].first or op.opName != "sessionRead" or op.parent >= 0: continue
@@ -514,7 +523,7 @@ proc selectStep*(t: Trace; step = -1; slice = ""; dims = Dims()): StepSelection 
           anyLogits = true
     var bestScore = 0
     var occurrences = 0
-    for a in 0 ..< ss.len:
+    for a in firstSession ..< ss.len:
       # No fixed maximum unit width: a decode unit may span many sessions.
       for period in 1 .. (ss.len-a) div 2:
         var count = 1
@@ -540,7 +549,7 @@ proc selectStep*(t: Trace; step = -1; slice = ""; dims = Dims()): StepSelection 
           width = period
           occurrences = count
     if bestScore == 0:
-      if ss.len != 1:
+      if ss.len - firstSession != 1:
         raise newException(ValueError, "no repeating complete session unit; choose --slice A:B")
       width = 1
       occurrences = 1
@@ -559,8 +568,8 @@ proc selectStep*(t: Trace; step = -1; slice = ""; dims = Dims()): StepSelection 
             raise newException(ValueError, "repeating unit changes raw program/geometry; dynamic launch lowering is required (use --slice A:B only for fixed-launch replay)")
     result.occurrence = chosen
     start += chosen*width
-  if start < 0 or width <= 0 or start+width > ss.len:
-    raise newException(ValueError, "--slice is outside complete session range 0:" & $ss.len)
+  if start < firstSession or width <= 0 or start+width > ss.len:
+    raise newException(ValueError, "--slice is outside complete session range " & $firstSession & ":" & $ss.len)
   var first = ss[start].first
   let lastSession = ss[start+width-1].last
   let stop = if start+width < ss.len: ss[start+width].first else: high(int)

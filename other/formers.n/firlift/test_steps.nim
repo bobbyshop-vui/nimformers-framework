@@ -165,6 +165,37 @@ proc main() =
     check not sidecarAllZero(MemorySource, b.data.len - 4, 16), "a range past the end is not zero"
     memoryActive = false
 
+  block codestralScenario:
+    # The merge shader has no VM words and writes packed weights used by decode.
+    # Prefill still writes the recurrent arena consumed by the same decode step.
+    let t = parseTrace("""backend vulkan
+buf b0 bytes=64 origin=upload
+buf b1 bytes=4096 origin=upload
+op o0 tag=fir::sessionUploadPrivate in=() out=() attrs() impl=session:sessionUploadPrivate parent=none prog=none
+upload u0 op=o0 dst=b0@0:64 n=16
+op o1 tag=fir::sessionBegin in=() out=() attrs() impl=session:sessionBegin parent=none prog=none
+disp d0 pipe=codestral_merge_gpu_lut op=none prog=none bind=(b0:b0@0:64)
+op o2 tag=fir::sessionEnd in=() out=() attrs() impl=session:sessionEnd parent=none prog=none
+name b0@0:64 name="projection.packed" dtype=fir_codestral shape=()
+codestral_prompt base adapter 5
+op o3 tag=fir::sessionBegin in=() out=() attrs() impl=session:sessionBegin parent=none prog=none
+op o4 tag=fir::sessionMamba2SsdPrefillEnc in=(arena=b1@0:4096) out=() attrs() impl=session:sessionMamba2SsdPrefillEnc parent=none prog=none
+op o5 tag=fir::sessionEnd in=() out=() attrs() impl=session:sessionEnd parent=none prog=none
+op o6 tag=fir::sessionBegin in=() out=() attrs() impl=session:sessionBegin parent=none prog=none
+op o7 tag=fir::sessionVecOp in=(a=b1@0:4096,b=b0@0:64) out=(c=b1@0:4096) attrs(op=add) impl=session:sessionVecOp parent=none prog=none
+op o8 tag=fir::sessionEnd in=() out=() attrs() impl=session:sessionEnd parent=none prog=none
+op o9 tag=fir::sessionBegin in=() out=() attrs() impl=session:sessionBegin parent=none prog=none
+op o10 tag=fir::sessionVecOp in=(a=b1@0:4096,b=b0@0:64) out=(c=b1@0:4096) attrs(op=add) impl=session:sessionVecOp parent=none prog=none
+op o11 tag=fir::sessionEnd in=() out=() attrs() impl=session:sessionEnd parent=none prog=none
+""")
+    let sel = selectStep(t)
+    check sel.firstSession == 2 and sel.sessionCount == 1, "decode keeps its recorded session index"
+    check sel.trace.ops.len == 4 and sel.trace.ops[0].id == 4 and sel.trace.ops[0].phase == 1 and
+      sel.trace.ops[2].id == 7 and sel.trace.ops[2].phase == 0,
+      "Codestral replays SSD prefill and decode without replaying the LoRA merge"
+    check sel.trace.names == t.names and sel.trace.transfers == t.transfers,
+      "the lifter keeps resource names and upload metadata from setup"
+
   block ropeUploadsScenario:
     var b: Builder
     b.t.sourcePath = MemorySource
