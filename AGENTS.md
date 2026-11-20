@@ -35,6 +35,10 @@
 - Keep formers.n orchestration in `other/formers.n` as `.bybylang` code.
 - Codestral/Mamba-3 kernels must use Nim micro-VM programs and shared lowering
   to Metal/GLSL/CPU, including tensor-core paths; no handwritten backend kernels.
+- Codestral FIR trace/lift/run must emit exactly the same greedy token IDs as
+  native inference for the same model, prompt, and decode settings. Replay the
+  exact native session operation when arithmetic differs; successful graph
+  construction alone does not establish token parity.
 - Keep LoRA merge enabled; do not use `--no-merge-lora` or `BYBY_MERGE_LORA=0`.
 - Benchmark comparisons use GPU results and exclude cold JIT/setup/autotune.
   Keep one current result per machine/backend; show setup separately.
