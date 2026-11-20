@@ -8,6 +8,17 @@ from unittest.mock import patch
 from formers import Model, check_fir
 
 
+class _BatchGroup:
+    def __init__(self):
+        self.call = None
+
+    def generate_batch(self, cli_path, base_args, prompts, **kwargs):
+        self.call = (cli_path, base_args, prompts, kwargs)
+        if kwargs["token_ids"]:
+            return [prompt.replace(",", " ") for prompt in prompts]
+        return ["answer:" + prompt for prompt in prompts]
+
+
 class FormersTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -90,6 +101,24 @@ else:
         self.assertEqual(model.generate_ids([5, 17]), [5, 17])
         with self.assertRaises(ValueError):
             model.generate_ids([])
+
+    def test_generate_batch_preserves_order_and_model_options(self):
+        model = Model("models", cli_path=self.cli, backend="vulkan", env={"MODEL_BATCH_ENV": "kept"})
+        group = _BatchGroup()
+        self.assertEqual(model.generate_batch(["first", "second", "third"], group=group,
+                                              ratios=[1, 2], max_tokens=9, temperature=0),
+                         ["answer:first", "answer:second", "answer:third"])
+        self.assertEqual(group.call[2], ["first", "second", "third"])
+        self.assertEqual(group.call[1], ["--models", "models", "--backend", "vulkan"])
+        self.assertEqual(group.call[3]["ratios"], [1, 2])
+
+    def test_generate_ids_batch_uses_ids_mode_and_empty_is_noop(self):
+        model = Model("models", cli_path=self.cli, prompt_ids="99")
+        group = _BatchGroup()
+        self.assertEqual(model.generate_ids_batch([[4, 8], [2]], group=group), [[4, 8], [2]])
+        self.assertEqual(group.call[2], ["4,8", "2"])
+        self.assertEqual(group.call[1], ["--models", "models", "--backend", "auto"])
+        self.assertEqual(model.generate_ids_batch([], group=group), [])
 
     def test_inspection_commands(self):
         self.assertEqual(Model("models", cli_path=self.cli).detect(), "arch: fir")

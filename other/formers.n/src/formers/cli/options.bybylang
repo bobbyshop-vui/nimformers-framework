@@ -11,6 +11,7 @@ type
     modelsDir*, modelFile*, loraFile*, configFile*, tokenizerDir*: string
     noLora*: bool
     prompt*, systemText*: string
+    batchPrompts*: seq[string]   ## repeated --prompt/-p values for distributed batches
     rawPrompt*: bool
     addSpecialTokens*: bool
     promptIds*: seq[int]          ## --prompt-ids: FIR graph reads and prints token IDs
@@ -20,6 +21,8 @@ type
     seed*: int64
     ngl*: int                     ## -1 = every layer on the GPU
     backend*: string
+    distributedDevices*: seq[string]
+    distributedRatios*: seq[float64]
     showProgress*, detectOnly*, showHelp*: bool
     conversation*: bool           ## chat: "> " turns, context kept between turns
     ctxSize*: int                 ## KV capacity in tokens; 0 = automatic
@@ -62,6 +65,7 @@ function fmUsage(): string
     lines.add("")
     lines.add("Generation:")
     lines.add("  -p, --prompt TEXT      prompt")
+    lines.add("                         repeat -p to provide prompts for a distributed batch")
     lines.add("  -f, --file FILE        read the prompt from a file")
     lines.add("  --system TEXT          system prompt (chat template)")
     lines.add("  --raw, --raw-prompt     do not apply the chat template")
@@ -87,6 +91,8 @@ function fmUsage(): string
     lines.add("")
     lines.add("Device:")
     lines.add("  --backend NAME         auto | cpu | metal | vulkan | cuda (= vulkan)")
+    lines.add("  --distributed DEVICES  batch prompts across cpu,metal:N or vulkan:N workers")
+    lines.add("  --distributed-ratios R per-device work ratios, comma-separated; default is auto")
     lines.add("  -ngl, --ngl, --n-gpu-layers N")
     lines.add("                         layers on the GPU (default: all)")
     lines.add("")
@@ -155,11 +161,13 @@ function fmParseOptions(args: seq[string]): FmOptions
         of "-p", "--prompt":
             result.prompt = fmOptValue(args, i, flag, inlineVal, hasInline, result.errors)
             result.promptSet = true
+            result.batchPrompts.add(result.prompt)
         of "-f", "--file":
             let path = fmOptValue(args, i, flag, inlineVal, hasInline, result.errors)
             if fileExists(path):
                 result.prompt = readFile(path)
                 result.promptSet = true
+                result.batchPrompts.add(result.prompt)
             else:
                 result.errors.add(flag & ": file not found: " & path)
         of "--system", "-sys":
@@ -194,6 +202,19 @@ function fmParseOptions(args: seq[string]): FmOptions
             result.seed = fmToInt(fmOptValue(args, i, flag, inlineVal, hasInline, result.errors), flag, result.errors).int64
         of "--backend":
             result.backend = fmOptValue(args, i, flag, inlineVal, hasInline, result.errors).toLowerAscii()
+        of "--distributed":
+            for device in fmOptValue(args, i, flag, inlineVal, hasInline, result.errors).split(','):
+                let value = device.strip()
+                if value.len == 0:
+                    result.errors.add("--distributed contains an empty device")
+                else:
+                    result.distributedDevices.add(value)
+        of "--distributed-ratios":
+            for ratio in fmOptValue(args, i, flag, inlineVal, hasInline, result.errors).split(','):
+                if ratio.strip().len > 0:
+                    result.distributedRatios.add(fmToFloat(ratio, flag, result.errors).float64)
+                else:
+                    result.errors.add("--distributed-ratios contains an empty ratio")
         of "-ngl", "--ngl", "--n-gpu-layers", "--gpu-layers":
             result.ngl = fmToInt(fmOptValue(args, i, flag, inlineVal, hasInline, result.errors), flag, result.errors)
         of "--no-progress":
@@ -242,5 +263,18 @@ function fmParseOptions(args: seq[string]): FmOptions
         result.errors.add("--repeat-last-n must be >= 0")
     if result.ngl < -1:
         result.errors.add("--ngl must be >= 0 (or -1 = all)")
+    if result.distributedDevices.len > 0:
+        if result.distributedDevices.len < 2:
+            result.errors.add("--distributed requires at least two devices")
+        if result.batchPrompts.len < 1:
+            result.errors.add("--distributed requires at least one -p/--prompt or -f/--file option")
+        if result.conversation:
+            result.errors.add("--distributed cannot be combined with conversation mode")
+        if result.detectOnly or result.firCheck.len > 0:
+            result.errors.add("--distributed cannot be combined with --detect-only or --fir-check")
+        if result.promptIds.len > 0:
+            result.errors.add("--distributed currently accepts text prompts, not --prompt-ids")
+    elif result.distributedRatios.len > 0:
+        result.errors.add("--distributed-ratios requires --distributed")
     if result.backend notin ["auto", "cpu", "metal", "vulkan", "cuda"]:
         result.errors.add("invalid --backend: " & result.backend)

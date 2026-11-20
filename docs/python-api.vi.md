@@ -17,6 +17,9 @@ và sinh văn bản Llama trong tiến trình Python. Package `formers` gọi
 `formers-cli` để chạy các họ model được hỗ trợ và graph FIR.
 [Python API của formers.n](../other/formers.n/README.md#python-api)
 
+[`nimformers.distributed`](distributed.vi.md) gọi bộ điều phối thiết bị native
+của BybyLang để chạy batch micro-VM và batch model độc lập.
+
 Xem [hướng dẫn Python](python-guide.vi.md) cho cài đặt, ví dụ hoàn chỉnh, xem
 checkpoint và xử lý lỗi. [Hướng dẫn lệnh Make](make-commands.vi.md) mô tả input
 và output của từng target.

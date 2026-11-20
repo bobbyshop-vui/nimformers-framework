@@ -219,6 +219,8 @@ for Llama/DeepSeek models compatible with the loader. See
 
 For Codestral with merged LoRA, use the `formers` package to drive native
 inference or run the lifted FIR graph. [formers.n Python API](../other/formers.n/README.md#python-api)
+For independent micro-VM and prompt batches across local devices, see
+[Device-parallel execution](distributed.md).
 
 Spectron and Codestral training use Nim entry points. Python can invoke the
 Spectron trainer with `subprocess.run(["make", "run-metal"], cwd=repo, check=True)`.

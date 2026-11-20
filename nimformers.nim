@@ -82,3 +82,7 @@ export backend.sessionBegin, backend.sessionUpload, backend.sessionUploadIndices
 # backward-compatible shims if old code still does `import session_vm`.)
 import vendor/bybylang/micro_kernel
 export micro_kernel
+
+import vendor/bybylang/distributed
+import parallel_vm, formers_parallel
+export distributed, parallel_vm, formers_parallel

@@ -73,6 +73,7 @@ typedef struct NimfStateDict    NimfStateDict;
 typedef struct NimfVmProgram    NimfVmProgram;
 typedef struct NimfBuffer       NimfBuffer;
 typedef struct NimfResidentQ4   NimfResidentQ4;
+typedef struct NimfParallel     NimfParallel;
 typedef struct NimfResidentF32  NimfResidentF32;
 typedef struct NimfTokenizer    NimfTokenizer;
 typedef struct NimfSentencePiece NimfSentencePiece;
@@ -405,6 +406,23 @@ NIMF_API char* NIMF_CALL nimf_llama_generate(NimfContext*, NimfLlama*, NimfToken
     const char* prompt, const char* system_text, int64_t max_new_tokens,
     float temperature, float top_p, int32_t use_chat_template);
 NIMF_API int32_t NIMF_CALL nimf_llama_destroy(NimfLlama*);
+
+/* =========================== device parallelism ======================= */
+/* Local child processes use their own device context. Ratios are a JSON array
+ * or NULL for automatic weighting; returned strings use nimf_free_string.
+ * A group may be reused across calls. Serialize calls on the same group. */
+NIMF_API NimfParallel* NIMF_CALL nimf_parallel_create(const char* devices_json,
+    const char* ratios_json);
+NIMF_API int32_t NIMF_CALL nimf_parallel_destroy(NimfParallel*);
+NIMF_API char* NIMF_CALL nimf_parallel_partition(NimfParallel*, int64_t length,
+    const char* ratios_json);
+NIMF_API int32_t NIMF_CALL nimf_parallel_vm_run(NimfParallel*, const uint32_t* words,
+    int64_t words_len, const float* memory, int64_t memory_len, int64_t item_size,
+    int64_t threads_per_item, int64_t tg_floats, int64_t tg_size,
+    const char* ratios_json, const char* worker_path, float* out);
+/* request_json fields: executable, args[], prompts[], max_tokens, temperature,
+ * optional token_ids, env (key -> value or null to unset), and ratios. */
+NIMF_API char* NIMF_CALL nimf_parallel_generate(NimfParallel*, const char* request_json);
 
 #ifdef __cplusplus
 }  /* extern "C" */

@@ -1,0 +1,9 @@
+import nim "nimformers_shared"
+
+ctx = nimformers_shared.newContext("cpu")
+group = nimformers_shared.newProcessGroup(@["cpu"])
+print nimformers_shared.backendName(ctx)
+print nimformers_shared.add(ctx, @[1'f32, 2, 3], @[10'f32, 20, 30])
+print nimformers_shared.partition(group, 12)
+nimformers_shared.close(group)
+nimformers_shared.close(ctx)
