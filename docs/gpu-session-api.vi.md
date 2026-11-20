@@ -31,7 +31,8 @@ dành cho kết quả sẽ được tính sau.
 
 ```nim
 proc sessionMatmul*(backend: GpuBackend, a, b: SessionHandle, c: var SessionHandle, M, K, N: int): bool
-proc sessionMatmulNT*(backend: GpuBackend, a, b: SessionHandle, c: var SessionHandle, M, K, N: int): bool
+proc sessionMatmulNT*(backend: GpuBackend, a, b: SessionHandle, c: var SessionHandle,
+  M, K, N: int; bOffsetElems = 0): bool
 proc sessionMatmulQ4*(backend: GpuBackend, a: SessionHandle, w: ResidentWeightHandle, c: var SessionHandle, M: int): bool
 ```
 
@@ -46,7 +47,8 @@ session; bên gọi có thể chọn nhánh không dùng session thay vì coi m�
 
 ```nim
 proc sessionVecOp*(backend: GpuBackend, op: string, a, b: SessionHandle, c: var SessionHandle, n: int): bool
-proc sessionActivation*(backend: GpuBackend, op: string, x: SessionHandle, y: var SessionHandle, n: int): bool
+proc sessionActivation*(backend: GpuBackend, op: string, x: SessionHandle, y: var SessionHandle,
+  n: int, p: float32 = 0.0'f32): bool
 ```
 
 `sessionVecOp` thực hiện phép từng phần tử (`"add"`, `"sub"`, `"mul"`,
@@ -57,15 +59,19 @@ proc sessionActivation*(backend: GpuBackend, op: string, x: SessionHandle, y: va
 proc sessionSoftmax*(backend: GpuBackend, x: SessionHandle, y: var SessionHandle, rows, cols: int): bool
 proc sessionLayernormEnc*(backend: GpuBackend, x, gamma, beta: SessionHandle, y: var SessionHandle,
                           rows, cols: int, eps: float32): bool
+proc sessionRmsnormEnc*(backend: GpuBackend, x, gamma: SessionHandle, y: var SessionHandle,
+  rows, cols: int, eps: float32): bool
 proc sessionAttentionFusedEnc*(backend: GpuBackend, q, k, v: SessionHandle,
   o, sMatrix: var SessionHandle, B, H, S, D: int, scale: float32): bool
 proc sessionRope*(backend: GpuBackend, x: SessionHandle, cosT, sinT: SessionHandle,
   T, Hn, D: int): bool
 ```
 
-Các phép cấp cao có thể encode gồm softmax từng hàng, LayerNorm, fused
-attention và xoay RoPE. Mức hỗ trợ phụ thuộc backend, hiện đầy đủ nhất ở
-Metal; luôn kiểm tra `bool` và chọn nhánh thay thế nếu trả `false`.
+Session hỗ trợ softmax theo hàng, LayerNorm, RMSNorm, fused attention và
+RoPE. Giá trị `bool` cho biết backend có thực hiện thành công hay không.
+Python hỗ trợ sao chép buffer resident, nhân ma trận FP32/Q4, chuẩn hóa,
+attention, phép vector và activation qua `Context.session()`.
+[Session API trong Python](python-api.vi.md#buffer-resident-và-session)
 
 ```nim
 proc sessionCopyInto*(backend: GpuBackend, src: SessionHandle, dst: var SessionHandle,

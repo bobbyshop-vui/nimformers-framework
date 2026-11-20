@@ -21,7 +21,7 @@ không cần flag nào. Chỉ đặt flag để tắt một tối ưu, ép một
 | `FIRLIFT_Q4_GEMM` | `tensor_core` | `auto` | `auto` lift GEMM Tensor Core khi trace ghi nhận hỗ trợ Vulkan cooperative matrix hoặc Metal simdgroup matrix |
 | `FIRLIFT_Q4_GEMV` | `word_parallel` / `auto` | `auto` | `auto` lift GEMV subgroup trên Vulkan (nhanh hơn `word_parallel`) |
 | `BYBY_FIR_PROBE_STEPS` | `prefill:2,decode:1` | mọi bước | các bước recorder giữ (chỉ khi lift) |
-| `BYBY_FIR_PROBE_DATA` | `0` | `1` dưới `firlift --run` | pipe dữ liệu upload (chỉ khi lift) |
+| `BYBY_FIR_PROBE_DATA` | `0` | `1` với `firlift --run` thông thường | pipe dữ liệu upload khi lift. Codestral chỉ ghi metadata. |
 | `BYBY_FIR_PROFILE` | `1` | `0` | chỉ để chẩn đoán |
 
 Chồng encode với GPU không cần flag: bước decode FIR được ghi một lần rồi phát lại
@@ -33,14 +33,14 @@ chờ (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | Flag | Mặc định | Tác dụng |
 | --- | --- | --- |
 | `BYBY_FIR_DECODE_REPLAY` | `1` | Vulkan và Metal: ở bước đầu ghi bước decode một lần (Vulkan: một command buffer dùng lại được; Metal: các dispatch của bước, xem `BYBY_METAL_REPLAY_ICB`); các bước sau chỉ ghi token/position vào buffer host-visible, phát lại, rồi đọc logits từ buffer đã map (không encode trên host). Hàng embedding được gather trên GPU. Các node session chính xác được hỗ trợ (RMSNorm, vector/activation, FP4 Metal GEMM và NT GEMM) cũng phát lại thao tác session native. `0`: encode mỗi bước. Tự tắt khi có probe, `BYBY_FIR_PROFILE=2` hoặc `BYBY_FIR_Q4_BACKEND=native`, và khi bước upload, cấp phát hoặc giải phóng buffer trong lúc ghi. |
-| `BYBY_FIR_FP4_GEMV_TUNE` | `1` | Lúc nạp, nhận ra kernel GEMV FP4-KM của decode đã lift, dựng các biến thể độ rộng threadgroup khác (thêm simdgroup trên Metal), kiểm tra với kernel gốc và đo thời gian trên trọng số thật; mọi node của kernel đó dùng biến thể nhanh nhất. `0` giữ kernel đã lift. |
+| `BYBY_FIR_FP4_GEMV_TUNE` | `1` | Lúc nạp, tune kernel GEMV FP4-KM nhận diện được trong graph FIR thông thường và kiểm tra các biến thể với chương trình đã lift. `0` giữ kernel đã lift. FIR Codestral dùng kernel đã ghi. `BYBY_FIR_Q4_COOP_VERBOSE=1` cùng `--verbose` in thời gian đo. |
 | `BYBY_METAL_REPLAY_ICB` | `1` | Metal phát lại session đã ghi (`BYBY_FIR_DECODE_REPLAY`): `1` dựng một indirect command buffer một lần rồi chạy bằng `executeCommandsInBuffer` khi GPU hỗ trợ; `0` phát lại các dispatch đã ghi trên encoder thường trong một vòng lặp (cả hai đều không duyệt graph). |
 | `BYBY_METAL_REPLAY_LOG` | không đặt | Đặt: log mỗi lần Metal ghi session (số lệnh, pipeline, buffer) và lý do không giữ được bản ghi. |
 | `BYBY_FIR_DECODE_REPLAY_VERBOSE` | `0` | `1` in `[fir] decode replay on/off: ...` (cũng in khi có `BYBY_FIR_PROFILE`). |
 | `BYBY_FIR_DECODE_CB_NODES` | `64` | Bước decode phải encode (replay tắt): submit không chờ sau mỗi chừng này node (lần đầu sau 16) để GPU chạy trong lúc host encode. `0`: một command buffer. |
 | `BYBY_FIR_Q4_BACKEND` | `micro` | `micro`: micro-kernel Q4 đã lift. `native`: công tắc chẩn đoán qua `sessionMatmulQ4` (không dùng được với node Tensor Core). |
 | `BYBY_FIR_SESSION_DIRECT` | `1` | `0` chuyển các lần phát lại session chính xác qua buffer scratch; `1` phát lại trực tiếp các thao tác session được hỗ trợ trên buffer graph. |
-| `BYBY_FIR_WARM_RELOAD` | `0` | `1` nạp lại weight mô hình cho lần chạy warm thay vì reset trạng thái graph đã lift. |
+| `BYBY_FIR_WARM_RELOAD` | `0` | Với graph FIR thông thường có session handle, `1` nạp lại trọng số sau warmup. FIR Codestral reset state của graph sau warmup để sinh token. |
 | `BYBY_METAL_SIMDGROUP_MATRIX` | `1` | `0` ẩn hỗ trợ simdgroup matrix của MSL, nên trace Metal ghi `device="plain"` và không dựng micro-kernel Tensor Core nào. |
 | `BYBY_FIR_Q4_GEMV_TUNE` | `1` | Vulkan: lúc load, đo mọi số hàng mỗi subgroup (1, 2, 4) và độ rộng workgroup (64, 128, 256) cho từng shape GEMV trên weight thật, giữ tổ hợp nhanh nhất. `0`: giữ lựa chọn lúc lift. |
 | `BYBY_FIR_Q4_GEMV_ROWS` | theo lift | Ép số hàng output mỗi subgroup của GEMV (1, 2 hoặc 4). |
@@ -52,8 +52,8 @@ chờ (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_FIR_Q4_MAP_LOG` | `0` | `1` log việc map Q4 resident (backend Q4 native). |
 | `BYBY_FIR_RELOC` | `1` | Graph arena trên Metal: một pipeline mỗi kernel. `0`: một pipeline mỗi node. |
 | `BYBY_FIR_PROFILE` | `0` | `1`: trung bình encode trên host / chờ GPU / đọc logits mỗi bước decode. `2`: kết thúc session sau mỗi node và báo thời gian từng kernel (chậm; chỉ để chẩn đoán). |
-| `BYBY_UBATCH` | `512` | Giới hạn số hàng một lần chạy phase prompt (trừ phase có logits mỗi hàng). `0`: không giới hạn. |
-| `BYBY_PREFILL_MIN_ROWS` | `5` | Codestral CLI: prefix hoặc đuôi ubatch cuối có từ chừng này token trở lên chạy prefill nhiều hàng; ít hơn thì decode. `1`: gộp mọi đuôi từ 2 token. FIR Codestral giữ lại số hàng native đã chạy trong từng batch, kể cả phần đuôi. |
+| `BYBY_UBATCH` | `512` | Giới hạn số hàng của phase prompt ở graph FIR thông thường (trừ phase có logits mỗi hàng). `0`: không giới hạn. FIR Codestral dùng số hàng ghi từ native. |
+| `BYBY_PREFILL_MIN_ROWS` | `5` | Số hàng tối thiểu để chọn một phase prompt trong graph FIR thông thường. FIR Codestral dùng số hàng ghi từ native. |
 
 ## Inference native (`nim_inference`, route native của `formers-cli`)
 
@@ -64,6 +64,7 @@ chờ (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_EMBED_RAM` | `1` | Giữ embedding không tied trong RAM. |
 | `BYBY_LM_HEAD` | `q4` | Lượng tử hoá `lm_head` fp32 sang Q4 để chạy GEMV đã tune. `fp32`: giữ nguyên. |
 | `BYBY_UBATCH` | `512` | Số hàng micro-batch prefill. Native Codestral và `firlift --run` chạy một lượt resident prefill nếu prefix vừa batch; prefix dài hơn nối state giữa các lượt. Codestral có khoảng 2..4096, `0` = 4096. CLI giữ token prompt cuối để decode lấy logits. Thời gian compile/autotune được báo riêng. |
+| `BYBY_PREFILL_MIN_ROWS` | `5` | Số hàng tối thiểu để Codestral CLI chạy prefill theo batch cho prefix hoặc đuôi ubatch cuối. Đuôi ngắn hơn chạy decode. `1`: gộp mọi đuôi từ hai token. |
 | `BYBY_PREFILL_CB_MS` | `300` | Thời gian GPU đích của một command buffer prefill. |
 | `BYBY_PREFILL_MAX_ROWS` | `512` | Số hàng tối đa của một đoạn prefill. |
 | `BYBY_PREFILL_SESSION_MB` | `1024` | Ngân sách scratch của một session prefill. |
@@ -154,7 +155,7 @@ chờ (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `FIRLIFT_NOSIDE` | không đặt | Không ghép các kernel decode độc lập liên tiếp thành một lần chạy. |
 | `FIRLIFT_NOREUSE` | không đặt | Mỗi output có buffer riêng (không dùng lại buffer tạm). |
 | `BYBY_FIR_PROBE_STEPS` | mọi bước | Các bước recorder giữ, ví dụ `prefill:2,decode:1`. |
-| `BYBY_FIR_PROBE_DATA` | `1` dưới `--run` | Gửi dữ liệu upload chính xác qua pipe dữ liệu (cần cho upload không tên như LUT). `0` khi mọi weight đều có tên trong `model.nimq`. |
+| `BYBY_FIR_PROBE_DATA` | `1` với `--run` thông thường | Gửi dữ liệu upload qua pipe khi lift cần payload. Codestral `--run` luôn đặt `0` và dùng lại checkpoint gốc. |
 
 Codestral Vulkan mặc định dùng `BYBY_MEMORY_LIMIT_MB=10000` và
 `BYBY_CODESTRAL_TOKEN_IDS=1`, kể cả khi ghi qua `firlift --run`. Có thể đặt

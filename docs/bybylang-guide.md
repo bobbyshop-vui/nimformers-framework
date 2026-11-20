@@ -12,6 +12,8 @@ There are three ways to use the repository runtime:
 All use the vendored runtime in `vendor/bybylang/`. See the
 [BybyLang API](bybylang-api.md) for signatures and
 [GPU sessions](gpu-session-api.md)/[micro-VM](microkernel-api.md) for deeper APIs.
+The Python package calls the framework C ABI through its native shared library.
+[Python guide](python-guide.md)
 
 
 ## Build the compiler and run an existing example
@@ -32,7 +34,7 @@ does not execute its operations; the last command runs them.
 `BYBYLANG_NIMCACHE` selects the compiler cache, not the output path.
 Inspect CLI options with `./vendor/bybylang/bybylang --help`.
 
-Run both native DSL and C ABI tests:
+Run the integration suite:
 
 ```sh
 make bybylang-test
@@ -112,6 +114,7 @@ print OUT
 local ID in U0, so this indexing only handles one group. Multiple groups
 need a global index derived from group and local IDs. The final two zeros
 in the load/store instructions are address register and offset; do not omit them.
+Use `gpu backend is "cpu"` to run the example through the CPU VM.
 
 
 ## Call the C ABI from `.bybylang`

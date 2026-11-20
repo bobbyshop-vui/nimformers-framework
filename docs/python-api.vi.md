@@ -12,6 +12,11 @@ Phiên bản ABI là **2**, được trả bởi `nimf_abi_version()`. Lựa ch�
 có cả `"cpu"`, backend SIMD chọn lúc chạy (SSE4/AVX2/AVX-512/NEON) không cần
 GPU; xem [Backend CPU](cpu-backend.vi.md).
 
+`nimformers` chạy kernel, thao tác checkpoint và tokenizer, chạy micro-kernel
+và sinh văn bản Llama trong tiến trình Python. Package `formers` gọi
+`formers-cli` để chạy các họ model được hỗ trợ và graph FIR.
+[Python API của formers.n](../other/formers.n/README.md#python-api)
+
 Xem [hướng dẫn Python](python-guide.vi.md) cho cài đặt, ví dụ hoàn chỉnh, xem
 checkpoint và xử lý lỗi. [Hướng dẫn lệnh Make](make-commands.vi.md) mô tả input
 và output của từng target.
@@ -289,15 +294,41 @@ số thread/group, 0 để backend chọn.
 
 ## Buffer resident và Session
 
-Model cần trọng số và trạng thái nằm lại trên GPU giữa các dispatch. `Buffer` giữ dữ liệu float32 trên
-thiết bị còn `Session` ghi nhiều dispatch rồi mới submit một lần. Dispatch cần backend Metal
-(`ctx.backend == "metal"`); buffer và chương trình được tạo qua context.
+`Buffer` giữ dữ liệu float32 phẳng trên backend của context. Dùng
+`ctx.buffer(data)` để nạp dữ liệu hoặc `ctx.buffer(size=n)` để cấp phát toàn
+số 0. `Buffer(ctx, ...)` và `ctx.buffer(...)` đều hỗ trợ `with`. Đóng buffer
+trước khi đóng context.
+
+Dùng `with ctx.session() as sess:` để gom các phép toán. Session submit khi
+thoát, sau đó `Buffer.read()` chép kết quả về NumPy. Các phép toán dưới đây
+gọi API session của BybyLang trên CPU, Metal hoặc Vulkan. Chạy
+`make build-for-python` để dùng các symbol mới trong ABI v2.
+
+| Phương thức Python | Hàm Nim / BybyLang |
+| --- | --- |
+| `sess.copy_into(src, dst, n, src_offset=0, dst_offset=0)` | `sessionCopyInto`. Độ lệch và độ dài tính theo số float. Hai vùng trong cùng buffer phải rời nhau. |
+| `sess.matmul(a, b, out, m=..., k=..., n=..., transpose_b=False)` | `sessionMatmul` hoặc `sessionMatmulNT`. Lưu `b` dạng `(k, n)` mặc định hoặc `(n, k)` với `transpose_b=True`. |
+| `sess.matmul_q4(x, weight, out, rows=...)` | `sessionMatmulQ4`. Dùng handle từ `ctx.resident_q4` và buffer đầu ra có `rows * weight.n` phần tử. |
+| `sess.softmax(x, out, rows=..., cols=...)` | `sessionSoftmax` theo các cột của từng hàng. |
+| `sess.layernorm(x, gamma, beta, out, rows=..., cols=..., eps=1e-5)` | `sessionLayernormEnc`. Mỗi buffer `gamma` và `beta` cung cấp `cols` giá trị. |
+| `sess.rmsnorm(x, gamma, out, rows=..., cols=..., eps=1e-5)` | `sessionRmsnormEnc`. Buffer `gamma` cung cấp `cols` giá trị. |
+| `sess.attention(q, k, v, out, scores, batch=..., heads=..., steps=..., dim=..., scale=None)` | `sessionAttentionFusedEnc`. Causal attention với dữ liệu dạng `(batch, heads, steps, dim)` và scores dạng `(batch, heads, steps, steps)`. Mặc định `scale = 1 / sqrt(dim)`. |
+| `sess.vec_op(op, a, b, out)` | `sessionVecOp` trên `out.size` phần tử. Hỗ trợ `add`, `sub`, `mul`, `div`. |
+| `sess.activation(op, x, out, p=0.0)` | `sessionActivation` trên `out.size` phần tử. Hỗ trợ `relu`, `sigmoid`, `tanh`, `exp`, `log`, `sqrt` và `pow` với số mũ `p`. |
+
+Lưu ma trận theo hàng và dùng buffer thuộc cùng context. Các phép toán ghi
+vào buffer đầu ra riêng, có đúng kích thước kết quả. GPU submit các phép toán
+cùng nhau. CPU thực thi từng phép toán ngay khi gọi.
+
+`Session.compile` và `Session.dispatch` dùng Metal để chạy micro-kernel
+trên buffer resident. Với bytecode chạy độc lập trên backend khác, dùng
+`ctx.vm_run`.
 
 ```python
 import numpy as np
 from nimformers import Buffer, Context, Op, Session
 
-with Context() as ctx:
+with Context("metal") as ctx:
     x = Buffer(ctx, np.arange(64, dtype=np.float32))     # trọng số / đầu vào
     y = Buffer(ctx, size=64)                              # trạng thái, khởi tạo 0
     p = ctx.vm_program()
@@ -407,7 +438,7 @@ text decode, source lower và khóa chương trình phải được giải phón
 | `quant.nim` | `nimf_quantize` / `nimf_quant_dequantize`, truy cập payload và state dict NIMQ |
 | `customfloat.nim` | encode/decode, chọn dtype APF và cast training |
 | `vendor/bybylang/micro_kernel` | tạo chương trình, I/O `.bvm`, lower và dispatch |
-| `session_low.nim` / `session_vm_dispatch.nim` | buffer resident, session, dispatch có trạng thái (`nimf_buf_*`, `nimf_sess_*`, `nimf_prog_compile`) |
+| `vendor/bybylang/gpubackend.nim`, `session_vm_dispatch.nim` | `Buffer`, phép toán native trong `Session`, và micro-kernel resident trên Metal (`nimf_buf_*`, `nimf_sess_*`, `nimf_prog_compile`) |
 | `trace.nim` | recorder trace FIR (`nimf_trace_*`, `nimf_probe_step`) |
 | `test/deepseek-inference/native_hf_tokenizer.nim` | tokenizer HF |
 | `test/codestral/sentencepiece_native.nim` | tokenizer SentencePiece |
@@ -416,9 +447,9 @@ text decode, source lower và khóa chương trình phải được giải phón
 Các class layer/model trong `nimformer.nim` (`Linear`, `LayerNorm`,
 `CausalSelfAttention`, `FeedForward`, `TransformerBlock`, `NimformerModel`)
 và cache Jamba/Mamba là tổ hợp kernel phía Nim. Python tổ hợp các primitive
-tương tự như `matmul_nt`, `layernorm`, `attention`, `linear_q4`, resident
-weights. Ứng dụng riêng như `infer_lora`, training Jamba/Hybrid và Spectron
-vẫn là chương trình CLI; các thành phần cơ bản được cung cấp qua API trên.
+tương tự như `matmul_nt`, `layernorm`, `attention`, `linear_q4` và resident
+weights. Dùng package `formers` để chạy inference Codestral và graph FIR
+resident. Huấn luyện Jamba/Hybrid và Spectron dùng entry point Nim.
 
 Wrapper không có autograd hay API Adam/`fit` cấp model. Phải tự tổ hợp
 backward kernel như `layernorm_backward`/`attention_backward`. Dùng entry

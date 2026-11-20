@@ -192,17 +192,35 @@ tự chịu trách nhiệm về chỉ số buffer và kích thước dispatch; v
 đúng 64 phần tử và 64 thread. Xem [micro-VM API](microkernel-api.vi.md).
 
 
+## Nối các phép toán trên buffer resident
+
+```python
+from nimformers import Context
+
+with Context("cpu") as ctx:
+    with ctx.buffer([[1, 2], [3, 4]]) as x, ctx.buffer([[2, 0], [0, 2]]) as w:
+        with ctx.buffer(size=4) as product, ctx.buffer(size=4) as scores:
+            with ctx.session() as sess:
+                sess.matmul(x, w, product, m=2, k=2, n=2)
+                sess.softmax(product, scores, rows=2, cols=2)
+            print(scores.read().reshape(2, 2))
+```
+
+Với context Metal hoặc Vulkan, kết quả nhân ma trận nằm trên thiết bị và
+được đưa vào softmax trong cùng lượt submit. [API buffer và session](python-api.vi.md#buffer-resident-và-session)
+
 ## Inference model và gọi trainer
 
 Python có `ctx.load_llama(configPath, nimqPath)` và `model.generate(...)`
 cho Llama/DeepSeek tương thích loader. Ví dụ đầy đủ tại
 [Python API — inference Llama](python-api.vi.md#inference-llama).
 
-Spectron và Codestral LoRA hiện dùng entry point Nim/CLI cho training và
-inference riêng; Python API chưa có `SpectronModel.fit`, `backward()` tự
-động hay optimizer Adam cấp model. Muốn điều khiển trainer từ Python có thể
-dùng `subprocess.run(["make", "run-metal"], cwd=repo, check=True)`; cấu hình
-Spectron vẫn ở constants trong source. Xem [Spectron](spectron-guide.vi.md).
+Với Codestral LoRA đã merge, package `formers` gọi inference native hoặc chạy
+graph FIR đã lift. [Python API của formers.n](../other/formers.n/README.md#python-api)
+
+Huấn luyện Spectron và Codestral dùng entry point Nim. Từ Python có thể gọi
+trainer Spectron bằng `subprocess.run(["make", "run-metal"], cwd=repo, check=True)`.
+[Hướng dẫn Spectron](spectron-guide.vi.md)
 
 
 ## Test và lỗi thường gặp
@@ -217,8 +235,8 @@ make python-test PYTEST='python -m pytest' PYTEST_FLAGS=-q
   `library_path()` hoặc đặt `NIMFORMERS_LIB` tới file đầy đủ.
 - Thiếu symbol `nimf_*`: rebuild thư viện và kiểm tra không trỏ nhầm một
   bản library cũ.
-- Không có GPU/không truy cập được Metal: kiểm tra GPU runtime và quyền truy
-  cập thiết bị của tiến trình; package không cung cấp backend CPU thay thế.
+- Dùng `Context("cpu")` cho phép toán và session trên CPU. Khi dispatch
+  micro-kernel trên Metal, kiểm tra GPU runtime và quyền truy cập thiết bị.
 - Lỗi shape/backend từ C ABI được đưa lên thành `NimformersError`; lỗi input
   do Python wrapper kiểm tra thường là `ValueError` hoặc `TypeError`.
 

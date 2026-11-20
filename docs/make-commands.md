@@ -239,6 +239,7 @@ original. See [checkpoint formats](checkpoint-formats.md).
 
 ```sh
 make formers-cli
+make firlift
 make formers
 make formers FORMERS_MODELS=test/deepseek-inference/models
 make formers ARGS='--models test/codestral/models -p "Write quicksort in Python." -n 200'
@@ -247,13 +248,15 @@ make formers-fir-test
 make formers-smoke
 ```
 
-`formers-cli` (alias `build-formers`) compiles `other/formers.n/` with BybyLang into
-`other/formers.n/formers-cli` and does not run a model. `formers` builds, then starts a
+`formers-cli` (alias `build-formers`) builds `other/formers.n/formers-cli` with
+BybyLang and `other/formers.n/firlift/firlift` with Nim. `make firlift` rebuilds
+the lifter alone. `formers` builds, then starts a
 chat with `--models $(FORMERS_MODELS)` (default `test/codestral/models`); a non-empty
 `ARGS` replaces every argument. `formers-test` checks the architecture detection without
 loading weights; `formers-fir-test` runs the FIR parser/registry and Mamba-3 kernel checks on the CPU; `formers-smoke` runs a tiny random Llama on the GPU. `formers-clean`
-removes the formers.n build. Usage and flags: the
-[formers.n section of the readme](../readme.md#run-deepseek-or-codestral-with-formersn-formers-cli).
+removes the formers.n build. See the [formers.n runner guide](../other/formers.n/README.md)
+and [Codestral FIR lift on Vulkan](fir-script-lift.md#codestral-on-vulkan) for
+usage and flags.
 
 
 ## Python, C, and BybyLang

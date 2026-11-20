@@ -21,14 +21,16 @@ proc sessionAllocScratch*(backend: GpuBackend, n: int): SessionHandle
 
 ```nim
 proc sessionMatmul*(backend: GpuBackend, a, b: SessionHandle, c: var SessionHandle, M, K, N: int): bool
-proc sessionMatmulNT*(backend: GpuBackend, a, b: SessionHandle, c: var SessionHandle, M, K, N: int): bool
+proc sessionMatmulNT*(backend: GpuBackend, a, b: SessionHandle, c: var SessionHandle,
+  M, K, N: int; bOffsetElems = 0): bool
 proc sessionMatmulQ4*(backend: GpuBackend, a: SessionHandle, w: ResidentWeightHandle, c: var SessionHandle, M: int): bool
 ```
 Encode a matmul into the open session, writing the result into `c` (usually a handle from `sessionAllocScratch`). `sessionMatmulNT` computes `C(M,N) = A(M,K) @ B(N,K)^T` with `B` kept in its original `[N,K]` layout (no CPU-side transpose needed) — used for attention decode against K/V-cache slices. `sessionMatmulQ4` multiplies against an int4-resident weight handle (see `beResidentUploadQ4`). All return `false` if the backend doesn't support that op inside a session — the caller must not treat `false` as a hard error, just fall back to the non-session path.
 
 ```nim
 proc sessionVecOp*(backend: GpuBackend, op: string, a, b: SessionHandle, c: var SessionHandle, n: int): bool
-proc sessionActivation*(backend: GpuBackend, op: string, x: SessionHandle, y: var SessionHandle, n: int): bool
+proc sessionActivation*(backend: GpuBackend, op: string, x: SessionHandle, y: var SessionHandle,
+  n: int, p: float32 = 0.0'f32): bool
 ```
 `sessionVecOp`: element-wise op (`"add"`, `"sub"`, `"mul"`, `"div"`) between two uploaded/scratch buffers. `sessionActivation`: activation op (`"relu"`, `"sigmoid"`, `"tanh"`, ...) on a single buffer.
 
@@ -36,12 +38,18 @@ proc sessionActivation*(backend: GpuBackend, op: string, x: SessionHandle, y: va
 proc sessionSoftmax*(backend: GpuBackend, x: SessionHandle, y: var SessionHandle, rows, cols: int): bool
 proc sessionLayernormEnc*(backend: GpuBackend, x, gamma, beta: SessionHandle, y: var SessionHandle,
                           rows, cols: int, eps: float32): bool
+proc sessionRmsnormEnc*(backend: GpuBackend, x, gamma: SessionHandle, y: var SessionHandle,
+  rows, cols: int, eps: float32): bool
 proc sessionAttentionFusedEnc*(backend: GpuBackend, q, k, v: SessionHandle,
   o, sMatrix: var SessionHandle, B, H, S, D: int, scale: float32): bool
 proc sessionRope*(backend: GpuBackend, x: SessionHandle, cosT, sinT: SessionHandle,
   T, Hn, D: int): bool
 ```
-Higher-level ops encodable inside a session: row-wise softmax, layernorm, fused attention, and RoPE rotation. Support varies by backend (currently richest on Metal) — always check the returned `bool` and fall back if `false`.
+Sessions support row-wise softmax, LayerNorm, RMSNorm, fused attention, and
+RoPE. Check the returned `bool` for backend support and execution status.
+Python exposes resident copies, FP32/Q4 matmul, normalization, attention,
+vector operations, and activations through `Context.session()`.
+[Python Session API](python-api.md#resident-buffers-and-sessions)
 
 ```nim
 proc sessionCopyInto*(backend: GpuBackend, src: SessionHandle, dst: var SessionHandle,

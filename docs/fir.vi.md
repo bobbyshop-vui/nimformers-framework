@@ -12,6 +12,11 @@ hard-code kiến trúc đó.
 Model đầu tiên là Mamba-3 SISO 1.5B: [`models/mamba3-1.5b/model.fir`](../models/mamba3-1.5b/model.fir).
 Định dạng đầy đủ và ABI kernel nằm trong [`models/FIR.md`](../models/FIR.md) (tiếng Anh).
 
+`script_abi 1` và `script_abi 2` chọn hợp đồng có phiên bản cho `layout script`.
+`require feature weights_bf16` và `require feature weights_f16` khai báo yêu cầu
+hỗ trợ chuyển đổi checkpoint. ABI 2 cùng `require feature resident_q4` bật
+trọng số `q4r` hoặc `q4r<G>` và binding slot `outN` cho kernel raw.
+
 ## Các loại node
 
 | Loại | Ý nghĩa | Ví dụ |
@@ -19,6 +24,7 @@ Model đầu tiên là Mamba-3 SISO 1.5B: [`models/mamba3-1.5b/model.fir`](../mo
 | `micro` | micro-kernel đã đăng ký (bytecode VM, JIT trên GPU) | `node scan micro m3.ssm_step ...` |
 | `ext` | kernel backend theo tên (GEMV Q4, embedding) | `node project ext m3.gemv_q4 ...` |
 | `builtin` | phép nhỏ (`rms_norm`, `add`) | `node r builtin add ...` |
+| `session` | lời gọi session native được hỗ trợ, kèm thuộc tính đã ghi | `node add session sessionVecOp:op=add,n=128 a b -> c` |
 
 ## Cách dùng
 
@@ -37,6 +43,16 @@ other/formers.n/formers-cli --models test/mamba3/models \
 
 Khi có `--fir`, formers.n in `FIR: provider used for N programs`. Không có cờ này runtime
 vẫn dùng builder trực tiếp; kết quả giống nhau.
+
+## Codestral trên Vulkan
+
+`firlift --run` lift một lượt inference native với một prompt, từ metadata
+trace trong RAM. Khi chạy lại `model.fir` và `config.json`, dùng base `.nimq`,
+adapter và tokenizer gốc. Graph khai báo `require feature codestral_resident`
+và dùng `initnative` để gắn trọng số cùng state do loader native chuẩn bị.
+FIR chạy theo số hàng prefill đã ghi. Dùng `-p` với cùng tokenizer và cài đặt
+prompt để đối chiếu dòng `[codestral-tokens]` với native. Xem
+[lệnh ghi và chạy lại](fir-script-lift.md#codestral-on-vulkan).
 
 ## Test
 

@@ -30,19 +30,42 @@ require feature weights_bf16
 require feature weights_f16
 ```
 
-`script_abi 1` selects the versioned runner contract. `FirProgram.scriptAbi` is
-1 when declared and 0 when omitted. Existing script files without this directive
-keep their legacy instruction validation. The runner supports the required
-features `weights_bf16` and `weights_f16`; each `require feature NAME` asserts
-runner support and is retained in `FirProgram.requiredFeatures`. Features do not
-select a storage dtype or change a weight declaration. Repeated feature
-requirements are idempotent. The ABI directive occurs at most once.
+`script_abi 1` or `script_abi 2` selects the versioned runner contract.
+`FirProgram.scriptAbi` holds the declared version, or 0 for legacy instruction
+validation. Each `require feature NAME` asserts runner support and is retained
+in `FirProgram.requiredFeatures`. Repeated feature requirements are idempotent.
+The ABI directive occurs at most once.
+
+The supported features are `weights_bf16`, `weights_f16`, `resident_q4`, and
+`codestral_resident`. `resident_q4` requires ABI 2 and enables `q4r` and
+`q4r<G>` declarations for separate resident Q4 buffers. ABI 2 with `resident_q4`
+also permits raw kernel slots to bind output ports such as `mem:out0`.
 
 Both directives require `layout script`. The parser resolves the final layout
 outside kernel bodies before checking gated declarations, including when layout
 appears later in the file. Unknown ABI versions, malformed directives and unknown
 required features fail before checkpoint loading. The graph loader also checks
 the contract for programs constructed directly by a caller.
+
+### Codestral graph initializers
+
+`require feature codestral_resident` identifies a `runtime graph` that borrows
+buffers from the native Codestral loader on Vulkan. The accompanying
+`config.json` contains `fir_codestral` with the base fingerprint, adapter
+fingerprint, and prompt token count. The graph has fixed prefill phases.
+
+```text
+buf b12 f32 1024
+initnative b12 block0.mamba.work
+buf scratch f32 128
+initzero scratch
+```
+
+`initnative BUFFER RESOURCE` binds a graph buffer to a named native resource.
+The loader validates its backend and byte size. `initzero BUFFER` initializes
+a graph buffer to zero. Each directive applies to a base buffer and is its sole
+initializer. File-backed initializers for other buffers use the original
+`checkpoint`. See [Codestral FIR on Vulkan](../docs/fir-script-lift.md#codestral-on-vulkan).
 
 ### Script checkpoint loading
 
@@ -135,7 +158,7 @@ bytes the float arena holds.
 Weight shapes and activation element counts are resolved and validated without loading weights.
 The example uses a tied embedding/language-head tensor.
 
-Nodes use `node id micro|ext|builtin kernel.name inputs -> outputs`, for example:
+Nodes use `node id micro|ext|builtin|session operation inputs -> outputs`, for example:
 
 ```text
 node prepare micro m3.prepare proj b_norm c_norm b_bias c_bias dt_bias phase -> k q coeff phase
@@ -144,6 +167,10 @@ node carry micro m3.carry k proj -> prev_k prev_v
 node project ext m3.gemv_q4 ssm_out out_proj -> residual
 node residual builtin add hidden_in residual -> hidden_in
 ```
+
+A `session` node replays a supported backend session call and gives its
+attributes in the operation field. For a vector addition, write
+`node add session sessionVecOp:op=add,n=128 a b -> c`.
 
 `repeat layers` / `endrepeat` marks a layer-scoped subgraph. The parser retains
 that scope on each node; a runtime caller iterates it and resolves `{i}` in weight

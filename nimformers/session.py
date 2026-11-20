@@ -1,4 +1,4 @@
-"""Resident buffers and stateful sessions for micro-kernel models.
+"""Resident buffers and stateful sessions for native operations and micro-kernels.
 
 ``Context.vm_run`` uploads a new arena for every call. A model needs weights and state that stay on
 the GPU between dispatches, so this module exposes named resident buffers and a session that encodes
@@ -9,12 +9,16 @@ the program are relative to the bound buffer (plus the bind offset).
 from __future__ import annotations
 
 import ctypes as ct
+import math
 import weakref
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import numpy as np
 
 from ._lib import F32, V, NimformersError
+
+if TYPE_CHECKING:
+    from .core import ResidentQ4Weights
 
 __all__ = ["Buffer", "Session"]
 
@@ -30,7 +34,7 @@ def _raise(lib):
 
 
 class Buffer:
-    """A float32 buffer resident on the GPU."""
+    """A float32 buffer resident on the context's backend."""
 
     def __init__(self, ctx, data=None, size: Optional[int] = None):
         self.ctx = ctx
@@ -59,6 +63,12 @@ class Buffer:
             self.ctx.lib.nimf_buf_free(self.ctx._ctx, self.handle)
             self.handle = None
 
+    def __enter__(self) -> Buffer:
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
+
     def __del__(self):  # pragma: no cover
         try:
             self.close()
@@ -67,7 +77,7 @@ class Buffer:
 
 
 class Session:
-    """One command buffer: ``with Session(ctx) as s: s.dispatch(...)`` submits on exit."""
+    """Encode native operations or micro-kernel dispatches and submit on exit."""
 
     def __init__(self, ctx):
         self.ctx = ctx
@@ -111,6 +121,65 @@ class Session:
         arr = np.ascontiguousarray(values, dtype=np.float32).reshape(-1)
         if self.ctx.lib.nimf_sess_set(self.ctx._ctx, buf.handle, offset, arr.ctypes.data_as(F32), arr.size) != 0:
             _raise(self.ctx.lib)
+
+    def _encode(self, symbol: str, *args) -> None:
+        fn = getattr(self.ctx.lib, symbol, None)
+        if fn is None:
+            raise NimformersError(f"missing {symbol}; rebuild with `make build-for-python`")
+        if fn(self.ctx._ctx, *args) != 0:
+            _raise(self.ctx.lib)
+
+    def copy_into(self, src: Buffer, dst: Buffer, n: int, *,
+                  src_offset: int = 0, dst_offset: int = 0) -> None:
+        """Copy a range of floats between resident buffers within this session."""
+        self._encode("nimf_sess_copy", src.handle, dst.handle, src_offset, dst_offset, n)
+
+    def matmul(self, a: Buffer, b: Buffer, out: Buffer, *,
+               m: int, k: int, n: int, transpose_b: bool = False) -> None:
+        """Write an (m, n) product to out. With transpose_b, b is stored as (n, k)."""
+        self._encode("nimf_sess_matmul", a.handle, b.handle, out.handle, m, k, n,
+                     int(transpose_b))
+
+    def matmul_q4(self, x: Buffer, weight: ResidentQ4Weights, out: Buffer, *,
+                  rows: int) -> None:
+        """Multiply (rows, k) activations by an already resident int4_asym weight."""
+        self._encode("nimf_sess_matmul_q4", x.handle, weight.handle, out.handle, rows)
+
+    def softmax(self, x: Buffer, out: Buffer, *, rows: int, cols: int) -> None:
+        """Normalize each row of a row-major matrix."""
+        self._encode("nimf_sess_softmax", x.handle, out.handle, rows, cols)
+
+    def layernorm(self, x: Buffer, gamma: Buffer, beta: Buffer, out: Buffer, *,
+                  rows: int, cols: int, eps: float = 1e-5) -> None:
+        """Apply row-wise LayerNorm with column-wise gamma and beta."""
+        if beta.handle is None:
+            raise NimformersError("LayerNorm requires an open beta buffer")
+        self._encode("nimf_sess_norm", x.handle, gamma.handle, beta.handle, out.handle,
+                     rows, cols, eps)
+
+    def rmsnorm(self, x: Buffer, gamma: Buffer, out: Buffer, *,
+                rows: int, cols: int, eps: float = 1e-5) -> None:
+        """Apply row-wise RMSNorm with column-wise gamma."""
+        self._encode("nimf_sess_norm", x.handle, gamma.handle, None, out.handle,
+                     rows, cols, eps)
+
+    def attention(self, q: Buffer, k: Buffer, v: Buffer, out: Buffer, scores: Buffer, *,
+                  batch: int, heads: int, steps: int, dim: int,
+                  scale: Optional[float] = None) -> None:
+        """Run causal attention on (batch, heads, steps, dim) inputs."""
+        if dim <= 0:
+            raise ValueError("attention head dimension must be positive")
+        scale = 1.0 / math.sqrt(dim) if scale is None else scale
+        self._encode("nimf_sess_attention", q.handle, k.handle, v.handle, out.handle,
+                     scores.handle, batch, heads, steps, dim, scale)
+
+    def vec_op(self, op: str, a: Buffer, b: Buffer, out: Buffer) -> None:
+        """Apply add, sub, mul or div to the first out.size elements."""
+        self._encode("nimf_sess_vec", a.handle, b.handle, out.handle, op.encode(), out.size)
+
+    def activation(self, op: str, x: Buffer, out: Buffer, *, p: float = 0.0) -> None:
+        """Apply relu, sigmoid, tanh, exp, log, sqrt or pow (exponent p)."""
+        self._encode("nimf_sess_activation", x.handle, out.handle, op.encode(), out.size, p)
 
     def step(self, token: int, position: int, kind: str = "decode"):
         """Context manager marking one decode/prefill step for the FIR recorder.

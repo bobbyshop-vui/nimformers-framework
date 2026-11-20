@@ -318,6 +318,20 @@ def _bind(lib: ct.CDLL) -> None:
     _fn(lib, "nimf_sess_begin", [V], CINT)
     _fn(lib, "nimf_sess_end", [V], CINT)
     _fn(lib, "nimf_sess_set", [V, V, CI64, F32, CI64], CINT)
+    # These additive ABI v2 exports are absent in older builds.
+    session_ops = {
+        "nimf_sess_copy": [V, V, V, CI64, CI64, CI64],
+        "nimf_sess_matmul": [V, V, V, V, CI64, CI64, CI64, CINT],
+        "nimf_sess_matmul_q4": [V, V, V, V, CI64],
+        "nimf_sess_softmax": [V, V, V, CI64, CI64],
+        "nimf_sess_norm": [V, V, V, V, V, CI64, CI64, CF32],
+        "nimf_sess_attention": [V, V, V, V, V, V, CI64, CI64, CI64, CI64, CF32],
+        "nimf_sess_vec": [V, V, V, V, CSTR, CI64],
+        "nimf_sess_activation": [V, V, V, CSTR, CI64, CF32],
+    }
+    for name, args in session_ops.items():
+        if hasattr(lib, name):
+            _fn(lib, name, args, CINT)
     _fn(lib, "nimf_trace_start", [CSTR, CSTR, CINT, CI64], CINT)
     _fn(lib, "nimf_trace_stop", [], CINT)
     _fn(lib, "nimf_trace_active", [], CINT)

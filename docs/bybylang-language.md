@@ -2,9 +2,15 @@
 
 [English](bybylang-language.md) | [Tiếng Việt](bybylang-language.vi.md)
 
-This is the framework-tracked bilingual edition of the [vendored BybyLang README](../vendor/bybylang/readme.md). The multi-group micro-kernel example computes a global index from group/local IDs.
+This is the framework's bilingual BybyLang reference. For host buffer lifetime,
+command replay and prefill encoders, see the GPU API reference.
+[BybyLang API](bybylang-api.md) · [Vendored README](../vendor/bybylang/readme.md)
 
-A Nim-based DSL, AOT-compiled to Nim source then built into a native binary. Its `gpu ...` commands generate tensor operations; `session:` batches supported operations; and `micro kernel` defines a native BybyLang VM kernel that is lowered to Metal or Vulkan GPU code. Generic control flow and hardware-simulation commands are also available.
+A Nim-based DSL that compiles to Nim source and then a native binary. Its
+`gpu ...` commands generate tensor operations and `session:` batches supported
+operations. A `micro kernel` block defines VM bytecode for Metal and Vulkan
+lowering or the CPU interpreter. General control flow and hardware-simulation
+commands are also available.
 
 
 ## Build & run
@@ -268,10 +274,12 @@ The old `cu*` resident-tensor names are compatibility stubs in this revision; th
 
 ## 5. Native BybyLang micro-kernels
 
-Write a `micro kernel` block directly in `.bybylang`; no Nim helper module or external micro-kernel import is required. The compiler builds a `VmProgram`, lowers it to Metal or Vulkan code, dispatches it in a GPU session, and reads back the output:
+The `.bybylang` compiler builds a `VmProgram` from the `micro kernel` block.
+The CPU VM interprets it, while GPU execution lowers it to Metal or Vulkan
+and reads the output after dispatch.
 
-```text
-gpu backend is "vulkan"
+```bybylang
+gpu backend is "cpu"
 gpu array INPUT = [1, 2, 3, 4, 5, 6, 7, 8]
 
 micro kernel scale INPUT -> OUTPUT threads 8 tg 4 out 8:
@@ -290,7 +298,13 @@ print OUTPUT
 
 The VM instruction API is exported by `vendor/bybylang/micro_kernel` and re-exported by `vendor/bybylang/bybylang`: create a `VmProgram` and append instructions with `emit*` procedures. Instructions include float/integer loads and stores, arithmetic, FMA, loops and conditionals, thread/threadgroup IDs, threadgroup memory and barriers, atomics, and virtual-threadgroup helpers. Integer registers are 32-bit; float registers are `float32`. Each instruction takes register indices and offsets as documented at its declaration in `micro_kernel/session_vm.nim`.
 
-The DSL header is `micro kernel NAME INPUT -> OUTPUT threads N tg N out N:` and its indented body accepts `emit...` instruction calls. `threads` is the dispatch thread count, `tg` the threadgroup size, and `out` the output element count. Choose counts and guard memory accesses so every dispatched thread stays in bounds. This path currently requires Metal or Vulkan; it raises for CPU/unsupported backends. For more complex kernels, import `vendor/bybylang/bybylang`, create the `VmProgram` in Nim, and call `executeMicroKernel(backend, kernelName, program, input, outputElems, threads, tgSize)` directly.
+The header sets total dispatch threads, threads per group and output elements.
+The example uses `group_id * 4 + local_id` to cover both groups and prints
+`@[2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0]`. Choose counts or guard accesses
+so each thread stays in bounds. From Nim, import `vendor/bybylang/bybylang`,
+build a `VmProgram` and call
+`executeMicroKernel(backend, kernelName, program, input, outputElems, threads, tgSize)`
+directly.
 
 ---
 

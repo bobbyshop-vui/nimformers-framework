@@ -320,8 +320,9 @@ NIMF_API int32_t NIMF_CALL nimf_micro_vm_dispatch(NimfContext*, const uint32_t* 
     int64_t n_threads, int64_t tg_floats, int64_t tg_size);
 
 /* ===================== resident buffers and sessions ================== */
-/* Metal only for dispatch.  Buffers stay on the GPU between dispatches; a session
- * encodes many dispatches before one submit.  Offsets and sizes are in floats. */
+/* Buffers stay resident between operations; a session encodes many operations before
+ * one submit. Native operations support CPU, Metal and Vulkan. Custom bytecode
+ * dispatch (nimf_sess_dispatch) requires Metal. Offsets and sizes are in floats. */
 
 NIMF_API NimfBuffer* NIMF_CALL nimf_buf_alloc(NimfContext*, const float* data, int64_t n);
 NIMF_API int32_t NIMF_CALL nimf_buf_free(NimfContext*, NimfBuffer*);
@@ -331,6 +332,26 @@ NIMF_API int32_t NIMF_CALL nimf_sess_begin(NimfContext*);
 NIMF_API int32_t NIMF_CALL nimf_sess_end(NimfContext*);
 NIMF_API int32_t NIMF_CALL nimf_sess_set(NimfContext*, NimfBuffer*, int64_t offset,
     const float* data, int64_t n);                /* inside an open session */
+/* Native operations require an open session. All buffers belong to its context.
+ * Output buffers have exactly the result size and are distinct from the inputs,
+ * except for non-overlapping ranges of nimf_sess_copy. */
+NIMF_API int32_t NIMF_CALL nimf_sess_copy(NimfContext*, NimfBuffer* src, NimfBuffer* dst,
+    int64_t src_offset, int64_t dst_offset, int64_t n);
+NIMF_API int32_t NIMF_CALL nimf_sess_matmul(NimfContext*, NimfBuffer* a, NimfBuffer* b,
+    NimfBuffer* out, int64_t m, int64_t k, int64_t n, int32_t transpose_b);
+NIMF_API int32_t NIMF_CALL nimf_sess_matmul_q4(NimfContext*, NimfBuffer* x,
+    NimfResidentQ4* weight, NimfBuffer* out, int64_t rows);
+NIMF_API int32_t NIMF_CALL nimf_sess_softmax(NimfContext*, NimfBuffer* x, NimfBuffer* out,
+    int64_t rows, int64_t cols);
+NIMF_API int32_t NIMF_CALL nimf_sess_norm(NimfContext*, NimfBuffer* x, NimfBuffer* gamma,
+    NimfBuffer* beta /* NULL = RMSNorm */, NimfBuffer* out, int64_t rows, int64_t cols, float eps);
+NIMF_API int32_t NIMF_CALL nimf_sess_attention(NimfContext*, NimfBuffer* q, NimfBuffer* k,
+    NimfBuffer* v, NimfBuffer* out, NimfBuffer* scores,
+    int64_t batch, int64_t heads, int64_t steps, int64_t dim, float scale);
+NIMF_API int32_t NIMF_CALL nimf_sess_vec(NimfContext*, NimfBuffer* a, NimfBuffer* b,
+    NimfBuffer* out, const char* op /* add, sub, mul, div */, int64_t n);
+NIMF_API int32_t NIMF_CALL nimf_sess_activation(NimfContext*, NimfBuffer* x, NimfBuffer* out,
+    const char* op /* relu, sigmoid, tanh, exp, log, sqrt, pow */, int64_t n, float p);
 NIMF_API int32_t NIMF_CALL nimf_sess_set_step_inputs(NimfContext*, NimfBuffer*,
     int64_t token_offset, int64_t position_offset, int64_t token, int64_t position);
 NIMF_API const char* NIMF_CALL nimf_prog_compile(NimfContext*, NimfVmProgram*, const char* tag);

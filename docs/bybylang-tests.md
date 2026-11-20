@@ -2,10 +2,9 @@
 
 [English](bybylang-tests.md) | [Tiếng Việt](bybylang-tests.vi.md)
 
-This page explains how to run, read, and extend the two `.bybylang` programs
-in `test/bybylang_test`. It documents only the APIs those tests currently use;
-see the [BybyLang API](bybylang-api.md) and
-[language reference](bybylang-language.md) for the complete language surface.
+This page explains how to run the integration suite and walks through the DSL
+and C ABI tests. See the language and GPU API references for the full surface.
+[BybyLang API](bybylang-api.md) · [Language reference](bybylang-language.md)
 
 
 ## Test files
@@ -17,7 +16,11 @@ see the [BybyLang API](bybylang-api.md) and
   `../../lib_c_api` as a Nim module. It tests the ABI version, backend context,
   addition, matmul, softmax, LayerNorm, INT8 quantization, micro-VM dispatch,
   and fused attention.
-- [`run.sh`](../test/bybylang_test/run.sh) AOT-compiles and executes both files.
+- [`cpu_test.bybylang`](../test/bybylang_test/cpu_test.bybylang) explicitly
+  selects CPU and checks immediate operations, a session block and the CPU VM.
+- The suite also exercises language syntax, core tracing, diagnostics and CPU
+  kernel results. The runner lists the exact test order.
+  [`run.sh`](../test/bybylang_test/run.sh)
 - [`nim.cfg`](../test/bybylang_test/nim.cfg) supplies the repository search paths
   required by generated Nim code that imports `lib_c_api.nim`.
 
@@ -33,10 +36,10 @@ Run from the repository root:
 make bybylang-test
 ```
 
-The tests require Nim, the vendored BybyLang compiler, and a Metal or Vulkan
-GPU. Backend `auto` tries Metal first on macOS and then Vulkan. The legacy name
-`cuda` is an alias for Vulkan. Although the parser accepts `cpu`, the native
-micro-kernel requires Metal or Vulkan, so the complete suite is not a CPU test.
+The tests require Nim and the vendored compiler. Tests using `auto` try Metal
+on macOS, then Vulkan, then CPU. Use a machine with the matching GPU to verify
+GPU dispatch. `cpu_test.bybylang` explicitly selects the CPU backend even on a
+machine with a GPU. The legacy name `cuda` maps to Vulkan.
 
 The runner builds `vendor/bybylang/bybylang` only when the compiler executable
 is missing. Rebuild it explicitly after changing compiler source:

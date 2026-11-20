@@ -32,8 +32,10 @@ the exact upload bytes (with `BYBY_FIR_PROBE_DATA=1`) stream to descriptor `D`. 
 that is uploaded again is sent once and referenced by the same `capture=` offset. Mid-run
 snapshots are not written in this mode. `firlift --run` sets this up: it creates both
 pipes, starts the command with the environment above, reads the pipes until the command
-ends and lifts from memory. No `.fprobe` or `.data` file exists at any point; the only
-files are `model.fir` and the compacted `trace.data` in `--out`.
+ends and lifts from memory. It writes `model.fir` and `config.json` to `--out`.
+Generic lifts may also emit a compact `trace.data` or auxiliary checkpoint
+links when the graph needs them. The [Codestral path](#codestral-on-vulkan)
+uses its original checkpoints and records trace metadata only.
 
 ```sh
 BYBY_FIR_PROBE_STEPS=prefill:1,decode:1 \
@@ -42,9 +44,10 @@ other/formers.n/firlift/firlift --config CONFIG --weights model.nimq --out DIR -
 ```
 
 `--run` and everything after it is the command (put it last); `--trace` is not allowed with
-it. `BYBY_FIR_PROBE_DATA` defaults to `1` there. The upload bytes are held in memory until
-the lift ends, so they count against RAM: set `BYBY_FIR_PROBE_DATA_MAX` to leave out
-checkpoint-sized uploads that `--weights` can match by fingerprint. The command must be built
+it. `BYBY_FIR_PROBE_DATA` defaults to `1` for generic lifts and is forced to `0`
+for Codestral. Captured upload bytes are held in memory until the lift ends. Set
+`BYBY_FIR_PROBE_DATA_MAX` to omit checkpoint-sized uploads that `--weights` can
+match by fingerprint. The command must be built
 with the pipe-aware recorder; an older binary treats `fd:T,D` as a file name and writes
 `fd:T,D` and `fd:T,D.data` into the working directory.
 
@@ -165,7 +168,7 @@ it and passes `--fir-check`.
 ## Commands
 
 ```sh
-make -C other/formers.n build
+make formers-cli
 other/formers.n/formers-cli --models models/gpt2-125m --fir /tmp/gpt2-lifted/model.fir \
   -p "The capital of France is" -n 24 --temp 0 --backend cpu
 
@@ -184,7 +187,7 @@ other/formers.n/formers-cli --models models/tinyllama -m models/tinyllama/model.
 
 # builder
 nim c -d:release --path:vendor/bybylang --nimcache:nimcache/builder-test \
-  -o:/tmp/builder_test other/formers.n/firlift/builder_test.nim 2>/dev/null || true
+  -o:/tmp/builder_test other/formers.n/firlift/builder_test.nim
 ```
 
 ## Session-op kernels
@@ -220,6 +223,11 @@ output too.
 | `sessionPermuteEnc` | `genPermute` (the recorder keeps the short stride tables) | src -> dst |
 | `sessionApfluEnc` / `...BackwardEnc` | `genApflu` / `genApfluBackward` | x[, dy] -> y |
 | `sessionLayernormBackwardEnc` | `genLayernormBackwardDx` + `genLayernormBackwardParams` | dy, x, gamma -> dx; dy, x -> dgamma, dbeta |
+
+Raw replay can retain exact native calls as `session` nodes. For Codestral,
+these include the FP4 tile GEMMs, `sessionF16GemmTile` with its recorded
+`tensorCore` choice, and `sessionMamba2SsdPrefillEnc` with its recorded
+pipeline kind and arena offsets.
 
 Opt-in threadgroup-parallel variants `genMatmulQ4Par` / `genMatmulNTPar` split the K
 reduction over T lanes with a tree reduction (`FIRLIFT_TG=16|32|64`). On Intel Iris Plus
@@ -359,13 +367,17 @@ reported range or use an override.
 ## Codestral on Vulkan
 
 Run `make formers-cli` in the build step to compile both the CLI and the lifter.
-The lifter executable is `other/formers.n/firlift/firlift`.
+Run `make firlift` to rebuild only `other/formers.n/firlift/firlift`.
 
 Lift the actual prompt you want to run. With `model_type=mamba2`, `firlift`
 records native prefill batch widths, the selected SSD pipeline, and the names of
-resident buffers instead of copying weight payloads. A 247-token prompt normally
-records one 246-row phase. FIR replays the recorded FP4/FP16 tile GEMMs and SSD
-session operations. Decode uses the recorded micro-VM programs.
+resident buffers. The core sends trace metadata through a pipe and reports
+`upload data 0 bytes`. The `codestral_prompt` event marks the end of checkpoint
+setup, including LoRA merge. The lifter selects prefill and decode from that
+point, keeping the prefill writes that supply recurrent state to decode.
+A 247-token prompt normally records one 246-row phase. FIR replays the recorded
+FP4/FP16 tile GEMMs and SSD session operations. Decode uses the recorded
+micro-VM programs.
 
 ```sh
 other/formers.n/firlift/firlift --config "$HF_DIR/config.json" \
@@ -379,19 +391,26 @@ other/formers.n/formers-cli --models "$MODELS" -m "$BASE" --lora "$LORA" \
   --no-progress -c 512
 ```
 
-Use a new output directory. Codestral writes only `model.fir` and `config.json`.
-At load, it opens the original checkpoint and adapter, merges LoRA on the GPU,
-and binds the native buffers to the graph through `initnative`. `initzero`
-describes zero-filled scratch. The loader checks checkpoint fingerprints and
-resident buffer sizes. The runner uses the same SentencePiece tokenizer and
-sampler as native. Relift for a different prompt token count because the scan
-and its arena offsets are fixed by the recorded batch widths.
+Use the original `.nimq` as the first `--weights` and pass its adapter to
+`formers-cli --lora` for both commands. A fresh output directory contains
+`model.fir` and `config.json`. At load, the graph checks the original checkpoint
+and adapter fingerprints, merges LoRA on the GPU, and borrows the resulting
+native buffers through `initnative`. `initzero` declares a zero-filled graph
+buffer. Use `-p` with the same prompt and template options to apply the native
+tokenizer and sampler. Relift when the prompt token count changes because the
+recorded scan dimensions and buffer offsets are fixed. Set `--context` high
+enough for the prompt plus the requested output tokens minus one. The runner
+supports one prompt per Codestral graph invocation.
 
 Codestral Vulkan uses a 10000 MB merge budget, automatic weight placement,
 tensor cores, a 512-row micro-batch, and automatic SSD selection by default.
 It prints the generated IDs after the text; set `BYBY_CODESTRAL_TOKEN_IDS=0`
 to hide them. Compare the first four IDs with the recording run, or compare
-equal-length runs to check the entire generation.
+equal-length runs to check the entire generation. A standard FIR run reports
+warmup separately, then prefill (including the last prompt token) and decode
+throughput. The first generated token is sampled from the prefill logits, so
+200 generated tokens take 199 timed decode steps. See the
+[Codestral benchmark](../test/codestral/benchmark.md#tesla-t4-vulkan-colab).
 
 ## Historical Codestral result
 

@@ -453,9 +453,10 @@ make formers-cli
 
 This builds the BybyLang compiler in `vendor/bybylang` when needed, compiles
 `other/formers.n/src/formers_cli.bybylang` ahead of time to Nim and writes
-`other/formers.n/formers-cli`. `make build-formers` is the same target. Only Nim and
-a C compiler are required; the GPU backends are the same Metal/Vulkan backends as the
-other inference targets.
+`other/formers.n/formers-cli` and compiles the Nim lifter to
+`other/formers.n/firlift/firlift`. `make build-formers` is the same target.
+`make firlift` rebuilds the lifter alone. The runner uses the framework's
+Metal and Vulkan backends.
 
 #### Quick start
 
@@ -577,7 +578,8 @@ and suggests rerunning with `--verbose`.
 
 | Target | What it does |
 | --- | --- |
-| `make formers-cli` / `make build-formers` | build `other/formers.n/formers-cli` |
+| `make formers-cli` / `make build-formers` | build `other/formers.n/formers-cli` and `other/formers.n/firlift/firlift` |
+| `make firlift` | build `other/formers.n/firlift/firlift` |
 | `make formers` | build, then chat with `FORMERS_MODELS` (default `test/codestral/models`); `ARGS='...'` replaces every argument |
 | `make formers-test` | architecture-detection test, no model load and no GPU |
 | `make formers-smoke` | builds a tiny random Llama and runs it end to end on the GPU |

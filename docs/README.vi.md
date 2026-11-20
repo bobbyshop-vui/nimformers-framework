@@ -58,6 +58,7 @@ lượng tử hóa, backend, session và micro-VM.
 - [Trace API](trace-api.vi.md): `nf.trace` cho Python, Nim, BybyLang và C: ghi một lần chạy thành trace FIR rồi lift thành `model.fir`.
 - [nfgraph2torch](nfgraph2torch.vi.md): chuyển module torch thành FIR / `model.fir` (replay ATen cộng micro-kernel).
 - [FIR (formers IR)](fir.vi.md): file đồ thị phía model khai báo micro-kernel, kernel backend và kích thước; cờ `--fir` / `--fir-check` của formers.n.
+- [FIR Codestral trên Vulkan](fir.vi.md#codestral-trên-vulkan) hướng dẫn ghi trong RAM, dùng lại checkpoint và adapter gốc, và đối chiếu token ID với native.
 - [Test tích hợp BybyLang](../test/bybylang_test/README.vi.md): import
   `lib_c_api`, kiểm tra C ABI và native DSL `gpu ...`.
 - [Tham khảo API test BybyLang](bybylang-tests.vi.md): cách chạy và mở rộng
@@ -82,6 +83,8 @@ lượng tử hóa, backend, session và micro-VM.
   [backend CPU](cpu-backend.vi.md).
 - `tensor_ops.nim`: [API tensor](tensor-ops-api.vi.md).
 - `trace.nim`: [Trace API](trace-api.vi.md).
+- `other/formers.n/`: [runner và API module](../other/formers.n/README.md),
+  [định dạng FIR](../models/FIR.md), [lifter cho trace core](fir-script-lift.md).
 - `nimformer.nim`: [API model cơ bản](base-model-api.vi.md).
 - `test/deepseek-inference/nim_inference.nim`:
   [inference LLaMA](llama-inference-api.vi.md), [tokenizer](tokenizer-api.vi.md).

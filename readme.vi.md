@@ -451,8 +451,10 @@ make formers-cli
 
 Target này build compiler BybyLang trong `vendor/bybylang` khi cần, biên dịch AOT
 `other/formers.n/src/formers_cli.bybylang` sang Nim và ghi ra
-`other/formers.n/formers-cli`. `make build-formers` là cùng target. Chỉ cần Nim và
-trình biên dịch C; backend GPU giống các target inference khác (Metal/Vulkan).
+`other/formers.n/formers-cli`, đồng thời biên dịch lifter Nim thành
+`other/formers.n/firlift/firlift`. `make build-formers` là cùng target.
+`make firlift` chỉ build lại lifter. Runner dùng backend Metal và Vulkan
+của framework.
 
 #### Chạy nhanh
 
@@ -571,7 +573,8 @@ và gợi ý chạy lại với `--verbose`.
 
 | Target | Làm gì |
 | --- | --- |
-| `make formers-cli` / `make build-formers` | build `other/formers.n/formers-cli` |
+| `make formers-cli` / `make build-formers` | build `other/formers.n/formers-cli` và `other/formers.n/firlift/firlift` |
+| `make firlift` | build `other/formers.n/firlift/firlift` |
 | `make formers` | build rồi chat với `FORMERS_MODELS` (mặc định `test/codestral/models`); `ARGS='...'` thay toàn bộ đối số |
 | `make formers-test` | test nhận diện kiến trúc, không nạp model, không cần GPU |
 | `make formers-smoke` | tạo một Llama ngẫu nhiên tí hon và chạy end to end trên GPU |

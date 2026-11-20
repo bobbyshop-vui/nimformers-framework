@@ -5,9 +5,9 @@
 
 BybyLang is vendored under `vendor/bybylang`. Nim callers can import `vendor/bybylang/bybylang` for the DSL compiler or `vendor/bybylang/gpubackend` for its GPU operations. The framework facade re-exports selected backend/session symbols through `backend.nim` and `nimformers.nim`.
 
-See the [BybyLang walkthrough](bybylang-guide.md) for complete examples: build the compiler, compile/run a script, call the C ABI, and
-manage source/output search paths. `make bybylang-test` runs the native DSL
-and imported C ABI examples together.
+The walkthrough covers building the compiler, running a script and calling the
+framework C ABI. The Python package calls the same C ABI through the shared
+library. [BybyLang walkthrough](bybylang-guide.md) · [Python API](python-api.md)
 
 
 ## Backend selection
@@ -22,7 +22,10 @@ proc detectBackend*(): GpuBackend
 proc setForbidCpuFallback*(forbid: bool)
 ```
 
-`parseBackend("cuda")` maps to Vulkan. The framework-level `newBackend("cpu")` is unsupported; direct BybyLang GPU functions have CPU reference/fallback behavior for operations where implemented. `setForbidCpuFallback(true)` turns operation fallback into a hard error.
+`parseBackend("cuda")` maps to Vulkan. Both `parseBackend("cpu")` and the
+framework's `newBackend("cpu")` select CPU explicitly. With `auto`, detection
+tries Metal on macOS, then Vulkan, then CPU. For an operation with a CPU
+fallback, `setForbidCpuFallback(true)` makes a GPU failure raise an error.
 
 
 ## Immediate GPU operations
@@ -87,13 +90,66 @@ session:
 Supported operations depend on backend. The compiler falls back to immediate operations for unsupported session encoders where a fallback exists. See [GPU Session API](gpu-session-api.md).
 
 
+## Native command replay
+
+Use the Nim session API for fixed-shape steps whose buffer handles can stay
+live across runs. Replay submits the same commands against those handles, so a
+host write can change the input values between steps.
+
+1. Check `sessionCanRecord(backend)`. Allocate persistent inputs, outputs and
+   scratch before `sessionBeginRecording(backend)`.
+2. Encode the step and call `sessionEnd(backend)`. Check its return value and
+   the ID from `sessionLastRecording(backend)`. An ID of `-1` means the commands
+   executed but could not be retained after a successful `sessionEnd`. Staging
+   uploads, deferred frees and internal scratch can prevent retention.
+3. Use `sessionHostBuffer` and `sessionHostWrite` to supply changing input. For
+   host readback, encode a copy to the mapped output and record
+   `sessionHostReadBarrier(backend)` before ending the session. Call
+   `sessionReplay(backend, id)` outside an active session and check its return
+   value before reading with `sessionHostRead`.
+4. Release the recording with `sessionFreeRecording(backend, id)` before
+   freeing any of its buffers.
+
+Vulkan keeps a reusable command buffer and its descriptor pools. Metal can use
+an indirect command buffer or issue the recorded dispatches on a plain encoder.
+`sessionRecordingNote(backend, id)` reports the Metal route or the reason for
+refusal. `BYBY_METAL_REPLAY_ICB=0` selects the plain encoder. The Metal replay
+test shows the buffer lifecycle and compares replay with a fresh encode.
+[Replay test](../vendor/bybylang/tests/t_metal_session_replay.nim)
+
+## Prefill session operations
+
+- `sessionFp4GemmTensorCore` uses Vulkan cooperative matrices for packed FP4-KM
+  weights. `sessionFp4GemmTiledEnc` uses register tiles on Vulkan.
+  `sessionFp4GemmMetal` uses register tiles or Apple `simdgroup_matrix` when
+  requested and supported. Allocate the Metal output handle before encoding.
+- `sessionF16GemmTile(backend, a, w, c, M, K, N, tensorCore)` expects IEEE FP16
+  weights in `[N, K]` order and computes `c = a @ w.T`. Vulkan uses cooperative
+  matrices when `tensorCore` is true and register tiles otherwise. For Vulkan
+  FP4-KM and FP16 routes, call `sessionTileGemmReady` outside a session before
+  first use to run the parity check. An encoder returning `false` leaves the
+  choice of a fallback to the caller.
+- `sessionMamba2SsdPrepare(backend, N, D, Q)` prepares chunked SSD prefill on
+  Vulkan outside an active session. It returns `"coop"`, `"scalar"`, or `""`
+  for an unavailable route. `sessionMamba2SsdPrefillEnc` then encodes five
+  dispatches against the supplied `float32` arena, including state carry.
+- `sessionCompileSeconds()` is a process-wide running total for shader
+  compilation and pipeline creation on cache misses. Take the difference
+  before and after prefill to report its setup time separately.
+
+The tile programs are built by `buildFp4TileGemmProgram` and
+`buildF16TileGemmProgram` in the VM instruction module. `tile_gemm.nim` lowers
+those programs for the selected GPU. [Session signatures](../vendor/bybylang/gpubackend.nim) ·
+[Tile GEMM lowering](../vendor/bybylang/micro_kernel/tile_gemm.nim)
+
+
 ## Native micro-kernel block
 
 Micro-kernel bytecode can be declared directly in `.bybylang`:
 
 ```bybylang
 micro kernel double A -> OUT threads 4 tg 4 out 4:
-  emitRToU 0 0
+  emitULid 0
   emitULoadIn 1 0 0
   emitLoadConstF32 2 2.0'f32
   emitMul 1 1 2
@@ -101,7 +157,11 @@ micro kernel double A -> OUT threads 4 tg 4 out 4:
   emitHalt
 ```
 
-`A` is a float input array. `threads` is dispatch size, `tg` is threadgroup size, and `out` is output element count. The block compiles the `emit*` lines to `VmProgram` bytecode and runs it via the selected GPU session. See [Micro-VM / JIT API](microkernel-api.md).
+`A` is a float input array. `threads` sets the dispatch size, `tg` sets the
+threadgroup size, and `out` sets the output element count. `emitULid` uses the
+local index within this single group. Use a group offset for multiple groups.
+The compiler builds `VmProgram` bytecode for GPU lowering or execution by the
+CPU VM. [Micro-VM / JIT API](microkernel-api.md)
 
 
 ## AOT build and run
@@ -136,6 +196,13 @@ traceStart("run.fprobe", "decode:2", true, 0)   # path, steps, data, dataMax
 traceStop()
 ```
 
-Start the trace **before** compiling kernels: the recorder only sees programs compiled while it is on.
-`traceActive()`, `traceFile()`, `traceBegin`/`traceEnd` (step markers) and the `withTrace`/`traceStep`
-templates are also available. Full reference: [Trace API](trace-api.md).
+Start recording before the operations you want to capture. Registered kernel
+bytecode survives across traces, so pipelines can be compiled beforehand.
+`traceBegin` and `traceEnd` mark steps. `traceActive`, `traceFile`, `withTrace`
+and `traceStep` are also available.
+
+For Codestral Vulkan, use `firlift --run` with the native CLI to record through
+an in-memory pipe. The lift uses the original checkpoint and LoRA at graph load
+and writes `model.fir` and `config.json`. The `codestral_prompt` marker bounds
+the operations that can enter the replay. [Trace API](trace-api.md) ·
+[Codestral FIR lift](fir-script-lift.md#codestral-on-vulkan)

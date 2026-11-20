@@ -6,7 +6,7 @@ import std/[math, random, sequtils, tables, algorithm, os, strformat, strutils, 
 when defined(posix): import std/posix
 import nimformers  # Tensor, Linear, newLinear, flatten2D, transpose, Embedding, addT...
 import native_hf_tokenizer
-from probe import firProbeOn, probeStepBegin, probeStepEnd
+from vendor/bybylang/probe import firProbeOn, probeStepBegin, probeStepEnd
 export native_hf_tokenizer
 
 # ─────────────────────────────────────────────────────────────

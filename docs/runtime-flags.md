@@ -34,14 +34,14 @@ without waiting (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | Flag | Default | Effect |
 | --- | --- | --- |
 | `BYBY_FIR_DECODE_REPLAY` | `1` | Vulkan and Metal: record the decode step once at the first step (Vulkan: one reusable command buffer; Metal: the step's dispatches, see `BYBY_METAL_REPLAY_ICB`), then each step only writes token/position into a host-visible buffer, replays it, and reads logits from a mapped buffer (no host encode). The embedding row is gathered on the GPU. Supported exact session nodes (RMSNorm, vector/activation, FP4 Metal GEMM and NT GEMM) also replay their native session operation. `0` encodes every step. Turns itself off with probe, `BYBY_FIR_PROFILE=2` or `BYBY_FIR_Q4_BACKEND=native`, and when the step uploads, allocates or frees buffers while recording. |
-| `BYBY_FIR_FP4_GEMV_TUNE` | `1` | At load, recognise the lifted FP4-KM decode GEMV kernels, build the other threadgroup-width variants (and the simdgroup one on Metal), check them against the lifted kernel and time them on the resident weights; every node of that kernel uses the fastest. `0` keeps the lifted kernels. `BYBY_FIR_Q4_COOP_VERBOSE=1` with `--verbose` prints the timings. |
+| `BYBY_FIR_FP4_GEMV_TUNE` | `1` | At load, tune recognised FP4-KM decode GEMV kernels in generic FIR graphs, checking each variant against the lifted program. `0` keeps the lifted kernels. Codestral FIR uses the recorded kernels. `BYBY_FIR_Q4_COOP_VERBOSE=1` with `--verbose` prints the timings. |
 | `BYBY_METAL_REPLAY_ICB` | `1` | Metal replay of a recorded session (`BYBY_FIR_DECODE_REPLAY`): unset: indirect command buffer on Apple GPUs only (on Intel GPUs a plain encoder replay was ~25% faster); `1` forces an indirect command buffer (built once, run with `executeCommandsInBuffer`) when the GPU supports it; `0` re-issues the recorded dispatches on a plain encoder in one loop (no graph walk either way). |
 | `BYBY_METAL_REPLAY_LOG` | unset | Set: log each Metal session recording (commands, pipelines, buffers) and why one was not kept. |
 | `BYBY_FIR_DECODE_REPLAY_VERBOSE` | `0` | `1` prints `[fir] decode replay on/off: ...` (also printed with `BYBY_FIR_PROFILE`). |
 | `BYBY_FIR_DECODE_CB_NODES` | `64` | Encoded decode step (replay off): submit without waiting every this many nodes (the first after 16) so the GPU starts while the host encodes. `0`: one command buffer. |
 | `BYBY_FIR_Q4_BACKEND` | `micro` | `micro`: lifted Q4 micro-kernels. `native`: diagnostic switch through `sessionMatmulQ4` (not allowed with Tensor Core nodes). |
 | `BYBY_FIR_SESSION_DIRECT` | `1` | `0` stages exact session replays through scratch buffers; `1` replays supported session operations directly on graph buffers. |
-| `BYBY_FIR_WARM_RELOAD` | `0` | `1` reloads model weights for the warm run instead of resetting lifted graph state. |
+| `BYBY_FIR_WARM_RELOAD` | `0` | For generic FIR graphs with session handles, `1` reloads weights after warmup. Codestral FIR resets warmed graph state for generation. |
 | `BYBY_METAL_SIMDGROUP_MATRIX` | `1` | `0` hides MSL simdgroup matrix support, so Metal traces record `device="plain"` and no Tensor Core micro-kernel is built. |
 | `BYBY_FIR_Q4_GEMV_TUNE` | `1` | Vulkan: at load, time every rows-per-subgroup (1, 2, 4) and workgroup width (64, 128, 256) per GEMV shape on the resident weights and keep the fastest. `0` keeps the lifted choice. |
 | `BYBY_FIR_Q4_GEMV_ROWS` | lifted | Force GEMV output rows per subgroup (1, 2 or 4). |
@@ -53,8 +53,8 @@ without waiting (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_FIR_Q4_MAP_LOG` | `0` | `1` logs resident Q4 mapping (native Q4 backend). |
 | `BYBY_FIR_RELOC` | `1` | Metal arena graphs: share one pipeline per kernel. `0`: one per node. |
 | `BYBY_FIR_PROFILE` | `0` | `1`: mean host encode / GPU wait / logits read per decode step. `2`: ends the session after every node and reports per-kernel wall time (slow; diagnostics only). |
-| `BYBY_UBATCH` | `512` | Caps the rows of a prompt phase run (phases with per-row logits excepted). `0`: no cap. |
-| `BYBY_PREFILL_MIN_ROWS` | `5` | Codestral CLI: a prompt prefix or final ubatch tail of at least this many tokens uses batched prefill; fewer use decode. `1`: batch every tail of 2+ tokens. Codestral FIR records the native batch widths, including the tail. |
+| `BYBY_UBATCH` | `512` | Caps prompt phase rows in generic FIR graphs (phases with per-row logits excepted). `0`: no cap. Codestral FIR uses the recorded native widths. |
+| `BYBY_PREFILL_MIN_ROWS` | `5` | Minimum rows to select a prompt phase in generic FIR graphs. Codestral FIR uses the recorded native widths. |
 
 ## Native inference (`nim_inference`, `formers-cli` native route)
 
@@ -65,6 +65,7 @@ without waiting (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_EMBED_RAM` | `1` | Keep an untied embedding in RAM. |
 | `BYBY_LM_HEAD` | `q4` | Quantize an fp32 `lm_head` to Q4 for the tuned GEMV. `fp32` keeps it. |
 | `BYBY_UBATCH` | `512` | Prefill micro-batch rows. `0`: uncapped on paced devices. Codestral native and `firlift --run`: a prefix up to this many tokens runs as one resident prefill pass; longer prefixes carry state between passes. Codestral range 2..4096, `0` = 4096. The CLI reserves the final prompt token for decode/logits. Compile/autotune time is reported separately from throughput. |
+| `BYBY_PREFILL_MIN_ROWS` | `5` | Minimum batched prefill rows for the Codestral CLI prompt prefix or its final ubatch tail. Shorter tails use decode. `1`: batch every tail of at least two tokens. |
 | `BYBY_PREFILL_CB_MS` | `300` | Target GPU time of one prefill command buffer. |
 | `BYBY_PREFILL_MAX_ROWS` | `512` | Upper bound of rows in one prefill chunk. |
 | `BYBY_PREFILL_SESSION_MB` | `1024` | Scratch budget of one prefill session. |
@@ -155,7 +156,7 @@ without waiting (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `FIRLIFT_NOSIDE` | unset | Do not merge independent consecutive decode kernels into one launch. |
 | `FIRLIFT_NOREUSE` | unset | Give every op output its own buffer (no temporary reuse). |
 | `BYBY_FIR_PROBE_STEPS` | every step | Steps the recorder keeps, for example `prefill:2,decode:1`. |
-| `BYBY_FIR_PROBE_DATA` | `1` under `--run` | Send exact upload payloads down the data pipe (needed for unnamed uploads such as LUTs). `0` when every weight is named in `model.nimq`. |
+| `BYBY_FIR_PROBE_DATA` | `1` for generic `--run` | Send exact upload payloads down the data pipe for uploads that need them. Codestral `--run` forces `0` and reuses the original checkpoints. |
 
 Codestral Vulkan uses `BYBY_MEMORY_LIMIT_MB=10000` and `BYBY_CODESTRAL_TOKEN_IDS=1`
 by default, including when recording with `firlift --run`. Set either variable

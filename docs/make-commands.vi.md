@@ -235,6 +235,7 @@ chọn output riêng như ví dụ để giữ bản gốc. Xem [định dạng 
 
 ```sh
 make formers-cli
+make firlift
 make formers
 make formers FORMERS_MODELS=test/deepseek-inference/models
 make formers ARGS='--models test/codestral/models -p "Write quicksort in Python." -n 200'
@@ -243,12 +244,14 @@ make formers-fir-test
 make formers-smoke
 ```
 
-`formers-cli` (alias `build-formers`) biên dịch `other/formers.n/` bằng BybyLang thành
-`other/formers.n/formers-cli`, không chạy model. `formers` build rồi mở chat với
+`formers-cli` (alias `build-formers`) build `other/formers.n/formers-cli` bằng
+BybyLang và `other/formers.n/firlift/firlift` bằng Nim. `make firlift` chỉ build
+lại lifter. `formers` build rồi mở chat với
 `--models $(FORMERS_MODELS)` (mặc định `test/codestral/models`); `ARGS` khác rỗng thì
 thay toàn bộ đối số. `formers-test` kiểm tra nhận diện kiến trúc mà không nạp trọng số;
 `formers-fir-test` chạy kiểm tra parser/registry FIR và kernel Mamba-3 trên CPU; `formers-smoke` chạy một Llama ngẫu nhiên tí hon trên GPU. `formers-clean` xoá build của
-formers.n. Cách dùng và flag: [mục formers.n trong readme](../readme.vi.md#chạy-deepseek-hoặc-codestral-bằng-formersn-formers-cli).
+formers.n. Xem cách dùng trong [hướng dẫn formers.n](../other/formers.n/README.md)
+và [lift FIR cho Codestral trên Vulkan](fir-script-lift.md#codestral-on-vulkan).
 
 
 ## Python, C và BybyLang
