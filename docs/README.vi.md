@@ -19,8 +19,12 @@ lượng tử hóa, backend, session và micro-VM.
   micro-kernel và C ABI.
 - [Bắt đầu sử dụng](getting-started.vi.md): yêu cầu cài/build, import,
   chọn backend và chương trình nhỏ.
+- [Package Nimble](nimble-package.vi.md): cài thư viện Nim native, build shared runtime,
+  gọi từ Nim hoặc BybyLang.
 - [Python và C ABI](python-api.vi.md): binding ctypes/NumPy, header C,
   lượng tử hóa, state dict NIMQ, micro-VM, tokenizer và sinh Llama.
+- [Thực thi phân tán trên một máy](distributed.vi.md): process group, chia shard,
+  chạy micro-VM portable và batch prompt model độc lập.
 - [API backend](backend-api.vi.md): khởi tạo backend và phép GPU `be*`.
 - [Backend CPU](cpu-backend.vi.md): dispatch ISA SIMD (SSE4/AVX2/AVX-512/NEON),
   chính sách AVX offset, chia block matmul theo L3, session CPU và micro-VM.
@@ -102,6 +106,7 @@ lượng tử hóa, backend, session và micro-VM.
 - `vendor/bybylang/`: [DSL](bybylang-api.vi.md), [ngôn ngữ](bybylang-language.vi.md),
   [session](gpu-session-api.vi.md), [micro-VM/JIT](microkernel-api.vi.md).
 - `lib_c_api.nim` / `nimformers/` / `include/nimformers.h`: [Python và C ABI](python-api.vi.md).
+- `nimformers.distributed`: [thực thi phân tán trên một máy](distributed.vi.md).
 
 Chữ ký hàm trong docs thuộc module công khai và facade export. Kernel nội
 bộ và helper chỉ dùng test/benchmark không phải API ứng dụng ổn định.

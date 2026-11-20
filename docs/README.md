@@ -13,7 +13,9 @@ This directory is the user documentation for the public Nimformer APIs. Use the 
 - [Python walkthrough](python-guide.md): source installation and complete API examples.
 - [BybyLang walkthrough](bybylang-guide.md): compiler, DSL/AOT, sessions, micro-kernels, and the C ABI.
 - [Getting Started](getting-started.md): install/build prerequisites, imports, backend selection, and a small example.
+- [Nimble Package](nimble-package.md): install the native Nim library, build the shared runtime, and call it from Nim or BybyLang.
 - [Python and C ABI](python-api.md): `ctypes`/NumPy bindings, the stable C header, quantization, NIMQ state dicts, micro-VM dispatch, tokenizers, and Llama generation.
+- [Single-host distributed execution](distributed.md): process groups, shard mapping, portable micro-VM work, and independent model prompt batches.
 - [Backend API](backend-api.md): backend creation and `be*` GPU operations.
 - [CPU Backend](cpu-backend.md): SIMD ISA dispatch (SSE4/AVX2/AVX-512/NEON), AVX-offset policy, L3-aware matmul blocking, CPU sessions and micro-VM.
 - [Tensor Operations API](tensor-ops-api.md): tensor views, shape operations, reductions, comparisons, scans, and dropout.
@@ -70,6 +72,7 @@ This directory is the user documentation for the public Nimformer APIs. Use the 
 | `test/codestral/rawbin.nim` / `test/codestral/qlorabin.nim` / `test/codestral/checkpoint.nim` | [Checkpoint and Binary Formats](checkpoint-formats.md) |
 | `vendor/bybylang/` | [BybyLang DSL](bybylang-api.md), [Language reference](bybylang-language.md), [Sessions](gpu-session-api.md), [Micro-VM/JIT](microkernel-api.md) |
 | `lib_c_api.nim` / `nimformers/` / `include/nimformers.h` | [Python and C ABI](python-api.md) |
+| `nimformers.distributed` | [Single-host distributed execution](distributed.md) |
 
 The signatures shown here are for user-facing modules and facade exports. Internal kernels and test/benchmark-only helpers are not stable application APIs. Source files remain the final authority when an API is marked experimental or backend-specific.
 

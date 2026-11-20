@@ -6,7 +6,9 @@
 #
 # Exit codes: 0 ok, 1 runtime failure, 2 bad options, 3 unsupported model.
 
-import nim "std/os"
+import nim "std/[os, strutils]"
+import nim "nimformers"
+import nim "formers_parallel"
 import "formers/cli/options.bybylang"
 import "formers/arch/detect.bybylang"
 import "formers/runtime/signals.bybylang"
@@ -15,6 +17,19 @@ import "formers/router.bybylang"
 import "formers/ir/fir_parse.bybylang"
 import "formers/ir/fir_exec.bybylang"
 import "formers/ir/fir_graph_kernels.bybylang"
+
+function fmDistributedBaseArgs(args: seq[string]): seq[string]
+    ## Remove scheduler-only flags before each child CLI parses the arguments.
+    var i = 0
+    while i < args.len:
+        let arg = args[i]
+        if arg in ["--distributed", "--distributed-ratios"]:
+            i += 2
+        elif arg.startsWith("--distributed=") or arg.startsWith("--distributed-ratios="):
+            inc i
+        else:
+            result.add(arg)
+            inc i
 
 opts = fmParseOptions(commandLineParams())
 if opts.showHelp:
@@ -25,6 +40,25 @@ if opts.errors.len > 0:
         stderr.writeLine("[formers.n] " & e)
     stderr.writeLine("[formers.n] see: formers-cli --help")
     quit(2)
+if opts.distributedDevices.len > 0:
+    try:
+        let group = initProcessGroup(opts.distributedDevices, opts.distributedRatios)
+        let counts = group.partition(opts.batchPrompts.len, opts.distributedRatios)
+        var assignment: seq[string]
+        for i, device in group.devices:
+            assignment.add(device.backend & ":" & $device.ordinal & "=" & $counts[i])
+        stderr.writeLine("[formers.n] distributed prompt batch: " & $opts.batchPrompts.len & " prompts across " & assignment.join(", "))
+        let outputs = runFormersBatchDetailed(group, getAppFilename(), fmDistributedBaseArgs(commandLineParams()), opts.batchPrompts, false, opts.nPredict, opts.temperature.float64, @[], opts.distributedRatios)
+        for i, output in outputs:
+            stdout.writeLine("=== distributed prompt " & $(i + 1) & " ===")
+            stdout.writeLine(output.stdout)
+            if opts.verbose and output.stderr.len > 0:
+                stderr.writeLine("[formers.n] worker logs for prompt " & $(i + 1))
+                stderr.write(output.stderr)
+        quit(0)
+    except Exception as e:
+        stderr.writeLine("[formers.n] distributed inference failed: " & e.msg)
+        quit(1)
 if opts.firCheck.len > 0:
     try:
         firProgram = firParse(opts.firCheck)

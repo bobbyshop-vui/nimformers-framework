@@ -114,6 +114,31 @@ class Model:
         except ValueError as exc:
             raise RuntimeError("formers-cli did not return space-separated token IDs") from exc
 
+    def generate_batch(self, prompts, *, group, ratios=None, max_tokens=128, temperature=0.8):
+        """Generate text for prompts in parallel using the native scheduler."""
+        if isinstance(prompts, str):
+            raise TypeError("prompts must be a sequence of prompt strings")
+        return group.generate_batch(self.cli_path, self._base_args()[1:], list(prompts),
+                                    token_ids=False, max_tokens=max_tokens,
+                                    temperature=temperature, env=self.env, ratios=ratios)
+
+    def generate_ids_batch(self, prompts, *, group, ratios=None, max_tokens=128, temperature=0.8):
+        """Generate token IDs for prompt-ID sequences using the native scheduler."""
+        encoded = []
+        for prompt_ids in prompts:
+            tokens = ",".join(str(index(token_id)) for token_id in prompt_ids)
+            if not tokens:
+                raise ValueError("each prompt_ids sequence must contain at least one token")
+            encoded.append(tokens)
+        args = self._base_args(exclude=("--prompt-ids",))[1:]
+        outputs = group.generate_batch(self.cli_path, args, encoded,
+                                       token_ids=True, max_tokens=max_tokens,
+                                       temperature=temperature, env=self.env, ratios=ratios)
+        try:
+            return [[int(token) for token in output.split()] for output in outputs]
+        except ValueError as exc:
+            raise RuntimeError("formers-cli did not return space-separated token IDs") from exc
+
     def _generate(self, args, stream, stderr_callback):
         process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    text=True, bufsize=1, env=self._subprocess_env())

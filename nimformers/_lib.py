@@ -341,6 +341,18 @@ def _bind(lib: ct.CDLL) -> None:
     _fn(lib, "nimf_prog_compile", [V, V, CSTR], V)
     _fn(lib, "nimf_sess_dispatch", [V, CSTR, ct.POINTER(V), ct.POINTER(CI64), CI64, CI64, CI64], CINT)
 
+    parallel_ops = {
+        "nimf_parallel_create": ([CSTR, CSTR], V),
+        "nimf_parallel_destroy": ([V], CINT),
+        "nimf_parallel_partition": ([V, CI64, CSTR], V),
+        "nimf_parallel_vm_run": ([V, U32, CI64, F32, CI64, CI64, CI64, CI64, CI64,
+                                 CSTR, CSTR, F32], CINT),
+        "nimf_parallel_generate": ([V, CSTR], V),
+    }
+    for name, (args, restype) in parallel_ops.items():
+        if hasattr(lib, name):
+            _fn(lib, name, args, restype)
+
 
 def abi_version(lib: Optional[ct.CDLL] = None) -> int:
     """Return the numeric ABI version of the loaded library."""

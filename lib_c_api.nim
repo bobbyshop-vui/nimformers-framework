@@ -28,7 +28,7 @@
 ## * The library is not thread-safe for concurrent GPU calls on the same
 ##   context.  The error string is thread-local.
 
-import std/[math, strutils]
+import std/[json, math, strutils]
 import nimformers
 import backend
 import tensor_ops
@@ -88,6 +88,9 @@ type
 
   NimfLlama = object
     model: nfinfer.LlamaModelL
+
+  NimfParallel = object
+    group: ProcessGroup
 
 # =====================================================================
 # Error handling
@@ -2665,3 +2668,113 @@ proc nimf_sess_dispatch*(ctxHandle: pointer; kname: cstring; bufs: ptr pointer;
     ok()
   except CatchableError as e:
     fail(e.msg)
+
+# =====================================================================
+# Native device-parallel scheduling
+# =====================================================================
+
+proc jsonStrings(node: JsonNode): seq[string] =
+  if node == nil or node.kind != JArray:
+    raise newException(ValueError, "expected an array of strings")
+  for item in node:
+    if item.kind != JString: raise newException(ValueError, "expected a string")
+    result.add item.getStr()
+
+proc parallelRatios(text: cstring): seq[float64] =
+  if text == nil: return @[]
+  let value = parseJson($text)
+  if value.kind != JArray or value.len == 0:
+    raise newException(ValueError, "expected a nonempty array of device ratios")
+  for item in value:
+    if item.kind notin {JInt, JFloat}: raise newException(ValueError, "expected a numeric ratio")
+    result.add item.getFloat()
+
+proc parallelGroup(handle: pointer): ProcessGroup =
+  if handle == nil: raise newException(ValueError, "null process group")
+  cast[ptr NimfParallel](handle).group
+
+proc nimf_parallel_create*(devices, ratios: cstring): pointer
+    {.exportc: "nimf_parallel_create", cdecl, dynlib.} =
+  if devices == nil: return failPtr("missing parallel devices")
+  try:
+    let group = initProcessGroup(jsonStrings(parseJson($devices)), parallelRatios(ratios))
+    let handle = cast[ptr NimfParallel](allocShared0(sizeof(NimfParallel)))
+    if handle == nil: return failPtr("process group allocation failed")
+    handle.group = group
+    discard ok()
+    cast[pointer](handle)
+  except CatchableError as error:
+    failPtr(error.msg)
+
+proc nimf_parallel_destroy*(handle: pointer): cint
+    {.exportc: "nimf_parallel_destroy", cdecl, dynlib.} =
+  if handle != nil:
+    cast[ptr NimfParallel](handle).group = nil
+    deallocShared(handle)
+  ok()
+
+proc parallelJson(value: JsonNode): cstring =
+  result = allocCString($value)
+  if result == nil: return failCString("parallel result allocation failed")
+  discard ok()
+
+proc nimf_parallel_partition*(handle: pointer; length: int64; ratios: cstring): cstring
+    {.exportc: "nimf_parallel_partition", cdecl, dynlib.} =
+  try:
+    if length < 0 or length > high(int).int64: return failCString("invalid partition length")
+    parallelJson(%parallelGroup(handle).partition(int(length), parallelRatios(ratios)))
+  except CatchableError as error:
+    failCString(error.msg)
+
+proc nimf_parallel_vm_run*(handle: pointer; words: ptr uint32; wordsLen: int64;
+    memory: ptr cfloat; memoryLen, itemSize, threadsPerItem, tgFloats, tgSize: int64;
+    ratios, workerPath: cstring; output: ptr cfloat): cint
+    {.exportc: "nimf_parallel_vm_run", cdecl, dynlib.} =
+  if words == nil or wordsLen <= 0 or wordsLen > high(int32).int64 or
+      memoryLen < 0 or memoryLen > high(int32).int64 or
+      (memoryLen > 0 and (memory == nil or output == nil)) or
+      itemSize <= 0 or itemSize > high(int32).int64 or
+      threadsPerItem <= 0 or threadsPerItem > high(int32).int64 or
+      tgFloats < 0 or tgFloats > high(int32).int64 or tgSize < 0 or tgSize > high(int32).int64:
+    return fail("invalid parallel micro-VM arguments")
+  try:
+    var code = newSeq[uint32](int(wordsLen))
+    copyMem(addr code[0], words, code.len * sizeof(uint32))
+    let values = runVmParallel(parallelGroup(handle), code, inputValues(memory, int(memoryLen)),
+      int(itemSize), int(threadsPerItem), int(tgFloats), int(tgSize),
+      parallelRatios(ratios), (if workerPath == nil: "" else: $workerPath))
+    writeValues(output, values)
+    ok()
+  except CatchableError as error:
+    fail(error.msg)
+
+proc nimf_parallel_generate*(handle: pointer; request: cstring): cstring
+    {.exportc: "nimf_parallel_generate", cdecl, dynlib.} =
+  if request == nil: return failCString("missing parallel generation request")
+  try:
+    let value = parseJson($request)
+    let maxTokens = value{"max_tokens"}
+    let temperature = value{"temperature"}
+    let tokenIds = value{"token_ids"}
+    if value.kind != JObject or value{"executable"}.getStr().len == 0 or
+        maxTokens == nil or maxTokens.kind != JInt or temperature == nil or
+        temperature.kind notin {JInt, JFloat} or (tokenIds != nil and tokenIds.kind != JBool):
+      return failCString("invalid parallel generation request")
+    var environment: seq[(string, string)]
+    var unsetEnvironment: seq[string]
+    let env = value{"env"}
+    if env != nil and env.kind != JObject: return failCString("expected an environment mapping")
+    if env != nil:
+      for key, val in env:
+        if val.kind == JNull: unsetEnvironment.add key
+        elif val.kind == JString: environment.add (key, val.getStr())
+        else: return failCString("expected an environment string or null")
+    let options = value{"ratios"}
+    let ratios = if options == nil or options.kind == JNull: @[] else: parallelRatios(cstring($options))
+    let results = runFormersBatch(parallelGroup(handle), value["executable"].getStr(),
+      jsonStrings(value{"args"}), jsonStrings(value{"prompts"}), tokenIds.getBool(),
+      value["max_tokens"].getInt(), value["temperature"].getFloat(), environment, ratios,
+      unsetEnvironment = unsetEnvironment)
+    parallelJson(%results)
+  except CatchableError as error:
+    failCString(error.msg)

@@ -75,14 +75,14 @@ MIGRATE_LORA_BIN := migrate_lora_json_to_bin$(EXE_EXT)
 MAMBA3_HF_FINETUNE_BIN := mamba3_hf_finetune_bin$(EXE_EXT)
 NIM_INFER_BIN   := nim_inference$(EXE_EXT)
 SPECTRON_BIN    := test_inferencespectron$(EXE_EXT)
-CLEAN_BINS      := $(TEST_BIN) $(GRAFT_BIN) $(FINETUNE_BIN) $(INFER_LORA_BIN) $(C_API_LIB) \
+CLEAN_BINS      := $(TEST_BIN) $(GRAFT_BIN) $(FINETUNE_BIN) $(INFER_LORA_BIN) $(C_API_LIB) nimformers-worker \
                    $(COMPACT_LORA_BIN) $(MIGRATE_LORA_BIN) $(MAMBA3_HF_FINETUNE_BIN) $(NIM_INFER_BIN) $(SPECTRON_BIN) \
                    $(BYBYLANG_TEST_BINS) $(addsuffix .nim,$(BYBYLANG_TEST_BINS))
 
 .PHONY: shaders all build run run-cpu run-metal run-vulkan run-opencl run-cuda clean \
         download-models download-fir-models download-datasets download-codestral-tokenizer \
         build-graft build-finetune build-infer-lora build-compact-lora \
-        build-migrate-lora build-nim-inference build-spectron build-for-python \
+        build-migrate-lora build-nim-inference build-spectron build-shared build-for-python \
         python-test python-example c-example bybylang-test bench-gflops \
         graft finetune-mamba hf-train build-hf-train infer-lora infer-mamba infer-deepseek run-spectron mamba-pipeline \
         build-formers build-formers-arm64 formers-cli firlift formers flash-attention-test q4-gemv-test q4-gemm-test formers-test formers-fir-test formers-smoke formers-clean
@@ -305,10 +305,15 @@ build-spectron:
 	$(NIM) check $(NIMFLAGS) $(SPECTRON_SRC)
 	$(NIM) c $(NIMFLAGS) -o:$(SPECTRON_BIN) $(SPECTRON_SRC)
 
-build-for-python:
+build-shared:
 	$(NIM) check $(NIMFLAGS) --nimcache:$(C_API_CHECK_NIMCACHE) $(C_API_SRC)
 	$(NIM) c $(NIMFLAGS) --app:lib --nimcache:$(C_API_NIMCACHE) -o:$(C_API_LIB) $(C_API_SRC)
-	@echo "Built $(C_API_LIB) (C ABI v2); header: include/nimformers.h"
+	$(NIM) c $(NIMFLAGS) --nimcache:nimcache/shared-worker -o:nimformers-worker$(EXE_EXT) nimformers_worker.nim
+	@echo "Built $(C_API_LIB) (C ABI v2) and nimformers-worker$(EXE_EXT); header: include/nimformers.h"
+
+# Compatibility alias; Python is one consumer of the common shared runtime.
+build-for-python: build-shared
+	@echo "build-for-python is an alias for build-shared"
 
 python-test: build-for-python
 	@echo "[python-test] Suite: test/python_test"

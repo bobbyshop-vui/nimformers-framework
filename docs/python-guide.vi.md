@@ -217,6 +217,8 @@ cho Llama/DeepSeek tương thích loader. Ví dụ đầy đủ tại
 
 Với Codestral LoRA đã merge, package `formers` gọi inference native hoặc chạy
 graph FIR đã lift. [Python API của formers.n](../other/formers.n/README.md#python-api)
+Để chạy batch micro-VM hoặc batch prompt độc lập trên nhiều thiết bị,
+xem [thực thi song song trên nhiều thiết bị](distributed.vi.md).
 
 Huấn luyện Spectron và Codestral dùng entry point Nim. Từ Python có thể gọi
 trainer Spectron bằng `subprocess.run(["make", "run-metal"], cwd=repo, check=True)`.
