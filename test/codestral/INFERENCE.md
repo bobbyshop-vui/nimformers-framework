@@ -21,28 +21,21 @@ on the current input/weight shape; MPS is selected only when it wins by at
 least 3%. Other Macs and Vulkan use MSL/packed kernels. Logs report the device
 gate and per-shape choice as `[prefill-matrix] ... MSL=... MPS=... -> ...`.
 
-Metal prefill also has a native packed-FP4 GEMM (`kernels/gemm_fp4km.metal`): a 256-thread
-register-blocked kernel decodes each 32-value group of the packed weights once into threadgroup
-memory and reuses it for every row of the tile (BM = 16/32/64 chosen from the row count). On an
-Apple GPU `kernels/gemm_fp4km_sg.metal` runs the same math with `simdgroup_matrix` (8x8 float
-accumulators, 4 simdgroups per 64x64 tile); it lives in its own library that is compiled only on an
-Apple GPU, and it is admitted only after it reproduces the register-blocked kernel on 16 rows of a
-real projection (`[fp4-gemm] simdgroup_matrix parity ...`). `BYBY_PREFILL_FP4_GEMM=auto|rb|sg|off`
-selects the kernel; `BYBY_PREFILL_FP4_GEMM_MIN_ROWS` is the smallest prefill row count that uses it
-(default 8 on Apple GPUs, 32 elsewhere, where the 8-row micro-VM tiles are as fast below that).
-`BYBY_FP4_SG_COMPILE_CHECK=1` compiles the simdgroup source on any GPU without building a pipeline.
+Metal packed-FP4 prefill uses the shared [tile GEMM micro-kernel](../../vendor/bybylang/micro_kernel/tile_gemm.nim).
+The JIT uses register tiles on supported Metal devices and can use
+`simdgroup_matrix` on Apple GPUs. The simdgroup path passes a parity check on
+16 rows of a real projection before use. `BYBY_PREFILL_FP4_GEMM=auto|rb|sg|off`
+selects the path. `BYBY_PREFILL_FP4_GEMM_MIN_ROWS` defaults to 8 on Apple GPUs
+and 32 elsewhere. Shorter prompts use smaller packed VM tiles.
 
-The FP32 matmul kernels (`kernels/gemm_blocked.metal`) are register-blocked as well: 4x4, 2x4 or 1x4
-accumulators per thread over 64/32/16-row tiles. `BYBY_METAL_GEMM_RB=0` selects the older 8x8 kernels.
+The [Metal FP32 matmul kernels](../../vendor/bybylang/backends/metal/kernels/gemm_blocked.metal)
+also use register blocking.
 
-Vulkan inference checks device features and the exact cooperative-matrix tile
-before selecting a low-precision path. For FP4-KM prefill it prefers E4M3 FP8
-when supported, decoding packed weights into FP8 only as each tile is loaded;
-otherwise it uses the FP16-input/FP32-accumulate matrix kernel. FP32 sidecars
-also try the FP16 matrix path. Unsupported shapes, hardware, or shader compiler
-fall back to the existing packed VM/scalar kernels. No full dequantized weight
-copy is created. FP8 converts activations and decoded weights to E4M3, so it
-uses less precision than the FP16 route; startup logs identify the route chosen.
+Vulkan inference checks device features and the exact cooperative-matrix tile.
+For packed FP4-KM, the tile GEMM JIT converts weights as each tile is loaded and
+uses FP16 cooperative matrix inputs with FP32 accumulation. The packed buffers
+stay resident. When the cooperative kernel is unavailable, native prefill uses
+the packed VM tiles. FP32 sidecars can also use FP16 cooperative matmul.
 The prefill log counts tensor-core and packed dispatches. Scan
 defaults to `auto`, which benchmarks the serial and parallel scan on the
 selected GPU and caches the faster route for each shape; `coalesced` remains a
@@ -78,8 +71,11 @@ prompt used to compile and autotune twice (128 + 118 rows).
 When the SSD pass runs, the scan autotune (lane parity, serial/parallel timing) is skipped, since no
 scan kernel is encoded. `BYBY_PREFILL_LAYERS_PER_COMMIT` defaults to four on Metal, eight on Vulkan.
 
-`formers-cli` keeps 128-token chunks for Codestral unless `BYBY_UBATCH` is set: a lifted FIR graph
-holds one phase per chunk and tail length, and the lifted models were recorded with 128.
+Native resident prefill and the Codestral Vulkan recorder share a default
+512-row micro-batch. `formers-cli` sends the final prompt token through decode
+to produce logits. A 247-token prompt therefore typically records one 246-row
+phase. FIR replay uses those exact batch widths. See
+[Codestral on Vulkan](../../docs/fir-script-lift.md#codestral-on-vulkan).
 
 The prefill copies the Mamba parameters (`convW|convB`, `aLog|dSkip|dtBias|normW`) out of the
 decode work buffer. That buffer aligns every region to 64 floats, so the regions are adjacent only

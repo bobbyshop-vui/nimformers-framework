@@ -17,9 +17,13 @@ giải thích theo từng dòng cho DSL và các lời gọi C ABI.
 - `native_gpu_test.bybylang`: lệnh native DSL `gpu ...` trên cùng runtime
   `vendor/bybylang/gpubackend.nim`, cùng block `micro kernel ...:` phát
   bytecode rồi lower qua micro-VM Nimformers.
+- `cpu_test.bybylang`: chạy DSL, block `session:` và micro-kernel trên backend
+  CPU được chọn bằng `gpu backend is "cpu"`.
+- `trace_test.bybylang`, `diag_test.bybylang` và `cpu_kernel_regression.nim`:
+  kiểm tra core trace, chẩn đoán lỗi nguồn và kết quả kernel CPU.
 - `nim.cfg`: search path Nim khi executable sinh ra import `lib_c_api`,
   gồm module gốc và đường dẫn các module model cần dùng.
-- `run.sh`: compile AOT và chạy cả hai test.
+- `run.sh`: compile AOT, chạy các chương trình tích hợp và kiểm tra chẩn đoán.
 
 Chạy:
 
@@ -33,7 +37,8 @@ Runner đặt `BYBYLANG_NIMCACHE=nimcache/bybylang-test`, nên cache compiler
 được dọn qua cleanup `nimcache` thông thường. Các file sinh ra `*_bin` và
 `*_bin.nim` được git-ignore.
 
-Cả hai test cần GPU Metal/Vulkan như framework.
+Các ca `auto` dùng Metal hoặc Vulkan khi có. `cpu_test.bybylang` luôn chọn
+CPU và chạy được trên máy không có GPU.
 
 BybyLang phân tích dòng không phải command có `=` thành assignment
 `left = right`. Tránh `=` trong comment cuối dòng Nim thô; đặt comment

@@ -17,7 +17,10 @@ xem [API BybyLang](bybylang-api.vi.md) và
   `../../lib_c_api` như một module Nim. File kiểm tra ABI version, backend
   context, phép cộng, matmul, softmax, LayerNorm, lượng tử INT8, dispatch
   micro-VM và fused attention.
-- [`run.sh`](../test/bybylang_test/run.sh) compile AOT rồi chạy cả hai file.
+- [`cpu_test.bybylang`](../test/bybylang_test/cpu_test.bybylang) chọn trực tiếp
+  CPU và kiểm tra phép immediate, block session và CPU VM.
+- Bộ test còn kiểm tra cú pháp ngôn ngữ, core trace, chẩn đoán lỗi và kết quả
+  kernel CPU. Thứ tự chạy nằm trong runner. [`run.sh`](../test/bybylang_test/run.sh)
 - [`nim.cfg`](../test/bybylang_test/nim.cfg) cung cấp search path trong repo cho
   mã Nim sinh ra khi import `lib_c_api.nim`.
 
@@ -33,10 +36,10 @@ Chạy từ thư mục gốc repo:
 make bybylang-test
 ```
 
-Test cần Nim, compiler BybyLang vendored và GPU Metal hoặc Vulkan. Backend
-`auto` thử Metal trước trên macOS, sau đó thử Vulkan. Tên cũ `cuda` là alias
-của Vulkan. Parser có nhận `cpu`, nhưng native micro-kernel bắt buộc Metal hoặc
-Vulkan, nên toàn bộ suite không phải là test CPU.
+Test cần Nim và compiler vendored. Khi chọn `auto`, runtime thử Metal trên
+macOS, rồi Vulkan, rồi CPU. Dùng máy có GPU tương ứng để kiểm tra dispatch GPU.
+`cpu_test.bybylang` chọn CPU rõ ràng ngay cả khi máy có GPU. Tên cũ `cuda` ánh
+xạ sang Vulkan.
 
 Runner chỉ build `vendor/bybylang/bybylang` khi chưa có compiler executable.
 Sau khi sửa source compiler, cần build lại rõ ràng:

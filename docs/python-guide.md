@@ -194,17 +194,35 @@ responsible for buffer indexing and dispatch size; this example has exactly
 64 elements and 64 threads. See the [micro-VM API](microkernel-api.md).
 
 
+## Chain operations on resident buffers
+
+```python
+from nimformers import Context
+
+with Context("cpu") as ctx:
+    with ctx.buffer([[1, 2], [3, 4]]) as x, ctx.buffer([[2, 0], [0, 2]]) as w:
+        with ctx.buffer(size=4) as product, ctx.buffer(size=4) as scores:
+            with ctx.session() as sess:
+                sess.matmul(x, w, product, m=2, k=2, n=2)
+                sess.softmax(product, scores, rows=2, cols=2)
+            print(scores.read().reshape(2, 2))
+```
+
+With a Metal or Vulkan context, the product stays on the device and feeds
+softmax in the same submission. See the [resident Session API](python-api.md#resident-buffers-and-sessions).
+
 ## Model inference and invoking trainers
 
 Python provides `ctx.load_llama(configPath, nimqPath)` and `model.generate(...)`
 for Llama/DeepSeek models compatible with the loader. See
 [Python API — Llama inference](python-api.md#llama-inference) for an example.
 
-Spectron and Codestral LoRA use their Nim/CLI entry points for their own
-training/inference. There is no Python `SpectronModel.fit`, automatic
-`backward()`, or model-level Adam optimizer. Python can invoke a trainer
-with `subprocess.run(["make", "run-metal"], cwd=repo, check=True)`; Spectron
-configuration remains in source constants. See [Spectron](spectron-guide.md).
+For Codestral with merged LoRA, use the `formers` package to drive native
+inference or run the lifted FIR graph. [formers.n Python API](../other/formers.n/README.md#python-api)
+
+Spectron and Codestral training use Nim entry points. Python can invoke the
+Spectron trainer with `subprocess.run(["make", "run-metal"], cwd=repo, check=True)`.
+[Spectron walkthrough](spectron-guide.md)
 
 
 ## Tests and troubleshooting
@@ -218,8 +236,8 @@ make python-test PYTEST='python -m pytest' PYTEST_FLAGS=-q
 - Shared library missing: run `make build-for-python`, inspect
   `library_path()`, or set `NIMFORMERS_LIB` to the full file path.
 - Missing `nimf_*` symbols: rebuild and check for an older selected library.
-- No GPU/Metal access: check the runtime and process access to the device;
-  the package does not provide a replacement CPU backend.
+- For CPU math kernels and native sessions, use `Context("cpu")`. For Metal
+  micro-kernel dispatch, check device access and the Metal runtime.
 - C ABI shape/backend errors become `NimformersError`; Python input
   validation usually raises `ValueError` or `TypeError`.
 

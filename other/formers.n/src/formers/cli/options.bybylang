@@ -13,7 +13,7 @@ type
     prompt*, systemText*: string
     rawPrompt*: bool
     addSpecialTokens*: bool
-    promptIds*: seq[int]          ## --prompt-ids: FIR graph models read/print token ids, no tokenizer
+    promptIds*: seq[int]          ## --prompt-ids: FIR graph reads and prints token IDs
     nPredict*: int
     temperature*, topP*, minP*, repeatPenalty*: float32
     repeatLastN*: int
@@ -66,8 +66,8 @@ function fmUsage(): string
     lines.add("  --system TEXT          system prompt (chat template)")
     lines.add("  --raw, --raw-prompt     do not apply the chat template")
     lines.add("  --add-special-tokens   FIR graph: apply tokenizer BOS/EOS processing to the prompt")
-    lines.add("  --prompt-ids A,B,C     FIR graph: comma-separated prompt token ids; no tokenizer is needed and the")
-    lines.add("                         generated token ids are printed space-separated instead of text")
+    lines.add("  --prompt-ids A,B,C     FIR graph: supply prompt token IDs and print generated token IDs")
+    lines.add("                         Codestral FIR requires the original tokenizer even in ID mode")
     lines.add("  -n, --n-predict N      maximum tokens to generate (default 128)")
     lines.add("  --temp T               temperature (default 0.7; 0 = greedy)")
     lines.add("  --top-p P              nucleus sampling (default 0.9; 1 = off)")
@@ -78,7 +78,8 @@ function fmUsage(): string
     lines.add("")
     lines.add("Chat (like llama-cli):")
     lines.add("  -cnv, --conversation   multi-turn chat, context (KV/state) kept between turns")
-    lines.add("  -i, --interactive      same as -cnv (Llama, Mamba-2, Mamba-3 and FIR graph models; the chat template comes from the model folder)")
+    lines.add("  -i, --interactive      same as -cnv (Llama, Mamba-2, Mamba-3 and compatible FIR graphs)")
+    lines.add("                         Codestral FIR accepts a single prompt with -p")
     lines.add("                         in chat -p is the system prompt; -n limits each reply")
     lines.add("  -c, --ctx-size N       context size in tokens (Llama chat default 1024; FIR graph models: up to their positions)")
     lines.add("                         type /exit to quit; Ctrl+C stops a reply, Ctrl+C at the prompt quits;")
@@ -94,7 +95,7 @@ function fmUsage(): string
     lines.add("  --no-warmup            skip the startup warmup (GPU pipeline compile) before the first prompt")
     lines.add("  -v, --verbose          show every log line (loader, JIT, kernel tuning, profiles); default: quiet")
     lines.add("  --detect-only          detect the architecture and exit")
-    lines.add("  --fir FILE             use a FIR model file (Mamba-3 resident provider or a self-contained graph)")
+    lines.add("  --fir FILE             use a FIR graph or a Mamba-3 kernel provider")
     lines.add("  --fir-f32             keep q4 matrices of a FIR graph model in fp32 (correctness reference)")
     lines.add("  --fir-check FILE       resolve FIR kernel names and build programs without weights")
     lines.add("  -h, --help             show this help")

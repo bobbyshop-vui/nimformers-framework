@@ -3,9 +3,13 @@
 [English](trace-api.md) | [Tiếng Việt](trace-api.vi.md)
 
 A **trace** records what a model run did on the GPU: the buffers, the micro-VM programs, every
-dispatch, and the host inputs of each step. The FIR lifter (`firlift`) turns a trace into a
-`model.fir`, which `formers-cli` then runs without the original code. `nf.trace` is the one API for
-starting and stopping the recorder from Python, Nim, BybyLang and C.
+dispatch, and the host inputs of each step. The FIR lifter (`firlift`) turns a
+trace into a `model.fir` for `formers-cli`. `nf.trace` starts and stops the
+file recorder from Python, Nim, BybyLang and C.
+
+[Codestral on Vulkan](fir-script-lift.md#codestral-on-vulkan) uses `firlift --run`
+to collect trace metadata in memory and produces `model.fir` and `config.json`.
+Replay loads the original checkpoint and adapter.
 
 ```text
 your model code ──nf.trace──▶ run.fprobe (+ run.fprobe.data) ──firlift──▶ model.fir ──formers-cli──▶ tokens

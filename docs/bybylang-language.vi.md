@@ -2,12 +2,14 @@
 
 [English](bybylang-language.md) | [Tiếng Việt](bybylang-language.vi.md)
 
-Đây là bản song ngữ được theo dõi trong framework của [README BybyLang vendored](../vendor/bybylang/readme.md). Ví dụ micro-kernel nhiều group tính chỉ số toàn cục từ group/local ID.
+Tài liệu tham chiếu BybyLang song ngữ của framework. Xem API GPU để biết cách
+quản lý buffer ánh xạ với host, replay lệnh và encode phép prefill.
+[API BybyLang](bybylang-api.vi.md) · [README vendored](../vendor/bybylang/readme.md)
 
 DSL viết bằng Nim, compile AOT sang source Nim rồi thành binary native.
-Lệnh `gpu ...` tạo phép toán tensor; `session:` gom các phép được hỗ trợ;
-`micro kernel` định nghĩa kernel VM BybyLang native để lower sang code GPU
-Metal/Vulkan. Ngôn ngữ còn có điều khiển luồng và lệnh mô phỏng phần cứng.
+Lệnh `gpu ...` tạo phép toán tensor. `session:` gom các phép được hỗ trợ.
+`micro kernel` tạo bytecode VM để lower sang Metal/Vulkan hoặc chạy bằng
+trình thông dịch CPU. Ngôn ngữ còn có điều khiển luồng và lệnh mô phỏng phần cứng.
 
 
 ## Build và chạy
@@ -336,12 +338,12 @@ chuyển sang Vulkan.
 
 ## 5. Micro-kernel BybyLang native
 
-Viết block `micro kernel` trực tiếp trong `.bybylang`, không cần module
-Nim helper hay import micro-kernel ngoài. Compiler tạo `VmProgram`, lower
-sang Metal/Vulkan, dispatch trong session GPU rồi đọc output:
+Compiler `.bybylang` tạo `VmProgram` từ block `micro kernel`. CPU VM thông
+dịch bytecode. Nhánh GPU lower sang Metal hoặc Vulkan và đọc output sau khi
+dispatch.
 
-```text
-gpu backend is "vulkan"
+```bybylang
+gpu backend is "cpu"
 gpu array INPUT = [1, 2, 3, 4, 5, 6, 7, 8]
 
 micro kernel scale INPUT -> OUTPUT threads 8 tg 4 out 8:
@@ -365,12 +367,11 @@ ID thread/group, bộ nhớ group và barrier, atomic, helper virtual group.
 Thanh ghi integer 32-bit; thanh ghi float là float32. Mỗi lệnh nhận chỉ số
 thanh ghi/offset theo khai báo trong `micro_kernel/session_vm.nim`.
 
-Header DSL là `micro kernel NAME INPUT -> OUTPUT threads N tg N out N:`;
-thân thụt dòng nhận các lệnh `emit...`. `threads` là tổng thread dispatch,
-`tg` là số thread/group, `out` là số phần tử output. Chọn kích thước và
-chặn truy cập để mọi thread ở trong giới hạn. Nhánh này cần Metal/Vulkan,
-báo lỗi với CPU/backend không hỗ trợ. Kernel phức tạp có thể tạo
-`VmProgram` từ Nim sau khi import `vendor/bybylang/bybylang`, rồi gọi
+Header đặt tổng số thread dispatch, số thread mỗi group và số phần tử output.
+Ví dụ dùng `group_id * 4 + local_id` để xử lý cả hai group và in
+`@[2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0]`. Chọn kích thước hoặc kiểm tra
+địa chỉ để mọi thread truy cập trong giới hạn. Từ Nim, import
+`vendor/bybylang/bybylang`, tạo `VmProgram` rồi gọi trực tiếp
 `executeMicroKernel(backend, kernelName, program, input, outputElems, threads, tgSize)`.
 
 ---

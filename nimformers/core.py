@@ -11,6 +11,7 @@ import numpy as np
 from ._lib import F32, I32, I64, U8, get_library, NimformersError
 from .model import LlamaConfig, LlamaModel
 from .quant import KIND_IDS, QuantTensor
+from .session import Buffer, Session
 from .state import StateDict
 from .tensor import Tensor
 from .tokenizer import SentencePieceTokenizer, Tokenizer
@@ -566,6 +567,14 @@ class Context:
 
     def resident_q4(self, weight: QuantTensor) -> ResidentQ4Weights:
         return ResidentQ4Weights(self, weight)
+
+    def buffer(self, data=None, *, size: Optional[int] = None) -> Buffer:
+        """Allocate resident float32 storage from data or a zero-filled size."""
+        return Buffer(self, data, size)
+
+    def session(self) -> Session:
+        """Create a session for operations on resident buffers."""
+        return Session(self)
 
     # -- neural-network kernels ----------------------------------------
     def softmax(self, x, axis: int = -1) -> np.ndarray:

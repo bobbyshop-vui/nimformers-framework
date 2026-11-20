@@ -40,6 +40,7 @@ This directory is the user documentation for the public Nimformer APIs. Use the 
 - [Trace API](trace-api.md): `nf.trace` for Python, Nim, BybyLang and C: record a run into a FIR trace, then lift it to `model.fir`.
 - [nfgraph2torch](nfgraph2torch.md): convert a torch module to FIR / `model.fir` (ATen replay plus micro-kernels).
 - [FIR (formers IR)](fir.md): model-side graph file naming micro-kernels, backend kernels and dimensions; `--fir` and `--fir-check` in formers.n.
+- [Codestral FIR on Vulkan](fir-script-lift.md#codestral-on-vulkan) covers recording in memory, reusing the original checkpoint and adapter, and comparing native and FIR token IDs.
 - [BybyLang integration tests](../test/bybylang_test/README.md): BybyLang scripts that import `lib_c_api` and exercise the C ABI plus the native `gpu ...` DSL.
 - [BybyLang test API reference](bybylang-tests.md): run and extend the two `.bybylang` tests, with every DSL command and C ABI call explained.
 - [BybyLang GPU API and DSL](bybylang-api.md): GPU backend functions, DSL syntax, session blocks, imports, and native micro-kernel blocks.
@@ -57,6 +58,7 @@ This directory is the user documentation for the public Nimformer APIs. Use the 
 | `backend.nim` | [Backend API](backend-api.md), [GPU Session API](gpu-session-api.md), [CPU Backend](cpu-backend.md) |
 | `tensor_ops.nim` | [Tensor Operations API](tensor-ops-api.md) |
 | `trace.nim` | [Trace API](trace-api.md) |
+| `other/formers.n/` | [Runner and module API](../other/formers.n/README.md), [FIR format](../models/FIR.md), [Core trace lifter](fir-script-lift.md) |
 | `nimformer.nim` | [Base Model API](base-model-api.md) |
 | `test/deepseek-inference/nim_inference.nim` | [LLaMA Inference API](llama-inference-api.md), [Tokenizer APIs](tokenizer-api.md) |
 | `test/codestral/jamba_hybrid.nim` | [Hybrid Jamba Model API](jamba-model-api.md) |

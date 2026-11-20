@@ -3,9 +3,13 @@
 [English](trace-api.md) | [Tiếng Việt](trace-api.vi.md)
 
 **Trace** ghi lại việc một lần chạy model đã làm trên GPU: các buffer, các chương trình micro-VM, mọi
-dispatch và các đầu vào host của từng bước. Bộ lift FIR (`firlift`) biến trace thành `model.fir`, rồi
-`formers-cli` chạy file đó mà không cần code gốc. `nf.trace` là API duy nhất để bật và tắt recorder
-từ Python, Nim, BybyLang và C.
+dispatch và các đầu vào host của từng bước. Lifter `firlift` chuyển trace thành
+`model.fir` cho `formers-cli`. `nf.trace` bật và tắt trình ghi ra file từ
+Python, Nim, BybyLang và C.
+
+[Codestral trên Vulkan](fir.vi.md#codestral-trên-vulkan) dùng `firlift --run`
+để thu metadata trace trong RAM và tạo `model.fir` cùng `config.json`. Khi
+chạy lại, runner nạp checkpoint và adapter gốc.
 
 ```text
 code model ──nf.trace──▶ run.fprobe (+ run.fprobe.data) ──firlift──▶ model.fir ──formers-cli──▶ token

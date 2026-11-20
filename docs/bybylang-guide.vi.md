@@ -12,6 +12,8 @@ Có ba cách dùng runtime trong repo:
 Các cách này dùng runtime vendored trong `vendor/bybylang/`.
 Xem [BybyLang API](bybylang-api.vi.md) cho signatures,
 [GPU sessions](gpu-session-api.vi.md) và [micro-VM](microkernel-api.vi.md) cho API sâu hơn.
+Gói Python gọi C ABI của framework qua thư viện native dùng chung.
+[Hướng dẫn Python](python-guide.vi.md)
 
 
 ## Build compiler và chạy ví dụ có sẵn
@@ -32,7 +34,7 @@ chưa chạy các phép tính trong binary; dòng cuối mới chạy chúng. Bi
 `BYBYLANG_NIMCACHE` chọn thư mục cache compiler, không phải đường dẫn output.
 Kiểm tra tùy chọn CLI bằng `./vendor/bybylang/bybylang --help`.
 
-Cách chạy cả hai test native DSL và C ABI:
+Chạy bộ kiểm thử tích hợp:
 
 ```sh
 make bybylang-test
@@ -111,6 +113,7 @@ print OUT
 vào U0, nên ví dụ chỉ đánh địa chỉ đúng cho một group; khi dùng nhiều group
 cần tính global index từ group ID và local ID. Hai số 0 cuối các lệnh
 load/store ở đây là address register và offset, không được bỏ thiếu.
+Dùng `gpu backend is "cpu"` để chạy ví dụ qua CPU VM.
 
 
 ## Gọi C ABI từ `.bybylang`

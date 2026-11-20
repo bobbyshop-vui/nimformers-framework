@@ -26,13 +26,15 @@ The loader checks the complete shape and copies values in row-major order.
 Rank-2 matrices keep their resident storage for external linear and embedding
 calls. Unknown layout values are rejected. The Python exporter writes `layout script`.
 
-`script_abi 1` opts a `layout script` file into the versioned script contract.
+`script_abi 1` and `script_abi 2` select versioned contracts for `layout script`.
 `require feature weights_bf16` and `require feature weights_f16` declare required
-checkpoint conversion capabilities. Layout is resolved before these directives,
+checkpoint conversion capabilities. ABI 2 plus `require feature resident_q4`
+enables `q4r` or `q4r<G>` weights and `outN` slot bindings in raw kernels.
+Layout is resolved before these directives,
 so it may appear later in the file. Unknown ABI versions and required features
 fail during parsing, before weight upload. Both directives require `layout script`;
 script files without `script_abi` retain the legacy instruction contract.
-ABI 1 requires immutable float loop-count registers inside their loops and shift
+The versioned contracts require immutable float loop-count registers inside their loops and shift
 counts in 0..31. See [the script contract](../models/FIR.md) for loading rules and
 the instruction whitelist.
 
@@ -43,6 +45,7 @@ the instruction whitelist.
 | `micro` | a registered micro-kernel (VM bytecode, JIT-compiled on GPU) | `node scan micro m3.ssm_step ...` |
 | `ext` | a backend kernel by name (Q4 GEMV, embedding) | `node project ext m3.gemv_q4 ...` |
 | `builtin` | small ops (`rms_norm`, `add`) | `node r builtin add ...` |
+| `session` | a supported native session call with recorded attributes | `node add session sessionVecOp:op=add,n=128 a b -> c` |
 
 ## Use
 
@@ -61,6 +64,16 @@ other/formers.n/formers-cli --models test/mamba3/models \
 
 With `--fir`, formers.n prints `FIR: provider used for N programs`. Without it the
 runtime keeps its direct builders; output is the same.
+
+## Codestral on Vulkan
+
+`firlift --run` lifts the single-prompt native run from trace metadata in RAM.
+Use the original base `.nimq`, adapter, and tokenizer when running the lifted
+`model.fir` and `config.json`. The graph declares `require feature codestral_resident`
+and uses `initnative` to bind weights and state prepared by the native loader.
+FIR replay uses the recorded prefill widths. Use `-p` with the same tokenizer
+and prompt settings to compare `[codestral-tokens]` with native. See the
+[record and replay commands](fir-script-lift.md#codestral-on-vulkan).
 
 ## Tests
 

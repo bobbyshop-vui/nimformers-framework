@@ -1,9 +1,11 @@
+import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from formers import Model
+from formers import Model, check_fir
 
 
 class FormersTests(unittest.TestCase):
@@ -11,13 +13,31 @@ class FormersTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.cli = Path(self.temp.name) / "formers-cli"
         self.cli.write_text("""#!/usr/bin/env python3
+import os
 import sys
 args = sys.argv[1:]
+if '--detect-only' in args:
+    print('arch: fir', file=sys.stderr)
+    sys.exit(0)
+if '--fir-check' in args:
+    print('checked:' + args[args.index('--fir-check') + 1])
+    sys.exit(0)
 if '-cnv' not in args:
     if '--fail' in args:
         print('runtime issue', file=sys.stderr)
         sys.exit(1)
-    print('answer:' + args[args.index('-p') + 1], end='', flush=True)
+    if '--fir' in args:
+        for flag in ('--model', '--lora', '--config', '--tokenizer', '--fir'):
+            print(flag + '=' + args[args.index(flag) + 1], file=sys.stderr)
+        if os.getenv('BYBY_CODESTRAL_TOKEN_IDS') == '1':
+            print('[codestral-tokens] 781 1117', file=sys.stderr)
+        if 'BYBY_FIR_DECODE_REPLAY' not in os.environ:
+            print('decode replay: default', file=sys.stderr)
+    if '--prompt-ids' in args:
+        assert args.count('--prompt-ids') == 1
+        print(args[args.index('--prompt-ids') + 1].replace(',', ' '))
+    else:
+        print('answer:' + args[args.index('-p') + 1], end='', flush=True)
 else:
     while True:
         print('\\n> ', end='', flush=True)
@@ -45,6 +65,63 @@ else:
         model = Model("models", cli_path=self.cli, backend="cpu", fir_f32=True)
         self.assertEqual(model.generate("hello"), "answer:hello")
         self.assertEqual(list(model.generate("world", stream=True)), ["answer:world"])
+
+    def test_codestral_fir_uses_original_adapter_and_reports_diagnostics(self):
+        model = Model(
+            "models", cli_path=self.cli, backend="vulkan", model="base.nimq",
+            lora="original adapter.bin", config="lifted/config.json", tokenizer="hf",
+            fir="lifted/model.fir",
+            env={"BYBY_CODESTRAL_TOKEN_IDS": 1, "BYBY_FIR_DECODE_REPLAY": None},
+        )
+        messages = []
+        with patch.dict(os.environ, {"BYBY_FIR_DECODE_REPLAY": "0"}):
+            text = model.generate("a prompt\nwith a '$'", temperature=0,
+                                  stderr_callback=messages.append)
+            self.assertEqual(os.environ["BYBY_FIR_DECODE_REPLAY"], "0")
+        self.assertEqual(text, "answer:a prompt\nwith a '$'")
+        self.assertEqual(messages, [
+            "--model=base.nimq", "--lora=original adapter.bin", "--config=lifted/config.json",
+            "--tokenizer=hf", "--fir=lifted/model.fir", "[codestral-tokens] 781 1117",
+            "decode replay: default",
+        ])
+
+    def test_generate_ids_replaces_default_prompt_ids(self):
+        model = Model("models", cli_path=self.cli, prompt_ids="0,1")
+        self.assertEqual(model.generate_ids([5, 17]), [5, 17])
+        with self.assertRaises(ValueError):
+            model.generate_ids([])
+
+    def test_inspection_commands(self):
+        self.assertEqual(Model("models", cli_path=self.cli).detect(), "arch: fir")
+        self.assertEqual(check_fir(Path("lifted/model.fir"), cli_path=self.cli),
+                         "checked:lifted/model.fir")
+
+    def test_lift_fir_records_the_native_cli_with_original_weights_and_adapter(self):
+        lifter = self.cli.parent / "firlift" / "firlift"
+        lifter.parent.mkdir()
+        lifter.write_text("""#!/usr/bin/env python3
+import json
+import sys
+print(json.dumps(sys.argv[1:]), flush=True)
+print('recorded in memory: upload data 0 bytes', file=sys.stderr, flush=True)
+""")
+        lifter.chmod(0o755)
+        model = Model("models", cli_path=self.cli, backend="vulkan", lora="original adapter.bin",
+                      fir="lifted/model.fir", config="lifted/config.json", prompt_ids="0,1")
+        logs = []
+        path = model.lift_fir("prompt", "lifted", config="hf/config.json", weights="base.nimq",
+                              context=512, log_callback=logs.append)
+        command = json.loads(logs[0])
+        run = command.index("--run")
+        self.assertEqual(command[:run], ["--config", "hf/config.json", "--weights", "base.nimq",
+                                         "--out", "lifted", "--report", "--context", "512"])
+        self.assertEqual(command[run + 1:], [
+            str(self.cli), "--models", "models", "--backend", "vulkan", "--lora", "original adapter.bin",
+            "--config", "hf/config.json", "-m", "base.nimq", "-p", "prompt", "-n", "4", "--temp", "0",
+            "--repeat-penalty", "1.0", "--no-progress",
+        ])
+        self.assertEqual(logs[1], "recorded in memory: upload data 0 bytes")
+        self.assertEqual(path, Path("lifted/model.fir"))
 
     def test_chat_keeps_process_for_turns(self):
         with Model("models", cli_path=self.cli).chat() as chat:

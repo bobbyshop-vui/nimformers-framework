@@ -13,6 +13,11 @@ The ABI version is **2** and is reported by `nimf_abi_version()`.  Backend
 selection includes `"cpu"`, a runtime-dispatched SIMD backend (SSE4/AVX2/
 AVX-512/NEON) that needs no GPU; see [CPU Backend](cpu-backend.md).
 
+`nimformers` exposes in-process kernels, checkpoints, tokenizers, micro-kernels,
+and Llama generation. The separate `formers` Python package drives
+`formers-cli` for its supported model families and FIR graphs.
+[formers.n Python API](../other/formers.n/README.md#python-api)
+
 For installation, runnable examples, checkpoint inspection, and troubleshooting
 see the [Python walkthrough](python-guide.md). For Make target
 inputs and outputs, see the [Make command guide](make-commands.md).
@@ -294,15 +299,43 @@ forces the threads per threadgroup (0 = backend default).
 
 ## Resident buffers and sessions
 
-A model needs weights and state that stay on the GPU between dispatches. `Buffer` holds float32
-data on the device and `Session` encodes many dispatches before one submit. Dispatch needs the
-Metal backend (`ctx.backend == "metal"`); buffers and programs are created through the context.
+`Buffer` holds flat float32 storage on the context backend. `ctx.buffer(data)`
+uploads data and `ctx.buffer(size=n)` allocates zeros. Close buffers before
+closing their context. Both `Buffer(ctx, ...)` and `ctx.buffer(...)` support
+`with`.
+
+Use `with ctx.session() as sess:` to group native operations. The session
+submits on exit, then `Buffer.read()` copies results back to NumPy. These
+operations use the CPU, Metal, or Vulkan implementations of the corresponding
+BybyLang session calls. Build the current shared library with
+`make build-for-python` to use these additions to ABI v2.
+
+| Python method | Nim / BybyLang call |
+| --- | --- |
+| `sess.copy_into(src, dst, n, src_offset=0, dst_offset=0)` | `sessionCopyInto`. Offsets and lengths count floats. Ranges in the same buffer must be disjoint. |
+| `sess.matmul(a, b, out, m=..., k=..., n=..., transpose_b=False)` | `sessionMatmul` or `sessionMatmulNT`. Store `b` as `(k, n)` by default and `(n, k)` with `transpose_b=True`. |
+| `sess.matmul_q4(x, weight, out, rows=...)` | `sessionMatmulQ4`. Pass the handle returned by `ctx.resident_q4` and an output with `rows * weight.n` floats. |
+| `sess.softmax(x, out, rows=..., cols=...)` | `sessionSoftmax` over the columns of each row. |
+| `sess.layernorm(x, gamma, beta, out, rows=..., cols=..., eps=1e-5)` | `sessionLayernormEnc`. `gamma` and `beta` each supply `cols` values. |
+| `sess.rmsnorm(x, gamma, out, rows=..., cols=..., eps=1e-5)` | `sessionRmsnormEnc`. `gamma` supplies `cols` values. |
+| `sess.attention(q, k, v, out, scores, batch=..., heads=..., steps=..., dim=..., scale=None)` | `sessionAttentionFusedEnc`. Causal attention with `(batch, heads, steps, dim)` data and `(batch, heads, steps, steps)` scores. Defaults to `1 / sqrt(dim)`. |
+| `sess.vec_op(op, a, b, out)` | `sessionVecOp` over `out.size` elements. Operations are `add`, `sub`, `mul`, and `div`. |
+| `sess.activation(op, x, out, p=0.0)` | `sessionActivation` over `out.size` elements. Operations are `relu`, `sigmoid`, `tanh`, `exp`, `log`, `sqrt`, and `pow` with exponent `p`. |
+
+Use row-major input data and buffers belonging to the session's context.
+The math methods write into a distinct output buffer sized exactly for the
+result. On GPUs the operations are submitted together. On CPU they execute
+as each method is called.
+
+To dispatch a custom resident micro-kernel, use `Session.compile` and
+`Session.dispatch` with a Metal context. For standalone bytecode on other
+backends, use `ctx.vm_run`.
 
 ```python
 import numpy as np
 from nimformers import Buffer, Context, Op, Session
 
-with Context() as ctx:
+with Context("metal") as ctx:
     x = Buffer(ctx, np.arange(64, dtype=np.float32))     # weights / input
     y = Buffer(ctx, size=64)                              # zero-filled state
     p = ctx.vm_program()
@@ -413,7 +446,7 @@ program keys) must be released with `nimf_free_string()`.
 | `quant.nim` | `nimf_quantize` / `nimf_quant_dequantize`, payload accessors, NIMQ state dicts |
 | `customfloat.nim` | encode/decode, APF dtype selection, APF training cast |
 | `vendor/bybylang/micro_kernel` | program builder, `.bvm` I/O, lowering, dispatch |
-| `session_low.nim` / `session_vm_dispatch.nim` | resident buffers, sessions, stateful dispatch (`nimf_buf_*`, `nimf_sess_*`, `nimf_prog_compile`) |
+| `vendor/bybylang/gpubackend.nim`, `session_vm_dispatch.nim` | `Buffer`, native `Session` operations, and stateful Metal micro-kernel dispatch (`nimf_buf_*`, `nimf_sess_*`, `nimf_prog_compile`) |
 | `trace.nim` | FIR trace recorder (`nimf_trace_*`, `nimf_probe_step`) |
 | `test/deepseek-inference/native_hf_tokenizer.nim` | HF tokenizer |
 | `test/codestral/sentencepiece_native.nim` | SentencePiece tokenizer |
@@ -423,10 +456,9 @@ The layer/model classes in `nimformer.nim` (`Linear`, `LayerNorm`,
 `CausalSelfAttention`, `FeedForward`, `TransformerBlock`, `NimformerModel`)
 and the Jamba/Mamba layer caches are Nim-side compositions of these kernels;
 Python code composes the same primitives (`matmul_nt`, `layernorm`,
-`attention`, `linear_q4`, resident weights, ...).  Model-specific
-applications (`infer_lora`, Jamba/Hybrid training, Spectron training) remain
-command-line programs; their building blocks are available through the APIs
-above.
+`attention`, `linear_q4`, resident weights). For Codestral inference and
+resident FIR generation, use the `formers` package. Jamba/Hybrid and
+Spectron training use the Nim training entry points.
 
 The wrapper has no automatic differentiation engine or model-level Adam/`fit`
 API. Backward kernels such as `layernorm_backward` and `attention_backward`

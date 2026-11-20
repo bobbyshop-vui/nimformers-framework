@@ -23,7 +23,10 @@ For a line-by-line explanation of the DSL and C ABI calls, see the
   required.
 - `nim.cfg` — extra Nim search paths needed when the generated executable
   imports `lib_c_api` (root modules plus the model-specific paths it uses).
-- `run.sh` — AOT-compiles and runs both tests.
+- `trace_test.bybylang`, `diag_test.bybylang` and `cpu_kernel_regression.nim`
+  cover core tracing, source diagnostics and CPU kernel results.
+- `run.sh` — AOT-compiles and runs the integration programs and checks their
+  diagnostic output.
 
 Run:
 
@@ -37,7 +40,8 @@ The runner sets `BYBYLANG_NIMCACHE` to `nimcache/bybylang-test`, so the
 generated Nim files and binaries can be cleaned with the normal `nimcache`
 cleanup. Generated `*_bin` / `*_bin.nim` files are git-ignored.
 
-Both tests need a Metal or Vulkan GPU, like the rest of the framework.
+The `auto` cases use Metal or Vulkan when available. `cpu_test.bybylang`
+always selects the CPU VM and also runs on machines without a GPU.
 
 BybyLang parses every non-command line containing `=` as an assignment
 (`left = right`).  Avoid `=` inside trailing comments on raw Nim lines; put

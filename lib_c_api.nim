@@ -28,7 +28,7 @@
 ## * The library is not thread-safe for concurrent GPU calls on the same
 ##   context.  The error string is thread-local.
 
-import std/strutils
+import std/[math, strutils]
 import nimformers
 import backend
 import tensor_ops
@@ -57,6 +57,7 @@ const
 type
   NimfContext = object
     backend: Backend
+    sessionOpen: bool
 
   NimfTensor = object
     data: seq[float32]
@@ -74,6 +75,7 @@ type
 
   NimfResidentQ4 = object
     weight: byby.ResidentWeightHandle
+    owner: pointer
 
   NimfResidentF32 = object
     weight: byby.SessionHandle
@@ -752,6 +754,7 @@ proc nimf_resident_q4_upload*(ctxHandle: pointer; packed: ptr uint8;
     h.weight = beResidentUploadQ4(requireContext(ctxHandle), bytes,
       inputValues(scales, int(scaleLen)), inputValues(zeros, int(zeroLen)),
       int(k), int(n), int(groupSize), int(groupsPerRow))
+    h.owner = ctxHandle
     discard ok()
     cast[pointer](h)
   except CatchableError as e:
@@ -2311,7 +2314,7 @@ proc nimf_micro_vm_dispatch*(ctxHandle: pointer; code: ptr uint32; codeLen: int6
     fail(e.msg)
 
 # =====================================================================
-# Persistent buffers + stateful sessions (Metal)
+# Persistent buffers + stateful sessions
 # =====================================================================
 # `nimf_vm_run` uploads a fresh arena per call, so nothing survives between dispatches. These calls
 # keep weights and state resident in named GPU buffers and encode several dispatches into one
@@ -2320,17 +2323,58 @@ proc nimf_micro_vm_dispatch*(ctxHandle: pointer; code: ptr uint32; codeLen: int6
 type NimfBuf = object
   h: byby.SessionHandle
   n: int64
+  owner: pointer
+
+proc requireSession(ctxHandle: pointer): byby.GpuBackend =
+  let ctx = requireContext(ctxHandle)
+  if not cast[ptr NimfContext](ctxHandle).sessionOpen:
+    raise newException(ValueError, "an open session is required")
+  ctx.kind.toByby()
+
+proc requireBuffer(ctxHandle, handle: pointer; n: int64; offset = 0'i64): ptr NimfBuf =
+  if handle == nil: raise newException(ValueError, "null session buffer")
+  result = cast[ptr NimfBuf](handle)
+  if result.owner != ctxHandle: raise newException(ValueError, "buffer belongs to another context")
+  if n <= 0 or offset < 0 or offset > result.n or n > result.n - offset:
+    raise newException(ValueError, "session buffer range is out of bounds")
+
+proc requireOutput(ctxHandle, handle: pointer; n: int64; inputs: openArray[pointer]): ptr NimfBuf =
+  result = requireBuffer(ctxHandle, handle, n)
+  if result.n != n: raise newException(ValueError, "session output buffer has the wrong size")
+  if handle in inputs: raise newException(ValueError, "session output must be distinct from the inputs")
+
+proc sessionElements(rows, cols: int64): int64 =
+  if rows <= 0 or cols <= 0 or cols > int64(high(cint)) div rows:
+    raise newException(ValueError, "invalid session dimensions")
+  rows * cols
+
+proc checkSessionResult(be: byby.GpuBackend; success: bool; op: string): cint =
+  if success: return ok()
+  let detail = byby.sessionGetLastError(be)
+  fail(op & " failed" & (if detail.len > 0: ": " & detail else: ""))
 
 proc nimf_buf_alloc*(ctxHandle: pointer; data: ptr cfloat; n: int64): pointer
     {.exportc: "nimf_buf_alloc", cdecl, dynlib.} =
-  ## Resident GPU buffer of n floats, initialised from `data` (NULL = zeros).
+  ## Resident buffer of n floats, initialised from `data` (NULL = zeros).
   if ctxHandle == nil or n <= 0: return failPtr("invalid buffer allocation arguments")
   try:
     let ctx = requireContext(ctxHandle)
     let vals = if data == nil: newSeq[float32](int(n)) else: inputValues(data, int(n))
+    let be = ctx.kind.toByby()
+    var h = byby.sessionUploadPrivate(be, vals)
+    let uploaded = case be
+      of byby.gbMetal: h.metalHandle != nil
+      of byby.gbVulkan, byby.gbCuda: h.vulkanHandle.buf != nil
+      of byby.gbCpu: h.cpuData.len == n
+      else: false
+    if not uploaded: return failPtr("session buffer upload failed")
     let b = cast[ptr NimfBuf](allocShared0(sizeof(NimfBuf)))
-    b.h = byby.sessionUploadPrivate(ctx.kind.toByby(), vals)
+    if b == nil:
+      byby.sessionFree(be, h)
+      return failPtr("session buffer handle allocation failed")
+    b.h = move(h)
     b.n = n
+    b.owner = ctxHandle
     discard ok()
     cast[pointer](b)
   except CatchableError as e:
@@ -2341,6 +2385,7 @@ proc nimf_buf_free*(ctxHandle, bufHandle: pointer): cint
   if bufHandle == nil: return ok()
   try:
     let b = cast[ptr NimfBuf](bufHandle)
+    if b.owner != ctxHandle: return fail("buffer belongs to another context")
     byby.sessionFree(requireContext(ctxHandle).kind.toByby(), b.h)
     deallocShared(bufHandle)
     ok()
@@ -2353,9 +2398,9 @@ proc nimf_buf_read*(ctxHandle, bufHandle: pointer; offset, n: int64; outData: pt
   if ctxHandle == nil or bufHandle == nil or n <= 0 or offset < 0 or outData == nil:
     return fail("invalid buffer read arguments")
   try:
-    let b = cast[ptr NimfBuf](bufHandle)
-    if offset + n > b.n: return fail("buffer read out of range")
+    let b = requireBuffer(ctxHandle, bufHandle, n, offset)
     let vals = byby.sessionRead(requireContext(ctxHandle).kind.toByby(), b.h, int(offset + n))
+    if vals.len < offset + n: return fail("incomplete session buffer read")
     writeValues(outData, vals[int(offset) ..< int(offset + n)])
     ok()
   except CatchableError as e:
@@ -2367,6 +2412,7 @@ proc nimf_sess_begin*(ctxHandle: pointer): cint
   try:
     if not byby.sessionBegin(requireContext(ctxHandle).kind.toByby()):
       return fail("sessionBegin failed")
+    cast[ptr NimfContext](ctxHandle).sessionOpen = true
     ok()
   except CatchableError as e:
     fail(e.msg)
@@ -2376,6 +2422,7 @@ proc nimf_sess_end*(ctxHandle: pointer): cint
   if ctxHandle == nil: return fail("null context")
   try:
     let be = requireContext(ctxHandle).kind.toByby()
+    defer: cast[ptr NimfContext](ctxHandle).sessionOpen = false
     if not byby.sessionEnd(be):
       return fail("sessionEnd failed: " & byby.sessionGetLastError(be))
     ok()
@@ -2395,6 +2442,121 @@ proc nimf_sess_set*(ctxHandle, bufHandle: pointer; offset: int64; data: ptr cflo
     if not byby.sessionCopyInto(be, src, b.h, 0, int(offset), int(n)):
       return fail("buffer write failed")
     ok()
+  except CatchableError as e:
+    fail(e.msg)
+
+proc nimf_sess_copy*(ctx, src, dst: pointer; srcOffset, dstOffset, n: int64): cint
+    {.exportc: "nimf_sess_copy", cdecl, dynlib.} =
+  try:
+    let be = requireSession(ctx)
+    let a = requireBuffer(ctx, src, n, srcOffset)
+    let b = requireBuffer(ctx, dst, n, dstOffset)
+    if src == dst and srcOffset < dstOffset + n and dstOffset < srcOffset + n:
+      return fail("session copy ranges overlap")
+    checkSessionResult(be, byby.sessionCopyInto(be, a.h, b.h, int(srcOffset), int(dstOffset), int(n)), "session copy")
+  except CatchableError as e:
+    fail(e.msg)
+
+proc nimf_sess_matmul*(ctx, a, b, output: pointer; m, k, n: int64; transposeB: cint): cint
+    {.exportc: "nimf_sess_matmul", cdecl, dynlib.} =
+  try:
+    let be = requireSession(ctx)
+    let lhs = requireBuffer(ctx, a, sessionElements(m, k))
+    let rhs = requireBuffer(ctx, b, sessionElements(k, n))
+    let dst = requireOutput(ctx, output, sessionElements(m, n), [a, b])
+    let success = if transposeB != 0:
+                    byby.sessionMatmulNT(be, lhs.h, rhs.h, dst.h, int(m), int(k), int(n))
+                  else:
+                    byby.sessionMatmul(be, lhs.h, rhs.h, dst.h, int(m), int(k), int(n))
+    checkSessionResult(be, success, "session matmul")
+  except CatchableError as e:
+    fail(e.msg)
+
+proc nimf_sess_matmul_q4*(ctx, x, weight, output: pointer; rows: int64): cint
+    {.exportc: "nimf_sess_matmul_q4", cdecl, dynlib.} =
+  try:
+    let be = requireSession(ctx)
+    if weight == nil: return fail("null resident Q4 weight")
+    let w = cast[ptr NimfResidentQ4](weight)
+    if w.owner != ctx: return fail("resident weight belongs to another context")
+    let src = requireBuffer(ctx, x, sessionElements(rows, int64(w.weight.k)))
+    let dst = requireOutput(ctx, output, sessionElements(rows, int64(w.weight.n)), [x])
+    checkSessionResult(be, byby.sessionMatmulQ4(be, src.h, w.weight, dst.h, int(rows)), "session Q4 matmul")
+  except CatchableError as e:
+    fail(e.msg)
+
+proc nimf_sess_softmax*(ctx, x, output: pointer; rows, cols: int64): cint
+    {.exportc: "nimf_sess_softmax", cdecl, dynlib.} =
+  try:
+    let be = requireSession(ctx)
+    let size = sessionElements(rows, cols)
+    let src = requireBuffer(ctx, x, size)
+    let dst = requireOutput(ctx, output, size, [x])
+    checkSessionResult(be, byby.sessionSoftmax(be, src.h, dst.h, int(rows), int(cols)), "session softmax")
+  except CatchableError as e:
+    fail(e.msg)
+
+proc nimf_sess_norm*(ctx, x, gamma, beta, output: pointer; rows, cols: int64; eps: cfloat): cint
+    {.exportc: "nimf_sess_norm", cdecl, dynlib.} =
+  try:
+    let be = requireSession(ctx)
+    if eps < 0 or classify(eps) in {fcNan, fcInf, fcNegInf}:
+      return fail("session normalization epsilon must be nonnegative and finite")
+    let size = sessionElements(rows, cols)
+    let src = requireBuffer(ctx, x, size)
+    let gain = requireBuffer(ctx, gamma, cols)
+    let dst = requireOutput(ctx, output, size, [x, gamma, beta])
+    if beta == nil:
+      return checkSessionResult(be, byby.sessionRmsnormEnc(be, src.h, gain.h, dst.h,
+        int(rows), int(cols), eps), "session RMSNorm")
+    let bias = requireBuffer(ctx, beta, cols)
+    checkSessionResult(be, byby.sessionLayernormEnc(be, src.h, gain.h, bias.h, dst.h,
+      int(rows), int(cols), eps), "session LayerNorm")
+  except CatchableError as e:
+    fail(e.msg)
+
+proc nimf_sess_attention*(ctx, q, k, v, output, scores: pointer;
+    batch, heads, steps, dim: int64; scale: cfloat): cint
+    {.exportc: "nimf_sess_attention", cdecl, dynlib.} =
+  try:
+    let be = requireSession(ctx)
+    if classify(scale) in {fcNan, fcInf, fcNegInf}: return fail("session attention scale must be finite")
+    let rows = sessionElements(sessionElements(batch, heads), steps)
+    let size = sessionElements(rows, dim)
+    let query = requireBuffer(ctx, q, size)
+    let key = requireBuffer(ctx, k, size)
+    let value = requireBuffer(ctx, v, size)
+    let dst = requireOutput(ctx, output, size, [q, k, v])
+    let matrix = requireOutput(ctx, scores, sessionElements(rows, steps), [q, k, v, output])
+    checkSessionResult(be, byby.sessionAttentionFusedEnc(be, query.h, key.h, value.h, dst.h,
+      matrix.h, int(batch), int(heads), int(steps), int(dim), scale), "session attention")
+  except CatchableError as e:
+    fail(e.msg)
+
+proc nimf_sess_vec*(ctx, a, b, output: pointer; op: cstring; n: int64): cint
+    {.exportc: "nimf_sess_vec", cdecl, dynlib.} =
+  try:
+    let be = requireSession(ctx)
+    if op == nil or $op notin ["add", "sub", "mul", "div"]:
+      return fail("unsupported session vector operation")
+    let size = sessionElements(1, n)
+    let lhs = requireBuffer(ctx, a, size)
+    let rhs = requireBuffer(ctx, b, size)
+    let dst = requireOutput(ctx, output, size, [a, b])
+    checkSessionResult(be, byby.sessionVecOp(be, $op, lhs.h, rhs.h, dst.h, int(size)), "session vector operation")
+  except CatchableError as e:
+    fail(e.msg)
+
+proc nimf_sess_activation*(ctx, x, output: pointer; op: cstring; n: int64; p: cfloat): cint
+    {.exportc: "nimf_sess_activation", cdecl, dynlib.} =
+  try:
+    let be = requireSession(ctx)
+    if op == nil or $op notin ["relu", "sigmoid", "tanh", "exp", "log", "sqrt", "pow"]:
+      return fail("unsupported session activation")
+    let size = sessionElements(1, n)
+    let src = requireBuffer(ctx, x, size)
+    let dst = requireOutput(ctx, output, size, [x])
+    checkSessionResult(be, byby.sessionActivation(be, $op, src.h, dst.h, int(size), p), "session activation")
   except CatchableError as e:
     fail(e.msg)
 

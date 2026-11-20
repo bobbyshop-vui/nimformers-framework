@@ -32,10 +32,17 @@ builds every micro program without loading weights. Details: [`docs/fir.md`](../
 and [`models/FIR.md`](../../models/FIR.md). Tests: `make fir-test` (or `make formers-fir-test` at
 the repository root).
 
-A native run can also be recorded (`BYBY_FIR_PROBE`) and lifted by `firlift` into a standalone
-`model.fir` that `--fir --raw` runs without the model's own code, Mamba-3 with a merged LoRA
-included (prompt phases, state clears and single-token units are described there). See
-[`docs/fir-script-lift.md`](../../docs/fir-script-lift.md); tests: `make fir-lift-test`.
+`make formers-cli` builds the runner and `other/formers.n/firlift/firlift`.
+`make firlift` rebuilds the lifter. `firlift --run` records a native run in memory
+and lifts the selected operations to `model.fir`. The resulting graph can use
+native session calls and raw VM programs. See [FIR from a core trace](../../docs/fir-script-lift.md).
+
+[Codestral FIR on Vulkan](../../docs/fir-script-lift.md#codestral-on-vulkan)
+records a single prompt with merged LoRA. Replay opens the original `.nimq`
+and adapter, merges LoRA at startup and uses the graph's recorded prefill widths.
+Pass the lifted `model.fir` with `--fir`, its `config.json` with `--config`,
+and the original tokenizer directory with `--tokenizer`.
+The [`fir-lift-test` target](Makefile) exercises the recorder and lifter on small fixtures.
 
 ## Layout
 
@@ -65,9 +72,14 @@ other/formers.n/
 
 ## Python API
 
-The pure standard-library Python 3.9+ wrapper is in [`python/`](python/). It invokes
-`formers-cli` for generation and keeps one `-cnv` process alive for multi-turn chat.
-Build the CLI with `make -C other/formers.n build`, then use:
+The standard-library Python 3.9+ `formers` package in [`python/`](python/) invokes
+`formers-cli`. From the repository root, build the CLI and put the package on the
+import path:
+
+```sh
+make formers-cli
+export PYTHONPATH="$PWD/other/formers.n/python${PYTHONPATH:+:$PYTHONPATH}"
+```
 
 ```python
 from formers import Model
@@ -78,8 +90,69 @@ with model.chat() as chat:
     reply = chat.send("Hello")
 ```
 
-Pass `cli_path=` or set `FORMERS_CLI` to select the executable. Python tests use a fake
-CLI and run without loading model weights: `cd other/formers.n/python && python3 -m unittest`.
+Pass `cli_path=` or set `FORMERS_CLI` to select the executable. Keyword options
+forward to CLI flags, so `ctx_size=512` passes `--ctx-size 512` and
+`no_progress=True` passes `--no-progress`. The `env` mapping sets variables in
+each subprocess and removes inherited variables for keys set to `None`.
+
+- `Model.detect()` returns the `--detect-only` report without running inference.
+- `formers.check_fir(path, cli_path=None, fir_f32=False)` runs `--fir-check`
+  and returns the validation summary without loading weights.
+- `Model.lift_fir(prompt, out_dir, config=..., weights=...)` starts the native
+  CLI through `firlift --run` and returns the path to `model.fir`.
+- `Model.generate(..., stream=True)` yields stdout lines. Both generation modes
+  accept `stderr_callback` for diagnostics, including throughput lines.
+- `Model.generate_ids(prompt_ids, ...)` maps FIR `--prompt-ids` to a list of
+  generated IDs. Use it with a graph that accepts token IDs and the default
+  quiet CLI logging.
+- `Model.chat()` keeps the CLI process alive across turns. Use it as a context
+  manager and call `chat.send(message)` for each reply.
+
+### Codestral resident FIR from Python
+
+Pass the original Hugging Face config, base checkpoint, tokenizer and LoRA to
+the native run. The core recorder keeps the Codestral trace in memory with
+upload capture disabled. The replay CLI applies the same prompt template and
+tokenizer and accepts prompts of the recorded token count.
+
+```python
+from formers import Model
+
+prompt = "Write a typed Python function to check whether a string is a palindrome."
+models_dir = "test/codestral/models"
+native_config = "test/codestral/models/hf/config.json"
+options = dict(
+    model="test/codestral/models/codestral_mamba_only.nimq",
+    lora="test/codestral/models/jamba_parallel_lora.bin",
+    tokenizer="test/codestral/models/hf",
+    backend="vulkan",
+    ctx_size=512,
+    repeat_penalty=1.0,
+    no_progress=True,
+    env={"BYBY_CODESTRAL_TOKEN_IDS": "1"},
+)
+native = Model(models_dir, config=native_config, **options)
+fir_path = native.lift_fir(
+    prompt,
+    "/content/codestral-t4-fir-resident",
+    config=native_config,
+    weights=options["model"],
+    context=512,
+    log_callback=print,
+)
+resident = Model(models_dir, config=fir_path.with_name("config.json"), fir=fir_path, **options)
+for line in resident.generate(prompt, max_tokens=200, temperature=0,
+                              stream=True, stderr_callback=print):
+    print(line, end="", flush=True)
+```
+
+For an existing graph, set `fir_path` to its location and reuse the prompt from
+its native recording. `log_callback` receives the recorder and lifter output
+after the lift completes. Use `firlift_path=` to select an executable outside
+the CLI's `firlift/` directory. For interactive Codestral chat, use `native.chat()`.
+
+Run the wrapper tests with `cd other/formers.n/python && python3 -m unittest tests.test_formers`.
+They use a fake CLI and load no weights.
 
 ### OpenAI-compatible server
 
@@ -103,6 +176,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 | Mamba-3 SISO tensors + official 187M or 1.5B config | `mamba3` | `test/mamba3` resident inference |
 | Mamba-3 SISO + LoRA `.bin` (R/P/G blocks) | `mamba3` | `test/mamba3` inference with the checkpoint |
 | F32 safetensors + `model.fir` declaring `runtime graph` | `fir` | generic FIR graph executor |
+| Codestral `.nimq`, matching lifted config and `codestral_resident` FIR graph | `fir` | Vulkan graph executor with native model buffers and the recorded adapter |
 | anything else (gemma, qwen2, Mamba-1, ...) | `unknown` | not run, `fmRun` returns `false`, exit 3 |
 
 Detection checks the layer count, hidden size, head and KV-head counts, head_dim, FFN size,
@@ -235,16 +309,17 @@ shows everything, as before. An error in quiet mode prints its message and sugge
 `--verbose` for the full log. Use `--verbose` to see Mamba-3 runtime statistics; set
 `BYBY_METAL_JIT_LOG=0` to suppress Metal JIT messages in verbose output.
 
-A Mamba-2 LoRA is merged into the resident FP4-KM weights at startup
-(`infer_lora.mergeResidentLoraIfEnabled`, ~35 s on Codestral 7B): the decode kernels then
-drop the A/B fusion and the answers match a merged checkpoint. The merge is mandatory:
-there is no separate-adapter mode, and a failed or partial merge stops the run.
+A Mamba-2 LoRA is merged into the resident FP4-KM weights at startup by
+`infer_lora.mergeResidentLoraIfEnabled`. Decode uses those merged weights directly. A
+failed or partial merge stops the run. With `BYBY_CODESTRAL_TOKEN_IDS=1`, both
+native and FIR print the generated IDs in a `[codestral-tokens]` line.
 
 Flags: `--models`, `-m/--model`, `--lora`, `--no-lora`, `--config`, `--tokenizer`,
 `-p/--prompt`, `-f/--file`, `--system`, `--raw-prompt`, `-n/--n-predict`, `--temp`,
 `--top-p`, `--min-p`, `--repeat-penalty`, `--repeat-last-n`, `-s/--seed`, `--backend`,
 `-ngl/--ngl/--n-gpu-layers`, `-cnv/--conversation`, `-i/--interactive`, `-c/--ctx-size`,
-`--no-progress`, `--no-warmup`, `-v/--verbose`, `--detect-only`, `--fir`, `--fir-f32`, `--fir-check`, `-h`. Exit codes: 0 ok, 1 runtime error,
+`--no-progress`, `--no-warmup`, `-v/--verbose`, `--detect-only`, `--fir`, `--prompt-ids`,
+`--fir-f32`, `--fir-check`, `-h`. Exit codes: 0 ok, 1 runtime error,
 2 bad options, 3 unsupported model.
 
 ## Module API
@@ -282,11 +357,9 @@ on Apple Silicon.
   sliding window is not emulated. `head_dim` ≠ hidden/heads, attention bias and
   rope_scaling other than linear/dynamic are rejected.
 - Llama chat: no `/reset` or context shifting when full.
-- Mamba-2: sizes come from the config, but the GPU kernels have only been run at the
-  Codestral 7B size. Kernel settings come from `infer_lora.configureInferenceDefaults`.
-  No norm-preset bisect yet.
-- The Codestral path (base, LoRA, Linear++) builds but has not been run end to end, since it
-  needs the 7B model.
+- Mamba-2 sizes come from the config. Kernel defaults come from
+  `infer_lora.configureInferenceDefaults`. End-to-end Codestral 7B results are
+  recorded in the [Codestral benchmark](../../test/codestral/benchmark.md).
 
 ## Graph models through FIR
 
