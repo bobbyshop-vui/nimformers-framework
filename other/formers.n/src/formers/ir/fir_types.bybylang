@@ -11,6 +11,8 @@ type
     dims*: seq[int]
     perLayer*: bool
     viewOf*, initFile*, initFingerprint*: string
+    runtimeSource*: string
+    initZero*: bool
     viewOffset*, initOffset*, initBytes*: int
     initialWords*: seq[uint32]
   FirNode* = object
@@ -88,7 +90,10 @@ type
 
 const FirScriptAbi* = 1
 const FirScriptResidentQ4Abi* = 2
-const FirScriptFeatures* = ["weights_bf16", "weights_f16", "resident_q4"]
+const FirScriptFeatures* = ["weights_bf16", "weights_f16", "resident_q4", "codestral_resident"]
+
+function firUsesCodestral(model: FirProgram): bool
+    return "codestral_resident" in model.requiredFeatures
 
 function firResidentRaw(model: FirProgram, name: string): bool
     # Raw weights consumed exclusively through slot kernels need no arena copy.
@@ -128,6 +133,16 @@ function firFp4kmWords(n: int, k: int): int
 
 function firCheckScriptContract(model: FirProgram)
     # Also validate callers that construct FirProgram without the text parser.
+    let codestral = firUsesCodestral(model)
+    for name, buffer in model.buffers:
+        if buffer.runtimeSource.len > 0 or buffer.initZero:
+            if not codestral or buffer.viewOf.len > 0 or buffer.kind == "weight" or buffer.initFile.len > 0 or
+                buffer.initialWords.len > 0 or (buffer.runtimeSource.len > 0 and buffer.initZero):
+                raise newException(ValueError, "FIR invalid Codestral initializer: " & name)
+        if codestral and buffer.initFile.len > 0 and buffer.initFile != "checkpoint":
+            raise newException(ValueError, "Codestral FIR uses the original checkpoint for file initializers: " & name)
+    if codestral and (model.runtime != "graph" or model.phasePartial.len > 0):
+        raise newException(ValueError, "Codestral FIR requires a graph with fixed prefill phases")
     if model.layout != "script":
         if model.scriptAbi != 0 or model.requiredFeatures.len > 0:
             raise newException(ValueError, "FIR script_abi and required features need 'layout script'")

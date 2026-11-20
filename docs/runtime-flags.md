@@ -22,7 +22,7 @@ an optimization off, force one choice, or get diagnostics.
 | `FIRLIFT_Q4_GEMM` | `tensor_core` | `auto` | `auto` lifts Tensor Core GEMMs when the trace records Vulkan cooperative matrix or Metal simdgroup matrix support |
 | `FIRLIFT_Q4_GEMV` | `word_parallel` / `auto` | `auto` | `auto` lifts the subgroup GEMV micro-kernel on Vulkan (faster than `word_parallel`) |
 | `BYBY_FIR_PROBE_STEPS` | `prefill:2,decode:1` | every step | steps the recorder keeps (lift only) |
-| `BYBY_FIR_PROBE_DATA` | `0` | `1` under `firlift --run` | upload payload pipe (lift only) |
+| `BYBY_FIR_PROBE_DATA` | `0` | `1` under most `firlift --run` routes | upload payload pipe (lift only). Codestral uses metadata only. |
 | `BYBY_FIR_PROFILE` | `1` | `0` | diagnostics only |
 
 Decode overlap needs no flag: the FIR decode step is recorded once and replayed
@@ -54,7 +54,7 @@ without waiting (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_FIR_RELOC` | `1` | Metal arena graphs: share one pipeline per kernel. `0`: one per node. |
 | `BYBY_FIR_PROFILE` | `0` | `1`: mean host encode / GPU wait / logits read per decode step. `2`: ends the session after every node and reports per-kernel wall time (slow; diagnostics only). |
 | `BYBY_UBATCH` | `512` | Caps the rows of a prompt phase run (phases with per-row logits excepted). `0`: no cap. |
-| `BYBY_PREFILL_MIN_ROWS` | `5` | Codestral CLI: a prompt prefix or final ubatch tail of at least this many tokens uses batched prefill; fewer use decode. `1`: batch every tail of 2+ tokens. Full ubatches always run. Native resident prefill keeps an arbitrary tail as one batch; FIR recording/replay uses fixed tail phases, so their minimum-row settings must match when lifting and replaying. |
+| `BYBY_PREFILL_MIN_ROWS` | `5` | Codestral CLI: a prompt prefix or final ubatch tail of at least this many tokens uses batched prefill; fewer use decode. `1`: batch every tail of 2+ tokens. Codestral FIR records the native batch widths, including the tail. |
 
 ## Native inference (`nim_inference`, `formers-cli` native route)
 
@@ -64,7 +64,7 @@ without waiting (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_PREFAULT` | `1` | One sequential pass over the mapped file to fill the page cache. |
 | `BYBY_EMBED_RAM` | `1` | Keep an untied embedding in RAM. |
 | `BYBY_LM_HEAD` | `q4` | Quantize an fp32 `lm_head` to Q4 for the tuned GEMV. `fp32` keeps it. |
-| `BYBY_UBATCH` | `512` | Prefill micro-batch rows. `0`: uncapped on paced devices. Codestral (`infer_lora` and native resident `formers-cli`): a prefix up to this many tokens runs as one resident prefill pass; longer prefixes carry state between passes. Codestral range 2..4096, `0` = 4096; `BYBY_PREFILL_BATCH_SIZE` is the older name. The CLI reserves the final prompt token for decode/logits. FIR recording and legacy CLI fallbacks keep the default 128-row chunks and fixed tail sizes for lifted-phase compatibility. New native lengths can JIT; compile/autotune time is reported separately from throughput. |
+| `BYBY_UBATCH` | `512` | Prefill micro-batch rows. `0`: uncapped on paced devices. Codestral native and `firlift --run`: a prefix up to this many tokens runs as one resident prefill pass; longer prefixes carry state between passes. Codestral range 2..4096, `0` = 4096. The CLI reserves the final prompt token for decode/logits. Compile/autotune time is reported separately from throughput. |
 | `BYBY_PREFILL_CB_MS` | `300` | Target GPU time of one prefill command buffer. |
 | `BYBY_PREFILL_MAX_ROWS` | `512` | Upper bound of rows in one prefill chunk. |
 | `BYBY_PREFILL_SESSION_MB` | `1024` | Scratch budget of one prefill session. |
@@ -133,7 +133,7 @@ without waiting (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_Q4_TUNE_VERBOSE` | `0` | Log autotune parity rejects. |
 | `BYBY_FLASH_ATTENTION` | `auto` | Flash attention kind; `scalar` forces FP32. |
 | `BYBY_FUSE_ROPE` | `1` | Fuse RoPE into the KV append. |
-| `BYBY_SSD` | `auto` | Mamba2 SSD kernel. During an active FIR recording, `auto` leaves the micro-VM scan path enabled because the native SSD shaders cannot be replayed by a lifted graph; `1` forces SSD and `0` disables it. When the SSD pass runs, the resident prefill skips the scan autotune (lane parity and serial/parallel timing), since no scan kernel is encoded. |
+| `BYBY_SSD` | `auto` | Mamba2 SSD kernel. Vulkan Codestral records and replays the selected native SSD pipeline. `scalar` selects FP32 tiles, and `0` uses the micro-VM scan. When SSD runs, native prefill skips scan autotuning. |
 
 ## Lifting (`firlift --run`)
 

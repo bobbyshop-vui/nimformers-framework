@@ -356,54 +356,40 @@ or host-side shape changes need a dynamic lowering rule. An explicit slice is
 only a fixed-launch replay in that case. The selector is a heuristic, so inspect its
 reported range or use an override.
 
-The supplied legacy `cs2.fprobe` was recorded before the core upload hook knew
-buffer sizes, so every packed weight binding has zero bytes and no fingerprint;
-it cannot become a runnable model. Record again with the updated core:
+## Codestral on Vulkan
+
+Lift the actual prompt you want to run. With `model_type=mamba2`, `firlift`
+records native prefill batch widths, the selected SSD pipeline, and the names of
+resident buffers instead of copying weight payloads. A 247-token prompt normally
+records one 246-row phase. FIR replays the recorded FP4/FP16 tile GEMMs and SSD
+session operations. Decode uses the recorded micro-VM programs.
 
 ```sh
-BYBY_MODEL_MMAP=1 BYBY_ONE_DISPATCH=0 \
-BYBY_FIR_PROBE="$TRACE" BYBY_FIR_PROBE_DATA=1 BYBY_FIR_PROBE_DATA_MAX=16777216 \
-  timeout 420 ./infer_lora_bin test/codestral/models/jamba_parallel_lora.bin \
-  "hi" 0 test/codestral/models/hf test/codestral/models/codestral_mamba_only.nimq
+export BYBY_MEMORY_LIMIT_MB=10000 BYBY_CODESTRAL_TOKEN_IDS=1
+other/formers.n/firlift/firlift --config "$HF_DIR/config.json" \
+  --weights "$BASE" --context 512 --out "$OUT" --report \
+  --run other/formers.n/formers-cli --models "$MODELS" -m "$BASE" \
+  --lora "$LORA" --tokenizer "$HF_DIR" --backend vulkan \
+  -p "$PROMPT" -n 4 --temp 0 --repeat-penalty 1.0 --no-progress
+other/formers.n/formers-cli --models "$MODELS" -m "$BASE" --lora "$LORA" \
+  --tokenizer "$HF_DIR" --fir "$OUT/model.fir" --config "$OUT/config.json" \
+  --backend vulkan -p "$PROMPT" -n 200 --temp 0 --repeat-penalty 1.0 \
+  --no-progress -c 512
 ```
 
-`BYBY_FIR_PROBE_DATA_MAX` caps the exact-bytes sidecar at 16 MiB per upload:
-state arenas (4.8-11 MB) and adapters are kept, checkpoint-sized packed weights
-are only fingerprinted. The cap is a recorder-only option; with the probe off it
-is a single environment lookup that is never executed.
+Use a new output directory. Codestral writes only `model.fir` and `config.json`.
+At load, it opens the original checkpoint and adapter, merges LoRA on the GPU,
+and binds the native buffers to the graph through `initnative`. `initzero`
+describes zero-filled scratch. The loader checks checkpoint fingerprints and
+resident buffer sizes. The runner uses the same SentencePiece tokenizer and
+sampler as native. Relift for a different prompt token count because the scan
+and its arena offsets are fixed by the recorded batch widths.
 
-Lift with the primary NIMQ checkpoint and, when the model stores trained tensors
-outside it, one or more auxiliary checkpoints. Every `--weights` file is indexed
-(NIMQ2/3, safetensors or raw-fp32 NIMBIN), and each raw upload is matched by
-exact byte size plus sampled content fingerprint. Ambiguous or missing matches
-fails with the buffer name; nothing is guessed:
+`BYBY_CODESTRAL_TOKEN_IDS=1` prints the exact generated IDs after the text. The
+first four IDs from the long FIR run can be compared with the recording run;
+compare equal-length runs to check the entire generation.
 
-```sh
-other/formers.n/firlift/firlift --trace "$TRACE" --config "$CONFIG" \
-  --weights test/codestral/models/codestral_mamba_only.nimq \
-  --weights test/codestral/models/jamba_parallel_lora.bin \
-  --out models/codestral-fir --report
-other/formers.n/formers-cli --fir-check models/codestral-fir/model.fir
-```
-
-The output directory is self-contained apart from explicit symlinks:
-
-```text
-model.fir            lifted graph (slot kernels + exact session-replay nodes)
-config.json          copied from --config
-trace.data           only the referenced sidecar ranges, deduplicated
-jamba_parallel_lora.bin.raw   symlink to the auxiliary checkpoint
-model.nimq           symlink to the primary checkpoint
-tokenizer.model      SentencePiece model, tokenizer_config.json
-```
-
-The `.raw` suffix keeps the auxiliary checkpoint from being mistaken for a LoRA
-adapter by model discovery. The tokenizer directory deliberately contains only
-`tokenizer.model` and `tokenizer_config.json`: the full HuggingFace directory's
-`tokenizer.json` maps `[INST]`/`[/INST]` to added special tokens, while the
-native baseline tokenizes them as ordinary BPE pieces.
-
-## Measured Codestral result
+## Historical Codestral result
 
 `firlift` selects session `243:244` (605 dispatches). The lift contains 960
 buffers, 605 raw slot nodes, 158 exact session-replay nodes, one embedding node
@@ -416,9 +402,8 @@ by 0.2-0.7 (native `781:8.655`, lifted `781:9.396`) because the native prompt
 uses its batched T=8 prefill path while a decode-only graph feeds the prompt
 through decode kernels. At token 4 that small state difference flips a 0.18-logit
 margin (`17057 "INST"` vs `3713 "INT"`), after which the text diverges from the
-baseline. Exact 60-token equality therefore requires replaying the prefill unit
-(the 16 prefill group sessions in the trace) before the decode unit; that is not
-implemented. The decode-only graph must not be claimed token-equivalent.
+baseline. The older graph ran only the recorded decode unit. Use the prompt
+prefill recording described above for a comparison against the native path.
 
 The previous all-zero-weight failure and the missing auxiliary data are gone:
 the fresh trace records weight sizes, full-upload fingerprints and exact bytes

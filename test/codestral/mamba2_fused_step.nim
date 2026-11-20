@@ -297,6 +297,8 @@ proc resetLayerStateV2*(ctx: Backend; blockIdx: int): bool =
   if gZeroLen < n:
     gZeroBuf = byby.sessionUploadPrivate(l.be, newSeq[float32](n))
     gZeroLen = n
+    if byby.firProbeOn and getEnv("BYBY_FIR_CODESTRAL", "0") == "1":
+      byby.probeName(gZeroBuf, "zero", "fir_zero", [], bytes = n*4)
   result = true
   if not sessionCopyInto(l.be, gZeroBuf, l.hWork, 0, l.off.offConvSt, l.cDim * (l.K - 1)):
     result = false

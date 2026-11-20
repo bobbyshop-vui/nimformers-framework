@@ -60,6 +60,10 @@ type
     selectionSession*: int
     backend*: string
     device*: string      ## device features of the recorded run ("coopmatrix" on Vulkan, "simdmatrix" on Metal, "plain"; "unspecified" for older traces)
+    codestralBase*, codestralLora*: string ## checkpoint fingerprints; "-" means no adapter
+    codestralTokens*: int
+    codestralPrefill*: seq[int]
+    codestralSsd*: Table[(int, int, int), string] ## (N, D, Q) -> the native SSD implementation
     bufs*: seq[BufferRec]
     programs*: Table[string, seq[uint32]]
     ops*: seq[Op]
@@ -243,6 +247,19 @@ proc parseTrace*(text: string): Trace =
       if w.len >= 2: result.backend = w[1]
       for item in w:
         if item.startsWith("device="): result.device = unquote(item[7 .. ^1])
+    elif raw.startsWith("codestral_prompt "):
+      let w = raw.splitWhitespace()
+      if w.len != 4: raise newException(ValueError, "invalid Codestral trace metadata")
+      result.codestralBase = w[1]
+      result.codestralLora = w[2]
+      result.codestralTokens = parseInt(w[3])
+    elif raw.startsWith("codestral_prefill "):
+      result.codestralPrefill.add parseInt(raw["codestral_prefill ".len .. ^1])
+    elif raw.startsWith("codestral_ssd "):
+      let w = raw.splitWhitespace()
+      if w.len != 5 or w[4] notin ["coop", "scalar"]:
+        raise newException(ValueError, "invalid Codestral SSD trace metadata")
+      result.codestralSsd[(parseInt(w[1]), parseInt(w[2]), parseInt(w[3]))] = w[4]
     elif raw.startsWith("buf "):
       var b = BufferRec()
       for item in raw[4 .. ^1].splitWhitespace():

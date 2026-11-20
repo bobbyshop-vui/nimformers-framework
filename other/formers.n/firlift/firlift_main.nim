@@ -7,6 +7,7 @@ import ./sessionlift
 import ./steps
 import ./sidecar
 import ./record
+import probe_data
 
 proc compactTraceData(model: var string; tracePath, outDir: string) =
   ## Copy only the byte ranges the model references and merge ranges with equal
@@ -56,6 +57,7 @@ proc compactTraceData(model: var string; tracePath, outDir: string) =
 proc usage() =
   echo "usage: firlift (--trace FILE | --run COMMAND...) --config FILE --out DIR [--weights CHECKPOINT]... [--slice A:B | --step N] [--context TOKENS] [--name NAME] [--embedding TENSOR] [--report] [--coverage] [--fuse] [--grid-tg N | --dynamic-grid-tg N] [--core-idiom [--q4]]"
   echo "  --run COMMAND...: record the command's trace in memory through pipes (no .fprobe or .data file); must be last"
+  echo "  Mamba-2/Codestral: record with the original .nimq as the first --weights; output is model.fir and config.json only"
   echo "  --slice A:B: zero-based complete session range, B exclusive"
   echo "  --step N: zero-based occurrence of the automatically detected repeating unit"
   echo "  --context TOKENS: cap the lifted graph's KV buffers and position kernels (also writes config.json)"
@@ -141,21 +143,6 @@ proc main() =
   if name.len == 0: name = extractFilename(parentDir(configPath))
   if slice.len > 0 and step >= 0: raise newException(ValueError, "choose --slice or --step")
   if contextSize < 0: raise newException(ValueError, "--context must be a positive token count")
-  var parsed: Trace
-  if recordRun:
-    # The command writes its trace and upload bytes into pipes; nothing reaches the disk.
-    var recorded = recordCommand(runCommand)
-    if recorded.exitCode != 0:
-      stderr.writeLine("firlift: the recorded command exited with code " & $recorded.exitCode)
-    if recorded.trace.len == 0:
-      raise newException(IOError, "the command wrote no trace (does it use the core recorder?)")
-    echo "recorded in memory: trace ", recorded.trace.len, " bytes, upload data ", recorded.data.len, " bytes"
-    useMemory(move recorded.data)   # the upload bytes can be GBs: no copy
-    parsed = parseTrace(recorded.trace)
-    parsed.sourcePath = MemorySource
-  else:
-    parsed = parseTrace(readFile(tracePath))
-    parsed.sourcePath = absolutePath(tracePath)
   # HF configs written by Python may hold bare Infinity/NaN (Codestral's
   # "time_step_limit": [0.0, Infinity]); they become null, as in the CLI's detection.
   let rawCfgText = readFile(configPath)
@@ -186,6 +173,45 @@ proc main() =
       # A recurrent model declares no context length; --context then sets the
       # graph's position capacity.
       cfgJson["max_position_embeddings"] = newJInt(contextSize)
+  let modelType = cfgJson{"model_type"}.getStr("").toLowerAscii()
+  let architectures = cfgJson{"architectures"}
+  let mamba2 = modelType == "mamba2" or (modelType.len == 0 and architectures != nil and
+    architectures.kind == JArray and architectures.len > 0 and architectures[0].getStr("") == "Mamba2ForCausalLM")
+  let codestral = mamba2 and not coverage
+  if codestral:
+    if weightsPaths.len == 0 or not weightsPaths[0].endsWith(".nimq"):
+      raise newException(ValueError, "Codestral needs the original .nimq as the first --weights")
+    if coreIdiom or fuseDispatches or gridTg > 0:
+      raise newException(ValueError, "Codestral FIR requires the recorded session and dispatch geometry")
+  var parsed: Trace
+  if recordRun:
+    var recorded = recordCommand(runCommand, mamba2)
+    if recorded.exitCode != 0:
+      let message = "the recorded command exited with code " & $recorded.exitCode
+      if codestral: raise newException(IOError, message)
+      stderr.writeLine("firlift: " & message)
+    if recorded.trace.len == 0:
+      raise newException(IOError, "the command wrote no trace (does it use the core recorder?)")
+    echo "recorded in memory: trace ", recorded.trace.len, " bytes, upload data ", recorded.data.len, " bytes"
+    useMemory(move recorded.data)
+    parsed = parseTrace(recorded.trace)
+    parsed.sourcePath = MemorySource
+  else:
+    parsed = parseTrace(readFile(tracePath))
+    parsed.sourcePath = absolutePath(tracePath)
+  if codestral:
+    if parsed.backend != "vulkan" or parsed.codestralTokens <= 0:
+      raise newException(ValueError, "re-record with the current formers-cli on Vulkan for a Codestral graph without sidecars")
+    let base = weightsPaths[0]
+    if parsed.codestralBase != fingerprintFile(base, 0, getFileSize(base).int):
+      raise newException(ValueError, "first --weights differs from the Codestral checkpoint used to record the trace")
+    if weightsPaths.len > 1:
+      let adapter = weightsPaths[1]
+      if weightsPaths.len > 2 or parsed.codestralLora != fingerprintFile(adapter, 0, getFileSize(adapter).int):
+        raise newException(ValueError, "auxiliary --weights must be the original LoRA used to record the trace")
+      weightsPaths.setLen(1)
+    cfgJson["fir_codestral"] = %*{"base": parsed.codestralBase, "lora": parsed.codestralLora,
+      "prompt_tokens": parsed.codestralTokens}
   var dims = Dims()
   for key in ["hidden_size", "n_embd", "d_model", "dim"]:
     if cfgJson.hasKey(key) and cfgJson[key].kind == JInt: dims.hidden = cfgJson[key].getInt()
@@ -197,7 +223,7 @@ proc main() =
       " (", selected.dispatches, " dispatches, occurrence ", selected.occurrence, ")"
     if selected.resetCopies > 0:
       echo "state resets left to the graph's initial contents: ", selected.resetCopies, " copies"
-  let rewriteConfig = contextSize > 0 or cfgSanitized
+  let rewriteConfig = contextSize > 0 or cfgSanitized or codestral
   let cfgText = if rewriteConfig: $cfgJson else: rawCfgText
   if coverage:
     let report = liftSessionFiles(trace, cfgText, name, embedding, true, weightsPaths)
@@ -206,7 +232,7 @@ proc main() =
     quit(0)
   var model = if trace.graphOps().len > 0: buildModel(trace, cfgText, name)
               elif coreIdiom: liftCore(trace, cfgText, name, embedding, useQ4)
-              else: liftSessionFiles(trace, cfgText, name, embedding, false, weightsPaths, fuseDispatches, gridTg, dynamicGrid)
+              else: liftSessionFiles(trace, cfgText, name, embedding, false, weightsPaths, fuseDispatches, gridTg, dynamicGrid, codestral)
   if droppedSingleRowUnits > 0:
     echo "single-token units left to the decode step: ", droppedSingleRowUnits
   if droppedFailedCalls > 0:
@@ -218,30 +244,31 @@ proc main() =
   if fuseDispatches or gridTg > 0:
     echo "dispatch fusion: ", fuseStats.fused, " of ", fuseStats.pairs, " consecutive raw pairs merged, ", fuseStats.bindable, " share one binding set"
     for reason, count in fuseStats.reasons: echo "  rejected ", count, "x: ", reason
-  createDir(outDir)
-  if " trace.data " in model:
-    compactTraceData(model, tracePath, outDir)
+  if codestral:
+    for line in model.splitLines():
+      if line.startsWith("init ") and line.splitWhitespace()[2] != "checkpoint":
+        raise newException(ValueError, "Codestral lift would require an upload sidecar: " & line)
+    createDir(outDir)
+  else:
+    createDir(outDir)
+    if " trace.data " in model: compactTraceData(model, tracePath, outDir)
+    # Legacy graphs may refer to an auxiliary checkpoint next to model.fir.
+    for line in model.splitLines():
+      if not line.startsWith("init "): continue
+      let parts = line.splitWhitespace()
+      if parts.len < 3: continue
+      let name = parts[2]
+      if name in ["checkpoint", "trace.data"]: continue
+      for path in weightsPaths:
+        if extractFilename(path) & ".raw" == name:
+          let target = outDir / name
+          if not fileExists(target):
+            try: createSymlink(absolutePath(path), target)
+            except CatchableError: copyFile(path, target)
+          break
   writeFile(outDir / "model.fir", model)
-  # Auxiliary weight files (raw .bin uploads outside the primary checkpoint) are
-  # referenced by file name so the model directory is self-contained.
-  for line in model.splitLines():
-    if not line.startsWith("init "): continue
-    let parts = line.splitWhitespace()
-    if parts.len < 3: continue
-    let name = parts[2]
-    if name in ["checkpoint", "trace.data"]: continue
-    for path in weightsPaths:
-      if extractFilename(path) & ".raw" == name:
-        let target = outDir / name
-        if not fileExists(target):
-          try: createSymlink(absolutePath(path), target)
-          except CatchableError: copyFile(path, target)
-        break
-  if configPath != outDir / "config.json":
-    if rewriteConfig:
-      writeFile(outDir / "config.json", cfgText & "\n")
-    else:
-      copyFile(configPath, outDir / "config.json")
+  if rewriteConfig: writeFile(outDir / "config.json", cfgText & "\n")
+  elif configPath != outDir / "config.json": copyFile(configPath, outDir / "config.json")
   if doReport:
     var graphNodes = 0
     for op in trace.ops:

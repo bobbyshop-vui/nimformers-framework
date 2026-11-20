@@ -27,7 +27,9 @@
   through grep/tail/head/awk/sed/cut. Read source files directly; use required
   source-search tooling without filtering build/test output.
 - Trace in the Nim core via `firlift --run` pipes/RAM, not Python or on-disk
-  `.fprobe` files. Preserve final `model.fir`, `config.json`, and `trace.data`.
+  `.fprobe` files. Codestral lifts may write only `model.fir` and `config.json`;
+  reuse the original checkpoint and LoRA at runtime. Never create
+  `trace.data` or a LoRA `.raw` file for Codestral. Preserve existing artifacts.
 - Remove only identified temporary artifacts when no longer needed; never
   delete user checkpoints, model files, or unrelated caches.
 

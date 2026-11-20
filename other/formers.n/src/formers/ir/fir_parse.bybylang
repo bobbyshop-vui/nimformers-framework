@@ -259,6 +259,18 @@ function firParse(path: string, configOverride: string = ""): FirProgram
             if b.viewOf.len > 0 or b.initOffset < 0 or b.initBytes <= 0 or b.initBytes > b.elements*4:
                 raise newException(ValueError, "FIR invalid init range: " & b.name)
             result.buffers[w[1]] = b
+        of "initnative", "initzero":
+            let arity = if w[0] == "initnative": 3 else: 2
+            if w.len != arity or not result.buffers.hasKey(w[1]):
+                raise newException(ValueError, "FIR invalid Codestral initializer")
+            var b = result.buffers[w[1]]
+            if b.runtimeSource.len > 0 or b.initZero:
+                raise newException(ValueError, "FIR duplicate Codestral initializer: " & b.name)
+            if w[0] == "initnative":
+                b.runtimeSource = w[2]
+            else:
+                b.initZero = true
+            result.buffers[b.name] = b
         of "initwords":
             if w.len < 3 or not result.buffers.hasKey(w[1]):
                 raise newException(ValueError, "FIR invalid initwords declaration")

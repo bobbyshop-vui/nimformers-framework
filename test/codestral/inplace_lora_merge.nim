@@ -242,7 +242,7 @@ proc recordMergedFp4Weights(ctx: Backend; cache: Fp4LinCacheGpu) =
   ## merged ones. While the recorder is on, read both buffers back and record them as a fresh upload of
   ## the same buffers: dispatches recorded from here on bind the merged content. With the recorder off
   ## this is one boolean test and no readback.
-  if not firProbeOn: return
+  if not firProbeOn or getEnv("BYBY_FIR_CODESTRAL", "0") == "1": return
   let elements=cache.rows*cache.cols
   let weightFloats=(elements div 2+elements div 32) div 4
   var weights,lut:seq[float32]

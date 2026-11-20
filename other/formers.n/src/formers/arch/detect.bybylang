@@ -19,6 +19,7 @@ import "../ir/fir_parse.bybylang"
 import "../ir/fir_exec.bybylang"
 import "../ir/fir_graph_kernels.bybylang"
 import "../ir/fir_data.bybylang"
+import nim "vendor/bybylang/probe_data"
 
 type
   FmArch* = enum
@@ -439,9 +440,26 @@ function fmDetect(opts: FmOptions): FmDetection
                         discard fmValidateScriptTensor(header, source, buffer.dims)
                     elif source.len == 0 or header.tensors[source].dtype != "F32" or header.tensors[source].shape != buffer.dims:
                         raise newException(ValueError, "FIR graph safetensors shape/dtype mismatch: " & tensor)
-            if opts.promptIds.len == 0 and not fileExists(result.files.tokenizerDir / "tokenizer.json") and not fileExists(result.files.tokenizerDir / "tokenizer.model") and not fileExists(result.files.tokenizerDir / "tokenizer.model.v3"):
+            let codestral = firUsesCodestral(graph)
+            if (codestral or opts.promptIds.len == 0) and not fileExists(result.files.tokenizerDir / "tokenizer.json") and not fileExists(result.files.tokenizerDir / "tokenizer.model") and not fileExists(result.files.tokenizerDir / "tokenizer.model.v3"):
                 raise newException(ValueError, "FIR graph text runner requires tokenizer.json or tokenizer.model")
-            if result.files.loraPath.len > 0:
+            if codestral:
+                if opts.conversation:
+                    raise newException(ValueError, "Codestral FIR prefill is recorded for a single prompt; use -p")
+                let spec = cfg{"fir_codestral"}
+                let base = result.files.nimqPath
+                if spec{"prompt_tokens"}.getInt(0) <= 0 or spec{"base"}.getStr("") != fingerprintFile(base, 0, getFileSize(base).int):
+                    raise newException(ValueError, "Codestral FIR config or base .nimq differs from the recorded run")
+                let adapter = result.files.loraPath
+                let adapterId = if adapter.len > 0: fingerprintFile(adapter, 0, getFileSize(adapter).int) else: "-"
+                if spec{"lora"}.getStr("") != adapterId:
+                    raise newException(ValueError, "Codestral FIR needs the original LoRA passed to the trace (use --lora PATH)")
+                result.mamba = fmMamba2ConfigFrom(cfg, result.errors)
+                if adapter.len > 0:
+                    result.lora = fmLoraInfoFrom(adapter, result.errors)
+                if result.errors.len > 0:
+                    return
+            elif result.files.loraPath.len > 0:
                 raise newException(ValueError, "FIR graph models do not support LoRA")
             result.nLayers = graph.symbols["layers"]
             result.route = frFir
