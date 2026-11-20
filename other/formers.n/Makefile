@@ -1,6 +1,7 @@
 # formers.n — build the BybyLang sources into formers-cli and run the tests.
 #
-#   make            build ./formers-cli
+#   make            build ./formers-cli and ./firlift/firlift
+#   make firlift    build only ./firlift/firlift
 #   make test       architecture-detection test (no model load, no GPU)
 #   make smoke      tiny random Llama (2 layers, GQA) end to end on the GPU
 #
@@ -13,6 +14,8 @@ HERE        := other/formers.n
 BYBYLANG    := vendor/bybylang/bybylang
 CLI_SRC     := $(HERE)/src/formers_cli.bybylang
 CLI_BIN     := $(HERE)/formers-cli
+FIRLIFT_SRC := $(HERE)/firlift/firlift_main.nim
+FIRLIFT_BIN := $(HERE)/firlift/firlift
 TEST_SRC    := $(HERE)/tests/test_detect.bybylang
 FIR_TEST_SRC := $(HERE)/tests/test_fir.bybylang
 FIR_Q4_MICRO_CHECK := $(HERE)/tests/fixtures/q4_tensor_core_micro/model.fir
@@ -24,7 +27,7 @@ BYBYLANG_SOURCES := $(shell find $(ROOT)/vendor/bybylang -type f \( -name '*.nim
 export BYBYLANG_NIMCACHE ?= $(ROOT)/nimcache/formers-n
 export FIR_LIFT_TMP ?= /tmp/fir-lift-tests
 
-.PHONY: all build build-arm64 test fir-test fir-graph-test fir-probe fir-lift-test smoke clean
+.PHONY: all build build-arm64 firlift test fir-test fir-graph-test fir-probe fir-lift-test smoke clean
 
 all: build
 
@@ -34,7 +37,7 @@ $(ROOT)/$(BYBYLANG): $(BYBYLANG_SOURCES)
 # BybyLang writes <out>.nim next to <out> and compiles it; Nim picks up
 # $(HERE)/nim.cfg because build/ is below it. A Nim module name cannot
 # contain '-', so the binary is built as formers_cli and renamed.
-build: $(ROOT)/$(BYBYLANG)
+build: $(ROOT)/$(BYBYLANG) firlift
 	cd $(ROOT) && mkdir -p $(HERE)/build && \
 	  $(BYBYLANG) $(CLI_SRC) --aot=$(HERE)/build/formers_cli --quiet && \
 	  $(HERE)/build/formers_cli --fir-check $(FIR_Q4_MICRO_CHECK) && \
@@ -45,6 +48,11 @@ ifeq ($(FORMERS_NO_ARM64),)
 	$(MAKE) -C $(ROOT)/$(HERE) build-arm64
 endif
 endif
+
+firlift:
+	cd $(ROOT) && nim c -d:release --hints:off --path:vendor/bybylang \
+	  --nimcache:nimcache/firlift -o:$(FIRLIFT_BIN) $(FIRLIFT_SRC)
+	@echo "[formers.n] built $(FIRLIFT_BIN)"
 
 # Apple Silicon binary built on an Intel Mac (formers-cli is x86_64 and runs under Rosetta there).
 ARM64_BIN   := $(HERE)/formers-cli_arm64
@@ -80,7 +88,7 @@ smoke: build
 	  $(CLI_BIN) --models $(SMOKE_DIR) -p "def fib(n):" -n 8 --temp 0 --no-progress
 
 clean:
-	rm -rf $(ROOT)/$(HERE)/build $(ROOT)/$(CLI_BIN) $(BYBYLANG_NIMCACHE)
+	rm -rf $(ROOT)/$(HERE)/build $(ROOT)/$(CLI_BIN) $(ROOT)/$(FIRLIFT_BIN) $(BYBYLANG_NIMCACHE)
 
 fir-graph-test: $(ROOT)/$(BYBYLANG)
 	cd $(ROOT) && mkdir -p $(HERE)/build && \
@@ -94,8 +102,6 @@ fir-lift-test: build
 	cd $(ROOT) && nim c -r -d:release --hints:off --path:vendor/bybylang \
 	  --nimcache:nimcache/fir-q4-selection-test -o:$(HERE)/build/test_q4_selection $(HERE)/firlift/test_q4_selection.nim
 	mkdir -p $(FIR_LIFT_TMP)
-	cd $(ROOT) && nim c -d:release --hints:off --path:vendor/bybylang \
-	  --nimcache:nimcache/firlift -o:$(HERE)/firlift/firlift $(HERE)/firlift/firlift_main.nim
 	cd $(ROOT) && nim c -d:release --hints:off --path:vendor/bybylang \
 	  --nimcache:nimcache/fir-library-test -o:$(HERE)/firlift/test_library $(HERE)/firlift/test_library.nim
 	cd $(ROOT) && $(HERE)/firlift/test_library
@@ -115,7 +121,7 @@ fir-lift-test: build
 	# written to the disk); each must lower completely.
 	for b in metal vulkan; do \
 	  cd $(ROOT) && $(HERE)/build/backend_available $$b || continue; \
-	  cd $(ROOT) && BACKEND=$$b BYBY_FIR_PROBE_STEPS=decode:1 $(HERE)/firlift/firlift \
+	  cd $(ROOT) && BACKEND=$$b BYBY_FIR_PROBE_STEPS=decode:1 $(FIRLIFT_BIN) \
 	    --config $(HERE)/firlift/coverage_config.json --out $(FIR_LIFT_TMP)/session-ops-$$b --coverage \
 	    --run $(HERE)/firlift/test_session_gpu || exit 1; \
 	done

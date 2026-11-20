@@ -85,7 +85,7 @@ CLEAN_BINS      := $(TEST_BIN) $(GRAFT_BIN) $(FINETUNE_BIN) $(INFER_LORA_BIN) $(
         build-migrate-lora build-nim-inference build-spectron build-for-python \
         python-test python-example c-example bybylang-test bench-gflops \
         graft finetune-mamba hf-train build-hf-train infer-lora infer-mamba infer-deepseek run-spectron mamba-pipeline \
-        build-formers build-formers-arm64 formers-cli formers flash-attention-test q4-gemv-test q4-gemm-test formers-test formers-fir-test formers-smoke formers-clean
+        build-formers build-formers-arm64 formers-cli firlift formers flash-attention-test q4-gemv-test q4-gemm-test formers-test formers-fir-test formers-smoke formers-clean
 
 all: build run
 
@@ -435,7 +435,8 @@ endif
 
 # ── formers.n (other/formers.n): llama.cpp-style framework written in BybyLang;
 # detects Llama / Mamba-2 / Mamba-2 + LoRA/Linear++ -> formers-cli ──
-#   make formers-cli                      build other/formers.n/formers-cli
+#   make formers-cli                      build formers-cli and firlift
+#   make firlift                          build only other/formers.n/firlift/firlift
 #   make formers                          build, then chat with FORMERS_MODELS
 #   make formers FORMERS_MODELS=test/deepseek-inference/models
 #   make formers ARGS='--models test/codestral/models -p "..." -n 128'
@@ -449,6 +450,9 @@ build-formers-arm64:
 	$(MAKE) -C other/formers.n build-arm64
 
 formers-cli: build-formers
+
+firlift:
+	$(MAKE) -C other/formers.n firlift
 
 formers: build-formers
 ifeq ($(strip $(ARGS)),)
