@@ -866,7 +866,7 @@ proc table(l: SessionLift; p: PortRef): seq[int] =
   fail("table " & p.name & " (b" & $p.buffer & ") was not recorded; the table upload is outside the recorded step")
 
 const ExactSessionOps = ["sessionRmsnormEnc", "sessionVecOp", "sessionActivation", "sessionCopyInto",
-  "sessionFp4GemmMetal", "sessionMatmulNT", "sessionMatmulNTAccelerated"]
+  "sessionFp4GemmMetal", "sessionF16GemmTile", "sessionMatmulNT", "sessionMatmulNTAccelerated"]
 
 proc lowerSessionExact(l: SessionLift; op: Op) =
   ## Raw replay of a session API call. The runner stages the operands in dedicated
@@ -910,6 +910,12 @@ proc lowerSessionExact(l: SessionLift; op: Op) =
     outs = @[l.rd(op.outs.port("c"))]
     attrs = "M=" & $op.attrInt("M") & ",K=" & $op.attrInt("K") & ",N=" & $op.attrInt("N") &
       ",simdgroup=" & (if op.attrStr("simdgroup") == "true": "1" else: "0")
+  of "sessionF16GemmTile":
+    # Replay the same FP16 sidecar GEMM, including its cooperative-matrix choice.
+    ins = @[l.rd(op.ins.port("a")), l.rd(op.ins.port("w"))]
+    outs = @[l.rd(op.outs.port("c"))]
+    attrs = "M=" & $op.attrInt("M") & ",K=" & $op.attrInt("K") & ",N=" & $op.attrInt("N") &
+      ",tensorCore=" & (if op.attrStr("tensorCore") == "true": "1" else: "0")
   of "sessionMatmulNT", "sessionMatmulNTAccelerated":
     # The FP32 GEMM C = A @ B^T of the backend (a native shader; on an FP16 cooperative-matrix
     # device the accelerated call rounds its inputs to FP16): the runner calls the same op.
@@ -1149,7 +1155,7 @@ proc returnedFalse(op: Op): bool =
   ## A session call that reported it did not run (an unsupported route): it changed nothing.
   op.impl.startsWith("session:") and op.attrs.getOrDefault("result") == "false"
 
-const OptionalGemmOps = ["sessionFp4GemmTiledEnc", "sessionFp4GemmTensorCore", "sessionMatmulNTFp16Coop",
+const OptionalGemmOps = ["sessionFp4GemmTiledEnc", "sessionFp4GemmTensorCore", "sessionF16GemmTile", "sessionMatmulNTFp16Coop",
   "sessionMatmulNTAccelerated", "sessionMatmulNTTiledEnc"]
   ## Session GEMMs that report false on a device without their route; the caller then runs a fallback.
 

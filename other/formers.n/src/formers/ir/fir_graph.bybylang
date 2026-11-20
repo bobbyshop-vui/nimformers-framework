@@ -1766,6 +1766,17 @@ function fgEncodeSessionDirect(model: var FirGraph, name: string, attrs: Table[s
         done = true
         inc model.sessionOps
         result = sessionFp4GemmMetal(be, x, b, lut, y, fgAttrInt(attrs, "M", 0), fgAttrInt(attrs, "K", 0), fgAttrInt(attrs, "N", 0), fgAttrInt(attrs, "simdgroup", 0) == 1)
+    elif name == "sessionF16GemmTile":
+        if ins.len < 2 or not fgDirectPort(model, ins[1], bi, b) or yi == xi or (bi >= 0 and yi == bi):
+            return false
+        let m = fgAttrInt(attrs, "M", 0)
+        let k = fgAttrInt(attrs, "K", 0)
+        let n = fgAttrInt(attrs, "N", 0)
+        if m <= 0 or k <= 0 or n <= 0:
+            return false
+        done = true
+        inc model.sessionOps
+        result = sessionF16GemmTile(be, x, b, y, m, k, n, fgAttrInt(attrs, "tensorCore", 0) == 1)
     elif name == "sessionMatmulNT" or name == "sessionMatmulNTAccelerated":
         if ins.len < 2 or not fgDirectPort(model, ins[1], bi, b) or yi == xi or (bi >= 0 and yi == bi):
             return false
@@ -1889,6 +1900,27 @@ function fgEncodeSessionHandles(model: var FirGraph, node: FirNode, layer: int):
             return false
         model.scratchC = c
         return sessionCopyInto(be, model.scratchC, model.handles[targetIndex], 0, fgPortOffset(model, outs[0]), m*n)
+    if name == "sessionF16GemmTile":
+        # The sidecar weight is a raw FP16 buffer; stage the activation view and replay the same
+        # tile GEMM configuration used by the native prefill path.
+        let m = fgAttrInt(attrs, "M", 0)
+        let k = fgAttrInt(attrs, "K", 0)
+        let n = fgAttrInt(attrs, "N", 0)
+        var wi: int
+        var w: SessionHandle
+        if m <= 0 or k <= 0 or n <= 0 or not fgDirectPort(model, ins[1], wi, w):
+            raise newException(ValueError, "FIR graph FP16 GEMM replay needs a whole sidecar weight buffer: " & node.name)
+        let targetIndex = fgPortHandleIndex(model, outs[0])
+        if targetIndex < 0:
+            return false
+        model.copies += 2
+        if not sessionCopyInto(be, fgPortHandle(model, ins[0]), model.scratchA, fgPortOffset(model, ins[0]), 0, m*k):
+            return false
+        var c = model.scratchC
+        if not sessionF16GemmTile(be, model.scratchA, w, c, m, k, n, fgAttrInt(attrs, "tensorCore", 0) == 1):
+            return false
+        model.scratchC = c
+        return sessionCopyInto(be, model.scratchC, model.handles[targetIndex], 0, fgPortOffset(model, outs[0]), m*n)
     if name == "sessionMatmulNT" or name == "sessionMatmulNTAccelerated":
         # The activation ports are views: stage them; the weight is bound whole.
         let m = fgAttrInt(attrs, "M", 0)
@@ -1973,10 +2005,9 @@ function fgEncodeSession(model: var FirGraph, node: FirNode, layer: int): bool
         let dstOffset = memory[outs[0]] + fgAttrInt(attrs, "dstOff", 0)
         var dst = model.arena
         return sessionCopyInto(be, model.arena, dst, srcOffset, dstOffset, n)
-    if name == "sessionFp4GemmMetal" or (name == "sessionMatmulNTAccelerated" and be != gbCpu):
-        # These replays bind the weight at offset 0 (the accelerated GEMM may round its inputs to
-        # FP16 on the GPU, which the offset FP32 GEMM below would not): only a handle graph has
-        # whole weight buffers. Recorded graphs, the only ones with these nodes, always use handles.
+    if name == "sessionFp4GemmMetal" or name == "sessionF16GemmTile" or (name == "sessionMatmulNTAccelerated" and be != gbCpu):
+        # These replays bind packed or FP16 weights at offset 0: only a handle graph has whole
+        # weight buffers. Recorded graphs, the only ones with these nodes, always use handles.
         raise newException(ValueError, "FIR graph session replay " & name & " needs a handle graph (raw recorded buffers): " & node.name)
     if name == "sessionMatmulNT" or name == "sessionMatmulNTAccelerated":
         # The weight is read in place from the arena (an offset B); A is staged, C copied back.
