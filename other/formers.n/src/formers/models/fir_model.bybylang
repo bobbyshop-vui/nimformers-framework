@@ -234,7 +234,7 @@ function fmRunFir(det: FmDetection, cliOpts: FmOptions): bool
     elif not codestral and tok.totalVocabSize > graph.symbols["vocab"]:
         raise newException(ValueError, "FIR graph: tokenizer exceeds model vocabulary")
     backend.setForbidCpuFallback(true)
-    let ctx = newBackend(opts.backend)
+    let ctx = if codestral: fmMambaBackend(opts.backend) else: newBackend(opts.backend)
     var model = fmLoadFirForDetection(graph, det, ctx)
     defer: firFreeGraph(model)
     firGraphTuneGemv(model)

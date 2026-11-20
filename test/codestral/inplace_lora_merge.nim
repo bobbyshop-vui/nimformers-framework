@@ -300,4 +300,4 @@ proc mergeResidentLoraInplace*(m: var NimformerModelJamba; lo: var JambaLora; ct
     inc result
     let seconds=float64((getMonoTime()-mergeStart).inNanoseconds)/1e9
     echo &"[lora-merge] GPU in-place {name}: {seconds:.3f}s; buffer and LUT reused"
-  echo &"[lora-merge] {result}/{names.len} merged; peak RSS={peakResidentBytes() div 1_000_000} MB; limit=7000 MB"
+  echo &"[lora-merge] {result}/{names.len} merged; peak RSS={peakResidentBytes() div 1_000_000} MB; limit={limitBytes div 1_000_000} MB"

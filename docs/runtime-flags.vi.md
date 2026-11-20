@@ -156,7 +156,9 @@ chờ (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_FIR_PROBE_STEPS` | mọi bước | Các bước recorder giữ, ví dụ `prefill:2,decode:1`. |
 | `BYBY_FIR_PROBE_DATA` | `1` dưới `--run` | Gửi dữ liệu upload chính xác qua pipe dữ liệu (cần cho upload không tên như LUT). `0` khi mọi weight đều có tên trong `model.nimq`. |
 
-Để lift Codestral cần `BYBY_MEMORY_LIMIT_MB=10000` (merge LoRA luôn bật).
+Codestral Vulkan mặc định dùng `BYBY_MEMORY_LIMIT_MB=10000` và
+`BYBY_CODESTRAL_TOKEN_IDS=1`, kể cả khi ghi qua `firlift --run`. Có thể đặt
+từng biến để đổi giá trị mặc định.
 
 Header trace ghi `device="coopmatrix"` cho cooperative matrix của Vulkan, `device="simdmatrix"` cho simdgroup matrix của Metal, hoặc `device="plain"` nếu không có. Micro-kernel Tensor Core được tự động chọn cho Vulkan có cooperative matrix hoặc Metal trên Apple GPU family 7+; các thiết bị khác dùng kernel generic.
 

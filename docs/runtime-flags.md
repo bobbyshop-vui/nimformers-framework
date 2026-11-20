@@ -157,7 +157,9 @@ without waiting (`BYBY_FIR_DECODE_CB_NODES`, `BYBY_VULKAN_COMMIT_WAIT`).
 | `BYBY_FIR_PROBE_STEPS` | every step | Steps the recorder keeps, for example `prefill:2,decode:1`. |
 | `BYBY_FIR_PROBE_DATA` | `1` under `--run` | Send exact upload payloads down the data pipe (needed for unnamed uploads such as LUTs). `0` when every weight is named in `model.nimq`. |
 
-Lifting Codestral needs `BYBY_MEMORY_LIMIT_MB=10000` (the LoRA merge is always on).
+Codestral Vulkan uses `BYBY_MEMORY_LIMIT_MB=10000` and `BYBY_CODESTRAL_TOKEN_IDS=1`
+by default, including when recording with `firlift --run`. Set either variable
+explicitly to override its default.
 
 Trace headers record `device="coopmatrix"` for Vulkan cooperative matrix, `device="simdmatrix"` for Metal simdgroup matrix, or `device="plain"` otherwise. Tensor Core micro-kernels are selected automatically for Vulkan with cooperative matrix or Metal on Apple GPU family 7+; other devices use generic kernels.
 
