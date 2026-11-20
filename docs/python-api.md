@@ -18,6 +18,9 @@ and Llama generation. The separate `formers` Python package drives
 `formers-cli` for its supported model families and FIR graphs.
 [formers.n Python API](../other/formers.n/README.md#python-api)
 
+[`nimformers.distributed`](distributed.md) binds BybyLang's native
+device scheduler for independent micro-VM and model batches.
+
 For installation, runnable examples, checkpoint inspection, and troubleshooting
 see the [Python walkthrough](python-guide.md). For Make target
 inputs and outputs, see the [Make command guide](make-commands.md).

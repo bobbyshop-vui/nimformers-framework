@@ -20,6 +20,14 @@ Nimformer is a Nim framework for transformer inference and training with Metal a
 
 Start with the [documentation index](docs/README.md), then see [Getting Started](docs/getting-started.md) for a minimal program.
 
+## Install with Nimble
+
+Install the Nim package directly from GitHub:
+
+```sh
+nimble install https://github.com/bobbyshop-vui/nimformers-framework
+```
+
 Practical guides:
 
 - [Make commands](docs/make-commands.md): build versus run, binary outputs,
