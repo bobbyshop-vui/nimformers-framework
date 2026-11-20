@@ -358,6 +358,9 @@ reported range or use an override.
 
 ## Codestral on Vulkan
 
+Run `make formers-cli` in the build step to compile both the CLI and the lifter.
+The lifter executable is `other/formers.n/firlift/firlift`.
+
 Lift the actual prompt you want to run. With `model_type=mamba2`, `firlift`
 records native prefill batch widths, the selected SSD pipeline, and the names of
 resident buffers instead of copying weight payloads. A 247-token prompt normally

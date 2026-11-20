@@ -120,7 +120,8 @@ Intel Iris Plus 640 and Tesla T4 results per model: [DeepSeek Coder](../../test/
 ## Usage
 
 ```bash
-make build-formers          # -> other/formers.n/formers-cli
+make formers-cli            # builds formers-cli and firlift/firlift in other/formers.n
+make firlift                # builds only the lifter
 make formers-test           # detection test (no GPU, no weights loaded)
 make formers-fir-test       # FIR test (no GPU, no weights loaded)
 make formers-smoke          # tiny random Llama end to end on the GPU
@@ -330,11 +331,10 @@ compute subgroups are 32 wide (NVIDIA), a shared-memory sum elsewhere. It needs 
 and the Q4 group size divisible by 8. `BYBY_FIR_Q4_GEMV_ROWS` (1, 2, 4; default 2)
 sets the output rows per subgroup and `BYBY_FIR_Q4_GEMV_REDUCE` (auto, subgroup,
 shared) the sum; `BYBY_FIR_Q4_COOP_VERBOSE=1` prints the choices once per kernel.
-After updating the repository and submodules, rebuild `make formers-cli` as
-well as `firlift`: the AOT CLI contains its own VM opcode validator and JIT.
-The CLI build checks a tiny Tensor Core FIR fixture before installing the
-binary. Rebuilding only `firlift` leaves an older CLI unable to accept opcode
-`0xAA` (`q4coop`). Run the lifted graph with `BYBY_FIR_Q4_BACKEND=micro`.
+After updating the repository and submodules, `make formers-cli` rebuilds both
+tools. The AOT CLI contains its own VM opcode validator and JIT, and the build
+checks a tiny Tensor Core FIR fixture before installing the CLI. Run the lifted
+graph with `BYBY_FIR_Q4_BACKEND=micro`.
 
 Without `--fir`, the model directory's `model.fir` is used. This is one-shot
 completion (`-cnv` chat uses the model's chat template); partial offload, unsupported config variants and context overflow
