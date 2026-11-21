@@ -67,7 +67,7 @@ discard nimf_context_destroy(ctx)
 If you prefer to compile the Nim source directly into your AOT binary instead of loading a library file at runtime, you can import the framework's internal API directly:
 
 ```bybylang
-import nim "../../lib_c_api"
+import nim "../../nimformers_lib"
 # ... rest of script ...
 ```
 

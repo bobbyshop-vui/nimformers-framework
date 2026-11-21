@@ -4,7 +4,7 @@
 [English](python-guide.md) | [Tiếng Việt](python-guide.vi.md)
 
 The `nimformers/` package uses `ctypes` to call the shared library built from
-`lib_c_api.nim`. It exposes NumPy operations, owned tensors, quantization,
+`nimformers_lib.nim`. It exposes NumPy operations, owned tensors, quantization,
 NIMQ, resident weights, micro-VM, tokenizers, and Llama inference.
 
 

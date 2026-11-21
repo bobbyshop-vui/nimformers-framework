@@ -1,11 +1,11 @@
 # BybyLang integration test: import the Nim C-ABI module and call it.
 #
 # `import nim "..."` is a real Nim import placed at the top of the generated
-# source.  The relative path points at lib_c_api.nim in the repository root.
+# source.  The relative path points at nimformers_lib.nim in the repository root.
 # BybyLang passes non-DSL lines through as Nim, so the calls below exercise
 # the same functions the Python/ctypes layer uses.
 
-import nim "../../lib_c_api"
+import nim "../../nimformers_lib"
 
 print "=== BybyLang -> imported Nimformers C ABI ==="
 print "abi version: " & $nimf_abi_version()

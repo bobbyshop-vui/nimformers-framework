@@ -1,4 +1,4 @@
-## lib_c_api.nim — Stable C ABI for Nimformers.
+## nimformers_lib.nim — Stable C ABI for Nimformers.
 ##
 ## This module is the single shared-library entry point for non-Nim callers
 ## (Python/ctypes, C, C++, Rust, ...).  It exposes:

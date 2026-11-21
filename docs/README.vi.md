@@ -64,7 +64,7 @@ lượng tử hóa, backend, session và micro-VM.
 - [FIR (formers IR)](fir.vi.md): file đồ thị phía model khai báo micro-kernel, kernel backend và kích thước; cờ `--fir` / `--fir-check` của formers.n.
 - [FIR Codestral trên Vulkan](fir.vi.md#codestral-trên-vulkan) hướng dẫn ghi trong RAM, dùng lại checkpoint và adapter gốc, và đối chiếu token ID với native.
 - [Test tích hợp BybyLang](../test/bybylang_test/README.vi.md): import
-  `lib_c_api`, kiểm tra C ABI và native DSL `gpu ...`.
+  `nimformers_lib`, kiểm tra C ABI và native DSL `gpu ...`.
 - [Tham khảo API test BybyLang](bybylang-tests.vi.md): cách chạy và mở rộng
   hai test `.bybylang`, giải thích từng lệnh DSL và lời gọi C ABI.
 - [API BybyLang GPU/DSL](bybylang-api.vi.md): hàm backend, cú pháp DSL,
@@ -105,7 +105,7 @@ lượng tử hóa, backend, session và micro-VM.
   `test/codestral/checkpoint.nim`: [định dạng checkpoint](checkpoint-formats.vi.md).
 - `vendor/bybylang/`: [DSL](bybylang-api.vi.md), [ngôn ngữ](bybylang-language.vi.md),
   [session](gpu-session-api.vi.md), [micro-VM/JIT](microkernel-api.vi.md).
-- `lib_c_api.nim` / `nimformers/` / `include/nimformers.h`: [Python và C ABI](python-api.vi.md).
+- `nimformers_lib.nim` / `nimformers/` / `include/nimformers.h`: [Python và C ABI](python-api.vi.md).
 - `nimformers.distributed`: [thực thi phân tán trên một máy](distributed.vi.md).
 
 Chữ ký hàm trong docs thuộc module công khai và facade export. Kernel nội

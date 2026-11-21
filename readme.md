@@ -51,7 +51,7 @@ Model-specific programs and data live under `test/spectron/`, `test/codestral/`,
 ## Python and C ABI
 
 The core framework is available as a shared library with a stable C ABI
-(`lib_c_api.nim`). It exposes backend selection, owned tensors, every math /
+(`nimformers_lib.nim`). It exposes backend selection, owned tensors, every math /
 neural-network kernel, int8/int4/fp8/fp4/custom-float quantization, NIMQ
 state dicts, the micro-VM bytecode builder and dispatch, resident weights,
 tokenizers, and Llama inference.

@@ -269,7 +269,7 @@ make c-example
 make bybylang-test
 ```
 
-- `build-for-python`: checks/builds `lib_c_api.nim` into `libnimformers.dylib`
+- `build-for-python`: checks/builds `nimformers_lib.nim` into `libnimformers.dylib`
   on macOS, `libnimformers.so` on Linux, or `nimformers.dll` on Windows.
   It does not install the Python package.
 - `python-example`: builds the shared library and runs `examples/python/basic.py`.
@@ -277,7 +277,7 @@ make bybylang-test
 - `c-example`: builds the shared library, compiles `examples/c/smoke.c`, and
   runs `examples/c/smoke`. The recipe uses Unix-style linker options.
 - `bybylang-test`: builds/runs the native DSL and C ABI scripts. Its runner
-  uses the vendored compiler and compiles `lib_c_api.nim` into the AOT test;
+  uses the vendored compiler and compiles `nimformers_lib.nim` into the AOT test;
   no Python package or prebuilt shared library is needed.
 
 Use the active virtualenv interpreter:

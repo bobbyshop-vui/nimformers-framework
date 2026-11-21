@@ -48,7 +48,7 @@ runtime chung ở thư mục gốc.
 
 ## Python và C ABI
 
-Core framework có shared library với C ABI ổn định (`lib_c_api.nim`), cung
+Core framework có shared library với C ABI ổn định (`nimformers_lib.nim`), cung
 cấp chọn backend, tensor sở hữu bộ nhớ, kernel toán/neural network,
 lượng tử hóa int8/int4/fp8/fp4/CustomFloat, state dict NIMQ, tạo/dispatch
 bytecode micro-VM, resident weights, tokenizer và inference Llama.

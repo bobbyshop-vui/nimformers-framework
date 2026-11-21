@@ -186,9 +186,9 @@ make -C vendor/bybylang build
 ```
 
 `--aot` ghi và compile file Nim; cần chạy binary sinh ra riêng.
-`BYBYLANG_NIMCACHE` chọn thư mục cache. Ví dụ import `lib_c_api` cần search
+`BYBYLANG_NIMCACHE` chọn thư mục cache. Ví dụ import `nimformers_lib` cần search
 path framework; thư mục test cung cấp chúng qua
-`test/bybylang_test/nim.cfg`. `import nim` module `lib_c_api` compile
+`test/bybylang_test/nim.cfg`. `import nim` module `nimformers_lib` compile
 implementation ABI vào binary, không load động shared library Python.
 
 Trên macOS, thêm `caffeinate -i` trước lệnh cần giữ máy thức khi build/chạy.

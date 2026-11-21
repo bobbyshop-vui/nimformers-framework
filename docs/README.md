@@ -43,7 +43,7 @@ This directory is the user documentation for the public Nimformer APIs. Use the 
 - [nfgraph2torch](nfgraph2torch.md): convert a torch module to FIR / `model.fir` (ATen replay plus micro-kernels).
 - [FIR (formers IR)](fir.md): model-side graph file naming micro-kernels, backend kernels and dimensions; `--fir` and `--fir-check` in formers.n.
 - [Codestral FIR on Vulkan](fir-script-lift.md#codestral-on-vulkan) covers recording in memory, reusing the original checkpoint and adapter, and comparing native and FIR token IDs.
-- [BybyLang integration tests](../test/bybylang_test/README.md): BybyLang scripts that import `lib_c_api` and exercise the C ABI plus the native `gpu ...` DSL.
+- [BybyLang integration tests](../test/bybylang_test/README.md): BybyLang scripts that import `nimformers_lib` and exercise the C ABI plus the native `gpu ...` DSL.
 - [BybyLang test API reference](bybylang-tests.md): run and extend the two `.bybylang` tests, with every DSL command and C ABI call explained.
 - [BybyLang GPU API and DSL](bybylang-api.md): GPU backend functions, DSL syntax, session blocks, imports, and native micro-kernel blocks.
 - [BybyLang language reference](bybylang-language.md): the project-local bilingual edition of the vendored README, including syntax and hardware simulation.
@@ -71,7 +71,7 @@ This directory is the user documentation for the public Nimformer APIs. Use the 
 | `test/bybylang_test/*.bybylang` | [BybyLang test API reference](bybylang-tests.md) |
 | `test/codestral/rawbin.nim` / `test/codestral/qlorabin.nim` / `test/codestral/checkpoint.nim` | [Checkpoint and Binary Formats](checkpoint-formats.md) |
 | `vendor/bybylang/` | [BybyLang DSL](bybylang-api.md), [Language reference](bybylang-language.md), [Sessions](gpu-session-api.md), [Micro-VM/JIT](microkernel-api.md) |
-| `lib_c_api.nim` / `nimformers/` / `include/nimformers.h` | [Python and C ABI](python-api.md) |
+| `nimformers_lib.nim` / `nimformers/` / `include/nimformers.h` | [Python and C ABI](python-api.md) |
 | `nimformers.distributed` | [Single-host distributed execution](distributed.md) |
 
 The signatures shown here are for user-facing modules and facade exports. Internal kernels and test/benchmark-only helpers are not stable application APIs. Source files remain the final authority when an API is marked experimental or backend-specific.

@@ -122,7 +122,7 @@ Lưu đoạn sau trong `test/bybylang_test/abi_hello.bybylang` để dùng các 
 path của `test/bybylang_test/nim.cfg`:
 
 ```bybylang
-import nim "../../lib_c_api"
+import nim "../../nimformers_lib"
 
 ctx = nimf_context_create(0)
 if ctx == nil:
@@ -146,7 +146,7 @@ discard nimf_context_destroy(ctx)
 ./test/bybylang_test/abi_hello_bin
 ```
 
-Ở đây `import nim` compile module `lib_c_api.nim` vào chương trình AOT; nó
+Ở đây `import nim` compile module `nimformers_lib.nim` vào chương trình AOT; nó
 không load `libnimformers.dylib` bằng dynamic FFI như wrapper Python (xem chi tiết cách load dylib trong Python tại [Hướng dẫn tích hợp dylib](bybylang-integration.md)).
 Các symbol/signatures dùng chung C ABI, xem [public header](../include/nimformers.h).
 `nimf_context_create(0)` chọn auto; status `0` là thành công; các handle cần
@@ -185,7 +185,7 @@ cầu báo lỗi khi phép GPU phải fallback.
 
 ## Lỗi thường gặp
 
-- Không tìm thấy `lib_c_api`, `fp4_gemv_gpu` hoặc module model khi AOT:
+- Không tìm thấy `nimformers_lib`, `fp4_gemv_gpu` hoặc module model khi AOT:
   kiểm tra import tương đối và các `--path` trong `nim.cfg`.
 - Sửa compiler mà script vẫn dùng hành vi cũ: build lại compiler vendored.
 - Không truy cập Metal/Vulkan: thử binary từ terminal có quyền dùng GPU;

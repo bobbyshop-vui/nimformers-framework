@@ -176,9 +176,9 @@ make -C vendor/bybylang build
 
 `--aot` writes and compiles a Nim source file; execute the generated binary
 separately. `BYBYLANG_NIMCACHE` selects the compiler cache directory. Examples
-importing `lib_c_api` also need the framework's module search paths; the test
+importing `nimformers_lib` also need the framework's module search paths; the test
 directory supplies them in `test/bybylang_test/nim.cfg`. An `import nim` of
-`lib_c_api` compiles the Nim ABI implementation into the binary and does not
+`nimformers_lib` compiles the Nim ABI implementation into the binary and does not
 dynamically load the Python shared library.
 
 On macOS where the build/run session needs to remain awake, prefix the relevant commands with `caffeinate -i`. For the GPU process, ensure the backend can access the device; a sandboxed/headless launch may not expose Metal.

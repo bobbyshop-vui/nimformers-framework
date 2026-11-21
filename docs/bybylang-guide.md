@@ -123,7 +123,7 @@ Save this in `test/bybylang_test/abi_hello.bybylang` to use the search paths
 from `test/bybylang_test/nim.cfg`:
 
 ```bybylang
-import nim "../../lib_c_api"
+import nim "../../nimformers_lib"
 
 ctx = nimf_context_create(0)
 if ctx == nil:
@@ -147,7 +147,7 @@ discard nimf_context_destroy(ctx)
 ./test/bybylang_test/abi_hello_bin
 ```
 
-Here `import nim` compiles `lib_c_api.nim` into the AOT program; it does not
+Here `import nim` compiles `nimformers_lib.nim` into the AOT program; it does not
 load `libnimformers.dylib` with dynamic FFI as Python does. Symbols and
 signatures share the C ABI; see the [public header](../include/nimformers.h).
 `nimf_context_create(0)` selects auto; status `0` means success. Release
@@ -185,7 +185,7 @@ paths; `setForbidCpuFallback(true)` makes an operation's GPU fallback an error.
 
 ## Troubleshooting
 
-- AOT cannot find `lib_c_api`, `fp4_gemv_gpu`, or model modules:
+- AOT cannot find `nimformers_lib`, `fp4_gemv_gpu`, or model modules:
   check relative imports and `nim.cfg` search paths.
 - Old compiler behavior after source changes: rebuild the vendored compiler.
 - Metal/Vulkan unavailable: try the binary in a terminal with GPU access;
