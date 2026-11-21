@@ -114,30 +114,30 @@ proc ok(): cint {.inline.} =
   lastError.setLen(0)
   0
 
-proc nimf_abi_version*(): uint32 {.exportc: "nimf_abi_version", cdecl, dynlib.} =
+proc nimf_abi_version*(): uint32 {.exportc: "nimf_abi_version", cdecl, dynlib, apiHooked.} =
   NIMF_ABI_VERSION
 
-proc nimf_version*(): cstring {.exportc: "nimf_version", cdecl, dynlib.} =
+proc nimf_version*(): cstring {.exportc: "nimf_version", cdecl, dynlib, apiHooked.} =
   NIMF_VERSION_STRING.cstring
 
-proc nimf_last_error*(): cstring {.exportc: "nimf_last_error", cdecl, dynlib.} =
+proc nimf_last_error*(): cstring {.exportc: "nimf_last_error", cdecl, dynlib, apiHooked.} =
   lastError.cstring
 
-proc nimf_clear_error*() {.exportc: "nimf_clear_error", cdecl, dynlib.} =
+proc nimf_clear_error*() {.exportc: "nimf_clear_error", cdecl, dynlib, apiHooked.} =
   lastError.setLen(0)
 
-proc nimf_cpu_isa*(): cint {.exportc: "nimf_cpu_isa", cdecl, dynlib.} =
+proc nimf_cpu_isa*(): cint {.exportc: "nimf_cpu_isa", cdecl, dynlib, apiHooked.} =
   ## Numeric CPU ISA: 0=scalar, 1=SSE4, 2=AVX, 3=AVX2, 4=AVX-512, 5=NEON.
   let info = cpub.cpuInfo()
   result = if info.hasNeon: 5 else: cint(info.isa)
 
 var cpuIsaNameBuf {.threadvar.}: string
-proc nimf_cpu_isa_name*(): cstring {.exportc: "nimf_cpu_isa_name", cdecl, dynlib.} =
+proc nimf_cpu_isa_name*(): cstring {.exportc: "nimf_cpu_isa_name", cdecl, dynlib, apiHooked.} =
   let info = cpub.cpuInfo()
   cpuIsaNameBuf = if info.hasNeon: "neon" else: info.isaName
   cpuIsaNameBuf.cstring
 
-proc nimf_cpu_features*(): uint32 {.exportc: "nimf_cpu_features", cdecl, dynlib.} =
+proc nimf_cpu_features*(): uint32 {.exportc: "nimf_cpu_features", cdecl, dynlib, apiHooked.} =
   ## Bitmask: 1=SSE4 2=AVX 4=AVX2 8=FMA 16=AVX-512 32=NEON.
   let f = cpub.cpuFeatures()
   if f.sse4: result = result or 1'u32
@@ -148,7 +148,7 @@ proc nimf_cpu_features*(): uint32 {.exportc: "nimf_cpu_features", cdecl, dynlib.
   if f.neon: result = result or 32'u32
 
 proc nimf_cpu_cache_sizes*(l1, l2, l3: ptr int64): cint
-    {.exportc: "nimf_cpu_cache_sizes", cdecl, dynlib.} =
+    {.exportc: "nimf_cpu_cache_sizes", cdecl, dynlib, apiHooked.} =
   if l1 == nil or l2 == nil or l3 == nil:
     return fail("null CPU cache output pointer")
   let info = cpub.cpuInfo()
@@ -158,7 +158,7 @@ proc nimf_cpu_cache_sizes*(l1, l2, l3: ptr int64): cint
   ok()
 
 proc nimf_cpu_block_sizes*(mc, nc, kc: ptr int64): cint
-    {.exportc: "nimf_cpu_block_sizes", cdecl, dynlib.} =
+    {.exportc: "nimf_cpu_block_sizes", cdecl, dynlib, apiHooked.} =
   if mc == nil or nc == nil or kc == nil:
     return fail("null CPU block output pointer")
   let b = cpub.cpuBlockSizes()
@@ -167,7 +167,7 @@ proc nimf_cpu_block_sizes*(mc, nc, kc: ptr int64): cint
   kc[] = int64(b.kc)
   ok()
 
-proc nimf_free_string*(p: cstring) {.exportc: "nimf_free_string", cdecl, dynlib.} =
+proc nimf_free_string*(p: cstring) {.exportc: "nimf_free_string", cdecl, dynlib, apiHooked.} =
   if p != nil:
     deallocShared(cast[pointer](p))
 
@@ -246,7 +246,7 @@ proc invalidBuf(buf: pointer; n: int64): bool {.inline.} =
 # =====================================================================
 
 proc nimf_context_create*(backendKind: cint): pointer
-    {.exportc: "nimf_context_create", cdecl, dynlib.} =
+    {.exportc: "nimf_context_create", cdecl, dynlib, apiHooked.} =
   ## 0 = auto, 1 = Metal, 2 = Vulkan, 3 = CUDA (alias of Vulkan), 4 = CPU.
   try:
     let name = case backendKind
@@ -266,7 +266,7 @@ proc nimf_context_create*(backendKind: cint): pointer
     failPtr(e.msg)
 
 proc nimf_context_create_name*(backendName: cstring): pointer
-    {.exportc: "nimf_context_create_name", cdecl, dynlib.} =
+    {.exportc: "nimf_context_create_name", cdecl, dynlib, apiHooked.} =
   if backendName == nil: return failPtr("null backend name")
   try:
     let ctx = cast[ptr NimfContext](allocShared0(sizeof(NimfContext)))
@@ -278,13 +278,13 @@ proc nimf_context_create_name*(backendName: cstring): pointer
     failPtr(e.msg)
 
 proc nimf_context_destroy*(handle: pointer): cint
-    {.exportc: "nimf_context_destroy", cdecl, dynlib.} =
+    {.exportc: "nimf_context_destroy", cdecl, dynlib, apiHooked.} =
   if handle == nil: return ok()
   deallocShared(handle)
   ok()
 
 proc nimf_context_backend*(handle: pointer): cint
-    {.exportc: "nimf_context_backend", cdecl, dynlib.} =
+    {.exportc: "nimf_context_backend", cdecl, dynlib, apiHooked.} =
   ## Returns 1 for Metal, 2 for Vulkan, -1 on error.
   let ctx = checkContext(handle)
   if ctx == nil:
@@ -297,7 +297,7 @@ proc nimf_context_backend*(handle: pointer): cint
   of bkCpu: result = 4
 
 proc nimf_context_backend_name*(handle: pointer): cstring
-    {.exportc: "nimf_context_backend_name", cdecl, dynlib.} =
+    {.exportc: "nimf_context_backend_name", cdecl, dynlib, apiHooked.} =
   let ctx = checkContext(handle)
   if ctx == nil:
     discard fail("null context")
@@ -309,7 +309,7 @@ proc nimf_context_backend_name*(handle: pointer): cstring
   of bkCpu: result = "cpu"
 
 proc nimf_context_sync*(handle: pointer): cint
-    {.exportc: "nimf_context_sync", cdecl, dynlib.} =
+    {.exportc: "nimf_context_sync", cdecl, dynlib, apiHooked.} =
   ## Best-effort device synchronisation (opens and closes an empty session).
   let ctx = checkContext(handle)
   if ctx == nil: return fail("null context")
@@ -324,7 +324,7 @@ proc nimf_context_sync*(handle: pointer): cint
     fail(e.msg)
 
 proc nimf_context_set_cpu_fallback*(ctx: pointer; allowFallback: cint): cint
-    {.exportc: "nimf_context_set_cpu_fallback", cdecl, dynlib.} =
+    {.exportc: "nimf_context_set_cpu_fallback", cdecl, dynlib, apiHooked.} =
   ## allowFallback != 0 permits silent CPU fallback; 0 forbids it.
   if ctx == nil: return fail("null context")
   backend.setForbidCpuFallback(allowFallback == 0)
@@ -335,7 +335,7 @@ proc nimf_context_set_cpu_fallback*(ctx: pointer; allowFallback: cint): cint
 # =====================================================================
 
 proc nimf_tensor_create*(data: ptr cfloat; n: int64): pointer
-    {.exportc: "nimf_tensor_create", cdecl, dynlib.} =
+    {.exportc: "nimf_tensor_create", cdecl, dynlib, apiHooked.} =
   if n < 0 or (n > 0 and data == nil):
     return failPtr("invalid tensor pointer or length")
   try:
@@ -350,7 +350,7 @@ proc nimf_tensor_create*(data: ptr cfloat; n: int64): pointer
 
 proc nimf_tensor_create_shaped*(data: ptr cfloat; n: int64;
     shape: ptr int64; rank: int64): pointer
-    {.exportc: "nimf_tensor_create_shaped", cdecl, dynlib.} =
+    {.exportc: "nimf_tensor_create_shaped", cdecl, dynlib, apiHooked.} =
   try:
     let dims = readShape(shape, rank)
     if numelOf(dims) != n:
@@ -367,7 +367,7 @@ proc nimf_tensor_create_shaped*(data: ptr cfloat; n: int64;
     failPtr(e.msg)
 
 proc nimf_tensor_zeros*(shape: ptr int64; rank: int64; fill: cfloat): pointer
-    {.exportc: "nimf_tensor_zeros", cdecl, dynlib.} =
+    {.exportc: "nimf_tensor_zeros", cdecl, dynlib, apiHooked.} =
   try:
     let dims = readShape(shape, rank)
     let n = numelOf(dims)
@@ -383,7 +383,7 @@ proc nimf_tensor_zeros*(shape: ptr int64; rank: int64; fill: cfloat): pointer
     failPtr(e.msg)
 
 proc nimf_tensor_randn*(shape: ptr int64; rank: int64; scale: cfloat): pointer
-    {.exportc: "nimf_tensor_randn", cdecl, dynlib.} =
+    {.exportc: "nimf_tensor_randn", cdecl, dynlib, apiHooked.} =
   try:
     let dims = readShape(shape, rank)
     let tmp = randnTensor(dims, float32(scale))
@@ -398,7 +398,7 @@ proc nimf_tensor_randn*(shape: ptr int64; rank: int64; scale: cfloat): pointer
     failPtr(e.msg)
 
 proc nimf_tensor_clone*(handle: pointer): pointer
-    {.exportc: "nimf_tensor_clone", cdecl, dynlib.} =
+    {.exportc: "nimf_tensor_clone", cdecl, dynlib, apiHooked.} =
   let t = checkTensor(handle)
   if t == nil: return failPtr("null tensor")
   try:
@@ -412,7 +412,7 @@ proc nimf_tensor_clone*(handle: pointer): pointer
     failPtr(e.msg)
 
 proc nimf_tensor_destroy*(handle: pointer): cint
-    {.exportc: "nimf_tensor_destroy", cdecl, dynlib.} =
+    {.exportc: "nimf_tensor_destroy", cdecl, dynlib, apiHooked.} =
   if handle == nil: return ok()
   let t = cast[ptr NimfTensor](handle)
   t.data = @[]
@@ -421,7 +421,7 @@ proc nimf_tensor_destroy*(handle: pointer): cint
   ok()
 
 proc nimf_tensor_rank*(handle: pointer): int64
-    {.exportc: "nimf_tensor_rank", cdecl, dynlib.} =
+    {.exportc: "nimf_tensor_rank", cdecl, dynlib, apiHooked.} =
   let t = checkTensor(handle)
   if t == nil:
     discard fail("null tensor")
@@ -429,7 +429,7 @@ proc nimf_tensor_rank*(handle: pointer): int64
   int64(t.shape.len)
 
 proc nimf_tensor_numel*(handle: pointer): int64
-    {.exportc: "nimf_tensor_numel", cdecl, dynlib.} =
+    {.exportc: "nimf_tensor_numel", cdecl, dynlib, apiHooked.} =
   let t = checkTensor(handle)
   if t == nil:
     discard fail("null tensor")
@@ -437,7 +437,7 @@ proc nimf_tensor_numel*(handle: pointer): int64
   numelOf64(t.shape)
 
 proc nimf_tensor_shape*(handle: pointer; outShape: ptr int64; cap: int64): int64
-    {.exportc: "nimf_tensor_shape", cdecl, dynlib.} =
+    {.exportc: "nimf_tensor_shape", cdecl, dynlib, apiHooked.} =
   ## Writes up to `cap` dimensions and returns the tensor rank.
   let t = checkTensor(handle)
   if t == nil:
@@ -452,7 +452,7 @@ proc nimf_tensor_shape*(handle: pointer; outShape: ptr int64; cap: int64): int64
   int64(t.shape.len)
 
 proc nimf_tensor_data*(handle: pointer): ptr cfloat
-    {.exportc: "nimf_tensor_data", cdecl, dynlib.} =
+    {.exportc: "nimf_tensor_data", cdecl, dynlib, apiHooked.} =
   let t = checkTensor(handle)
   if t == nil or t.data.len == 0:
     discard fail("null tensor or empty tensor")
@@ -461,7 +461,7 @@ proc nimf_tensor_data*(handle: pointer): ptr cfloat
   cast[ptr cfloat](addr t.data[0])
 
 proc nimf_tensor_len*(handle: pointer): int64
-    {.exportc: "nimf_tensor_len", cdecl, dynlib.} =
+    {.exportc: "nimf_tensor_len", cdecl, dynlib, apiHooked.} =
   let t = checkTensor(handle)
   if t == nil:
     discard fail("null tensor")
@@ -470,7 +470,7 @@ proc nimf_tensor_len*(handle: pointer): int64
   int64(t.data.len)
 
 proc nimf_tensor_set_data*(handle: pointer; data: ptr cfloat; n: int64): cint
-    {.exportc: "nimf_tensor_set_data", cdecl, dynlib.} =
+    {.exportc: "nimf_tensor_set_data", cdecl, dynlib, apiHooked.} =
   let t = checkTensor(handle)
   if t == nil: return fail("null tensor")
   if n != numelOf64(t.shape):
@@ -483,14 +483,14 @@ proc nimf_tensor_set_data*(handle: pointer; data: ptr cfloat; n: int64): cint
     fail(e.msg)
 
 proc nimf_tensor_fill*(handle: pointer; value: cfloat): cint
-    {.exportc: "nimf_tensor_fill", cdecl, dynlib.} =
+    {.exportc: "nimf_tensor_fill", cdecl, dynlib, apiHooked.} =
   let t = checkTensor(handle)
   if t == nil: return fail("null tensor")
   for i in 0 ..< t.data.len: t.data[i] = float32(value)
   ok()
 
 proc nimf_tensor_reshape*(handle: pointer; shape: ptr int64; rank: int64): cint
-    {.exportc: "nimf_tensor_reshape", cdecl, dynlib.} =
+    {.exportc: "nimf_tensor_reshape", cdecl, dynlib, apiHooked.} =
   let t = checkTensor(handle)
   if t == nil: return fail("null tensor")
   try:
@@ -527,13 +527,13 @@ proc binaryOp(ctxHandle: pointer; a, b, outData: ptr cfloat; n: int64;
     fail(e.msg)
 
 proc nimf_add*(ctx: pointer; a, b, outData: ptr cfloat; n: int64): cint
-    {.exportc: "nimf_add", cdecl, dynlib.} = binaryOp(ctx, a, b, outData, n, 0)
+    {.exportc: "nimf_add", cdecl, dynlib, apiHooked.} = binaryOp(ctx, a, b, outData, n, 0)
 proc nimf_sub*(ctx: pointer; a, b, outData: ptr cfloat; n: int64): cint
-    {.exportc: "nimf_sub", cdecl, dynlib.} = binaryOp(ctx, a, b, outData, n, 1)
+    {.exportc: "nimf_sub", cdecl, dynlib, apiHooked.} = binaryOp(ctx, a, b, outData, n, 1)
 proc nimf_mul*(ctx: pointer; a, b, outData: ptr cfloat; n: int64): cint
-    {.exportc: "nimf_mul", cdecl, dynlib.} = binaryOp(ctx, a, b, outData, n, 2)
+    {.exportc: "nimf_mul", cdecl, dynlib, apiHooked.} = binaryOp(ctx, a, b, outData, n, 2)
 proc nimf_div*(ctx: pointer; a, b, outData: ptr cfloat; n: int64): cint
-    {.exportc: "nimf_div", cdecl, dynlib.} = binaryOp(ctx, a, b, outData, n, 3)
+    {.exportc: "nimf_div", cdecl, dynlib, apiHooked.} = binaryOp(ctx, a, b, outData, n, 3)
 
 proc unaryOp(ctxHandle: pointer; x, outData: ptr cfloat; n: int64;
              op: int; exponent: cfloat = 1): cint =
@@ -557,22 +557,22 @@ proc unaryOp(ctxHandle: pointer; x, outData: ptr cfloat; n: int64;
     fail(e.msg)
 
 proc nimf_sqrt*(ctx: pointer; x, outData: ptr cfloat; n: int64): cint
-    {.exportc: "nimf_sqrt", cdecl, dynlib.} = unaryOp(ctx, x, outData, n, 0)
+    {.exportc: "nimf_sqrt", cdecl, dynlib, apiHooked.} = unaryOp(ctx, x, outData, n, 0)
 proc nimf_exp*(ctx: pointer; x, outData: ptr cfloat; n: int64): cint
-    {.exportc: "nimf_exp", cdecl, dynlib.} = unaryOp(ctx, x, outData, n, 1)
+    {.exportc: "nimf_exp", cdecl, dynlib, apiHooked.} = unaryOp(ctx, x, outData, n, 1)
 proc nimf_log*(ctx: pointer; x, outData: ptr cfloat; n: int64): cint
-    {.exportc: "nimf_log", cdecl, dynlib.} = unaryOp(ctx, x, outData, n, 2)
+    {.exportc: "nimf_log", cdecl, dynlib, apiHooked.} = unaryOp(ctx, x, outData, n, 2)
 proc nimf_pow*(ctx: pointer; x, outData: ptr cfloat; n: int64; exponent: cfloat): cint
-    {.exportc: "nimf_pow", cdecl, dynlib.} = unaryOp(ctx, x, outData, n, 3, exponent)
+    {.exportc: "nimf_pow", cdecl, dynlib, apiHooked.} = unaryOp(ctx, x, outData, n, 3, exponent)
 proc nimf_sigmoid*(ctx: pointer; x, outData: ptr cfloat; n: int64): cint
-    {.exportc: "nimf_sigmoid", cdecl, dynlib.} = unaryOp(ctx, x, outData, n, 4)
+    {.exportc: "nimf_sigmoid", cdecl, dynlib, apiHooked.} = unaryOp(ctx, x, outData, n, 4)
 proc nimf_tanh*(ctx: pointer; x, outData: ptr cfloat; n: int64): cint
-    {.exportc: "nimf_tanh", cdecl, dynlib.} = unaryOp(ctx, x, outData, n, 5)
+    {.exportc: "nimf_tanh", cdecl, dynlib, apiHooked.} = unaryOp(ctx, x, outData, n, 5)
 proc nimf_relu*(ctx: pointer; x, outData: ptr cfloat; n: int64): cint
-    {.exportc: "nimf_relu", cdecl, dynlib.} = unaryOp(ctx, x, outData, n, 6)
+    {.exportc: "nimf_relu", cdecl, dynlib, apiHooked.} = unaryOp(ctx, x, outData, n, 6)
 
 proc nimf_neg*(ctxHandle: pointer; x, outData: ptr cfloat; n: int64): cint
-    {.exportc: "nimf_neg", cdecl, dynlib.} =
+    {.exportc: "nimf_neg", cdecl, dynlib, apiHooked.} =
   if ctxHandle == nil: return fail("null context")
   if n < 0 or invalidBuf(x, n) or invalidBuf(outData, n):
     return fail("invalid data pointer or length")
@@ -603,16 +603,16 @@ proc scalarOp(ctxHandle: pointer; x, outData: ptr cfloat; n: int64;
     fail(e.msg)
 
 proc nimf_add_scalar*(ctx: pointer; x, outData: ptr cfloat; n: int64;
-    scalar: cfloat): cint {.exportc: "nimf_add_scalar", cdecl, dynlib.} =
+    scalar: cfloat): cint {.exportc: "nimf_add_scalar", cdecl, dynlib, apiHooked.} =
   scalarOp(ctx, x, outData, n, scalar, true)
 
 proc nimf_mul_scalar*(ctx: pointer; x, outData: ptr cfloat; n: int64;
-    scalar: cfloat): cint {.exportc: "nimf_mul_scalar", cdecl, dynlib.} =
+    scalar: cfloat): cint {.exportc: "nimf_mul_scalar", cdecl, dynlib, apiHooked.} =
   scalarOp(ctx, x, outData, n, scalar, false)
 
 proc nimf_apflu*(ctxHandle: pointer; x, outData: ptr cfloat; n: int64;
     alpha, beta: cfloat): cint
-    {.exportc: "nimf_apflu", cdecl, dynlib.} =
+    {.exportc: "nimf_apflu", cdecl, dynlib, apiHooked.} =
   if ctxHandle == nil: return fail("null context")
   if n < 0 or invalidBuf(x, n) or invalidBuf(outData, n):
     return fail("invalid APFLU arguments")
@@ -626,7 +626,7 @@ proc nimf_apflu*(ctxHandle: pointer; x, outData: ptr cfloat; n: int64;
 
 proc nimf_apflu_backward*(ctxHandle: pointer; x, dy, outData: ptr cfloat;
     n: int64; alpha, beta: cfloat): cint
-    {.exportc: "nimf_apflu_backward", cdecl, dynlib.} =
+    {.exportc: "nimf_apflu_backward", cdecl, dynlib, apiHooked.} =
   if ctxHandle == nil: return fail("null context")
   if n < 0 or invalidBuf(x, n) or invalidBuf(dy, n) or invalidBuf(outData, n):
     return fail("invalid APFLU backward arguments")
@@ -644,7 +644,7 @@ proc nimf_apflu_backward*(ctxHandle: pointer; x, dy, outData: ptr cfloat;
 
 proc nimf_matmul*(ctxHandle: pointer; a, b, outData: ptr cfloat;
                   m, k, n: int64): cint
-    {.exportc: "nimf_matmul", cdecl, dynlib.} =
+    {.exportc: "nimf_matmul", cdecl, dynlib, apiHooked.} =
   if ctxHandle == nil: return fail("null context")
   if m < 0 or k < 0 or n < 0 or invalidBuf(a, m * k) or
       invalidBuf(b, k * n) or invalidBuf(outData, m * n):
@@ -660,7 +660,7 @@ proc nimf_matmul*(ctxHandle: pointer; a, b, outData: ptr cfloat;
 
 proc nimf_matmul2*(ctxHandle: pointer; a1, b1, out1: ptr cfloat;
     m1, k1, n1: int64; a2, b2, out2: ptr cfloat; m2, k2, n2: int64): cint
-    {.exportc: "nimf_matmul2", cdecl, dynlib.} =
+    {.exportc: "nimf_matmul2", cdecl, dynlib, apiHooked.} =
   if ctxHandle == nil: return fail("null context")
   if min([m1, k1, n1, m2, k2, n2]) < 0 or
       invalidBuf(a1, m1 * k1) or invalidBuf(b1, k1 * n1) or invalidBuf(out1, m1 * n1) or
@@ -683,7 +683,7 @@ proc nimf_matmul_q4*(ctxHandle: pointer; a: ptr cfloat; aLen: int64;
     packedWeight: ptr uint8; packedLen: int64;
     scales, zeros: ptr cfloat; scaleLen, zeroLen: int64;
     outData: ptr cfloat; m, k, n, groupSize, groupsPerRow: int64): cint
-    {.exportc: "nimf_matmul_q4", cdecl, dynlib.} =
+    {.exportc: "nimf_matmul_q4", cdecl, dynlib, apiHooked.} =
   if ctxHandle == nil: return fail("null context")
   if min([aLen, packedLen, scaleLen, zeroLen, m, k, n, groupSize, groupsPerRow]) < 0 or
       (aLen > 0 and a == nil) or (packedLen > 0 and packedWeight == nil) or
@@ -703,7 +703,7 @@ proc nimf_matmul_q4*(ctxHandle: pointer; a: ptr cfloat; aLen: int64;
 
 proc nimf_matmul_nt*(ctxHandle: pointer; a, b, outData: ptr cfloat;
     m, k, n: int64): cint
-    {.exportc: "nimf_matmul_nt", cdecl, dynlib.} =
+    {.exportc: "nimf_matmul_nt", cdecl, dynlib, apiHooked.} =
   ## C[M,N] = A[M,K] @ B[N,K]^T.  B keeps its natural [N,K] layout.
   if ctxHandle == nil: return fail("null context")
   if m < 0 or k < 0 or n < 0 or invalidBuf(a, m * k) or
@@ -743,7 +743,7 @@ proc nimf_matmul_nt*(ctxHandle: pointer; a, b, outData: ptr cfloat;
 proc nimf_resident_q4_upload*(ctxHandle: pointer; packed: ptr uint8;
     packedLen: int64; scales, zeros: ptr cfloat; scaleLen, zeroLen: int64;
     k, n, groupSize, groupsPerRow: int64): pointer
-    {.exportc: "nimf_resident_q4_upload", cdecl, dynlib.} =
+    {.exportc: "nimf_resident_q4_upload", cdecl, dynlib, apiHooked.} =
   if ctxHandle == nil: return failPtr("null context")
   if min([packedLen, scaleLen, zeroLen, k, n, groupSize, groupsPerRow]) < 0 or
       (packedLen > 0 and packed == nil) or (scaleLen > 0 and scales == nil) or
@@ -765,7 +765,7 @@ proc nimf_resident_q4_upload*(ctxHandle: pointer; packed: ptr uint8;
 
 proc nimf_resident_q4_linear*(ctxHandle, weightHandle: pointer; x: ptr cfloat;
     xLen, m: int64; outData: ptr cfloat): cint
-    {.exportc: "nimf_resident_q4_linear", cdecl, dynlib.} =
+    {.exportc: "nimf_resident_q4_linear", cdecl, dynlib, apiHooked.} =
   if ctxHandle == nil or weightHandle == nil: return fail("null handle")
   if xLen < 0 or m < 0 or (xLen > 0 and x == nil):
     return fail("invalid resident Q4 forward arguments")
@@ -781,7 +781,7 @@ proc nimf_resident_q4_linear*(ctxHandle, weightHandle: pointer; x: ptr cfloat;
     fail(e.msg)
 
 proc nimf_resident_q4_destroy*(ctxHandle, weightHandle: pointer): cint
-    {.exportc: "nimf_resident_q4_destroy", cdecl, dynlib.} =
+    {.exportc: "nimf_resident_q4_destroy", cdecl, dynlib, apiHooked.} =
   if weightHandle == nil: return ok()
   try:
     let h = cast[ptr NimfResidentQ4](weightHandle)
@@ -794,7 +794,7 @@ proc nimf_resident_q4_destroy*(ctxHandle, weightHandle: pointer): cint
 
 proc nimf_resident_f32_upload*(ctxHandle: pointer; weights: ptr cfloat;
     n: int64): pointer
-    {.exportc: "nimf_resident_f32_upload", cdecl, dynlib.} =
+    {.exportc: "nimf_resident_f32_upload", cdecl, dynlib, apiHooked.} =
   if ctxHandle == nil: return failPtr("null context")
   if n < 0 or (n > 0 and weights == nil):
     return failPtr("invalid resident fp32 upload arguments")
@@ -810,7 +810,7 @@ proc nimf_resident_f32_upload*(ctxHandle: pointer; weights: ptr cfloat;
 
 proc nimf_resident_f32_linear*(ctxHandle, weightHandle: pointer; x: ptr cfloat;
     xLen, m, k, n: int64; outData: ptr cfloat): cint
-    {.exportc: "nimf_resident_f32_linear", cdecl, dynlib.} =
+    {.exportc: "nimf_resident_f32_linear", cdecl, dynlib, apiHooked.} =
   if ctxHandle == nil or weightHandle == nil: return fail("null handle")
   if min([xLen, m, k, n]) < 0 or (xLen > 0 and x == nil):
     return fail("invalid resident fp32 forward arguments")
@@ -826,7 +826,7 @@ proc nimf_resident_f32_linear*(ctxHandle, weightHandle: pointer; x: ptr cfloat;
     fail(e.msg)
 
 proc nimf_resident_f32_destroy*(ctxHandle, weightHandle: pointer): cint
-    {.exportc: "nimf_resident_f32_destroy", cdecl, dynlib.} =
+    {.exportc: "nimf_resident_f32_destroy", cdecl, dynlib, apiHooked.} =
   if weightHandle == nil: return ok()
   try:
     let h = cast[ptr NimfResidentF32](weightHandle)
@@ -843,7 +843,7 @@ proc nimf_resident_f32_destroy*(ctxHandle, weightHandle: pointer): cint
 
 proc nimf_softmax*(ctxHandle: pointer; x, outData: ptr cfloat;
                    rows, cols: int64): cint
-    {.exportc: "nimf_softmax", cdecl, dynlib.} =
+    {.exportc: "nimf_softmax", cdecl, dynlib, apiHooked.} =
   if ctxHandle == nil: return fail("null context")
   if rows < 0 or cols < 0 or invalidBuf(x, rows * cols) or
       invalidBuf(outData, rows * cols):
@@ -857,7 +857,7 @@ proc nimf_softmax*(ctxHandle: pointer; x, outData: ptr cfloat;
 
 proc nimf_layernorm*(ctxHandle: pointer; x, gamma, beta, outData: ptr cfloat;
     rows, cols: int64; eps: cfloat): cint
-    {.exportc: "nimf_layernorm", cdecl, dynlib.} =
+    {.exportc: "nimf_layernorm", cdecl, dynlib, apiHooked.} =
   if ctxHandle == nil: return fail("null context")
   if rows < 0 or cols < 0 or invalidBuf(x, rows * cols) or
       invalidBuf(outData, rows * cols) or (cols > 0 and (gamma == nil or beta == nil)):
@@ -872,7 +872,7 @@ proc nimf_layernorm*(ctxHandle: pointer; x, gamma, beta, outData: ptr cfloat;
 
 proc nimf_add_layernorm*(ctxHandle: pointer; a, b, gamma, beta,
     sumOut, normOut: ptr cfloat; rows, cols: int64; eps: cfloat): cint
-    {.exportc: "nimf_add_layernorm", cdecl, dynlib.} =
+    {.exportc: "nimf_add_layernorm", cdecl, dynlib, apiHooked.} =
   if ctxHandle == nil: return fail("null context")
   if rows < 0 or cols < 0 or invalidBuf(a, rows * cols) or
       invalidBuf(b, rows * cols) or invalidBuf(sumOut, rows * cols) or
@@ -892,7 +892,7 @@ proc nimf_add_layernorm*(ctxHandle: pointer; a, b, gamma, beta,
 
 proc nimf_layernorm_backward*(ctxHandle: pointer; dy, x, gamma, beta: ptr cfloat;
     rows, cols: int64; eps: cfloat; dx, dgamma, dbeta: ptr cfloat): cint
-    {.exportc: "nimf_layernorm_backward", cdecl, dynlib.} =
+    {.exportc: "nimf_layernorm_backward", cdecl, dynlib, apiHooked.} =
   if ctxHandle == nil: return fail("null context")
   if min([rows, cols]) < 0 or invalidBuf(dy, rows * cols) or
       invalidBuf(x, rows * cols) or invalidBuf(dx, rows * cols) or
@@ -914,7 +914,7 @@ proc nimf_layernorm_backward*(ctxHandle: pointer; dy, x, gamma, beta: ptr cfloat
 proc nimf_attention*(ctxHandle: pointer; q, k, v, mask: ptr cfloat; maskLen: int64;
     batch, heads, sequenceLen, headDim: int64; scale: cfloat;
     outData, scores: ptr cfloat): cint
-    {.exportc: "nimf_attention", cdecl, dynlib.} =
+    {.exportc: "nimf_attention", cdecl, dynlib, apiHooked.} =
   let tensorLen = batch * heads * sequenceLen * headDim
   let scoreLen = batch * heads * sequenceLen * sequenceLen
   if ctxHandle == nil: return fail("null context")
@@ -937,7 +937,7 @@ proc nimf_attention*(ctxHandle: pointer; q, k, v, mask: ptr cfloat; maskLen: int
 proc nimf_attention_backward*(ctxHandle: pointer; q, k, v, scores, dy: ptr cfloat;
     batch, heads, sequenceLen, headDim: int64; scale: cfloat;
     dq, dk, dv: ptr cfloat): cint
-    {.exportc: "nimf_attention_backward", cdecl, dynlib.} =
+    {.exportc: "nimf_attention_backward", cdecl, dynlib, apiHooked.} =
   let tensorLen = batch * heads * sequenceLen * headDim
   let scoreLen = batch * heads * sequenceLen * sequenceLen
   if ctxHandle == nil: return fail("null context")
@@ -963,7 +963,7 @@ proc nimf_attention_backward*(ctxHandle: pointer; q, k, v, scores, dy: ptr cfloa
 proc nimf_embedding_lookup*(ctxHandle: pointer; table: ptr cfloat; tableLen: int64;
     indices: ptr int32; indexCount: int64; outData: ptr cfloat;
     vocab, dim: int64): cint
-    {.exportc: "nimf_embedding_lookup", cdecl, dynlib.} =
+    {.exportc: "nimf_embedding_lookup", cdecl, dynlib, apiHooked.} =
   if ctxHandle == nil: return fail("null context")
   if tableLen < 0 or indexCount < 0 or vocab < 0 or dim < 0 or
       (tableLen > 0 and table == nil) or
@@ -980,7 +980,7 @@ proc nimf_embedding_lookup*(ctxHandle: pointer; table: ptr cfloat; tableLen: int
 
 proc nimf_gather*(ctxHandle: pointer; src: ptr cfloat; srcLen: int64;
     indices: ptr int32; indexCount: int64; outData: ptr cfloat): cint
-    {.exportc: "nimf_gather", cdecl, dynlib.} =
+    {.exportc: "nimf_gather", cdecl, dynlib, apiHooked.} =
   if ctxHandle == nil: return fail("null context")
   if srcLen < 0 or indexCount < 0 or (srcLen > 0 and src == nil) or
       (indexCount > 0 and (indices == nil or outData == nil)):
@@ -996,7 +996,7 @@ proc nimf_gather*(ctxHandle: pointer; src: ptr cfloat; srcLen: int64;
 
 proc nimf_compare*(ctxHandle: pointer; a, b: ptr cfloat; n: int64;
     op: cint; outMask: ptr uint8): cint
-    {.exportc: "nimf_compare", cdecl, dynlib.} =
+    {.exportc: "nimf_compare", cdecl, dynlib, apiHooked.} =
   ## op: 0=gt, 1=lt, 2=eq, 3=ge, 4=le.  outMask receives 0/1 bytes.
   if ctxHandle == nil: return fail("null context")
   if n < 0 or op < 0 or op > 4 or invalidBuf(a, n) or invalidBuf(b, n) or
@@ -1013,7 +1013,7 @@ proc nimf_compare*(ctxHandle: pointer; a, b: ptr cfloat; n: int64;
 
 proc nimf_dropout*(ctxHandle: pointer; x, outData: ptr cfloat; n: int64;
     probability: cfloat; training: cint; seed: uint32): cint
-    {.exportc: "nimf_dropout", cdecl, dynlib.} =
+    {.exportc: "nimf_dropout", cdecl, dynlib, apiHooked.} =
   if ctxHandle == nil: return fail("null context")
   if n < 0 or probability < 0 or probability >= 1 or
       invalidBuf(x, n) or invalidBuf(outData, n):
@@ -1027,7 +1027,7 @@ proc nimf_dropout*(ctxHandle: pointer; x, outData: ptr cfloat; n: int64;
 
 proc nimf_dropout_mask*(ctxHandle: pointer; n: int64; probability: cfloat;
     seed: uint32; outData: ptr cfloat): cint
-    {.exportc: "nimf_dropout_mask", cdecl, dynlib.} =
+    {.exportc: "nimf_dropout_mask", cdecl, dynlib, apiHooked.} =
   ## Deterministic inverted-dropout mask (0 or 1/(1-p)) for a given seed.
   if ctxHandle == nil: return fail("null context")
   if n < 0 or probability < 0 or probability >= 1 or invalidBuf(outData, n):
@@ -1042,7 +1042,7 @@ proc nimf_dropout_mask*(ctxHandle: pointer; n: int64; probability: cfloat;
 proc nimf_argmax*(ctxHandle: pointer; x: ptr cfloat; xLen: int64;
     outer, dimSize, inner: int64; outValues: ptr cfloat;
     outIndices: ptr int64): cint
-    {.exportc: "nimf_argmax", cdecl, dynlib.} =
+    {.exportc: "nimf_argmax", cdecl, dynlib, apiHooked.} =
   if ctxHandle == nil: return fail("null context")
   if min([xLen, outer, dimSize, inner]) < 0 or invalidBuf(x, xLen) or
       invalidBuf(outValues, outer * inner) or invalidBuf(outIndices, outer * inner):
@@ -1084,7 +1084,7 @@ proc nimf_argmax*(ctxHandle: pointer; x: ptr cfloat; xLen: int64;
 
 proc nimf_masked_fill*(x: ptr cfloat; mask: ptr uint8; n: int64;
     value: cfloat; outData: ptr cfloat): cint
-    {.exportc: "nimf_masked_fill", cdecl, dynlib.} =
+    {.exportc: "nimf_masked_fill", cdecl, dynlib, apiHooked.} =
   if n < 0 or invalidBuf(x, n) or invalidBuf(mask, n) or invalidBuf(outData, n):
     return fail("invalid masked-fill arguments")
   let src = cast[ptr UncheckedArray[cfloat]](x)
@@ -1096,7 +1096,7 @@ proc nimf_masked_fill*(x: ptr cfloat; mask: ptr uint8; n: int64;
 
 proc nimf_where*(cond: ptr uint8; a, b: ptr cfloat; n: int64;
     outData: ptr cfloat): cint
-    {.exportc: "nimf_where", cdecl, dynlib.} =
+    {.exportc: "nimf_where", cdecl, dynlib, apiHooked.} =
   if n < 0 or invalidBuf(cond, n) or invalidBuf(a, n) or invalidBuf(b, n) or
       invalidBuf(outData, n):
     return fail("invalid where arguments")
@@ -1136,15 +1136,15 @@ proc reductionOp(ctxHandle: pointer; x: ptr cfloat; xLen: int64;
 
 proc nimf_sum*(ctx: pointer; x: ptr cfloat; xLen: int64; shape: ptr int64;
     rank, dim: int64; outData: ptr cfloat): cint
-    {.exportc: "nimf_sum", cdecl, dynlib.} =
+    {.exportc: "nimf_sum", cdecl, dynlib, apiHooked.} =
   reductionOp(ctx, x, xLen, shape, rank, dim, outData, 0)
 proc nimf_mean*(ctx: pointer; x: ptr cfloat; xLen: int64; shape: ptr int64;
     rank, dim: int64; outData: ptr cfloat): cint
-    {.exportc: "nimf_mean", cdecl, dynlib.} =
+    {.exportc: "nimf_mean", cdecl, dynlib, apiHooked.} =
   reductionOp(ctx, x, xLen, shape, rank, dim, outData, 1)
 proc nimf_max*(ctx: pointer; x: ptr cfloat; xLen: int64; shape: ptr int64;
     rank, dim: int64; outData: ptr cfloat): cint
-    {.exportc: "nimf_max", cdecl, dynlib.} =
+    {.exportc: "nimf_max", cdecl, dynlib, apiHooked.} =
   reductionOp(ctx, x, xLen, shape, rank, dim, outData, 2)
 
 proc scanOp(ctxHandle: pointer; x: ptr cfloat; xLen: int64; shape: ptr int64;
@@ -1166,16 +1166,16 @@ proc scanOp(ctxHandle: pointer; x: ptr cfloat; xLen: int64; shape: ptr int64;
 
 proc nimf_cumsum*(ctx: pointer; x: ptr cfloat; xLen: int64; shape: ptr int64;
     rank, dim: int64; outData: ptr cfloat): cint
-    {.exportc: "nimf_cumsum", cdecl, dynlib.} =
+    {.exportc: "nimf_cumsum", cdecl, dynlib, apiHooked.} =
   scanOp(ctx, x, xLen, shape, rank, dim, outData, 0)
 proc nimf_cumprod*(ctx: pointer; x: ptr cfloat; xLen: int64; shape: ptr int64;
     rank, dim: int64; outData: ptr cfloat): cint
-    {.exportc: "nimf_cumprod", cdecl, dynlib.} =
+    {.exportc: "nimf_cumprod", cdecl, dynlib, apiHooked.} =
   scanOp(ctx, x, xLen, shape, rank, dim, outData, 1)
 
 proc nimf_affine_scan*(ctxHandle: pointer; aCoef, bCoef: ptr cfloat; n: int64;
     shape: ptr int64; rank, dim: int64; outData: ptr cfloat): cint
-    {.exportc: "nimf_affine_scan", cdecl, dynlib.} =
+    {.exportc: "nimf_affine_scan", cdecl, dynlib, apiHooked.} =
   if ctxHandle == nil: return fail("null context")
   if n < 0 or rank <= 0 or dim < 0 or dim >= rank or shape == nil or
       invalidBuf(aCoef, n) or invalidBuf(bCoef, n) or invalidBuf(outData, n):
@@ -1200,7 +1200,7 @@ proc nimf_affine_scan*(ctxHandle: pointer; aCoef, bCoef: ptr cfloat; n: int64;
 proc nimf_permute*(ctxHandle: pointer; src: ptr cfloat; n: int64;
     newStrides, oldStrides, dimsMap: ptr int32; rank: int64;
     outData: ptr cfloat): cint
-    {.exportc: "nimf_permute", cdecl, dynlib.} =
+    {.exportc: "nimf_permute", cdecl, dynlib, apiHooked.} =
   if ctxHandle == nil: return fail("null context")
   if n < 0 or rank < 0 or invalidBuf(src, n) or invalidBuf(outData, n) or
       (rank > 0 and (newStrides == nil or oldStrides == nil or dimsMap == nil)):
@@ -1221,7 +1221,7 @@ proc nimf_permute*(ctxHandle: pointer; src: ptr cfloat; n: int64;
 
 proc nimf_split_slice*(ctxHandle: pointer; src: ptr cfloat;
     dimTotal, thisSize, offset, inner, n: int64; outData: ptr cfloat): cint
-    {.exportc: "nimf_split_slice", cdecl, dynlib.} =
+    {.exportc: "nimf_split_slice", cdecl, dynlib, apiHooked.} =
   ## `src` is the full flattened tensor (all outer slices), not just one.
   ## `n` is the output size; outer is derived as n / (thisSize * inner).
   if ctxHandle == nil: return fail("null context")
@@ -1246,7 +1246,7 @@ proc nimf_split_slice*(ctxHandle: pointer; src: ptr cfloat;
 proc nimf_concat*(ctxHandle: pointer; src: ptr cfloat; srcLen: int64;
     srcBase, srcDimSize, srcDimOffset: ptr int32; count, totalDim, inner,
     outLen: int64; outData: ptr cfloat): cint
-    {.exportc: "nimf_concat", cdecl, dynlib.} =
+    {.exportc: "nimf_concat", cdecl, dynlib, apiHooked.} =
   if ctxHandle == nil: return fail("null context")
   if min([srcLen, count, totalDim, inner, outLen]) < 0 or
       invalidBuf(src, srcLen) or
@@ -1296,7 +1296,7 @@ proc quantBytesPtr(qt: QuantTensor): pointer =
 
 proc nimf_quantize*(x: ptr cfloat; n: int64; shape: ptr int64; rank: int64;
     kind: cint; exponentBits, mantissaBits: cint): pointer
-    {.exportc: "nimf_quantize", cdecl, dynlib.} =
+    {.exportc: "nimf_quantize", cdecl, dynlib, apiHooked.} =
   ## Quantize `x` with `kind` (see QK_*).  For QK_CUSTOM, exponentBits and
   ## mantissaBits define the custom float; for the fixed fp8 kinds they are
   ## ignored.  Returns a quant handle or NULL.
@@ -1332,7 +1332,7 @@ proc nimf_quantize*(x: ptr cfloat; n: int64; shape: ptr int64; rank: int64;
 
 proc nimf_quant_dequantize*(handle: pointer; outData: ptr cfloat;
     capacity: int64): int64
-    {.exportc: "nimf_quant_dequantize", cdecl, dynlib.} =
+    {.exportc: "nimf_quant_dequantize", cdecl, dynlib, apiHooked.} =
   ## Writes the dequantized tensor and returns its element count, or -1.
   let q = checkQuant(handle)
   if q == nil:
@@ -1355,7 +1355,7 @@ proc nimf_quant_dequantize*(handle: pointer; outData: ptr cfloat;
 
 proc nimf_quant_dequantize_transposed*(handle: pointer; outData: ptr cfloat;
     capacity: int64): int64
-    {.exportc: "nimf_quant_dequantize_transposed", cdecl, dynlib.} =
+    {.exportc: "nimf_quant_dequantize_transposed", cdecl, dynlib, apiHooked.} =
   ## Dequantize a 2-D tensor directly into transposed [cols, rows] layout.
   let q = checkQuant(handle)
   if q == nil:
@@ -1380,7 +1380,7 @@ proc nimf_quant_dequantize_transposed*(handle: pointer; outData: ptr cfloat;
     -1
 
 proc nimf_quant_kind*(handle: pointer): cint
-    {.exportc: "nimf_quant_kind", cdecl, dynlib.} =
+    {.exportc: "nimf_quant_kind", cdecl, dynlib, apiHooked.} =
   let q = checkQuant(handle)
   if q == nil:
     discard fail("null quant tensor")
@@ -1388,7 +1388,7 @@ proc nimf_quant_kind*(handle: pointer): cint
   cint(ord(q.qt.kind))
 
 proc nimf_quant_rank*(handle: pointer): int64
-    {.exportc: "nimf_quant_rank", cdecl, dynlib.} =
+    {.exportc: "nimf_quant_rank", cdecl, dynlib, apiHooked.} =
   let q = checkQuant(handle)
   if q == nil:
     discard fail("null quant tensor")
@@ -1397,7 +1397,7 @@ proc nimf_quant_rank*(handle: pointer): int64
 
 proc nimf_quant_shape*(handle: pointer; outShape: ptr int64;
     cap: int64): int64
-    {.exportc: "nimf_quant_shape", cdecl, dynlib.} =
+    {.exportc: "nimf_quant_shape", cdecl, dynlib, apiHooked.} =
   let q = checkQuant(handle)
   if q == nil:
     discard fail("null quant tensor")
@@ -1411,7 +1411,7 @@ proc nimf_quant_shape*(handle: pointer; outShape: ptr int64;
   int64(q.qt.shape.len)
 
 proc nimf_quant_numel*(handle: pointer): int64
-    {.exportc: "nimf_quant_numel", cdecl, dynlib.} =
+    {.exportc: "nimf_quant_numel", cdecl, dynlib, apiHooked.} =
   let q = checkQuant(handle)
   if q == nil:
     discard fail("null quant tensor")
@@ -1419,7 +1419,7 @@ proc nimf_quant_numel*(handle: pointer): int64
   numelOf(q.qt.shape)
 
 proc nimf_quant_group_size*(handle: pointer): int64
-    {.exportc: "nimf_quant_group_size", cdecl, dynlib.} =
+    {.exportc: "nimf_quant_group_size", cdecl, dynlib, apiHooked.} =
   let q = checkQuant(handle)
   if q == nil:
     discard fail("null quant tensor")
@@ -1428,7 +1428,7 @@ proc nimf_quant_group_size*(handle: pointer): int64
 
 proc nimf_quant_cf_bits*(handle: pointer; exponentBitsOut,
     mantissaBitsOut: ptr cint): cint
-    {.exportc: "nimf_quant_cf_bits", cdecl, dynlib.} =
+    {.exportc: "nimf_quant_cf_bits", cdecl, dynlib, apiHooked.} =
   let q = checkQuant(handle)
   if q == nil: return fail("null quant tensor")
   if exponentBitsOut == nil or mantissaBitsOut == nil:
@@ -1438,7 +1438,7 @@ proc nimf_quant_cf_bits*(handle: pointer; exponentBitsOut,
   ok()
 
 proc nimf_quant_data_len*(handle: pointer): int64
-    {.exportc: "nimf_quant_data_len", cdecl, dynlib.} =
+    {.exportc: "nimf_quant_data_len", cdecl, dynlib, apiHooked.} =
   let q = checkQuant(handle)
   if q == nil:
     discard fail("null quant tensor")
@@ -1446,7 +1446,7 @@ proc nimf_quant_data_len*(handle: pointer): int64
   int64(quantBytesLen(q.qt))
 
 proc nimf_quant_data*(handle: pointer): ptr uint8
-    {.exportc: "nimf_quant_data", cdecl, dynlib.} =
+    {.exportc: "nimf_quant_data", cdecl, dynlib, apiHooked.} =
   let q = checkQuant(handle)
   if q == nil:
     discard fail("null quant tensor")
@@ -1454,7 +1454,7 @@ proc nimf_quant_data*(handle: pointer): ptr uint8
   cast[ptr uint8](quantBytesPtr(q.qt))
 
 proc nimf_quant_scale_len*(handle: pointer): int64
-    {.exportc: "nimf_quant_scale_len", cdecl, dynlib.} =
+    {.exportc: "nimf_quant_scale_len", cdecl, dynlib, apiHooked.} =
   let q = checkQuant(handle)
   if q == nil:
     discard fail("null quant tensor")
@@ -1462,7 +1462,7 @@ proc nimf_quant_scale_len*(handle: pointer): int64
   int64(q.qt.scale.len)
 
 proc nimf_quant_scale*(handle: pointer): ptr cfloat
-    {.exportc: "nimf_quant_scale", cdecl, dynlib.} =
+    {.exportc: "nimf_quant_scale", cdecl, dynlib, apiHooked.} =
   let q = checkQuant(handle)
   if q == nil:
     discard fail("null quant tensor")
@@ -1471,7 +1471,7 @@ proc nimf_quant_scale*(handle: pointer): ptr cfloat
   cast[ptr cfloat](addr q.qt.scale[0])
 
 proc nimf_quant_zero_len*(handle: pointer): int64
-    {.exportc: "nimf_quant_zero_len", cdecl, dynlib.} =
+    {.exportc: "nimf_quant_zero_len", cdecl, dynlib, apiHooked.} =
   let q = checkQuant(handle)
   if q == nil:
     discard fail("null quant tensor")
@@ -1479,7 +1479,7 @@ proc nimf_quant_zero_len*(handle: pointer): int64
   int64(q.qt.zero_point.len)
 
 proc nimf_quant_zero*(handle: pointer): ptr cfloat
-    {.exportc: "nimf_quant_zero", cdecl, dynlib.} =
+    {.exportc: "nimf_quant_zero", cdecl, dynlib, apiHooked.} =
   let q = checkQuant(handle)
   if q == nil:
     discard fail("null quant tensor")
@@ -1488,7 +1488,7 @@ proc nimf_quant_zero*(handle: pointer): ptr cfloat
   cast[ptr cfloat](addr q.qt.zero_point[0])
 
 proc nimf_quant_destroy*(handle: pointer): cint
-    {.exportc: "nimf_quant_destroy", cdecl, dynlib.} =
+    {.exportc: "nimf_quant_destroy", cdecl, dynlib, apiHooked.} =
   if handle == nil: return ok()
   let q = cast[ptr NimfQuantTensor](handle)
   q.qt.clearPayload()
@@ -1503,7 +1503,7 @@ proc nimf_quant_destroy*(handle: pointer): cint
 # =====================================================================
 
 proc nimf_state_dict_load*(path: cstring; mapped: cint): pointer
-    {.exportc: "nimf_state_dict_load", cdecl, dynlib.} =
+    {.exportc: "nimf_state_dict_load", cdecl, dynlib, apiHooked.} =
   ## Loads a NIMQ2 state dict.  mapped != 0 keeps tensor payloads in the OS
   ## page cache (recommended for large checkpoints); 0 copies them.
   if path == nil: return failPtr("null path")
@@ -1519,7 +1519,7 @@ proc nimf_state_dict_load*(path: cstring; mapped: cint): pointer
     failPtr(e.msg)
 
 proc nimf_state_dict_create*(): pointer
-    {.exportc: "nimf_state_dict_create", cdecl, dynlib.} =
+    {.exportc: "nimf_state_dict_create", cdecl, dynlib, apiHooked.} =
   ## Creates an empty state dict; append tensors with
   ## nimf_state_dict_append(), then persist with nimf_state_dict_save().
   try:
@@ -1532,7 +1532,7 @@ proc nimf_state_dict_create*(): pointer
 
 proc nimf_state_dict_append*(handle: pointer; name: cstring;
     quantHandle: pointer): cint
-    {.exportc: "nimf_state_dict_append", cdecl, dynlib.} =
+    {.exportc: "nimf_state_dict_append", cdecl, dynlib, apiHooked.} =
   ## Appends a copy of a quant tensor under `name`.
   if handle == nil or quantHandle == nil or name == nil:
     return fail("null state dict, quant handle, or name")
@@ -1545,7 +1545,7 @@ proc nimf_state_dict_append*(handle: pointer; name: cstring;
     fail(e.msg)
 
 proc nimf_state_dict_set_arch*(handle: pointer; arch: ptr int64): cint
-    {.exportc: "nimf_state_dict_set_arch", cdecl, dynlib.} =
+    {.exportc: "nimf_state_dict_set_arch", cdecl, dynlib, apiHooked.} =
   if handle == nil or arch == nil: return fail("null state dict or arch array")
   let h = cast[ptr NimfStateDict](handle)
   for i in 0 ..< 5:
@@ -1554,7 +1554,7 @@ proc nimf_state_dict_set_arch*(handle: pointer; arch: ptr int64): cint
 
 proc nimf_state_dict_save*(path: cstring; handle: pointer;
     arch: ptr int64): cint
-    {.exportc: "nimf_state_dict_save", cdecl, dynlib.} =
+    {.exportc: "nimf_state_dict_save", cdecl, dynlib, apiHooked.} =
   if path == nil or handle == nil or arch == nil:
     return fail("null path, handle, or arch array")
   try:
@@ -1566,7 +1566,7 @@ proc nimf_state_dict_save*(path: cstring; handle: pointer;
     fail(e.msg)
 
 proc nimf_state_dict_count*(handle: pointer): int64
-    {.exportc: "nimf_state_dict_count", cdecl, dynlib.} =
+    {.exportc: "nimf_state_dict_count", cdecl, dynlib, apiHooked.} =
   let h = cast[ptr NimfStateDict](handle)
   if h == nil:
     discard fail("null state dict")
@@ -1575,7 +1575,7 @@ proc nimf_state_dict_count*(handle: pointer): int64
 
 proc nimf_state_dict_arch*(handle: pointer; outArch: ptr int64;
     cap: int64): cint
-    {.exportc: "nimf_state_dict_arch", cdecl, dynlib.} =
+    {.exportc: "nimf_state_dict_arch", cdecl, dynlib, apiHooked.} =
   let h = cast[ptr NimfStateDict](handle)
   if h == nil: return fail("null state dict")
   if outArch == nil or cap < 5: return fail("arch output needs 5 int64 slots")
@@ -1584,7 +1584,7 @@ proc nimf_state_dict_arch*(handle: pointer; outArch: ptr int64;
   ok()
 
 proc nimf_state_dict_name*(handle: pointer; index: int64): cstring
-    {.exportc: "nimf_state_dict_name", cdecl, dynlib.} =
+    {.exportc: "nimf_state_dict_name", cdecl, dynlib, apiHooked.} =
   ## Returns an allocated string; free it with nimf_free_string().
   let h = cast[ptr NimfStateDict](handle)
   if h == nil: return failCString("null state dict")
@@ -1594,7 +1594,7 @@ proc nimf_state_dict_name*(handle: pointer; index: int64): cstring
   if result == nil: discard fail("string allocation failed")
 
 proc nimf_state_dict_tensor*(handle: pointer; index: int64): pointer
-    {.exportc: "nimf_state_dict_tensor", cdecl, dynlib.} =
+    {.exportc: "nimf_state_dict_tensor", cdecl, dynlib, apiHooked.} =
   ## Returns a NEW quant handle for entry `index`; destroy it separately.
   let h = cast[ptr NimfStateDict](handle)
   if h == nil: return failPtr("null state dict")
@@ -1610,7 +1610,7 @@ proc nimf_state_dict_tensor*(handle: pointer; index: int64): pointer
     failPtr(e.msg)
 
 proc nimf_state_dict_destroy*(handle: pointer): cint
-    {.exportc: "nimf_state_dict_destroy", cdecl, dynlib.} =
+    {.exportc: "nimf_state_dict_destroy", cdecl, dynlib, apiHooked.} =
   if handle == nil: return ok()
   let h = cast[ptr NimfStateDict](handle)
   h.items = @[]
@@ -1624,7 +1624,7 @@ proc nimf_state_dict_destroy*(handle: pointer): cint
 proc nimf_customfloat_encode*(ctxHandle: pointer; x: ptr cfloat; n: int64;
     exponentBits, mantissaBits: cint; outBytes: ptr uint8; capacity: int64;
     written: ptr int64): cint
-    {.exportc: "nimf_customfloat_encode", cdecl, dynlib.} =
+    {.exportc: "nimf_customfloat_encode", cdecl, dynlib, apiHooked.} =
   if ctxHandle == nil: return fail("null context")
   if n < 0 or exponentBits < 1 or mantissaBits < 0 or capacity < 0 or
       int(exponentBits) + int(mantissaBits) + 1 > 64 or
@@ -1647,7 +1647,7 @@ proc nimf_customfloat_encode*(ctxHandle: pointer; x: ptr cfloat; n: int64;
 proc nimf_customfloat_decode*(ctxHandle: pointer; bytes: ptr uint8;
     byteLen, itemCount: int64; exponentBits, mantissaBits: cint;
     outData: ptr cfloat): cint
-    {.exportc: "nimf_customfloat_decode", cdecl, dynlib.} =
+    {.exportc: "nimf_customfloat_decode", cdecl, dynlib, apiHooked.} =
   if ctxHandle == nil: return fail("null context")
   if byteLen < 0 or itemCount < 0 or exponentBits < 1 or mantissaBits < 0 or
       int(exponentBits) + int(mantissaBits) + 1 > 64 or
@@ -1669,7 +1669,7 @@ proc nimf_customfloat_decode*(ctxHandle: pointer; bytes: ptr uint8;
 proc nimf_apf_build_dtype*(x: ptr cfloat; n: int64; grad: ptr cfloat;
     gradLen: int64; relErrorTol: cfloat; expMargin: cint;
     exponentBitsOut, mantissaBitsOut: ptr cint): cint
-    {.exportc: "nimf_apf_build_dtype", cdecl, dynlib.} =
+    {.exportc: "nimf_apf_build_dtype", cdecl, dynlib, apiHooked.} =
   if n < 0 or (n > 0 and x == nil) or gradLen < 0 or
       (gradLen > 0 and grad == nil) or exponentBitsOut == nil or
       mantissaBitsOut == nil:
@@ -1687,7 +1687,7 @@ proc nimf_apf_cast_training*(x: ptr cfloat; n: int64; grad: ptr cfloat;
     gradLen: int64; relErrorTol: cfloat; expMargin: cint; outBytes: ptr uint8;
     capacity: int64; written: ptr int64; exponentBitsOut,
     mantissaBitsOut: ptr cint): cint
-    {.exportc: "nimf_apf_cast_training", cdecl, dynlib.} =
+    {.exportc: "nimf_apf_cast_training", cdecl, dynlib, apiHooked.} =
   if n < 0 or (n > 0 and x == nil) or gradLen < 0 or
       (gradLen > 0 and grad == nil) or capacity < 0 or
       (capacity > 0 and outBytes == nil) or written == nil or
@@ -1710,7 +1710,7 @@ proc nimf_apf_cast_training*(x: ptr cfloat; n: int64; grad: ptr cfloat;
 proc nimf_apf_decode_training*(bytes: ptr uint8; byteLen: int64;
     exponentBits, mantissaBits: cint; outData: ptr cfloat;
     capacity: int64): int64
-    {.exportc: "nimf_apf_decode_training", cdecl, dynlib.} =
+    {.exportc: "nimf_apf_decode_training", cdecl, dynlib, apiHooked.} =
   if byteLen < 0 or (byteLen > 0 and bytes == nil) or capacity < 0:
     discard fail("invalid APF decode arguments")
     return -1
@@ -1735,7 +1735,7 @@ proc nimf_apf_decode_training*(bytes: ptr uint8; byteLen: int64;
 # =====================================================================
 
 proc nimf_tokenizer_load*(modelDir: cstring): pointer
-    {.exportc: "nimf_tokenizer_load", cdecl, dynlib.} =
+    {.exportc: "nimf_tokenizer_load", cdecl, dynlib, apiHooked.} =
   ## Load a Hugging Face tokenizer directory (tokenizer.json +
   ## tokenizer_config.json, or tokenizer.model for SentencePiece).
   if modelDir == nil: return failPtr("null tokenizer directory")
@@ -1750,7 +1750,7 @@ proc nimf_tokenizer_load*(modelDir: cstring): pointer
     failPtr(e.msg)
 
 proc nimf_tokenizer_destroy*(handle: pointer): cint
-    {.exportc: "nimf_tokenizer_destroy", cdecl, dynlib.} =
+    {.exportc: "nimf_tokenizer_destroy", cdecl, dynlib, apiHooked.} =
   if handle == nil: return ok()
   let h = cast[ptr NimfTokenizer](handle)
   h.tok = default(hf.HFTokenizer)   # release refs/tables before freeing memory
@@ -1758,7 +1758,7 @@ proc nimf_tokenizer_destroy*(handle: pointer): cint
   ok()
 
 proc nimf_tokenizer_vocab_size*(handle: pointer): int64
-    {.exportc: "nimf_tokenizer_vocab_size", cdecl, dynlib.} =
+    {.exportc: "nimf_tokenizer_vocab_size", cdecl, dynlib, apiHooked.} =
   let h = cast[ptr NimfTokenizer](handle)
   if h == nil:
     discard fail("null tokenizer")
@@ -1766,7 +1766,7 @@ proc nimf_tokenizer_vocab_size*(handle: pointer): int64
   int64(h.tok.vocabSize)
 
 proc nimf_tokenizer_total_vocab_size*(handle: pointer): int64
-    {.exportc: "nimf_tokenizer_total_vocab_size", cdecl, dynlib.} =
+    {.exportc: "nimf_tokenizer_total_vocab_size", cdecl, dynlib, apiHooked.} =
   let h = cast[ptr NimfTokenizer](handle)
   if h == nil:
     discard fail("null tokenizer")
@@ -1775,7 +1775,7 @@ proc nimf_tokenizer_total_vocab_size*(handle: pointer): int64
 
 proc nimf_tokenizer_special_ids*(handle: pointer; bosOut, eosOut,
     padOut: ptr int64): cint
-    {.exportc: "nimf_tokenizer_special_ids", cdecl, dynlib.} =
+    {.exportc: "nimf_tokenizer_special_ids", cdecl, dynlib, apiHooked.} =
   let h = cast[ptr NimfTokenizer](handle)
   if h == nil: return fail("null tokenizer")
   if bosOut == nil or eosOut == nil or padOut == nil:
@@ -1787,7 +1787,7 @@ proc nimf_tokenizer_special_ids*(handle: pointer; bosOut, eosOut,
 
 proc nimf_tokenizer_encode*(handle: pointer; text: cstring; addSpecial: cint;
     outIds: ptr int32; capacity: int64): int64
-    {.exportc: "nimf_tokenizer_encode", cdecl, dynlib.} =
+    {.exportc: "nimf_tokenizer_encode", cdecl, dynlib, apiHooked.} =
   ## Tokenize text; returns the token count or -1 on error/buffer too small.
   let h = cast[ptr NimfTokenizer](handle)
   if h == nil or text == nil:
@@ -1811,7 +1811,7 @@ proc nimf_tokenizer_encode*(handle: pointer; text: cstring; addSpecial: cint;
 
 proc nimf_tokenizer_apply_chat*(handle: pointer; userText, systemText: cstring;
     outIds: ptr int32; capacity: int64): int64
-    {.exportc: "nimf_tokenizer_apply_chat", cdecl, dynlib.} =
+    {.exportc: "nimf_tokenizer_apply_chat", cdecl, dynlib, apiHooked.} =
   let h = cast[ptr NimfTokenizer](handle)
   if h == nil or userText == nil:
     discard fail("null tokenizer or text")
@@ -1835,7 +1835,7 @@ proc nimf_tokenizer_apply_chat*(handle: pointer; userText, systemText: cstring;
 
 proc nimf_tokenizer_decode*(handle: pointer; ids: ptr int32; count: int64;
     skipSpecial: cint): cstring
-    {.exportc: "nimf_tokenizer_decode", cdecl, dynlib.} =
+    {.exportc: "nimf_tokenizer_decode", cdecl, dynlib, apiHooked.} =
   ## Returns an allocated string; free with nimf_free_string().
   let h = cast[ptr NimfTokenizer](handle)
   if h == nil:
@@ -1853,7 +1853,7 @@ proc nimf_tokenizer_decode*(handle: pointer; ids: ptr int32; count: int64;
     result = failCString(e.msg)
 
 proc nimf_sentencepiece_load*(path: cstring): pointer
-    {.exportc: "nimf_sentencepiece_load", cdecl, dynlib.} =
+    {.exportc: "nimf_sentencepiece_load", cdecl, dynlib, apiHooked.} =
   ## Load a raw SentencePiece `tokenizer.model` file.
   if path == nil: return failPtr("null model path")
   try:
@@ -1867,7 +1867,7 @@ proc nimf_sentencepiece_load*(path: cstring): pointer
     failPtr(e.msg)
 
 proc nimf_sentencepiece_destroy*(handle: pointer): cint
-    {.exportc: "nimf_sentencepiece_destroy", cdecl, dynlib.} =
+    {.exportc: "nimf_sentencepiece_destroy", cdecl, dynlib, apiHooked.} =
   if handle == nil: return ok()
   let h = cast[ptr NimfSentencePiece](handle)
   h.model = nil
@@ -1876,7 +1876,7 @@ proc nimf_sentencepiece_destroy*(handle: pointer): cint
 
 proc nimf_sentencepiece_encode*(handle: pointer; text: cstring;
     outIds: ptr int32; capacity: int64): int64
-    {.exportc: "nimf_sentencepiece_encode", cdecl, dynlib.} =
+    {.exportc: "nimf_sentencepiece_encode", cdecl, dynlib, apiHooked.} =
   let h = cast[ptr NimfSentencePiece](handle)
   if h == nil or text == nil:
     discard fail("null SentencePiece model or text")
@@ -1899,7 +1899,7 @@ proc nimf_sentencepiece_encode*(handle: pointer; text: cstring;
 
 proc nimf_sentencepiece_decode*(handle: pointer; ids: ptr int32;
     count: int64): cstring
-    {.exportc: "nimf_sentencepiece_decode", cdecl, dynlib.} =
+    {.exportc: "nimf_sentencepiece_decode", cdecl, dynlib, apiHooked.} =
   let h = cast[ptr NimfSentencePiece](handle)
   if h == nil:
     return failCString("null SentencePiece model")
@@ -1916,7 +1916,7 @@ proc nimf_sentencepiece_decode*(handle: pointer; ids: ptr int32;
     result = failCString(e.msg)
 
 proc nimf_sentencepiece_piece_id*(handle: pointer; piece: cstring): int64
-    {.exportc: "nimf_sentencepiece_piece_id", cdecl, dynlib.} =
+    {.exportc: "nimf_sentencepiece_piece_id", cdecl, dynlib, apiHooked.} =
   let h = cast[ptr NimfSentencePiece](handle)
   if h == nil or piece == nil:
     discard fail("null SentencePiece model or piece")
@@ -1924,7 +1924,7 @@ proc nimf_sentencepiece_piece_id*(handle: pointer; piece: cstring): int64
   int64(sp.pieceId(h.model, $piece))
 
 proc nimf_sentencepiece_normalizer*(handle: pointer): cstring
-    {.exportc: "nimf_sentencepiece_normalizer", cdecl, dynlib.} =
+    {.exportc: "nimf_sentencepiece_normalizer", cdecl, dynlib, apiHooked.} =
   let h = cast[ptr NimfSentencePiece](handle)
   if h == nil:
     return failCString("null SentencePiece model")
@@ -1938,7 +1938,7 @@ proc nimf_sentencepiece_normalizer*(handle: pointer): cstring
 
 proc nimf_llama_config_load*(configPath: cstring; outInts: ptr int64;
     outFloats: ptr cfloat): cint
-    {.exportc: "nimf_llama_config_load", cdecl, dynlib.} =
+    {.exportc: "nimf_llama_config_load", cdecl, dynlib, apiHooked.} =
   ## Reads config.json and writes 7 ints + 2 floats:
   ## vocab, hidden, intermediate, layers, heads, kv_heads, max_positions,
   ## rms_norm_eps, rope_theta.
@@ -1963,7 +1963,7 @@ proc nimf_llama_config_load*(configPath: cstring; outInts: ptr int64;
 
 proc nimf_llama_load*(ctxHandle: pointer; configPath, weightsPath: cstring;
     uploadResident: cint): pointer
-    {.exportc: "nimf_llama_load", cdecl, dynlib.} =
+    {.exportc: "nimf_llama_load", cdecl, dynlib, apiHooked.} =
   ## Loads a Llama config + NIMQ weights.  Set uploadResident=1 to pin all
   ## quantized weights on the GPU immediately (faster decode, more VRAM).
   if ctxHandle == nil or configPath == nil or weightsPath == nil:
@@ -1986,7 +1986,7 @@ proc nimf_llama_load*(ctxHandle: pointer; configPath, weightsPath: cstring;
 
 proc nimf_llama_config*(handle: pointer; outInts: ptr int64;
     outFloats: ptr cfloat): cint
-    {.exportc: "nimf_llama_config", cdecl, dynlib.} =
+    {.exportc: "nimf_llama_config", cdecl, dynlib, apiHooked.} =
   let h = cast[ptr NimfLlama](handle)
   if h == nil: return fail("null Llama model")
   if outInts == nil or outFloats == nil:
@@ -2007,7 +2007,7 @@ proc nimf_llama_config*(handle: pointer; outInts: ptr int64;
 proc nimf_llama_generate*(ctxHandle, modelHandle, tokenizerHandle: pointer;
     prompt: cstring; systemText: cstring; maxNewTokens: int64;
     temperature, topP: cfloat; useChatTemplate: cint): cstring
-    {.exportc: "nimf_llama_generate", cdecl, dynlib.} =
+    {.exportc: "nimf_llama_generate", cdecl, dynlib, apiHooked.} =
   ## Generates text.  Returns an allocated string; free with
   ## nimf_free_string().  useChatTemplate=0 tokenizes the prompt verbatim.
   if ctxHandle == nil or modelHandle == nil or tokenizerHandle == nil or prompt == nil:
@@ -2035,7 +2035,7 @@ proc nimf_llama_generate*(ctxHandle, modelHandle, tokenizerHandle: pointer;
     result = failCString("internal generation error: " & e.msg)
 
 proc nimf_llama_destroy*(handle: pointer): cint
-    {.exportc: "nimf_llama_destroy", cdecl, dynlib.} =
+    {.exportc: "nimf_llama_destroy", cdecl, dynlib, apiHooked.} =
   if handle == nil: return ok()
   let h = cast[ptr NimfLlama](handle)
   h.model = default(nfinfer.LlamaModelL)   # release seqs/refs
@@ -2047,7 +2047,7 @@ proc nimf_llama_destroy*(handle: pointer): cint
 # =====================================================================
 
 proc nimf_vm_create*(): pointer
-    {.exportc: "nimf_vm_create", cdecl, dynlib.} =
+    {.exportc: "nimf_vm_create", cdecl, dynlib, apiHooked.} =
   try:
     let h = cast[ptr NimfVmProgram](allocShared0(sizeof(NimfVmProgram)))
     if h == nil: return failPtr("VM program allocation failed")
@@ -2057,7 +2057,7 @@ proc nimf_vm_create*(): pointer
     failPtr(e.msg)
 
 proc nimf_vm_destroy*(handle: pointer): cint
-    {.exportc: "nimf_vm_destroy", cdecl, dynlib.} =
+    {.exportc: "nimf_vm_destroy", cdecl, dynlib, apiHooked.} =
   if handle == nil: return ok()
   let h = cast[ptr NimfVmProgram](handle)
   h.prog.words = @[]
@@ -2065,7 +2065,7 @@ proc nimf_vm_destroy*(handle: pointer): cint
   ok()
 
 proc nimf_vm_len*(handle: pointer): int64
-    {.exportc: "nimf_vm_len", cdecl, dynlib.} =
+    {.exportc: "nimf_vm_len", cdecl, dynlib, apiHooked.} =
   let h = checkVm(handle)
   if h == nil:
     discard fail("null VM program")
@@ -2074,7 +2074,7 @@ proc nimf_vm_len*(handle: pointer): int64
 
 proc nimf_vm_words*(handle: pointer; outWords: ptr uint32;
     cap: int64): int64
-    {.exportc: "nimf_vm_words", cdecl, dynlib.} =
+    {.exportc: "nimf_vm_words", cdecl, dynlib, apiHooked.} =
   let h = checkVm(handle)
   if h == nil:
     discard fail("null VM program")
@@ -2089,7 +2089,7 @@ proc nimf_vm_words*(handle: pointer; outWords: ptr uint32;
 
 proc nimf_vm_set_words*(handle: pointer; words: ptr uint32;
     count: int64): cint
-    {.exportc: "nimf_vm_set_words", cdecl, dynlib.} =
+    {.exportc: "nimf_vm_set_words", cdecl, dynlib, apiHooked.} =
   let h = checkVm(handle)
   if h == nil: return fail("null VM program")
   if count < 0 or (count > 0 and words == nil):
@@ -2104,14 +2104,14 @@ proc nimf_vm_set_words*(handle: pointer; words: ptr uint32;
     fail(e.msg)
 
 proc nimf_vm_emit_word*(handle: pointer; word: uint32): cint
-    {.exportc: "nimf_vm_emit_word", cdecl, dynlib.} =
+    {.exportc: "nimf_vm_emit_word", cdecl, dynlib, apiHooked.} =
   let h = checkVm(handle)
   if h == nil: return fail("null VM program")
   h.prog.emit(word)
   ok()
 
 proc nimf_vm_emit*(handle: pointer; opcode: uint32; a, b, c, value: uint32): cint
-    {.exportc: "nimf_vm_emit", cdecl, dynlib.} =
+    {.exportc: "nimf_vm_emit", cdecl, dynlib, apiHooked.} =
   ## Generic instruction emitter.  Operand meaning depends on opcode:
   ##   math/U ops:       a=dest, b=src1, c=src2 (value=extra word/float bits)
   ##   load/store:       a=reg,  b=base, c=offset
@@ -2191,7 +2191,7 @@ proc nimf_vm_emit*(handle: pointer; opcode: uint32; a, b, c, value: uint32): cin
   ok()
 
 proc nimf_vm_save*(handle: pointer; path: cstring): cint
-    {.exportc: "nimf_vm_save", cdecl, dynlib.} =
+    {.exportc: "nimf_vm_save", cdecl, dynlib, apiHooked.} =
   if path == nil: return fail("null path")
   let h = checkVm(handle)
   if h == nil: return fail("null VM program")
@@ -2202,7 +2202,7 @@ proc nimf_vm_save*(handle: pointer; path: cstring): cint
     fail(e.msg)
 
 proc nimf_vm_load*(path: cstring): pointer
-    {.exportc: "nimf_vm_load", cdecl, dynlib.} =
+    {.exportc: "nimf_vm_load", cdecl, dynlib, apiHooked.} =
   if path == nil: return failPtr("null path")
   try:
     let prog = loadBvm($path)
@@ -2215,7 +2215,7 @@ proc nimf_vm_load*(path: cstring): pointer
     failPtr(e.msg)
 
 proc nimf_vm_merge*(handles: ptr pointer; count: int64): pointer
-    {.exportc: "nimf_vm_merge", cdecl, dynlib.} =
+    {.exportc: "nimf_vm_merge", cdecl, dynlib, apiHooked.} =
   if count < 0 or (count > 0 and handles == nil):
     return failPtr("invalid VM handle array")
   try:
@@ -2234,7 +2234,7 @@ proc nimf_vm_merge*(handles: ptr pointer; count: int64): pointer
     failPtr(e.msg)
 
 proc nimf_vm_lower_msl*(handle: pointer; kernelName: cstring): cstring
-    {.exportc: "nimf_vm_lower_msl", cdecl, dynlib.} =
+    {.exportc: "nimf_vm_lower_msl", cdecl, dynlib, apiHooked.} =
   ## Returns allocated Metal source; free with nimf_free_string().
   let h = checkVm(handle)
   if h == nil or kernelName == nil:
@@ -2247,7 +2247,7 @@ proc nimf_vm_lower_msl*(handle: pointer; kernelName: cstring): cstring
     result = failCString(e.msg)
 
 proc nimf_vm_lower_glsl*(handle: pointer; kernelName: cstring): cstring
-    {.exportc: "nimf_vm_lower_glsl", cdecl, dynlib.} =
+    {.exportc: "nimf_vm_lower_glsl", cdecl, dynlib, apiHooked.} =
   ## Returns allocated GLSL source; free with nimf_free_string().
   let h = checkVm(handle)
   if h == nil or kernelName == nil:
@@ -2260,7 +2260,7 @@ proc nimf_vm_lower_glsl*(handle: pointer; kernelName: cstring): cstring
     result = failCString(e.msg)
 
 proc nimf_vm_key*(handle: pointer; tag: cstring): cstring
-    {.exportc: "nimf_vm_key", cdecl, dynlib.} =
+    {.exportc: "nimf_vm_key", cdecl, dynlib, apiHooked.} =
   ## Deterministic program key (no GPU session needed).
   let h = checkVm(handle)
   if h == nil: return failCString("null VM program")
@@ -2274,7 +2274,7 @@ proc nimf_vm_key*(handle: pointer; tag: cstring): cstring
 
 proc nimf_vm_run*(ctxHandle, progHandle: pointer; memory: ptr cfloat;
     memoryLen, nThreads, tgFloats, tgSize: int64): cint
-    {.exportc: "nimf_vm_run", cdecl, dynlib.} =
+    {.exportc: "nimf_vm_run", cdecl, dynlib, apiHooked.} =
   ## Runs a VM program over `memory` in place.  `tgFloats` is the number of
   ## float32 slots of threadgroup memory; `tgSize` the threads per group
   ## (0 = backend default).
@@ -2295,7 +2295,7 @@ proc nimf_vm_run*(ctxHandle, progHandle: pointer; memory: ptr cfloat;
 
 proc nimf_micro_vm_dispatch*(ctxHandle: pointer; code: ptr uint32; codeLen: int64;
     memory: ptr cfloat; memoryLen: int64; nThreads, tgFloats, tgSize: int64): cint
-    {.exportc: "nimf_micro_vm_dispatch", cdecl, dynlib.} =
+    {.exportc: "nimf_micro_vm_dispatch", cdecl, dynlib, apiHooked.} =
   ## Backwards-compatible raw-bytecode dispatch (equivalent to building a
   ## VM program from `code` and calling nimf_vm_run).
   if ctxHandle == nil or code == nil or memory == nil or codeLen <= 0 or
@@ -2357,7 +2357,7 @@ proc checkSessionResult(be: byby.GpuBackend; success: bool; op: string): cint =
   fail(op & " failed" & (if detail.len > 0: ": " & detail else: ""))
 
 proc nimf_buf_alloc*(ctxHandle: pointer; data: ptr cfloat; n: int64): pointer
-    {.exportc: "nimf_buf_alloc", cdecl, dynlib.} =
+    {.exportc: "nimf_buf_alloc", cdecl, dynlib, apiHooked.} =
   ## Resident buffer of n floats, initialised from `data` (NULL = zeros).
   if ctxHandle == nil or n <= 0: return failPtr("invalid buffer allocation arguments")
   try:
@@ -2384,7 +2384,7 @@ proc nimf_buf_alloc*(ctxHandle: pointer; data: ptr cfloat; n: int64): pointer
     failPtr(e.msg)
 
 proc nimf_buf_free*(ctxHandle, bufHandle: pointer): cint
-    {.exportc: "nimf_buf_free", cdecl, dynlib.} =
+    {.exportc: "nimf_buf_free", cdecl, dynlib, apiHooked.} =
   if bufHandle == nil: return ok()
   try:
     let b = cast[ptr NimfBuf](bufHandle)
@@ -2396,7 +2396,7 @@ proc nimf_buf_free*(ctxHandle, bufHandle: pointer): cint
     fail(e.msg)
 
 proc nimf_buf_read*(ctxHandle, bufHandle: pointer; offset, n: int64; outData: ptr cfloat): cint
-    {.exportc: "nimf_buf_read", cdecl, dynlib.} =
+    {.exportc: "nimf_buf_read", cdecl, dynlib, apiHooked.} =
   ## Reads n floats starting at `offset`; the session must be closed (sessionEnd) first.
   if ctxHandle == nil or bufHandle == nil or n <= 0 or offset < 0 or outData == nil:
     return fail("invalid buffer read arguments")
@@ -2410,7 +2410,7 @@ proc nimf_buf_read*(ctxHandle, bufHandle: pointer; offset, n: int64; outData: pt
     fail(e.msg)
 
 proc nimf_sess_begin*(ctxHandle: pointer): cint
-    {.exportc: "nimf_sess_begin", cdecl, dynlib.} =
+    {.exportc: "nimf_sess_begin", cdecl, dynlib, apiHooked.} =
   if ctxHandle == nil: return fail("null context")
   try:
     if not byby.sessionBegin(requireContext(ctxHandle).kind.toByby()):
@@ -2421,7 +2421,7 @@ proc nimf_sess_begin*(ctxHandle: pointer): cint
     fail(e.msg)
 
 proc nimf_sess_end*(ctxHandle: pointer): cint
-    {.exportc: "nimf_sess_end", cdecl, dynlib.} =
+    {.exportc: "nimf_sess_end", cdecl, dynlib, apiHooked.} =
   if ctxHandle == nil: return fail("null context")
   try:
     let be = requireContext(ctxHandle).kind.toByby()
@@ -2433,7 +2433,7 @@ proc nimf_sess_end*(ctxHandle: pointer): cint
     fail(e.msg)
 
 proc nimf_sess_set*(ctxHandle, bufHandle: pointer; offset: int64; data: ptr cfloat; n: int64): cint
-    {.exportc: "nimf_sess_set", cdecl, dynlib.} =
+    {.exportc: "nimf_sess_set", cdecl, dynlib, apiHooked.} =
   ## Inside an open session: buf[offset ..< offset+n] = host data (upload + device copy).
   if ctxHandle == nil or bufHandle == nil or data == nil or n <= 0 or offset < 0:
     return fail("invalid buffer write arguments")
@@ -2449,7 +2449,7 @@ proc nimf_sess_set*(ctxHandle, bufHandle: pointer; offset: int64; data: ptr cflo
     fail(e.msg)
 
 proc nimf_sess_copy*(ctx, src, dst: pointer; srcOffset, dstOffset, n: int64): cint
-    {.exportc: "nimf_sess_copy", cdecl, dynlib.} =
+    {.exportc: "nimf_sess_copy", cdecl, dynlib, apiHooked.} =
   try:
     let be = requireSession(ctx)
     let a = requireBuffer(ctx, src, n, srcOffset)
@@ -2461,7 +2461,7 @@ proc nimf_sess_copy*(ctx, src, dst: pointer; srcOffset, dstOffset, n: int64): ci
     fail(e.msg)
 
 proc nimf_sess_matmul*(ctx, a, b, output: pointer; m, k, n: int64; transposeB: cint): cint
-    {.exportc: "nimf_sess_matmul", cdecl, dynlib.} =
+    {.exportc: "nimf_sess_matmul", cdecl, dynlib, apiHooked.} =
   try:
     let be = requireSession(ctx)
     let lhs = requireBuffer(ctx, a, sessionElements(m, k))
@@ -2476,7 +2476,7 @@ proc nimf_sess_matmul*(ctx, a, b, output: pointer; m, k, n: int64; transposeB: c
     fail(e.msg)
 
 proc nimf_sess_matmul_q4*(ctx, x, weight, output: pointer; rows: int64): cint
-    {.exportc: "nimf_sess_matmul_q4", cdecl, dynlib.} =
+    {.exportc: "nimf_sess_matmul_q4", cdecl, dynlib, apiHooked.} =
   try:
     let be = requireSession(ctx)
     if weight == nil: return fail("null resident Q4 weight")
@@ -2489,7 +2489,7 @@ proc nimf_sess_matmul_q4*(ctx, x, weight, output: pointer; rows: int64): cint
     fail(e.msg)
 
 proc nimf_sess_softmax*(ctx, x, output: pointer; rows, cols: int64): cint
-    {.exportc: "nimf_sess_softmax", cdecl, dynlib.} =
+    {.exportc: "nimf_sess_softmax", cdecl, dynlib, apiHooked.} =
   try:
     let be = requireSession(ctx)
     let size = sessionElements(rows, cols)
@@ -2500,7 +2500,7 @@ proc nimf_sess_softmax*(ctx, x, output: pointer; rows, cols: int64): cint
     fail(e.msg)
 
 proc nimf_sess_norm*(ctx, x, gamma, beta, output: pointer; rows, cols: int64; eps: cfloat): cint
-    {.exportc: "nimf_sess_norm", cdecl, dynlib.} =
+    {.exportc: "nimf_sess_norm", cdecl, dynlib, apiHooked.} =
   try:
     let be = requireSession(ctx)
     if eps < 0 or classify(eps) in {fcNan, fcInf, fcNegInf}:
@@ -2520,7 +2520,7 @@ proc nimf_sess_norm*(ctx, x, gamma, beta, output: pointer; rows, cols: int64; ep
 
 proc nimf_sess_attention*(ctx, q, k, v, output, scores: pointer;
     batch, heads, steps, dim: int64; scale: cfloat): cint
-    {.exportc: "nimf_sess_attention", cdecl, dynlib.} =
+    {.exportc: "nimf_sess_attention", cdecl, dynlib, apiHooked.} =
   try:
     let be = requireSession(ctx)
     if classify(scale) in {fcNan, fcInf, fcNegInf}: return fail("session attention scale must be finite")
@@ -2537,7 +2537,7 @@ proc nimf_sess_attention*(ctx, q, k, v, output, scores: pointer;
     fail(e.msg)
 
 proc nimf_sess_vec*(ctx, a, b, output: pointer; op: cstring; n: int64): cint
-    {.exportc: "nimf_sess_vec", cdecl, dynlib.} =
+    {.exportc: "nimf_sess_vec", cdecl, dynlib, apiHooked.} =
   try:
     let be = requireSession(ctx)
     if op == nil or $op notin ["add", "sub", "mul", "div"]:
@@ -2551,7 +2551,7 @@ proc nimf_sess_vec*(ctx, a, b, output: pointer; op: cstring; n: int64): cint
     fail(e.msg)
 
 proc nimf_sess_activation*(ctx, x, output: pointer; op: cstring; n: int64; p: cfloat): cint
-    {.exportc: "nimf_sess_activation", cdecl, dynlib.} =
+    {.exportc: "nimf_sess_activation", cdecl, dynlib, apiHooked.} =
   try:
     let be = requireSession(ctx)
     if op == nil or $op notin ["relu", "sigmoid", "tanh", "exp", "log", "sqrt", "pow"]:
@@ -2564,7 +2564,7 @@ proc nimf_sess_activation*(ctx, x, output: pointer; op: cstring; n: int64; p: cf
     fail(e.msg)
 
 proc nimf_trace_start*(path, steps: cstring; data: cint; dataMax: int64): cint
-    {.exportc: "nimf_trace_start", cdecl, dynlib.} =
+    {.exportc: "nimf_trace_start", cdecl, dynlib, apiHooked.} =
   ## Start a FIR trace at `path` (see trace.nim). `steps` may be NULL or "" (record everything),
   ## `data` != 0 also writes `<path>.data`, `dataMax` > 0 skips larger uploads.
   if path == nil or path.len == 0:
@@ -2575,7 +2575,7 @@ proc nimf_trace_start*(path, steps: cstring; data: cint; dataMax: int64): cint
   except CatchableError as e:
     fail(e.msg)
 
-proc nimf_trace_stop*(): cint {.exportc: "nimf_trace_stop", cdecl, dynlib.} =
+proc nimf_trace_stop*(): cint {.exportc: "nimf_trace_stop", cdecl, dynlib, apiHooked.} =
   ## Flush and close the active trace. Safe when no trace is active.
   try:
     trace.traceStop()
@@ -2583,17 +2583,17 @@ proc nimf_trace_stop*(): cint {.exportc: "nimf_trace_stop", cdecl, dynlib.} =
   except CatchableError as e:
     fail(e.msg)
 
-proc nimf_trace_active*(): cint {.exportc: "nimf_trace_active", cdecl, dynlib.} =
+proc nimf_trace_active*(): cint {.exportc: "nimf_trace_active", cdecl, dynlib, apiHooked.} =
   if trace.traceActive(): 1 else: 0
 
-proc nimf_trace_file*(): cstring {.exportc: "nimf_trace_file", cdecl, dynlib.} =
+proc nimf_trace_file*(): cstring {.exportc: "nimf_trace_file", cdecl, dynlib, apiHooked.} =
   ## Path of the trace file ("" when none). The pointer is valid until the next call.
   var path {.global.}: string
   path = trace.traceFile()
   cstring(path)
 
 proc nimf_probe_step*(begin: cint; kind: cint; index, position, token: int64): cint
-    {.exportc: "nimf_probe_step", cdecl, dynlib.} =
+    {.exportc: "nimf_probe_step", cdecl, dynlib, apiHooked.} =
   ## Host-driver step marker for the FIR recorder (same records the Nim decode loops write).
   ## begin=1 opens a step (kind 0 = prefill, 1 = decode), begin=0 closes it. No-op when
   ## the recorder is off.
@@ -2608,7 +2608,7 @@ proc nimf_probe_step*(begin: cint; kind: cint; index, position, token: int64): c
 
 proc nimf_sess_set_step_inputs*(ctxHandle, bufHandle: pointer; tokenOffset, positionOffset: int64;
     token, position: int64): cint
-    {.exportc: "nimf_sess_set_step_inputs", cdecl, dynlib.} =
+    {.exportc: "nimf_sess_set_step_inputs", cdecl, dynlib, apiHooked.} =
   ## Inside an open session: buf[tokenOffset] = token and buf[positionOffset] = position as the
   ## step's two scalar host inputs, annotated with the `token` / `position` roles so a trace
   ## of this driver can be lifted without any model-specific rule.
@@ -2631,7 +2631,7 @@ proc nimf_sess_set_step_inputs*(ctxHandle, bufHandle: pointer; tokenOffset, posi
     fail(e.msg)
 
 proc nimf_prog_compile*(ctxHandle, progHandle: pointer; tag: cstring): cstring
-    {.exportc: "nimf_prog_compile", cdecl, dynlib.} =
+    {.exportc: "nimf_prog_compile", cdecl, dynlib, apiHooked.} =
   ## JIT-compiles a VM program (outside any session) and returns its kernel name.
   if ctxHandle == nil: return failCString("null context")
   let h = checkVm(progHandle)
@@ -2646,7 +2646,7 @@ proc nimf_prog_compile*(ctxHandle, progHandle: pointer; tag: cstring): cstring
 
 proc nimf_sess_dispatch*(ctxHandle: pointer; kname: cstring; bufs: ptr pointer;
     offsets: ptr int64; nThreads, tgSize, tgBytes: int64): cint
-    {.exportc: "nimf_sess_dispatch", cdecl, dynlib.} =
+    {.exportc: "nimf_sess_dispatch", cdecl, dynlib, apiHooked.} =
   ## bufs / offsets: four entries for the mem, u8, lut and input domains (NULL = unbound);
   ## offsets are in floats. Encodes one dispatch into the open session (Metal slots 1..4).
   if ctxHandle == nil or kname == nil or bufs == nil or offsets == nil or nThreads <= 0 or tgSize <= 0:
@@ -2694,7 +2694,7 @@ proc parallelGroup(handle: pointer): ProcessGroup =
   cast[ptr NimfParallel](handle).group
 
 proc nimf_parallel_create*(devices, ratios: cstring): pointer
-    {.exportc: "nimf_parallel_create", cdecl, dynlib.} =
+    {.exportc: "nimf_parallel_create", cdecl, dynlib, apiHooked.} =
   if devices == nil: return failPtr("missing parallel devices")
   try:
     let group = initProcessGroup(jsonStrings(parseJson($devices)), parallelRatios(ratios))
@@ -2707,7 +2707,7 @@ proc nimf_parallel_create*(devices, ratios: cstring): pointer
     failPtr(error.msg)
 
 proc nimf_parallel_destroy*(handle: pointer): cint
-    {.exportc: "nimf_parallel_destroy", cdecl, dynlib.} =
+    {.exportc: "nimf_parallel_destroy", cdecl, dynlib, apiHooked.} =
   if handle != nil:
     cast[ptr NimfParallel](handle).group = nil
     deallocShared(handle)
@@ -2719,7 +2719,7 @@ proc parallelJson(value: JsonNode): cstring =
   discard ok()
 
 proc nimf_parallel_partition*(handle: pointer; length: int64; ratios: cstring): cstring
-    {.exportc: "nimf_parallel_partition", cdecl, dynlib.} =
+    {.exportc: "nimf_parallel_partition", cdecl, dynlib, apiHooked.} =
   try:
     if length < 0 or length > high(int).int64: return failCString("invalid partition length")
     parallelJson(%parallelGroup(handle).partition(int(length), parallelRatios(ratios)))
@@ -2729,7 +2729,7 @@ proc nimf_parallel_partition*(handle: pointer; length: int64; ratios: cstring): 
 proc nimf_parallel_vm_run*(handle: pointer; words: ptr uint32; wordsLen: int64;
     memory: ptr cfloat; memoryLen, itemSize, threadsPerItem, tgFloats, tgSize: int64;
     ratios, workerPath: cstring; output: ptr cfloat): cint
-    {.exportc: "nimf_parallel_vm_run", cdecl, dynlib.} =
+    {.exportc: "nimf_parallel_vm_run", cdecl, dynlib, apiHooked.} =
   if words == nil or wordsLen <= 0 or wordsLen > high(int32).int64 or
       memoryLen < 0 or memoryLen > high(int32).int64 or
       (memoryLen > 0 and (memory == nil or output == nil)) or
@@ -2749,7 +2749,7 @@ proc nimf_parallel_vm_run*(handle: pointer; words: ptr uint32; wordsLen: int64;
     fail(error.msg)
 
 proc nimf_parallel_generate*(handle: pointer; request: cstring): cstring
-    {.exportc: "nimf_parallel_generate", cdecl, dynlib.} =
+    {.exportc: "nimf_parallel_generate", cdecl, dynlib, apiHooked.} =
   if request == nil: return failCString("missing parallel generation request")
   try:
     let value = parseJson($request)

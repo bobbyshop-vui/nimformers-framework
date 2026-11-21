@@ -15,7 +15,9 @@ make run
 Trainer chưa có tùy chọn CLI. Sửa `CFG_*` đầu source để đổi kích thước
 model, sequence length, batch, số step, learning rate và giới hạn mẫu.
 `make run-metal` chọn Metal trên macOS. Target cũ `run-cpu` lỗi khi chạy vì
-CPU model execution không còn được hỗ trợ. `make build` chỉ build trainer;
+CPU model execution không còn được hỗ trợ. `make build` build shared
+runtime/worker cùng trainer mà chưa chạy training; `make build-shared` chỉ
+build shared runtime/worker. `make run` bắt đầu train;
 `make run-spectron` build/chạy chương trình inference tương tác riêng.
 
 
@@ -56,6 +58,32 @@ proc decodeBPEStr*(tok: BPETokenizer, ids: seq[int]): string
 Tokenizer do chương trình Spectron train và lưu tại
 `test/spectron/models/spectron_bpe_tokenizer.json`; tách biệt với tokenizer
 Hugging Face của DeepSeek/Codestral.
+
+## Raw Token Memory cho batch train
+
+`RawTokenMemory` giữ stream token ID BPE của corpus và ghi lại từng cửa sổ
+input được chọn theo step, hàng batch, vị trí corpus và số token. Batch này là
+đầu vào thực tế cho `trainStep`, vì vậy Linear++ attention và Mamba2 parallel
+scan nhận cùng một chuỗi token. Có thể khôi phục token gốc từ ID để xem hoặc
+replay; bộ nhớ này chỉ tồn tại trong tiến trình và không ghi vào checkpoint.
+
+```nim
+proc newRawTokenMemory*(tok: BPETokenizer,
+                        tokenIds: sink seq[int]): RawTokenMemory
+proc tokenCount*(memory: RawTokenMemory): int
+proc rawTokenAt*(memory: RawTokenMemory,
+                 corpusIndex: int): RawTokenRecord
+proc rawTokensForWindow*(memory: RawTokenMemory,
+                         window: RawTokenWindow): seq[RawTokenRecord]
+proc rawTextForWindow*(memory: RawTokenMemory,
+                       window: RawTokenWindow): string
+proc sampleRawTokenBatch*(memory: var RawTokenMemory, batchSize, seqLen,
+                          step: int, rng: var Rand): RawTokenBatch
+```
+
+`RawTokenRecord.text` là byte thô của một BPE piece; một piece có thể dừng
+giữa ký tự UTF-8 nhiều byte. Hãy ghép các piece liền nhau hoặc gọi
+`rawTextForWindow` để lấy lại text hoàn chỉnh của cửa sổ.
 
 
 ## Model, training và checkpoint

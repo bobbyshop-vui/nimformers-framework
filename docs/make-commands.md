@@ -36,10 +36,12 @@ make build
 ./test/spectron/test_nimformer
 ```
 
-`make build` runs `nim check`, then `nim c`, on
-`test/spectron/test_nimformer.nim`. The executable is
-`test/spectron/test_nimformer`. Building does not train; executing the binary
-starts corpus loading, tokenizer loading/training, and model training.
+`make build` builds the shared runtime and worker for FFI consumers, then runs
+`nim check` and `nim c` on `test/spectron/test_nimformer.nim`. The trainer
+executable is `test/spectron/test_nimformer`. Building does not train;
+executing the binary starts corpus loading, tokenizer loading/training, and
+model training. Use `make build-shared` when only the shared runtime and worker
+are needed.
 
 Combine building and running:
 
@@ -66,7 +68,10 @@ See the [Spectron guide](spectron-guide.md) for configuration, data, loss, and r
 
 - `make` or `make all`: runs `build`, then `run`, so **it starts training**.
   `run` checks/compiles again; use `make build` to compile only.
-- `make build`: checks and compiles the trainer; the default backend is `auto`.
+- `make build`: builds the shared runtime/worker and checks/compiles the
+  Spectron trainer; the trainer backend is `auto`.
+- `make build-shared`: checks/builds `nimformers_lib.nim` and the worker,
+  without compiling the trainer.
 - `make run`: checks, compiles, and runs the trainer with `auto`.
 - `make run-metal`: checks/compiles with `-d:backend=metal`, then trains.
   Outside macOS, it only prints that Metal is unsupported.
@@ -262,16 +267,20 @@ usage and flags.
 ## Python, C, and BybyLang
 
 ```sh
-make build-for-python
+make build
+make build-shared
 make python-example
 make python-test
 make c-example
 make bybylang-test
+make hook-plugin-test
 ```
 
-- `build-for-python`: checks/builds `nimformers_lib.nim` into `libnimformers.dylib`
+- `build`: the general framework build: shared runtime, worker, and Spectron trainer.
+- `build-shared`: checks/builds `nimformers_lib.nim` into `libnimformers.dylib`
   on macOS, `libnimformers.so` on Linux, or `nimformers.dll` on Windows.
-  It does not install the Python package.
+- `build-for-python`: compatibility alias for `build-shared`; use the general
+  `build` target for the full framework build.
 - `python-example`: builds the shared library and runs `examples/python/basic.py`.
 - `python-test`: builds the shared library and runs pytest on `test/python_test/`.
 - `c-example`: builds the shared library, compiles `examples/c/smoke.c`, and
@@ -286,6 +295,9 @@ Use the active virtualenv interpreter:
 make python-example PYTHON=python
 make python-test PYTEST='python -m pytest' PYTEST_FLAGS=-q
 ```
+
+`hook-plugin-test` compiles and runs an importable Nim plugin that hooks its own
+API and a low-level BybyLang session call.
 
 See the [Python guide](python-guide.md), [Python API](python-api.md),
 [BybyLang guide](bybylang-guide.md), and [BybyLang API](bybylang-api.md).

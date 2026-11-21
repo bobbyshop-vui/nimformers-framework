@@ -16,14 +16,17 @@ Từ thư mục gốc repo, tạo môi trường riêng rồi build thư viện:
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e '.[test]'
-make build-for-python
+make build
 make python-example PYTHON=python
 ```
 
 `pip install -e '.[test]'` cài Python wrapper, NumPy và pytest; không compile
-Nim. `make build-for-python` mới tạo `libnimformers.dylib` trên macOS,
-`libnimformers.so` trên Linux hoặc `nimformers.dll` trên Windows. Cần Nim,
-C compiler và Metal/Vulkan runtime cho các phép tính GPU.
+Nim. `make build` build shared runtime, worker và trainer Spectron.
+`make build-shared` chỉ build shared runtime và worker, tạo
+`libnimformers.dylib` trên macOS, `libnimformers.so` trên Linux hoặc
+`nimformers.dll` trên Windows. Cần Nim, C compiler và Metal/Vulkan runtime
+cho các phép tính GPU. `make build-for-python` vẫn là bí danh tương thích
+của `make build-shared`.
 
 Nếu chỉ dùng package, có thể dùng `python -m pip install -e .` và không cài
 test extra. Đọc toàn bộ signatures ở [Python API](python-api.vi.md).
@@ -233,7 +236,7 @@ make python-test PYTEST='python -m pytest' PYTEST_FLAGS=-q
 
 - `ModuleNotFoundError: nimformers`: cài wrapper vào đúng interpreter bằng
   `python -m pip install -e .`, hoặc chạy từ thư mục repo.
-- Không tìm thấy shared library: chạy `make build-for-python`, kiểm tra
+- Không tìm thấy shared library: chạy `make build-shared`, kiểm tra
   `library_path()` hoặc đặt `NIMFORMERS_LIB` tới file đầy đủ.
 - Thiếu symbol `nimf_*`: rebuild thư viện và kiểm tra không trỏ nhầm một
   bản library cũ.

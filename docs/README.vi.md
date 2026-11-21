@@ -31,6 +31,8 @@ lượng tử hóa, backend, session và micro-VM.
 - [API tensor](tensor-ops-api.vi.md): view, shape, giảm chiều, so sánh, scan, dropout.
 - [API model cơ bản](base-model-api.vi.md): tensor, layer, transformer block,
   forward/backward và APF Adam.
+- [Hook API Nim](forward-hooks.vi.md): hook Tensor/model, sửa args/kết quả typed của API
+  Nim/BybyLang, thay micro-kernel đã sinh, kèm plugin module và target test mẫu.
 - [API model Jamba lai](jamba-model-api.vi.md): model Mamba/attention hỗn hợp,
   batch forward, train và checkpoint.
 - [API inference LLaMA](llama-inference-api.vi.md): RoPE, RMSNorm, GQA,

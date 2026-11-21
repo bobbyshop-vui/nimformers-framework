@@ -28,7 +28,8 @@ inputs and outputs, see the [Make command guide](make-commands.md).
 ## Build
 
 ```sh
-make build-for-python      # checks and builds the shared library
+make build                 # builds shared runtime, worker, and Spectron trainer
+make build-shared          # builds just the shared runtime and worker
 make python-test           # builds, then runs the pytest suite
 make python-example        # runs examples/python/basic.py
 make c-example             # builds and runs examples/c/smoke.c
@@ -40,12 +41,13 @@ For an isolated source install:
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e '.[test]'
-make build-for-python
+make build
 make python-test PYTEST='python -m pytest' PYTEST_FLAGS=-q
 ```
 
 `pip install .` only installs the Python layer; it does not build the Nim
-library.  Run `make build-for-python` first and either copy the resulting
+library. Run `make build` first, or use `make build-shared` when you only need
+the FFI runtime, and either copy the resulting
 shared library into `nimformers/`, set `NIMFORMERS_LIB=/path/to/libnimformers`,
 or keep the repository root on the loader search path.
 
@@ -311,7 +313,7 @@ Use `with ctx.session() as sess:` to group native operations. The session
 submits on exit, then `Buffer.read()` copies results back to NumPy. These
 operations use the CPU, Metal, or Vulkan implementations of the corresponding
 BybyLang session calls. Build the current shared library with
-`make build-for-python` to use these additions to ABI v2.
+`make build-shared` to use these additions to ABI v2.
 
 | Python method | Nim / BybyLang call |
 | --- | --- |

@@ -80,6 +80,11 @@ Kết quả cộng là `[11,22,33,44]`; matmul là `[4,5,10,11]`, biểu diễn 
 
 ## Session và micro-kernel
 
+Dùng [hook API Nim](forward-hooks.vi.md) để quan sát API BybyLang session và
+micro-VM, hoặc thay micro-kernel đã sinh trước JIT/dispatch.
+Chạy `make hook-plugin-test` để compile và kiểm tra Nim plugin import được có
+hook sửa `sessionRead`; plugin được compile vào cùng process với host.
+
 Có thể gom các phép toán được backend hỗ trợ vào session:
 
 ```bybylang

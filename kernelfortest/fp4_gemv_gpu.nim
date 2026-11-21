@@ -26,6 +26,7 @@ import vendor/bybylang/gpubackend as byby   # sessionUploadPrivate
 import session_vm_dispatch
 import prefill_profile   # BYBY_PREFILL_PROFILE: fp4.upload / fp4.gpu / fp4.read
 import vendor/bybylang/backends/vulkan/vulkan_driver as vkDrv
+from vendor/bybylang/probe import apiHooked
 
 when defined(macosx):
   import vendor/bybylang/backends/metal/metal_backend as metalBackendMod
@@ -54,7 +55,7 @@ type
 var gFp4CacheGpu* = initTable[string, Fp4LinCacheGpu]()
 const Fp4KmMblock* = 4
 
-proc sessionUploadBytesShared*(backend: byby.GpuBackend, data: openArray[uint8]): byby.SessionHandle =
+proc sessionUploadBytesShared*(backend: byby.GpuBackend, data: openArray[uint8]): byby.SessionHandle  {.apiHooked.}=
   ## Packed FP4 weights → a Shared buffer (llama.cpp style: no Private/wired pinning).
   ## Metal: metalUploadBytes → MTLResourceStorageModeShared.
   ## Vulkan: vulkanSessionUploadU8 / vulkanSessionUploadBytes.
@@ -74,13 +75,13 @@ proc sessionUploadBytesShared*(backend: byby.GpuBackend, data: openArray[uint8])
     discard
 
 proc sessionUploadFloatsShared*(backend: byby.GpuBackend;
-                                data: openArray[float32]): byby.SessionHandle =
+                                data: openArray[float32]): byby.SessionHandle  {.apiHooked.}=
   let p = if data.len > 0: cast[ptr UncheckedArray[uint8]](unsafeAddr data[0]) else: nil
   sessionUploadBytesShared(backend, toOpenArray(p, 0, data.len * 4 - 1))
 
 proc uploadFp4WeightOnce*(ctx: Backend, name: string; wq: openArray[uint8];
                            lut: seq[float32]; rows, cols: int; jitName: string;
-                           rowsPerTg = 1) =
+                           rowsPerTg = 1)  {.apiHooked.}=
   ## Uploads W (u8 Shared) + lut (fp32 Private, small) ONCE.
   ## Idempotent: returns right away if already resident.
   if name in gFp4CacheGpu and gFp4CacheGpu[name].residentReady: return
@@ -98,14 +99,14 @@ proc uploadFp4WeightOnce*(ctx: Backend, name: string; wq: openArray[uint8];
   c.residentReady = true
   gFp4CacheGpu[name] = c
 
-proc buildFp4LutQ*(qt: QuantTensor): seq[float32] =
+proc buildFp4LutQ*(qt: QuantTensor): seq[float32]  {.apiHooked.}=
   result = newSeq[float32](256)
   let base = buildDecodeLUT(qt.cf)
   let sc = if qt.scale.len > 0: qt.scale[0] else: 1'f32
   for i in 0 .. 255:
     result[i] = base[i] * sc
 
-proc buildFp4KmLutQ*(qt: QuantTensor): seq[float32] =
+proc buildFp4KmLutQ*(qt: QuantTensor): seq[float32]  {.apiHooked.}=
   ## Combined LUT for FP4-KM, 272 elements (see the original lora.nim for the
   ## layout details): [0..15]=E2M1, [16..271]=E4M3 premultiplied by globalScale.
   result = newSeq[float32](272)
@@ -119,7 +120,7 @@ proc buildFp4KmLutQ*(qt: QuantTensor): seq[float32] =
     result[16 + b] = v
 
 proc encodeFp4Gemv*(c: Fp4LinCacheGpu; hIn: byby.SessionHandle; inOffElems: int;
-                    hOut: byby.SessionHandle; outOffElems: int): bool =
+                    hOut: byby.SessionHandle; outOffElems: int): bool  {.apiHooked.}=
   ## Encodes one fp4 gemv (M=1) into the open session. Kernel = JIT-compiled micro-VM
   ## bytecode (fp4_gemv_vm.buildFp4GemvProgram) - buffer layout of the JIT kernel:
   ## Metal: 1=output, 2=W fp4, 3=LUT, 4=x
@@ -151,7 +152,7 @@ proc encodeFp4Gemv*(c: Fp4LinCacheGpu; hIn: byby.SessionHandle; inOffElems: int;
   result = sessionEncDispatch(isVk, (c.rows div c.rowsPerTg) * tg, tg, c.tgBytes)
 
 proc encodeFp4GemmM4*(c: Fp4LinCacheGpu; hIn: byby.SessionHandle; inOffElems: int;
-                      hOut: byby.SessionHandle; outOffElems: int): bool =
+                      hOut: byby.SessionHandle; outOffElems: int): bool  {.apiHooked.}=
   ## Prefill tile: 4 input rows, weights read once per column (MBLOCK=4).
   if c.m4JitName.len == 0: return false
   let isVk = hOut.kind == byby.gbVulkan
@@ -178,7 +179,7 @@ proc encodeFp4GemmM4*(c: Fp4LinCacheGpu; hIn: byby.SessionHandle; inOffElems: in
 
 var gFp4PadM = -1   ## -1 = BYBY_FP4_PAD_M not read yet
 
-proc fp4GemmPaddedRows*(c: Fp4LinCacheGpu; M: int): int =
+proc fp4GemmPaddedRows*(c: Fp4LinCacheGpu; M: int): int  {.apiHooked.}=
   ## Number of rows encodeFp4GemmRows actually dispatches (>= M). A remainder M mod 4 >= 2
   ## is padded to one M4 tile: the M4 kernel has no row bound check, and a per-row GEMV
   ## re-reads ALL weights each time (T=11: 2 M4 + 3 GEMV = 5 weight passes;
@@ -192,7 +193,7 @@ proc fp4GemmPaddedRows*(c: Fp4LinCacheGpu; M: int): int =
   if r >= 2: result = M + (Fp4KmMblock - r)
 
 proc encodeFp4GemmRows*(c: Fp4LinCacheGpu; hIn: byby.SessionHandle;
-                        hOut: byby.SessionHandle; M: int): bool =
+                        hOut: byby.SessionHandle; M: int): bool  {.apiHooked.}=
   ## M rows: M4 tiles preferred (weights once per 4 tokens), the remainder as per-row GEMVs.
   ## Same open session — no sessionBegin/End here.
   ## hIn/hOut MUST hold fp4GemmPaddedRows(c, M) rows (the padding rows of hIn = 0;
@@ -218,7 +219,7 @@ proc encodeFp4GemmRows*(c: Fp4LinCacheGpu; hIn: byby.SessionHandle;
       return
     inc m
 
-proc fp4GemmGpuRows*(ctx: Backend; name: string; x: seq[float32]; M: int): seq[float32] =
+proc fp4GemmGpuRows*(ctx: Backend; name: string; x: seq[float32]; M: int): seq[float32]  {.apiHooked.}=
   ## Prefill/batch host entry: 1 session, M rows. Tile MBLOCK=4, phan du pad (fp4GemmPaddedRows).
   doAssert name in gFp4CacheGpu and gFp4CacheGpu[name].residentReady,
     "fp4GemmGpuRows: uploadFp4WeightOnce not called for " & name
@@ -254,7 +255,7 @@ proc fp4GemmGpuRows*(ctx: Backend; name: string; x: seq[float32]; M: int): seq[f
   sessionFree(be, hC)
   sessionFree(be, hA)
 
-proc fp4GemvGpu*(ctx: Backend; name: string; x: seq[float32]; M: int): seq[float32] =
+proc fp4GemvGpu*(ctx: Backend; name: string; x: seq[float32]; M: int): seq[float32]  {.apiHooked.}=
   ## Host path (test/debug): its own sessionBegin..sessionEnd + readback. NOT used
   ## in the infer hot path (hot path = encodeFp4Gemv inside one session/token).
   doAssert M == 1, "fp4GemvGpu: supports only M=1 (one token at a time)"
@@ -277,7 +278,7 @@ proc fp4GemvGpu*(ctx: Backend; name: string; x: seq[float32]; M: int): seq[float
   sessionFree(be, hA)
 
 proc fp4GemvGpuInto*(ctx: Backend; name: string; hX: byby.SessionHandle;
-                     hOut: var byby.SessionHandle; M: int): bool =
+                     hOut: var byby.SessionHandle; M: int): bool  {.apiHooked.}=
   ## Encodes an fp4 gemv into the open session - NO sessionRead.
   doAssert M == 1, "fp4GemvGpuInto: supports only M=1"
   doAssert name in gFp4CacheGpu and gFp4CacheGpu[name].residentReady,
@@ -289,7 +290,7 @@ proc fp4GemvGpuInto*(ctx: Backend; name: string; hX: byby.SessionHandle;
   result = encodeFp4Gemv(c, hX, 0, hOut, 0)
 
 proc fp4GemvGpuFromSeqInto*(ctx: Backend; name: string; x: seq[float32];
-                            hOut: var byby.SessionHandle; M: int): byby.SessionHandle =
+                            hOut: var byby.SessionHandle; M: int): byby.SessionHandle  {.apiHooked.}=
   ## Uploads x once, gemv into hOut, returns hX (the caller may free it). No readback.
   let be = ctx.kind.toByby()
   result = sessionUpload(be, x)

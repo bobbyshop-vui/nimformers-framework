@@ -20,7 +20,9 @@ make build
 ```
 
 The first command downloads six code JSONLs. If data already exists, start
-with `make build`. Building only checks/compiles; running the binary trains.
+with `make build`. That target builds the shared runtime and worker, then
+checks/compiles the Spectron trainer; running the binary trains. Use
+`make build-shared` to build only the shared runtime and worker.
 Combine the steps on macOS:
 
 ```sh
@@ -59,6 +61,14 @@ to change these settings.
 4. Load an existing checkpoint or initialize a model.
 5. Encode the corpus, sample random windows, and train next-token prediction with Adam.
 6. Save periodically, save once at the end, and generate a sample.
+
+During training, `RawTokenMemory` keeps the encoded corpus token IDs and records
+each sampled input window with its step, batch row, corpus offset, and length.
+The exact input IDs from each window feed both Linear++ attention and the
+Mamba2 parallel scan. `rawTokenAt` and `rawTokensForWindow` can recover the
+corresponding BPE IDs and raw byte pieces for inspection or replay; token text
+is reconstructed on demand to avoid duplicating strings across the corpus.
+This is an in-process training memory and is not added to the model checkpoint.
 
 
 ## Input data

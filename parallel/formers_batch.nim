@@ -1,5 +1,9 @@
 ## Native independent-prompt inference through the shared process scheduler.
 import std/strutils
+from vendor/bybylang/probe import apiHooked, bybyApiHooksActive,
+    runBybyApiHooks, bybyApiBefore, bybyApiAfter, bybyHookValue,
+    bybyApiValueHooksActive, runBybyApiValueHooks, BybyApiCall, BybyApiArg,
+    bybyHookTypeName
 import vendor/bybylang/distributed
 
 proc normalizedArgs(baseArgs: openArray[string]): seq[string] =
@@ -18,7 +22,7 @@ proc normalizedArgs(baseArgs: openArray[string]): seq[string] =
 proc runFormersBatchDetailed*(group: ProcessGroup; executable: string; baseArgs: seq[string];
                               prompts: seq[string]; tokenIds: bool; maxTokens: int;
                               temperature: float64; environment: seq[(string, string)];
-                              ratios: seq[float64]; unsetEnvironment: seq[string] = @[]): seq[ParallelResult] =
+                              ratios: seq[float64]; unsetEnvironment: seq[string] = @[]): seq[ParallelResult] {.apiHooked.} =
   ## Run one CLI process per prompt and retain stdout and stderr by input index.
   if group.isNil:
     raise newException(ValueError, "parallel inference requires an initialized process group")
@@ -44,7 +48,7 @@ proc runFormersBatchDetailed*(group: ProcessGroup; executable: string; baseArgs:
 proc runFormersBatch*(group: ProcessGroup; executable: string; baseArgs: seq[string];
                       prompts: seq[string]; tokenIds: bool; maxTokens: int;
                       temperature: float64; environment: seq[(string, string)];
-                      ratios: seq[float64]; unsetEnvironment: seq[string] = @[]): seq[string] =
+                      ratios: seq[float64]; unsetEnvironment: seq[string] = @[]): seq[string] {.apiHooked.} =
   ## Run a CLI batch and return stdout in prompt order.
   for item in runFormersBatchDetailed(group, executable, baseArgs, prompts, tokenIds,
       maxTokens, temperature, environment, ratios, unsetEnvironment):

@@ -6,6 +6,10 @@ import customfloat
 import backend  # Imports Backend and its helpers
 import quant     # QuantTensor, dequantizeTensor - keeps int4-compressed weights in RAM
 import vendor/bybylang/gpubackend as byby
+from vendor/bybylang/probe import apiHooked, bybyApiHooksActive,
+    runBybyApiHooks, bybyApiBefore, bybyApiAfter, bybyHookValue,
+    bybyApiValueHooksActive, runBybyApiValueHooks, BybyApiCall, BybyApiArg,
+    bybyHookTypeName
 import fp4_gemv_gpu  # gFp4CacheGpu, fp4GemmGpuRows (prefill FP4-KM)
 import prefill_profile  # BYBY_PREFILL_PROFILE: pfTime
 
@@ -20,20 +24,37 @@ type
 
 template floatValues*(t: Tensor): untyped = weightValues(t.data, t.mappedData)
 
+proc bybyHookValue*(value: Tensor): string =
+  "Tensor(shape=" & $value.shape & ", elements=" & $value.data.len & ")"
+
 type
   ForwardHook* = proc(ctx: Backend, input: Tensor): Tensor {.nimcall.}
   ForwardOutputHook* = proc(ctx: Backend, input, output: Tensor): Tensor {.nimcall.}
+  ApiInputHook* = proc(api: string; ctx: Backend; inputs: var seq[Tensor]) {.closure.}
+  ApiOutputHook* = proc(api: string; ctx: Backend; inputs: openArray[Tensor];
+      output: Tensor): Tensor {.closure.}
   ForwardHookId* = int
+  ApiHookId* = int
   ForwardHookRegistration = object
     id: ForwardHookId
     api: string
+    forwardOnly: bool
     before: ForwardHook
     after: ForwardOutputHook
+    apiBefore: ApiInputHook
+    apiAfter: ApiOutputHook
 
 const ForwardApiAll* = "*"
 const ForwardApiNames* = [
   "linear", "layer_norm", "causal_self_attention", "feed_forward",
   "transformer_block", "embedding", "nimformer_model_batch", "nimformer_model",
+]
+const HookApiNames* = [
+  "linear", "layer_norm", "causal_self_attention", "feed_forward",
+  "transformer_block", "embedding", "nimformer_model_batch", "nimformer_model",
+  "newtensor", "randntensor", "addt", "subt", "mult", "transpose",
+  "expt", "logt", "sqrtt", "powt", "view", "reshape", "permute",
+  "concat", "stack", "split", "cumsumt", "cumprodt", "maskedfill", "wheret",
 ]
 
 var gForwardHooks: seq[ForwardHookRegistration]
@@ -44,8 +65,8 @@ proc normalizeForwardApi(api: string): string {.inline.} =
 
 proc registerForwardHook*(api: string; before: ForwardHook = nil;
     after: ForwardOutputHook = nil): ForwardHookId =
-  ## Register before/after callbacks for a public forward API. Use "*" to
-  ## observe every API listed in `forwardApiNames()`.
+  ## Register the legacy single-input callbacks for a module forward API.
+  ## Use `registerApiHook` to also hook the low-level Tensor operations.
   let normalized = normalizeForwardApi(api)
   if normalized.len == 0:
     raise newException(ValueError, "forward hook API name must not be empty")
@@ -56,7 +77,24 @@ proc registerForwardHook*(api: string; before: ForwardHook = nil;
   result = gNextForwardHookId
   inc gNextForwardHookId
   gForwardHooks.add(ForwardHookRegistration(id: result, api: normalized,
-    before: before, after: after))
+    forwardOnly: true, before: before, after: after))
+
+proc registerApiHook*(api: string; before: ApiInputHook = nil;
+    after: ApiOutputHook = nil): ApiHookId =
+  ## Register a hook for a module forward or a public Tensor operation. Before
+  ## callbacks can replace every Tensor operand; after callbacks can replace
+  ## the output. Use `"*"` to apply the hook throughout nested operations.
+  let normalized = normalizeForwardApi(api)
+  if normalized.len == 0:
+    raise newException(ValueError, "API hook name must not be empty")
+  if normalized != ForwardApiAll and normalized notin HookApiNames:
+    raise newException(ValueError, "unknown hook API: " & api)
+  if before == nil and after == nil:
+    raise newException(ValueError, "an API hook needs a before or after callback")
+  result = gNextForwardHookId
+  inc gNextForwardHookId
+  gForwardHooks.add(ForwardHookRegistration(id: result, api: normalized,
+    forwardOnly: false, apiBefore: before, apiAfter: after))
 
 proc removeForwardHook*(id: ForwardHookId): bool =
   ## Remove one registration. Returns false when the ID is not registered.
@@ -65,15 +103,39 @@ proc removeForwardHook*(id: ForwardHookId): bool =
       gForwardHooks.delete(i)
       return true
 
+proc removeApiHook*(id: ApiHookId): bool =
+  ## Remove one hook registered through either hook API.
+  removeForwardHook(id)
+
 proc clearForwardHooks*(api = "") =
-  ## Remove all hooks, or only the hooks registered for one API name.
+  ## Remove legacy forward hooks, or only those registered for one API name.
   if api.len == 0:
-    gForwardHooks.setLen(0)
+    var retained: seq[ForwardHookRegistration]
+    for registration in gForwardHooks:
+      if not registration.forwardOnly:
+        retained.add(registration)
+    gForwardHooks = retained
     return
   let normalized = normalizeForwardApi(api)
   var retained: seq[ForwardHookRegistration]
   for registration in gForwardHooks:
-    if registration.api != normalized:
+    if not registration.forwardOnly or registration.api != normalized:
+      retained.add(registration)
+  gForwardHooks = retained
+
+proc clearApiHooks*(api = "") =
+  ## Remove API hooks, or only those registered for one API name.
+  if api.len == 0:
+    var retained: seq[ForwardHookRegistration]
+    for registration in gForwardHooks:
+      if registration.forwardOnly:
+        retained.add(registration)
+    gForwardHooks = retained
+    return
+  let normalized = normalizeForwardApi(api)
+  var retained: seq[ForwardHookRegistration]
+  for registration in gForwardHooks:
+    if registration.forwardOnly or registration.api != normalized:
       retained.add(registration)
   gForwardHooks = retained
 
@@ -81,21 +143,49 @@ proc forwardApiNames*(): seq[string] =
   ## Return the high-level forward APIs that accept custom hooks.
   @ForwardApiNames
 
-proc applyForwardBefore(api: string; ctx: Backend; input: Tensor): Tensor =
-  result = input
-  let normalized = normalizeForwardApi(api)
-  for registration in gForwardHooks:
-    if (registration.api == ForwardApiAll or registration.api == normalized) and
-        registration.before != nil:
-      result = registration.before(ctx, result)
+proc hookApiNames*(): seq[string] =
+  ## Return every module-forward and Tensor operation API that accepts hooks.
+  @HookApiNames
 
-proc applyForwardAfter(api: string; ctx: Backend; input, output: Tensor): Tensor =
+proc registrationMatches(registration: ForwardHookRegistration;
+    api: string): bool {.inline.} =
+  result = registration.api == api or
+    (registration.api == ForwardApiAll and
+      (not registration.forwardOnly or api in ForwardApiNames))
+
+proc applyApiBefore*(api: string; ctx: Backend; inputs: var seq[Tensor]) =
+  let normalized = normalizeForwardApi(api)
+  let expectedInputs = inputs.len
+  for registration in gForwardHooks:
+    if registrationMatches(registration, normalized):
+      if registration.apiBefore != nil:
+        registration.apiBefore(normalized, ctx, inputs)
+      if registration.forwardOnly and registration.before != nil and
+          normalized in ForwardApiNames and inputs.len > 0:
+        inputs[0] = registration.before(ctx, inputs[0])
+      if inputs.len != expectedInputs:
+        raise newException(ValueError,
+          "API hooks must preserve the number of Tensor operands for " & normalized)
+
+proc applyApiAfter*(api: string; ctx: Backend; inputs: openArray[Tensor];
+    output: Tensor): Tensor =
   result = output
   let normalized = normalizeForwardApi(api)
   for registration in gForwardHooks:
-    if (registration.api == ForwardApiAll or registration.api == normalized) and
-        registration.after != nil:
-      result = registration.after(ctx, input, result)
+    if registrationMatches(registration, normalized):
+      if registration.apiAfter != nil:
+        result = registration.apiAfter(normalized, ctx, inputs, result)
+      if registration.forwardOnly and registration.after != nil and
+          normalized in ForwardApiNames and inputs.len > 0:
+        result = registration.after(ctx, inputs[0], result)
+
+proc applyForwardBefore(api: string; ctx: Backend; input: Tensor): Tensor =
+  var inputs = @[input]
+  applyApiBefore(api, ctx, inputs)
+  result = if inputs.len > 0: inputs[0] else: input
+
+proc applyForwardAfter(api: string; ctx: Backend; input, output: Tensor): Tensor =
+  applyApiAfter(api, ctx, [input], output)
 
 proc numel(shape: seq[int]): int =
   result = 1
@@ -105,55 +195,91 @@ var gLoraSizeMismatchWarned = 0  ## counts LoRA size-mismatch warnings
                                   ## (see forward() below) - capped so the log
                                   ## is not spammed when many Linears hit it.
 
-proc newTensor*(shape: seq[int], fill: float32 = 0'f32): Tensor =
+proc newTensor*(shape: seq[int], fill: float32 = 0'f32): Tensor {.apiHooked.} =
+  let ctx = Backend(kind: bkCpu)
+  var inputs: seq[Tensor]
+  applyApiBefore("newtensor", ctx, inputs)
   result.shape = shape
   result.data = newSeq[float32](numel(shape))
   if fill != 0'f32:
     for i in 0 ..< result.data.len: result.data[i] = fill
+  result = applyApiAfter("newtensor", ctx, inputs, result)
 
-proc randnTensor*(shape: seq[int], scale: float32): Tensor =
+proc randnTensor*(shape: seq[int], scale: float32): Tensor {.apiHooked.} =
+  let ctx = Backend(kind: bkCpu)
+  var inputs: seq[Tensor]
+  applyApiBefore("randntensor", ctx, inputs)
   result.shape = shape
   result.data = newSeq[float32](numel(shape))
   for i in 0 ..< result.data.len:
     result.data[i] = float32(gauss(0.0, 1.0)) * scale
+  result = applyApiAfter("randntensor", ctx, inputs, result)
 
-proc addT*(a, b: Tensor): Tensor =
-  result = a
-  for i in 0 ..< result.data.len: result.data[i] += b.data[i]
+proc addT*(a, b: Tensor): Tensor {.apiHooked.} =
+  let ctx = Backend(kind: bkCpu)
+  var inputs = @[a, b]
+  applyApiBefore("addt", ctx, inputs)
+  if inputs.len != 2:
+    raise newException(ValueError, "addT hooks must preserve the two Tensor operands")
+  result = inputs[0]
+  for i in 0 ..< result.data.len: result.data[i] += inputs[1].data[i]
+  result = applyApiAfter("addt", ctx, inputs, result)
 
-proc addT*(ctx: Backend, a, b: Tensor): Tensor =
+proc addT*(ctx: Backend, a, b: Tensor): Tensor {.apiHooked.} =
   ## The addT(a,b) above runs on the CPU even though beAdd (real GPU, implemented
   ## for CUDA/Metal/OpenCL) exists - this residual connection runs TWICE PER
   ## LAYER (attn + ff), i.e. 64 times/token for a 32-layer model, not a small
   ## operation to ignore. This overload goes through the GPU, as required ("never
   ## silently run on the CPU"). The old addT(a,b) (no ctx) stays for the
   ## other callers that have no Backend in scope.
-  result = a
-  result.data = beAdd(ctx, a.data, b.data)
+  var inputs = @[a, b]
+  applyApiBefore("addt", ctx, inputs)
+  if inputs.len != 2:
+    raise newException(ValueError, "addT hooks must preserve the two Tensor operands")
+  result = inputs[0]
+  result.data = beAdd(ctx, inputs[0].data, inputs[1].data)
+  result = applyApiAfter("addt", ctx, inputs, result)
 
-proc subT*(a, b: Tensor): Tensor =
-  result = a
-  for i in 0 ..< result.data.len: result.data[i] -= b.data[i]
+proc subT*(a, b: Tensor): Tensor {.apiHooked.} =
+  let ctx = Backend(kind: bkCpu)
+  var inputs = @[a, b]
+  applyApiBefore("subt", ctx, inputs)
+  if inputs.len != 2:
+    raise newException(ValueError, "subT hooks must preserve the two Tensor operands")
+  result = inputs[0]
+  for i in 0 ..< result.data.len: result.data[i] -= inputs[1].data[i]
+  result = applyApiAfter("subt", ctx, inputs, result)
 
-proc mulT*(a, b: Tensor): Tensor =
-  result = a
-  for i in 0 ..< result.data.len: result.data[i] *= b.data[i]
+proc mulT*(a, b: Tensor): Tensor {.apiHooked.} =
+  let ctx = Backend(kind: bkCpu)
+  var inputs = @[a, b]
+  applyApiBefore("mult", ctx, inputs)
+  if inputs.len != 2:
+    raise newException(ValueError, "mulT hooks must preserve the two Tensor operands")
+  result = inputs[0]
+  for i in 0 ..< result.data.len: result.data[i] *= inputs[1].data[i]
+  result = applyApiAfter("mult", ctx, inputs, result)
 
-proc flatten2D*(shape: seq[int]): tuple[rows, cols: int] =
+proc flatten2D*(shape: seq[int]): tuple[rows, cols: int] {.apiHooked.} =
   let cols = shape[^1]
   var rows = 1
   for i in 0 ..< shape.len - 1: rows *= shape[i]
   result = (rows, cols)
 
-proc transpose*(x: Tensor): Tensor =
+proc transpose*(x: Tensor): Tensor {.apiHooked.} =
   ## Transposes a tensor treated as a 2D matrix [rows, cols] (all dims except
   ## the last merged into "rows", like flatten2D) -> [cols, rows].
-  let (rows, cols) = flatten2D(x.shape)
+  let ctx = Backend(kind: bkCpu)
+  var inputs = @[x]
+  applyApiBefore("transpose", ctx, inputs)
+  let input = inputs[0]
+  let (rows, cols) = flatten2D(input.shape)
   result.shape = @[cols, rows]
   result.data = newSeq[float32](rows * cols)
   for i in 0 ..< rows:
     for j in 0 ..< cols:
-      result.data[j * rows + i] = x.floatValues[i * cols + j]
+      result.data[j * rows + i] = input.floatValues[i * cols + j]
+  result = applyApiAfter("transpose", ctx, inputs, result)
 
 # ===================================================================
 # Linear (forward/backward use Metal matmul)
@@ -197,7 +323,7 @@ type
 template loraAValues*(l: Linear): untyped = weightValues(l.loraA, l.mappedLoraA)
 template loraBValues*(l: Linear): untyped = weightValues(l.loraB, l.mappedLoraB)
 
-proc newLinear*(inF, outF: int; initializeWeights = true): Linear =
+proc newLinear*(inF, outF: int; initializeWeights = true): Linear {.apiHooked.} =
   let scale = sqrt(2'f32 / float32(inF))
   result.inF = inF
   result.outF = outF
@@ -206,7 +332,7 @@ proc newLinear*(inF, outF: int; initializeWeights = true): Linear =
   result.useQuant = false
   result.bias = newTensor(@[outF])
 
-proc setQuantWeight*(l: var Linear, qt: QuantTensor) =
+proc setQuantWeight*(l: var Linear, qt: QuantTensor) {.apiHooked.} =
   ## Called from loadLinear() when real weights are loaded from a .nimq - keeps them
   ## COMPRESSED (no immediate dequant) and frees the fp32 fallback weight
   ## (no longer needed, wasted RAM since weightQ exists).
@@ -220,7 +346,7 @@ proc setQuantWeight*(l: var Linear, qt: QuantTensor) =
   l.residentReady = false
   l.residentFp32Ready = false
   l.residentFp32NT = false
-proc uploadResident*(l: var Linear, ctx: Backend, sparsityPct: float32 = 0.0'f32) =
+proc uploadResident*(l: var Linear, ctx: Backend, sparsityPct: float32 = 0.0'f32) {.apiHooked.} =
   ## Uploads the weight to the GPU ONCE (called from loadLlamaWeightsL after
   ## loading, NOT inside the decode loop).
   ## - int4-per-group (Q4_K_M style, the llama.cpp-style path): uses the native
@@ -335,7 +461,7 @@ proc residentLinearNt(l: Linear; x: seq[float32]; rows: int; ctx: Backend): seq[
     byby.sessionFree(be, hx)
     byby.sessionFree(be, hy)
 
-proc forward*(l: Linear, x: Tensor, ctx: Backend): Tensor =
+proc forward*(l: Linear, x: Tensor, ctx: Backend): Tensor {.apiHooked.} =
   var input = applyForwardBefore("linear", ctx, x)
   if l.preForwardHook != nil:
     input = l.preForwardHook(ctx, input)
@@ -425,7 +551,7 @@ proc forward*(l: Linear, x: Tensor, ctx: Backend): Tensor =
         "), loraB.len=" & $l.loraBValues.len & " (need " & $(l.outF * l.loraR) &
         ")) - skipping the LoRA delta for this parameter, using the base weight.")
   result = applyForwardAfter("linear", ctx, input, result)
-proc backward*(l: Linear, x: Tensor, dOut: Tensor, ctx: Backend): tuple[dX, dW, dB: Tensor] =
+proc backward*(l: Linear, x: Tensor, dOut: Tensor, ctx: Backend): tuple[dX, dW, dB: Tensor] {.apiHooked.} =
   ## Linear backward:
   ## dW = x^T @ dOut  (accumulated over the batch)
   ## dB = sum(dOut, axis=0)
@@ -464,7 +590,7 @@ proc backward*(l: Linear, x: Tensor, dOut: Tensor, ctx: Backend): tuple[dX, dW, 
 
   result = (dX, dW, dB)
 
-proc backwardInputOnly*(l: Linear, x: Tensor, dOut: Tensor, ctx: Backend): Tensor =
+proc backwardInputOnly*(l: Linear, x: Tensor, dOut: Tensor, ctx: Backend): Tensor {.apiHooked.} =
   ## Backward that computes only dX while Linear.weight/bias are frozen. Avoids computing and
   ## allocating an unused dW=[outF,inF] (especially lm_head vocab x hidden).
   let (rows, cols) = flatten2D(x.shape)
@@ -494,13 +620,13 @@ type
     eps*: float32
     dim*: int
 
-proc newLayerNorm*(dim: int, eps: float32 = 1e-5'f32): LayerNorm =
+proc newLayerNorm*(dim: int, eps: float32 = 1e-5'f32): LayerNorm {.apiHooked.} =
   result.dim = dim
   result.gamma = newTensor(@[dim], 1'f32)
   result.beta  = newTensor(@[dim], 0'f32)
   result.eps   = eps
 
-proc forward*(ln: LayerNorm, x: Tensor, ctx: Backend): Tensor =
+proc forward*(ln: LayerNorm, x: Tensor, ctx: Backend): Tensor {.apiHooked.} =
   ## This function used to take `ctx: Backend` but NOT USE it - the whole
   ## LayerNorm ran as a plain Nim loop on the CPU whatever
   ## backend (cuda/metal/opencl) was chosen. backend.nim already has `beLayernorm` matching
@@ -513,7 +639,7 @@ proc forward*(ln: LayerNorm, x: Tensor, ctx: Backend): Tensor =
   result.data = beLayernorm(ctx, input.data, ln.gamma.data, ln.beta.data, rows, cols, ln.eps)
   result = applyForwardAfter("layer_norm", ctx, input, result)
 
-proc backward*(ln: LayerNorm, x: Tensor, dOut: Tensor, ctx: Backend): tuple[dX, dGamma, dBeta: Tensor] =
+proc backward*(ln: LayerNorm, x: Tensor, dOut: Tensor, ctx: Backend): tuple[dX, dGamma, dBeta: Tensor] {.apiHooked.} =
   ## LayerNorm backward (matrix ops / GPU-bound)
   let (rows, cols) = flatten2D(x.shape)
   assert cols == ln.dim
@@ -534,7 +660,7 @@ type
     nHeads*, headDim*, embedDim*: int
     qkv*, proj*: Linear
 
-proc newCausalSelfAttention*(embedDim, nHeads: int): CausalSelfAttention =
+proc newCausalSelfAttention*(embedDim, nHeads: int): CausalSelfAttention {.apiHooked.} =
   assert embedDim mod nHeads == 0
   result.embedDim = embedDim
   result.nHeads = nHeads
@@ -542,7 +668,7 @@ proc newCausalSelfAttention*(embedDim, nHeads: int): CausalSelfAttention =
   result.qkv = newLinear(embedDim, 3 * embedDim)
   result.proj = newLinear(embedDim, embedDim)
 
-proc forward*(attn: CausalSelfAttention, x: Tensor, ctx: Backend): Tensor =
+proc forward*(attn: CausalSelfAttention, x: Tensor, ctx: Backend): Tensor {.apiHooked.} =
   let input = applyForwardBefore("causal_self_attention", ctx, x)
   let B = input.shape[0]
   let T = input.shape[1]
@@ -572,7 +698,7 @@ proc forward*(attn: CausalSelfAttention, x: Tensor, ctx: Backend): Tensor =
   result = applyForwardAfter("causal_self_attention", ctx, input, result)
 
 proc backward*(attn: CausalSelfAttention, x: Tensor, dOut: Tensor, ctx: Backend): tuple[
-    dX, dQkvW, dQkvB, dProjW, dProjB: Tensor] =
+    dX, dQkvW, dQkvB, dProjW, dProjB: Tensor] {.apiHooked.} =
   let B = x.shape[0]
   let T = x.shape[1]
   let C = x.shape[2]
@@ -627,11 +753,11 @@ type
   FeedForward* = object
     fc1*, fc2*: Linear
 
-proc newFeedForward*(embedDim, mult: int): FeedForward =
+proc newFeedForward*(embedDim, mult: int): FeedForward {.apiHooked.} =
   result.fc1 = newLinear(embedDim, embedDim * mult)
   result.fc2 = newLinear(embedDim * mult, embedDim)
 
-proc forward*(ff: FeedForward, x: Tensor, ctx: Backend): Tensor =
+proc forward*(ff: FeedForward, x: Tensor, ctx: Backend): Tensor {.apiHooked.} =
   let input = applyForwardBefore("feed_forward", ctx, x)
   var h = ff.fc1.forward(input, ctx)
   h.data = beApflu(ctx, h.data, 0.1'f32, 1.0'f32)
@@ -639,7 +765,7 @@ proc forward*(ff: FeedForward, x: Tensor, ctx: Backend): Tensor =
   result = applyForwardAfter("feed_forward", ctx, input, result)
 
 proc backward*(ff: FeedForward, x: Tensor, dOut: Tensor, ctx: Backend): tuple[
-    dX, dFc1W, dFc1B, dFc2W, dFc2B: Tensor] =
+    dX, dFc1W, dFc1B, dFc2W, dFc2B: Tensor] {.apiHooked.} =
   let hidden = ff.fc1.forward(x, ctx)
   let dFc2 = ff.fc2.backward(hidden, dOut, ctx)
   var dHidden = dFc2.dX
@@ -656,13 +782,13 @@ type
     ff*: FeedForward
     ln1*, ln2*: LayerNorm
 
-proc newTransformerBlock*(embedDim, nHeads, ffMult: int): TransformerBlock =
+proc newTransformerBlock*(embedDim, nHeads, ffMult: int): TransformerBlock {.apiHooked.} =
   result.attn = newCausalSelfAttention(embedDim, nHeads)
   result.ff = newFeedForward(embedDim, ffMult)
   result.ln1 = newLayerNorm(embedDim)
   result.ln2 = newLayerNorm(embedDim)
 
-proc forward*(blk: TransformerBlock, x: Tensor, ctx: Backend): Tensor =
+proc forward*(blk: TransformerBlock, x: Tensor, ctx: Backend): Tensor {.apiHooked.} =
   let input = applyForwardBefore("transformer_block", ctx, x)
   let x1 = blk.ln1.forward(input, ctx)
   let attnOut = blk.attn.forward(x1, ctx)
@@ -686,7 +812,7 @@ proc forward*(blk: TransformerBlock, x: Tensor, ctx: Backend): Tensor =
 proc backward*(blk: TransformerBlock, x: Tensor, dOut: Tensor, ctx: Backend): tuple[
     dX, dAttnQkvW, dAttnQkvB, dAttnProjW, dAttnProjB,
     dFf1W, dFf1B, dFf2W, dFf2B,
-    dLn1G, dLn1B, dLn2G, dLn2B: Tensor] =
+    dLn1G, dLn1B, dLn2G, dLn2B: Tensor] {.apiHooked.} =
   
   # Forward again (needed for backward)
   let x1 = blk.ln1.forward(x, ctx)
@@ -727,13 +853,13 @@ type
     weight*: Tensor
     dim*, vocab*: int
 
-proc newEmbedding*(vocab, dim: int; initializeWeights = true): Embedding =
+proc newEmbedding*(vocab, dim: int; initializeWeights = true): Embedding {.apiHooked.} =
   result.vocab = vocab
   result.dim = dim
   result.weight = if initializeWeights: randnTensor(@[vocab, dim], sqrt(2'f32 / float32(vocab)))
                   else: Tensor(shape: @[vocab, dim], data: @[])
 
-proc lookupBatch*(e: Embedding, idsBatch: seq[seq[int]], ctx: Backend): Tensor =
+proc lookupBatch*(e: Embedding, idsBatch: seq[seq[int]], ctx: Backend): Tensor {.apiHooked.} =
   let B = idsBatch.len
   let T = idsBatch[0].len
   result = newTensor(@[B, T, e.dim])
@@ -747,7 +873,7 @@ proc lookupBatch*(e: Embedding, idsBatch: seq[seq[int]], ctx: Backend): Tensor =
   result = applyForwardBefore("embedding", ctx, result)
   result = applyForwardAfter("embedding", ctx, result, result)
 
-proc backward*(e: Embedding, idsBatch: seq[seq[int]], dOut: Tensor, ctx: Backend): Tensor =
+proc backward*(e: Embedding, idsBatch: seq[seq[int]], dOut: Tensor, ctx: Backend): Tensor {.apiHooked.} =
   let B = idsBatch.len
   let T = idsBatch[0].len
   var dWeight = newTensor(e.weight.shape)
@@ -770,7 +896,7 @@ type
     outProj*: Linear
     vocab*: int
 
-proc newNimformerModel*(vocab, embedDim, nHeads, nLayers, ffMult: int): NimformerModel =
+proc newNimformerModel*(vocab, embedDim, nHeads, nLayers, ffMult: int): NimformerModel {.apiHooked.} =
   result.vocab = vocab
   result.embed = newEmbedding(vocab, embedDim)
   result.blocks = newSeq[TransformerBlock](nLayers)
@@ -787,21 +913,21 @@ proc forwardModelIds(m: NimformerModel; idsBatch: seq[seq[int]]; ctx: Backend;
   result = m.outProj.forward(x, ctx)
   result = applyForwardAfter(api, ctx, x, result)
 
-proc forwardBatch*(m: NimformerModel, idsBatch: seq[seq[int]], ctx: Backend): Tensor =
+proc forwardBatch*(m: NimformerModel, idsBatch: seq[seq[int]], ctx: Backend): Tensor {.apiHooked.} =
   ## REAL forward with batch B (idsBatch.len sequences of the same length T) in one
   ## call — Linear/LayerNorm treat B*T as the "row" count, so the GPU gets M=B*T rows
   ## in each matmul instead of being called B times in sequence (B=1 each) as before.
   ## Returns logits of shape [B, T, vocab].
   result = forwardModelIds(m, idsBatch, ctx, "nimformer_model_batch")
 
-proc forward*(m: NimformerModel, ids: seq[int], ctx: Backend): Tensor =
+proc forward*(m: NimformerModel, ids: seq[int], ctx: Backend): Tensor {.apiHooked.} =
   ## Convenience for a single sequence (keeps the old API for test_nimformer.nim) —
   ## calls forwardBatch with B=1, then drops the batch dim.
   let logits = forwardModelIds(m, @[ids], ctx, "nimformer_model")
   result = Tensor(data: logits.data, shape: logits.shape[1 .. ^1])
 
 proc backwardBatch*(m: NimformerModel, idsBatch: seq[seq[int]], dLoss: Tensor,
-                     ctx: Backend): seq[Tensor] =
+                     ctx: Backend): seq[Tensor] {.apiHooked.} =
   ## REAL backward with batch B. dLoss: shape [B, T, vocab] (loss gradient
   ## w.r.t. logits, ALREADY batched — no more faking B=1 and wrapping an extra
   ## dim like the old version). Linear.backward accumulates gradients over B*T rows
@@ -829,7 +955,7 @@ proc backwardBatch*(m: NimformerModel, idsBatch: seq[seq[int]], dLoss: Tensor,
   grads.add(dEmb)
   return grads
 
-proc backward*(m: NimformerModel, ids: seq[int], dLoss: Tensor, ctx: Backend): seq[Tensor] =
+proc backward*(m: NimformerModel, ids: seq[int], dLoss: Tensor, ctx: Backend): seq[Tensor] {.apiHooked.} =
   ## Convenience for a single sequence (keeps the old API for test_nimformer.nim).
   let dLossBatch = Tensor(data: dLoss.data, shape: @[1] & dLoss.shape)
   result = m.backwardBatch(@[ids], dLossBatch, ctx)
@@ -842,14 +968,14 @@ type
     m*, v*: seq[float32]
     step*: int
 
-proc newApfAdamState*(paramLen: int): ApfAdamState =
+proc newApfAdamState*(paramLen: int): ApfAdamState {.apiHooked.} =
   result.m = newSeq[float32](paramLen)
   result.v = newSeq[float32](paramLen)
   result.step = 0
 
 proc apfAdamStep*(param: var Tensor, grad: Tensor, state: var ApfAdamState,
                    lr: float32 = 1e-3'f32, b1: float32 = 0.9'f32, b2: float32 = 0.999'f32,
-                   eps: float32 = 1e-8'f32, requantizeEvery: int = 1): CustomFloat =
+                   eps: float32 = 1e-8'f32, requantizeEvery: int = 1): CustomFloat {.apiHooked.} =
   ## Pure CPU version (KEPT - still used by test_nimformer.nim and elsewhere).
   ## The LoRA fine-tune pipeline (lora.nim/finetune_lora.nim) uses
   ## apfAdamStepGpu below instead (runs on ctx/GPU, see the reason in
@@ -871,13 +997,13 @@ proc apfAdamStep*(param: var Tensor, grad: Tensor, state: var ApfAdamState,
   else:
     result = buildCustomDtypeForTensor(param.data)
 
-proc constArrNf*(v: float32, n: int): seq[float32] =
+proc constArrNf*(v: float32, n: int): seq[float32] {.apiHooked.} =
   result = newSeq[float32](n)
   for i in 0 ..< n: result[i] = v
 
 proc apfAdamStepGpu*(ctx: Backend, param: var Tensor, grad: Tensor, state: var ApfAdamState,
                       lr: float32 = 1e-3'f32, b1: float32 = 0.9'f32, b2: float32 = 0.999'f32,
-                      eps: float32 = 1e-8'f32, requantizeEvery: int = 1): CustomFloat =
+                      eps: float32 = 1e-8'f32, requantizeEvery: int = 1): CustomFloat {.apiHooked.} =
   ## GPU version of apfAdamStep, using beMul/beAdd/beDiv (backend.nim) for all
   ## the multiply/add/divide parts of Adam (m,v accumulate, mHat/vHat, param
   ## update) instead of a CPU for loop.

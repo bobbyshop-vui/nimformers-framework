@@ -17,8 +17,10 @@ It has no training command-line options. Edit the `CFG_*` constants near the
 top of the source to change model size, sequence length, batch size, step
 count, learning rate, or dataset sample limit. `make run-metal` selects Metal
 on macOS. The legacy `run-cpu` target fails at runtime because CPU model
-execution is no longer supported. `make build` only builds the trainer;
-`make run-spectron` builds and runs the separate interactive inference program.
+execution is no longer supported. `make build` builds the shared runtime,
+worker, and trainer without starting training; `make build-shared` builds only
+the FFI artifacts. `make run-spectron` builds and runs the separate
+interactive inference program.
 
 
 ## Datasets and model files
@@ -49,6 +51,35 @@ proc decodeBPEStr*(tok: BPETokenizer, ids: seq[int]): string
 ```
 
 This tokenizer is trained by the Spectron program and saved at `test/spectron/models/spectron_bpe_tokenizer.json`. It is separate from the Hugging Face tokenizer used by DeepSeek and Codestral.
+
+## Raw Token Memory for training windows
+
+`RawTokenMemory` owns the corpus BPE ID stream used by the Spectron training
+loop and records every sampled input span as a `RawTokenWindow` (step, batch
+row, corpus offset, and token count). The IDs sampled from this memory are the
+actual `trainStep` inputs, so Linear++ attention and the Mamba2 parallel scan
+process the same token sequence. The window ledger lets callers retrieve the
+raw BPE records without storing a second copy of every decoded token string.
+
+```nim
+proc newRawTokenMemory*(tok: BPETokenizer,
+                        tokenIds: sink seq[int]): RawTokenMemory
+proc tokenCount*(memory: RawTokenMemory): int
+proc rawTokenAt*(memory: RawTokenMemory,
+                 corpusIndex: int): RawTokenRecord
+proc rawTokensForWindow*(memory: RawTokenMemory,
+                         window: RawTokenWindow): seq[RawTokenRecord]
+proc rawTextForWindow*(memory: RawTokenMemory,
+                       window: RawTokenWindow): string
+proc sampleRawTokenBatch*(memory: var RawTokenMemory, batchSize, seqLen,
+                          step: int, rng: var Rand): RawTokenBatch
+```
+
+`RawTokenRecord.text` is the exact decoded byte piece for one BPE ID; a piece
+can split a multi-byte UTF-8 character, so concatenate adjacent records before
+displaying complete text. `RawTokenMemory.windows` holds the current process's
+sample history; this diagnostic/replay memory is not written into NIMQ
+checkpoints.
 
 
 ## Model, training, and checkpoints

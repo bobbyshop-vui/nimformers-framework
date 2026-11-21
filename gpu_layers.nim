@@ -12,7 +12,7 @@
 import std/[tables, os, strutils, math, monotimes, times, algorithm, strformat]
 import backend
 import vendor/bybylang/gpubackend as byby
-from vendor/bybylang/probe import firProbeOn, probeUploaded
+from vendor/bybylang/probe import apiHooked, firProbeOn, probeUploaded
 import session_vm
 import session_vm_dispatch
 import jit_vm
@@ -32,7 +32,7 @@ var gVmCache = jit_vm.initJitCache(jit_vm.JitConfig(
 # Alias used by fp4_gemv_gpu / encode path
 var gJitV2* = gVmCache
 
-proc vmKernel*(p: VmProgram; tag: string): string =
+proc vmKernel*(p: VmProgram; tag: string): string  {.apiHooked.}=
   ## Lowers bytecode -> Metal (jit_vm) -> compile -> pipeline name. Called OUTSIDE
   ## a session (during prepare) so compilation is not in the hot path.
   ## Programs using U-* ops have NO interpreter path -> a compile failure raises right away
@@ -44,7 +44,7 @@ proc vmKernel*(p: VmProgram; tag: string): string =
       "interpreter path). Set BYBY_JIT_DUMP_SOURCE=1 to see the source + compile error.")
   kn
 
-proc vmKernelForBe*(p: VmProgram; tag: string; be: byby.GpuBackend): string =
+proc vmKernelForBe*(p: VmProgram; tag: string; be: byby.GpuBackend): string  {.apiHooked.}=
   ## Picks Metal MSL or Vulkan GLSL by backend.
   if be == byby.gbVulkan:
     result = jit_vm.kernelNameFor(gJitV2, p, tag)
@@ -54,7 +54,7 @@ proc vmKernelForBe*(p: VmProgram; tag: string; be: byby.GpuBackend): string =
     raise newException(CatchableError, "vmKernelForBe[" & tag & "]: JIT failed")
 
 var gVkPrewarmedEntries = 0
-proc prewarmVulkanJit*(be: byby.GpuBackend) =
+proc prewarmVulkanJit*(be: byby.GpuBackend)  {.apiHooked.}=
   ## Vulkan: compiles every micro-VM shader built so far (kernelNameFor) that has no SPIR-V on
   ## disk yet, several glslc processes at a time, so a cold cache does not compile them one by one
   ## inside the first dispatches. Call after building the kernels of a phase, inside its setup time.
@@ -72,7 +72,7 @@ var gDummyMetal: byby.SessionHandle
 var gDummyVulkan: byby.SessionHandle
 var gDummyMetalReady = false
 var gDummyVulkanReady = false
-proc ensureDummy*(be: byby.GpuBackend) =
+proc ensureDummy*(be: byby.GpuBackend)  {.apiHooked.}=
   if be == byby.gbVulkan:
     if not gDummyVulkanReady:
       gDummyVulkan = byby.sessionUploadPrivate(be, newSeq[float32](64))
@@ -82,7 +82,7 @@ proc ensureDummy*(be: byby.GpuBackend) =
       gDummyMetal = byby.sessionUploadPrivate(be, newSeq[float32](64))
       gDummyMetalReady = true
 
-proc gDummyFor*(be: byby.GpuBackend): byby.SessionHandle =
+proc gDummyFor*(be: byby.GpuBackend): byby.SessionHandle  {.apiHooked.}=
   ensureDummy(be)
   if be == byby.gbVulkan: gDummyVulkan else: gDummyMetal
 
@@ -104,7 +104,7 @@ proc bindOr(idx: int; h: byby.SessionHandle; offElems: int) =
 
 proc encodeVmKernel*(kname: string; nThreads, tgSize, tgBytes: int;
                      memOut: byby.SessionHandle; memOff: int;
-                     wU8, constF, inX: byby.SessionHandle; inOff: int) =
+                     wU8, constF, inX: byby.SessionHandle; inOff: int)  {.apiHooked.}=
   ## API chung Metal+Vulkan. Layout:
   ##   Metal slots 1..4 = mem / u8 / const / in
   ##   GLSL binding 0..4 = MemF32 / MemU8 / Lut / Input / MemU32
@@ -141,7 +141,7 @@ var gEluPlus1Kn = ""
 var gEluPlus1BackwardKn = ""
 var gGpuKernelsReady = false
 var gGpuKernelsBe: byby.GpuBackend
-proc ensureGpuKernels*(be: byby.GpuBackend) =
+proc ensureGpuKernels*(be: byby.GpuBackend)  {.apiHooked.}=
   ## Compiles the bias kernels FOR THE RIGHT backend. Switching Metal<->Vulkan needs a recompile
   ## (different kernel names + GLSL/MSL caches).
   if gGpuKernelsReady and gGpuKernelsBe == be: return
@@ -155,13 +155,13 @@ proc ensureGpuKernels*(be: byby.GpuBackend) =
   gGpuKernelsReady = true
 
 proc encodeBias*(hMem: byby.SessionHandle; memOff: int; hBias: byby.SessionHandle;
-                 n: int; apflu = false) =
+                 n: int; apflu = false)  {.apiHooked.}=
   ## mem[memOff ..< memOff+n] = act(mem + bias)
   let tg = min(n, 256)
   encodeVmKernel(if apflu: gKnBiasApflu else: gKnBias, n, tg, 16,
                  hMem, memOff, gDummy, hBias, gDummy, 0)
 
-proc encodeEluPlus1*(ctx: Backend; hInput, hOutput: byby.SessionHandle; n: int) =
+proc encodeEluPlus1*(ctx: Backend; hInput, hOutput: byby.SessionHandle; n: int)  {.apiHooked.}=
   ## GPU JIT feature map for Linear++ training: phi(x)=ELU(x)+1.
   let be = ctx.kind.toByby()
   ensureGpuKernels(be)
@@ -170,7 +170,7 @@ proc encodeEluPlus1*(ctx: Backend; hInput, hOutput: byby.SessionHandle; n: int) 
   encodeVmKernel(gEluPlus1Kn, n, min(n, 256), 16,
                  hOutput, 0, gDummy, gDummy, hInput, 0)
 
-proc encodeEluPlus1Backward*(ctx: Backend; hInput, hOutput: byby.SessionHandle; n: int) =
+proc encodeEluPlus1Backward*(ctx: Backend; hInput, hOutput: byby.SessionHandle; n: int)  {.apiHooked.}=
   ## GPU JIT feature-map derivative. hInput layout is [x[n] | dPhi[n]].
   let be = ctx.kind.toByby()
   ensureGpuKernels(be)
@@ -428,7 +428,7 @@ proc tuneFp4Plan(ctx: Backend; c: Fp4LinCacheGpu; batch: int): Fp4Plan =
     (if batch == 1: " (" & formatFloat(gbps, ffDecimal, 1) & " GB/s)" else: "") &
     &" ({(if gpuTimed: \"GPU time\" else: \"wall time\")}, parity checked, {candidates.len} candidates)"
 
-proc linearPpHalf*(): bool =
+proc linearPpHalf*(): bool  {.apiHooked.}=
   ## BYBY_LINEARPP_DTYPE = fp16 (default) | fp32: GPU storage of the FP32 Linear++ sidecar weights
   ## (block G qkvProj/outProj/fuseGate). fp16 halves their memory; every kernel that reads them
   ## widens to FP32 and accumulates in FP32.
@@ -438,7 +438,7 @@ proc linearPpHalf*(): bool =
   of "fp32", "f32", "float": false
   else: raise newException(ValueError, "BYBY_LINEARPP_DTYPE must be fp16 or fp32 (got '" & v & "')")
 
-proc prepareGpuLinForLinear*(ctx: Backend; name: string; lin: var Linear): GpuLin =
+proc prepareGpuLinForLinear*(ctx: Backend; name: string; lin: var Linear): GpuLin  {.apiHooked.}=
   ## Prepares a GPU Linear for EVERY weight form (R and A: resident fp4-KM,
   ## resident int4-asymmetric, or the random-init fp32 fallback before loading).
   ## The SAME gemv bytecode (no MSL) for all 3 branches, and the result is ALWAYS written
@@ -607,7 +607,7 @@ proc uploadBiasOrRaise(name: string; bias: seq[float32]; N: int): seq[float32] =
     "uploadBiasOrRaise[" & name & "]: bias.len=" & $bias.len & " != N=" & $N &
     " (shape mismatch, NO silent zero padding).")
 
-proc markFp4Lin*(ctx: Backend; name: string; bias: seq[float32]; K, N: int): GpuLin =
+proc markFp4Lin*(ctx: Backend; name: string; bias: seq[float32]; K, N: int): GpuLin  {.apiHooked.}=
   ## The weight is already in gFp4CacheGpu[name] (uploadFp4WeightOnce).
   let be = ctx.kind.toByby()
   ensureGpuKernels(be)
@@ -628,7 +628,7 @@ proc encodeLin*(l: GpuLin; hIn: byby.SessionHandle; inOff: int;
                 bias = true; apflu = false)
 
 proc encodeLinByName*(name: string; hIn: byby.SessionHandle; inOff: int;
-                      hOut: byby.SessionHandle; outOff: int): bool =
+                      hOut: byby.SessionHandle; outOff: int): bool  {.apiHooked.}=
   ## Used by R blocks (mamba2_fused_step.encodeLayerV2 calls it through fp4GemvAt).
   ## Looked up ONLY through gLinCache (see prepareGpuLinForLinear) - no more
   ## separate fp4-vs-int4-vs-fp32 guessing here (that was the earlier bug source: the
@@ -639,7 +639,7 @@ proc encodeLinByName*(name: string; hIn: byby.SessionHandle; inOff: int;
 
 proc encodeLin*(l: GpuLin; hIn: byby.SessionHandle; inOff: int;
                 hOut: byby.SessionHandle; outOff: int;
-                bias = true; apflu = false) =
+                bias = true; apflu = false)  {.apiHooked.}=
   ## y = W x (+ LoRA) (+ bias) (+ APFLU). Same order as Linear.forward():
   ## base -> add the LoRA delta -> add the bias.
   if l.isFp4:
@@ -674,7 +674,7 @@ type Fp4FusedGemv* = object
 
 var gFp4Fused = initTable[string, Fp4FusedGemv]()
 
-proc fp4DecodeFused*(name: string; accumulate, gatedInput: bool): Fp4FusedGemv =
+proc fp4DecodeFused*(name: string; accumulate, gatedInput: bool): Fp4FusedGemv  {.apiHooked.}=
   ## The decode GEMV of the FP4-KM projection `name`, built with the geometry the autotune chose
   ## (rows and threadgroup width, simdgroup or tree reduction), plus `accumulate` (out += W x: the
   ## residual add without its own dispatch) and/or `gatedInput` (x[k] = in[k] * silu(in[k + K]):
@@ -715,7 +715,7 @@ type
 
 var gAttnScratch* : AttnScratch
 
-proc ensureAttnScratch*(be: byby.GpuBackend; hidden, ffDim: int) =
+proc ensureAttnScratch*(be: byby.GpuBackend; hidden, ffDim: int)  {.apiHooked.}=
   if gAttnScratch.ready and gAttnScratch.hidden == hidden and gAttnScratch.ffDim >= ffDim: return
   gAttnScratch.hAttn = byby.sessionAllocScratch(be, hidden)
   if ffDim > 0:
@@ -749,7 +749,7 @@ var gZeroALen = 0
 proc initAttnLayer*(ctx: Backend; hidden, nHeads, ffDim: int;
                     qkv, outp, fc1, fc2: GpuLin;
                     ln1G, ln1B, ln2G, ln2B: seq[float32]; eps: float32;
-                    gate: GpuLin = GpuLin()): GpuAttnLayer =
+                    gate: GpuLin = GpuLin()): GpuAttnLayer  {.apiHooked.}=
   let be = ctx.kind.toByby()
   ensureGpuKernels(be)
   if hidden mod nHeads != 0:
@@ -785,7 +785,7 @@ proc initAttnLayer*(ctx: Backend; hidden, nHeads, ffDim: int;
   result.ready = true
   ensureAttnScratch(be, hidden, ffDim)
 
-proc resetAttnLayerState*(ctx: Backend; blockIdx: int): bool =
+proc resetAttnLayerState*(ctx: Backend; blockIdx: int): bool  {.apiHooked.}=
   ## Clears z and S (starts a new sequence). MUST be called inside an open session.
   if blockIdx notin gAttnLayers: return false
   let be = ctx.kind.toByby()
@@ -804,7 +804,7 @@ proc encodeLinearPlusBranch*(ctx: Backend; blockIdx: int;
                              hNorm: var byby.SessionHandle;
                              hOut: byby.SessionHandle;
                              useRms = false; unitGamma = false;
-                             inputPreNormalized = false) =
+                             inputPreNormalized = false)  {.apiHooked.}=
   ## Computes only the Linear++ branch from the input hidden; no residual/FFN added.
   ##
   ## The input norm MUST match the R branch of the same block: in training a P block computes ONE
@@ -834,7 +834,7 @@ proc encodeLinearPlusBranch*(ctx: Backend; blockIdx: int;
 
 proc encodeAttnLayer*(ctx: Backend; blockIdx: int;
                       hRes: byby.SessionHandle;          ## [hidden] in + out (in-place)
-                      hNorm: var byby.SessionHandle) =   ## [hidden] scratch
+                      hNorm: var byby.SessionHandle)  {.apiHooked.}=   ## [hidden] scratch
   let lp = addr gAttnLayers[blockIdx]
   template L: untyped = lp[]
   let be = ctx.kind.toByby()
@@ -853,7 +853,7 @@ proc encodeAttnLayer*(ctx: Backend; blockIdx: int;
   if not sessionVecOp(be, "add", hRes, hA, hDst, L.hidden):
     raise newException(CatchableError, "encodeAttnLayer: residual ffn failed")
 
-proc lpStepSelfCheck*(ctx: Backend; blockIdx: int; T = 4): string =
+proc lpStepSelfCheck*(ctx: Backend; blockIdx: int; T = 4): string  {.apiHooked.}=
   ## 100% GPU CHECK - NO model computation on the CPU. Runs the Linear++
   ## step kernel DIRECTLY (the same kernel/buffer/state as inference) with a made-up [Q|K|V] and compares with
   ## the ANALYTIC identities of linear attention:

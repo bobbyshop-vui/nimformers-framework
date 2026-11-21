@@ -28,7 +28,7 @@ else
     endif
 endif
 
-# Shared-library name for the C ABI (Python ctypes / C / Rust consumers).
+# Shared-library name for the C ABI (C, Python, Rust, and other FFI consumers).
 ifeq ($(IS_WINDOWS),yes)
     C_API_LIB := nimformers.dll
 else
@@ -56,6 +56,8 @@ else
 endif
 
 TEST_BIN  := test_nimformer$(EXE_EXT)
+HOOK_PLUGIN_BIN := test_hook_plugin_bin$(EXE_EXT)
+SPECTRON_BUILD_NIMCACHE := nimcache/spectron-build
 
 # ── Mamba binaries: graft / finetune (LoRA) / inference ──
 GRAFT_SRC       := test/codestral/graft_attention.nim
@@ -77,21 +79,23 @@ NIM_INFER_BIN   := nim_inference$(EXE_EXT)
 SPECTRON_BIN    := test_inferencespectron$(EXE_EXT)
 CLEAN_BINS      := $(TEST_BIN) $(GRAFT_BIN) $(FINETUNE_BIN) $(INFER_LORA_BIN) $(C_API_LIB) nimformers-worker \
                    $(COMPACT_LORA_BIN) $(MIGRATE_LORA_BIN) $(MAMBA3_HF_FINETUNE_BIN) $(NIM_INFER_BIN) $(SPECTRON_BIN) \
-                   $(BYBYLANG_TEST_BINS) $(addsuffix .nim,$(BYBYLANG_TEST_BINS))
+                   $(HOOK_PLUGIN_BIN) $(BYBYLANG_TEST_BINS) $(addsuffix .nim,$(BYBYLANG_TEST_BINS))
 
 .PHONY: shaders all build run run-cpu run-metal run-vulkan run-opencl run-cuda clean \
         download-models download-fir-models download-datasets download-codestral-tokenizer \
         build-graft build-finetune build-infer-lora build-compact-lora \
         build-migrate-lora build-nim-inference build-spectron build-shared build-for-python \
-        python-test python-example c-example bybylang-test bench-gflops \
+        python-test python-example c-example bybylang-test hook-plugin-test bench-gflops \
         graft finetune-mamba hf-train build-hf-train infer-lora infer-mamba infer-deepseek run-spectron mamba-pipeline \
         build-formers build-formers-arm64 formers-cli firlift formers flash-attention-test q4-gemv-test q4-gemm-test formers-test formers-fir-test formers-smoke formers-clean
 
 all: build run
 
-build:
-	$(NIM) check $(NIMFLAGS) $(TEST_SRC)
-	$(NIM) c $(NIMFLAGS) $(TEST_SRC)
+# Umbrella build: shared runtime/worker for Nim, C, Python and other FFI users,
+# plus the Spectron training executable kept as the repository's primary demo.
+build: build-shared
+	$(NIM) check $(NIMFLAGS) --nimcache:$(SPECTRON_BUILD_NIMCACHE) $(TEST_SRC)
+	$(NIM) c $(NIMFLAGS) --nimcache:$(SPECTRON_BUILD_NIMCACHE) $(TEST_SRC)
 
 run:
 	$(NIM) check $(NIMFLAGS) $(TEST_SRC)
@@ -311,28 +315,32 @@ build-shared:
 	$(NIM) c $(NIMFLAGS) --nimcache:nimcache/shared-worker -o:nimformers-worker$(EXE_EXT) parallel/worker.nim
 	@echo "Built $(C_API_LIB) (C ABI v2) and nimformers-worker$(EXE_EXT); header: include/nimformers.h"
 
-# Compatibility alias; Python is one consumer of the common shared runtime.
+# Compatibility alias retained for older Python-specific setup instructions.
 build-for-python: build-shared
-	@echo "build-for-python is an alias for build-shared"
+	@echo "build-for-python is a compatibility alias; use make build for the full build"
 
-python-test: build-for-python
+python-test: build-shared
 	@echo "[python-test] Suite: test/python_test"
 	@echo "[python-test] Library: $(C_API_LIB) (C ABI v2)"
 	$(PYTEST) $(PYTEST_FLAGS) test/python_test
 	@echo "[python-test] Suite finished."
 
-python-example: build-for-python
+python-example: build-shared
 	$(PYTHON) examples/python/basic.py
 
-c-example: build-for-python
+c-example: build-shared
 	$(CC) -Iinclude examples/c/smoke.c -L. -lnimformers -Wl,-rpath,$(CURDIR) -o examples/c/smoke
 	DYLD_LIBRARY_PATH=. LD_LIBRARY_PATH=. ./examples/c/smoke
 
 bybylang-test:
 	bash ./test/bybylang_test/run.sh
 
-bench-gflops: build-for-python
+bench-gflops: build-shared
 	$(PYTHON) benchmarks/bench_gflops.py
+
+hook-plugin-test:
+	$(NIM) c $(NIMFLAGS) --path:examples/nim/plugins --nimcache:nimcache/hook-plugin-test -o:$(HOOK_PLUGIN_BIN) test/hooks/test_hook_plugin.nim
+	$(RUN_PREFIX)$(HOOK_PLUGIN_BIN)
 
 # ── graft: build + RUN AUTOMATICALLY. No ARGS -> the GRAFT_DEFAULT_*
 # defaults. If the default old.bin/.nimq does not exist, PRINTS HELP

@@ -4,6 +4,10 @@
 ## GPU acceleration is automatic, with an automatic CPU fallback and a clear warning log.
 
 import std/[math, strformat, algorithm]
+from vendor/bybylang/probe import apiHooked, bybyApiHooksActive,
+    runBybyApiHooks, bybyApiBefore, bybyApiAfter, bybyHookValue,
+    bybyApiValueHooksActive, runBybyApiValueHooks, BybyApiCall, BybyApiArg,
+    bybyHookTypeName
 
 type
   CustomFloat* = object
@@ -12,7 +16,7 @@ type
     name*: string
     usesUint64*: bool
 
-proc newCustomFloat*(exponentBits, mantissaBits: int, name = ""): CustomFloat =
+proc newCustomFloat*(exponentBits, mantissaBits: int, name = ""): CustomFloat {.apiHooked.} =
   # === CHANGED: allow exponentBits = 0 for the int8/int4 case ===
   assert exponentBits >= 0 and mantissaBits >= 0  # changed from >= 1 to >= 0
   result.exponentBits = exponentBits
@@ -46,7 +50,7 @@ let
 # fp32 <-> packed uint64  (CPU fallback core, used when there is no GPU)
 # ─────────────────────────────────────────────────────────────
 
-proc fp32ToPackedU64*(x: float32, cf: CustomFloat): uint64 =
+proc fp32ToPackedU64*(x: float32, cf: CustomFloat): uint64 {.apiHooked.} =
   let bits32 = cast[uint32](x)
   let sign  = uint64((bits32 shr 31) and 0x1'u32)
   let exp32 = uint64((bits32 shr 23) and 0xFF'u32)
@@ -77,7 +81,7 @@ proc fp32ToPackedU64*(x: float32, cf: CustomFloat): uint64 =
     packed = sign shl topShift
   result = packed
 
-proc packedU64ToFp32*(packed: uint64, cf: CustomFloat): float32 =
+proc packedU64ToFp32*(packed: uint64, cf: CustomFloat): float32 {.apiHooked.} =
   let mantMask = if cf.mantissaBits == 0: 0'u64 else: (1'u64 shl cf.mantissaBits) - 1
   let topShift = uint64(cf.exponentBits + cf.mantissaBits)
   let sign = (packed shr topShift) and 1'u64
@@ -105,7 +109,7 @@ proc packedU64ToFp32*(packed: uint64, cf: CustomFloat): float32 =
 # Framework entry-point API (GPU OpenCL & CPU fallback support)
 # ─────────────────────────────────────────────────────────────
 
-proc buildDecodeLUT*(cf: CustomFloat): array[256, float32] =
+proc buildDecodeLUT*(cf: CustomFloat): array[256, float32] {.apiHooked.} =
   ## Fast decode LUT - ONLY usable when cf.itemSize == 1 (1 byte/element:
   ## used for both fp4 AND fp8 in this codebase, because itemSize = ceil(totalBits/8),
   ## so fp4 (4 bits) still takes a whole byte, not 2 values/byte). Built
@@ -117,7 +121,7 @@ proc buildDecodeLUT*(cf: CustomFloat): array[256, float32] =
   for b in 0 ..< 256:
     result[b] = packedU64ToFp32(uint64(b), cf)
 
-proc decodeArrayLUT*(buf: openArray[uint8], lut: array[256, float32]): seq[float32] =
+proc decodeArrayLUT*(buf: openArray[uint8], lut: array[256, float32]): seq[float32] {.apiHooked.} =
   ## Fast variant of decodeArray using a prebuilt LUT (buildDecodeLUT). The
   ## result is IDENTICAL to decodeArray(buf, cf) (verified - see test_lut_correctness
   ## in the smoke test) but faster because the bit arithmetic is not redone.
@@ -125,14 +129,14 @@ proc decodeArrayLUT*(buf: openArray[uint8], lut: array[256, float32]): seq[float
   for i in 0 ..< buf.len:
     result[i] = lut[int(buf[i])]
 
-proc cpuEncodeArray*(arr: openArray[float32], cf: CustomFloat): seq[uint8] =
+proc cpuEncodeArray*(arr: openArray[float32], cf: CustomFloat): seq[uint8] {.apiHooked.} =
   result = newSeq[uint8](arr.len * cf.itemSize)
   for i, v in arr:
     let packed = fp32ToPackedU64(v, cf)
     for b in 0 ..< cf.itemSize:
       result[i * cf.itemSize + b] = uint8((packed shr uint64(8 * b)) and 0xFF'u64)
 
-proc cpuDecodeArray*(buf: openArray[uint8], cf: CustomFloat): seq[float32] =
+proc cpuDecodeArray*(buf: openArray[uint8], cf: CustomFloat): seq[float32] {.apiHooked.} =
   assert buf.len mod cf.itemSize == 0
   let n = buf.len div cf.itemSize
   result = newSeq[float32](n)
@@ -142,13 +146,13 @@ proc cpuDecodeArray*(buf: openArray[uint8], cf: CustomFloat): seq[float32] =
       packed = packed or (uint64(buf[i * cf.itemSize + b]) shl uint64(8 * b))
     result[i] = packedU64ToFp32(packed, cf)
 
-proc encodeArray*(arr: openArray[float32], cf: CustomFloat): seq[uint8] =
+proc encodeArray*(arr: openArray[float32], cf: CustomFloat): seq[uint8] {.apiHooked.} =
   ## float32 -> bytes packed by the CustomFloat (itemSize bytes / element, little-endian)
   assert cf.usesUint64, "encodeArray supports only total_bits <= 64"
   if arr.len == 0: return @[]
   return cpuEncodeArray(arr, cf)
 
-proc decodeArray*(buf: openArray[uint8], cf: CustomFloat): seq[float32] =
+proc decodeArray*(buf: openArray[uint8], cf: CustomFloat): seq[float32] {.apiHooked.} =
   ## packed bytes -> float32
   assert cf.usesUint64, "decodeArray supports only total_bits <= 64"
   assert buf.len mod cf.itemSize == 0
@@ -166,7 +170,7 @@ const
   APF_MAX_MANTISSA_BITS* = 23
   APF_EXP_MARGIN_BITS* = 1
 
-proc computeRequiredExponentBits*(arr: openArray[float32], expMargin = APF_EXP_MARGIN_BITS): int =
+proc computeRequiredExponentBits*(arr: openArray[float32], expMargin = APF_EXP_MARGIN_BITS): int {.apiHooked.} =
   var minAbs = float32.high
   var maxAbs = 0'f32
   var any = false
@@ -197,7 +201,7 @@ proc computeRequiredExponentBits*(arr: openArray[float32], expMargin = APF_EXP_M
 
 proc computeRequiredMantissaBits*(arr: openArray[float32],
                                    relErrorTol = APF_DEFAULT_REL_ERROR_TOL,
-                                   gradArr: openArray[float32] = []): int =
+                                   gradArr: openArray[float32] = []): int {.apiHooked.} =
   var vals: seq[float32]
   for v in arr:
     if v.classify notin {fcNan, fcInf, fcNegInf} and v != 0'f32:
@@ -231,7 +235,7 @@ proc computeRequiredMantissaBits*(arr: openArray[float32],
 proc buildCustomDtypeForTensor*(arr: openArray[float32],
                                  gradArr: openArray[float32] = [],
                                  relErrorTol = APF_DEFAULT_REL_ERROR_TOL,
-                                 expMargin = APF_EXP_MARGIN_BITS): CustomFloat =
+                                 expMargin = APF_EXP_MARGIN_BITS): CustomFloat {.apiHooked.} =
   let eBits = computeRequiredExponentBits(arr, expMargin)
   let mBits = computeRequiredMantissaBits(arr, relErrorTol, gradArr)
   result = newCustomFloat(eBits, mBits, &"auto_e{eBits}m{mBits}")
@@ -239,9 +243,9 @@ proc buildCustomDtypeForTensor*(arr: openArray[float32],
 proc apfCastForTraining*(arr: openArray[float32],
                           gradArr: openArray[float32] = [],
                           relErrorTol = APF_DEFAULT_REL_ERROR_TOL,
-                          expMargin = APF_EXP_MARGIN_BITS): tuple[data: seq[uint8], cf: CustomFloat] =
+                          expMargin = APF_EXP_MARGIN_BITS): tuple[data: seq[uint8], cf: CustomFloat] {.apiHooked.} =
   let cf = buildCustomDtypeForTensor(arr, gradArr, relErrorTol, expMargin)
   result = (encodeArray(arr, cf), cf)
 
-proc apfDecodeForTraining*(encoded: openArray[uint8], cf: CustomFloat): seq[float32] =
+proc apfDecodeForTraining*(encoded: openArray[uint8], cf: CustomFloat): seq[float32] {.apiHooked.} =
   decodeArray(encoded, cf)

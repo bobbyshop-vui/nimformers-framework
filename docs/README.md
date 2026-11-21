@@ -20,6 +20,7 @@ This directory is the user documentation for the public Nimformer APIs. Use the 
 - [CPU Backend](cpu-backend.md): SIMD ISA dispatch (SSE4/AVX2/AVX-512/NEON), AVX-offset policy, L3-aware matmul blocking, CPU sessions and micro-VM.
 - [Tensor Operations API](tensor-ops-api.md): tensor views, shape operations, reductions, comparisons, scans, and dropout.
 - [Base Model API](base-model-api.md): tensors, layers, transformer blocks, model forward/backward, and APF Adam.
+- [Nim API hooks](forward-hooks.md): Tensor/model hooks, typed Nim and BybyLang API hooks, generated micro-kernel replacement, and an importable plugin example with a test target.
 - [Hybrid Jamba Model API](jamba-model-api.md): mixed Mamba/attention model construction, batch forward, training, and checkpoints.
 - [LLaMA Inference API](llama-inference-api.md): RoPE, RMSNorm, GQA, KV cache, weight loading, generation, and HF tokenization.
 - [LoRA API](lora-api.md): adapters, attaching/merging, GPU preparation, and generation helpers.

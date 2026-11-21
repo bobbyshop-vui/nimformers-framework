@@ -1,5 +1,9 @@
 ## Batch independent micro-VM inputs through the native process scheduler.
 import std/[hashes, math, os]
+from vendor/bybylang/probe import apiHooked, bybyApiHooksActive,
+    runBybyApiHooks, bybyApiBefore, bybyApiAfter, bybyHookValue,
+    bybyApiValueHooksActive, runBybyApiValueHooks, BybyApiCall, BybyApiArg,
+    bybyHookTypeName
 import vendor/bybylang/distributed
 
 const VmWorkerMagic* = "NFPVM001"
@@ -35,7 +39,7 @@ proc resolveVmWorker(path: string): string =
 
 proc runVmParallel*(group: ProcessGroup; words: seq[uint32]; memory: seq[float32];
                     itemSize, threadsPerItem: int; tgFloats = 0; tgSize = 0;
-                    ratios: openArray[float64] = []; workerPath = ""): seq[float32] =
+                    ratios: openArray[float64] = []; workerPath = ""): seq[float32] {.apiHooked.} =
   ## Addressing is shard-relative. Explicit threadgroups are never split.
   if words.len == 0 or words.len > high(int32).int or itemSize <= 0 or threadsPerItem <= 0 or
       tgFloats < 0 or tgFloats > high(int32).int div 4 or tgSize < 0 or

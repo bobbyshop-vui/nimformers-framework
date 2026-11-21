@@ -5,6 +5,10 @@
 
 The micro-VM bytecode API lives in `vendor/bybylang/micro_kernel/session_vm.nim`; GPU encoding is in `session_vm_dispatch.nim`; Metal/Vulkan source lowering and the JIT cache live in `jit_vm.nim`. The root-level `session_vm.nim`, `session_vm_dispatch.nim`, and `jit_vm.nim` are compatibility shims.
 
+Use `registerBybyApiHook` to observe bytecode/JIT calls and
+`registerMicroKernelHook` to replace a tagged `VmProgram` before lowering or
+dispatch. See the [Nim API hook reference](forward-hooks.md).
+
 
 ## Program and instruction emitters
 

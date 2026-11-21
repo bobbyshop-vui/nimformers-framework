@@ -2,6 +2,7 @@
 ## Set NIMFORMERS_LIB to override the library path.
 
 import std/[dynlib, json, os, strformat]
+from vendor/bybylang/probe import apiHooked
 
 type
   ContextHandle* = distinct pointer
@@ -38,7 +39,7 @@ proc libraryCandidates(): seq[string] =
     getCurrentDir() / defaultLibrary,
   ]
 
-proc findLibrary*(explicitPath = ""): string =
+proc findLibrary*(explicitPath = ""): string  {.apiHooked.}=
   ## Find the platform library in the Nimble package or return an explicit path.
   ## `NIMFORMERS_LIB` takes precedence over package-relative lookup.
   let requested = if explicitPath.len > 0: explicitPath else: getEnv("NIMFORMERS_LIB")
@@ -116,32 +117,32 @@ proc checkStatus(status: cint) =
     let message = if lastErrorImpl == nil: "unknown Nimformers error" else: $lastErrorImpl()
     raise newException(NimformersSharedError, message)
 
-proc abiVersion*(): uint32 =
+proc abiVersion*(): uint32  {.apiHooked.}=
   loadLibrary()
   result = abiVersionImpl()
 
-proc newContext*(backend = "auto"): ContextHandle =
+proc newContext*(backend = "auto"): ContextHandle  {.apiHooked.}=
   loadLibrary()
   let handle = contextCreateNameImpl(backend.cstring)
   if handle == nil:
     raise newException(NimformersSharedError, $lastErrorImpl())
   result = ContextHandle(handle)
 
-proc close*(ctx: var ContextHandle) =
+proc close*(ctx: var ContextHandle)  {.apiHooked.}=
   if cast[pointer](ctx) == nil:
     return
   loadLibrary()
   checkStatus(contextDestroyImpl(cast[pointer](ctx)))
   ctx = ContextHandle(nil)
 
-proc backendName*(ctx: ContextHandle): string =
+proc backendName*(ctx: ContextHandle): string  {.apiHooked.}=
   loadLibrary()
   let name = contextBackendNameImpl(cast[pointer](ctx))
   if name == nil:
     raise newException(NimformersSharedError, $lastErrorImpl())
   result = $name
 
-proc add*(ctx: ContextHandle; a, b: openArray[float32]): seq[float32] =
+proc add*(ctx: ContextHandle; a, b: openArray[float32]): seq[float32]  {.apiHooked.}=
   if a.len != b.len:
     raise newException(NimformersSharedError, "add inputs must have equal lengths")
   loadLibrary()
@@ -151,7 +152,7 @@ proc add*(ctx: ContextHandle; a, b: openArray[float32]): seq[float32] =
   checkStatus(addImpl(cast[pointer](ctx), unsafeAddr a[0], unsafeAddr b[0],
     addr result[0], int64(a.len)))
 
-proc lastError*(): string =
+proc lastError*(): string  {.apiHooked.}=
   loadLibrary()
   result = $lastErrorImpl()
 
@@ -165,7 +166,7 @@ proc ratioJson(ratios: openArray[float64]): string =
     values.add(%ratio)
   result = $values
 
-proc newProcessGroup*(devices: openArray[string]; ratios: openArray[float64] = []): ParallelGroupHandle =
+proc newProcessGroup*(devices: openArray[string]; ratios: openArray[float64] = []): ParallelGroupHandle  {.apiHooked.}=
   loadLibrary()
   if parallelCreateImpl == nil or parallelDestroyImpl == nil or
       parallelPartitionImpl == nil or parallelVmRunImpl == nil or freeStringImpl == nil:
@@ -182,7 +183,7 @@ proc newProcessGroup*(devices: openArray[string]; ratios: openArray[float64] = [
     raise newException(NimformersSharedError, $lastErrorImpl())
   result = ParallelGroupHandle(handle)
 
-proc close*(group: var ParallelGroupHandle) =
+proc close*(group: var ParallelGroupHandle)  {.apiHooked.}=
   if cast[pointer](group) == nil:
     return
   loadLibrary()
@@ -190,7 +191,7 @@ proc close*(group: var ParallelGroupHandle) =
   group = ParallelGroupHandle(nil)
 
 proc partition*(group: ParallelGroupHandle; length: int;
-    ratios: openArray[float64] = []): seq[int] =
+    ratios: openArray[float64] = []): seq[int]  {.apiHooked.}=
   loadLibrary()
   let ratioText = ratioJson(ratios)
   let encoded = parallelPartitionImpl(cast[pointer](group), int64(length),
@@ -206,7 +207,7 @@ proc partition*(group: ParallelGroupHandle; length: int;
 proc vmRun*(group: ParallelGroupHandle; words: openArray[uint32];
     memory: openArray[float32]; itemSize, threadsPerItem: int;
     tgFloats = 0; tgSize = 0; ratios: openArray[float64] = [];
-    workerPath = ""): seq[float32] =
+    workerPath = ""): seq[float32]  {.apiHooked.}=
   if words.len == 0:
     raise newException(NimformersSharedError, "micro-VM bytecode must not be empty")
   if itemSize <= 0 or threadsPerItem <= 0:
@@ -273,7 +274,7 @@ proc generateBatchImpl(group: ParallelGroupHandle; executable: string;
 proc generateBatch*(group: ParallelGroupHandle; executable: string;
     args, prompts: openArray[string]; maxTokens = 128; temperature = 0.8;
     ratios: openArray[float64] = []; environment: openArray[(string, string)] = [];
-    unsetEnvironment: openArray[string] = []): seq[string] =
+    unsetEnvironment: openArray[string] = []): seq[string]  {.apiHooked.}=
   ## Run independent text prompts. Results are returned in prompt order.
   generateBatchImpl(group, executable, args, prompts, false, maxTokens,
     temperature, ratios, environment, unsetEnvironment)
@@ -281,7 +282,7 @@ proc generateBatch*(group: ParallelGroupHandle; executable: string;
 proc generateIdsBatch*(group: ParallelGroupHandle; executable: string;
     args, promptIds: openArray[string]; maxTokens = 128; temperature = 0.8;
     ratios: openArray[float64] = []; environment: openArray[(string, string)] = [];
-    unsetEnvironment: openArray[string] = []): seq[string] =
+    unsetEnvironment: openArray[string] = []): seq[string]  {.apiHooked.}=
   ## Run independent prompt-token sequences; each result is space-separated IDs.
   generateBatchImpl(group, executable, args, promptIds, true, maxTokens,
     temperature, ratios, environment, unsetEnvironment)

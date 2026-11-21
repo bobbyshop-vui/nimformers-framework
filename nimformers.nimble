@@ -16,6 +16,7 @@ installFiles = @[
   "nimformers_lib.nim", "include/nimformers.h",
   "examples/nim/native_process_group.nim", "examples/nim/shared_library.nim",
   "examples/nim/custom_forward_hooks.nim", "examples/bybylang/shared_library.bybylang",
+  "examples/nim/plugins/token_hook_plugin.nim",
   "nimformer.nim", "backend.nim", "customfloat.nim", "quant.nim",
   "tensor_ops.nim", "trace.nim", "mapped_weights.nim", "fp4_gemv_gpu.nim",
   "fp4_gemv_vm.nim", "mamba2_vm_kernels.nim", "mamba2_full_vm.nim",

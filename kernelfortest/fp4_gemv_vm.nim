@@ -16,13 +16,14 @@
 import std/math
 import std/bitops
 import session_vm
+from vendor/bybylang/probe import apiHooked
 
 const
   GemvTg* = 32          ## threads / threadgroup of every gemv kernel (1 output column / threadgroup)
   Fp4KmLutLen* = 272
   Fp4LutLen* = 256
 
-proc alignUp64*(x: int): int {.inline.} = ((x + 63) div 64) * 64
+proc alignUp64*(x: int): int {.inline, apiHooked.} = ((x + 63) div 64) * 64
 
 # ── helper: 32-lane reduction in threadgroup memory ──────────
 proc emitTgReduce32(p: var VmProgram; accReg: uint32; tgBase: int) =
@@ -55,14 +56,14 @@ proc emitLidIsZeroIf(p: var VmProgram) =
   p.emitIfBegin(8)
 
 # ── 1) FP4 GEMV (M=1) ───────────────────────────────────────────
-proc fp4GemvTgBytes*(km: bool): int =
+proc fp4GemvTgBytes*(km: bool): int  {.apiHooked.}=
   ((if km: Fp4KmLutLen else: Fp4LutLen) + GemvTg) * 4
 
-proc fp4KmGemv2RowTgBytes*(): int =
+proc fp4KmGemv2RowTgBytes*(): int  {.apiHooked.}=
   ## LUT + two 32-lane reduction areas, for the 2-output-rows/threadgroup tile.
   (Fp4KmLutLen + 2 * GemvTg) * 4
 
-proc buildFp4GemvProgram*(K, N: int; km: bool; groupSize = 32): VmProgram =
+proc buildFp4GemvProgram*(K, N: int; km: bool; groupSize = 32): VmProgram  {.apiHooked.}=
   ## out[n] = sum_k x[k] * dequant(W[n,k]),  n = threadgroup id, 32 lanes split K.
   ## km=true : FP4-KM (E2M1 + E4M3 scale per group of 32, llama.cpp-style nibbles):
   ##           byte t holds element t (low nibble) and t+16 (high nibble);
@@ -176,7 +177,7 @@ proc buildFp4GemvProgram*(K, N: int; km: bool; groupSize = 32): VmProgram =
   p.emitHalt()
   result = p
 
-proc buildFp4KmGemv2RowProgram*(K, N: int): VmProgram =
+proc buildFp4KmGemv2RowProgram*(K, N: int): VmProgram  {.apiHooked.}=
   ## FP4-KM group-32 GEMV, two output rows/threadgroup.
   ## Borrowed from N_R0_MXFP4=2 in llama.cpp: each lane reuses x[k]
   ## for two weight rows; two independent reductions use two TG memory areas.
@@ -323,12 +324,12 @@ proc emitKmLutCopy(p: var VmProgram) =
     p.emitUAddK(8, 8, uint32(GemvTg))
   p.emitBarrierTg()
 
-proc fp4KmGemvRowsTgBytes*(rows: int): int = (Fp4KmLutLen + rows * GemvTg) * 4
+proc fp4KmGemvRowsTgBytes*(rows: int): int  {.apiHooked.}= (Fp4KmLutLen + rows * GemvTg) * 4
 
-proc fp4KmGemvWideSupported*(K, N: int): bool =
+proc fp4KmGemvWideSupported*(K, N: int): bool  {.apiHooked.}=
   K > 0 and K mod 256 == 0 and N > 0 and N mod 2 == 0
 
-proc buildFp4KmGemvWideProgram*(K, N: int): VmProgram =
+proc buildFp4KmGemvWideProgram*(K, N: int): VmProgram  {.apiHooked.}=
   ## 2 rows/threadgroup. Each lane loads ONE 32-bit WORD (8 values) per row; 4 lanes = 1 group
   ## of 32 values, 32 lanes = 8 groups / iteration. The E4M3 scale is looked up ONCE / group (old kernel: per value).
   ## Global/SLM load count drops ~3x. Per-group sum: acc += scale * sum(lut[nibble] * x).
@@ -393,7 +394,7 @@ proc buildFp4KmGemvWideProgram*(K, N: int): VmProgram =
   p.emitHalt()
   result = p
 
-proc buildFp4KmGemv4RowProgram*(K, N: int): VmProgram =
+proc buildFp4KmGemv4RowProgram*(K, N: int): VmProgram  {.apiHooked.}=
   ## 4 rows/threadgroup, same lane mapping as the 2-row kernel (x loaded once for 4 rows; LUT
   ## and barriers amortised over 4 rows). Loads 8 bytes (code+scale of 4 rows) BEFORE decoding.
   if K <= 0 or K mod 32 != 0 or N <= 0 or N mod 4 != 0:
@@ -437,7 +438,7 @@ proc buildFp4KmGemv4RowProgram*(K, N: int): VmProgram =
   p.emitHalt()
   result = p
 
-proc buildFp4KmGemmM8Program*(K, N: int): VmProgram =
+proc buildFp4KmGemmM8Program*(K, N: int): VmProgram  {.apiHooked.}=
   ## Eight input rows share one decoded weight. Save all eight accumulators
   ## before reducing them together, using just one barrier per tree level.
   doAssert K > 0 and K mod 32 == 0 and N > 0
@@ -521,7 +522,7 @@ proc emitKmReduceDynamic(p: var VmProgram; accum: openArray[uint32]; tg: int;
       else: p.emitUStoreF32(1, 2, uint32(r))
   p.emitHalt()
 
-proc buildFp4KmGemvTunedProgram*(K, N, tg, rows: int): VmProgram =
+proc buildFp4KmGemvTunedProgram*(K, N, tg, rows: int): VmProgram  {.apiHooked.}=
   ## Four-byte packed loads cover eight weights/lane. Wider groups split K
   ## over more lanes; rows reuse the activation. No weight repacking required.
   doAssert tg in [32, 64, 128, 256, 512, 1024] and rows in [2, 4]
@@ -593,7 +594,7 @@ proc emitKmReduceSimd(p: var VmProgram; accum: openArray[uint32]; tg: int) =
     for r, reg in accum: p.emitUStoreF32(reg, 2, uint32(r))
   p.emitHalt()
 
-proc buildFp4KmGemvSimdProgram*(K, N, tg, rows: int): VmProgram =
+proc buildFp4KmGemvSimdProgram*(K, N, tg, rows: int): VmProgram  {.apiHooked.}=
   ## The tuned FP4-KM decode GEMV with the Metal simdgroup reduction (simd_sum + one partial per
   ## simdgroup) in place of the log2(tg) barrier tree; same loads, same per-lane accumulation.
   doAssert tg in [32, 64, 128, 256, 512, 1024] and rows in [2, 4]
@@ -634,9 +635,9 @@ proc buildFp4KmGemvSimdProgram*(K, N, tg, rows: int): VmProgram =
 
 const Fp4DecodeTgBase = 16   ## threadgroup floats before the reduction area: the 16 FP4 values
 
-proc fp4KmGemvDecodeTgBytes*(rows, tg: int): int = (Fp4DecodeTgBase + rows * tg) * 4
+proc fp4KmGemvDecodeTgBytes*(rows, tg: int): int  {.apiHooked.}= (Fp4DecodeTgBase + rows * tg) * 4
 
-proc fp4KmGemvDecodeSupported*(K, N, tg, rows: int): bool =
+proc fp4KmGemvDecodeSupported*(K, N, tg, rows: int): bool  {.apiHooked.}=
   tg in [16, 32, 64, 128, 256, 512, 1024] and rows in [1, 2, 4, 8, 16] and
     K > 0 and K mod (tg * 8) == 0 and N > 0 and N mod rows == 0
 
@@ -703,7 +704,7 @@ proc emitDecodeReduceTree(p: var VmProgram; accum: openArray[uint32]; tg: int; a
 
 proc buildFp4KmGemvDecodeProgram*(K, N, tg, rows: int; simd: bool;
                                   accumulate = false; gatedInput = false; unroll = false;
-                                  lutConst = false; fakeLut = false): VmProgram =
+                                  lutConst = false; fakeLut = false): VmProgram  {.apiHooked.}=
   ## FP4-KM decode GEMV (one input row), out[n] (+)= sum_k W[n,k] * x[k].
   ## The loads and the per-lane accumulation order are those of buildFp4KmGemvTunedProgram, with
   ## three changes for the short K of small models, where the per-threadgroup set-up weighs as much
@@ -777,17 +778,17 @@ proc buildFp4KmGemvDecodeProgram*(K, N, tg, rows: int; simd: bool;
 
 const Fp4SubgroupWidth* = 32   ## lanes per subgroup the subgroup-row GEMV is written for
 
-proc fp4KmGemvSubgroupSupported*(K, N, tg, rows, unroll: int): bool =
+proc fp4KmGemvSubgroupSupported*(K, N, tg, rows, unroll: int): bool  {.apiHooked.}=
   tg in [32, 64, 128, 256] and rows in [1, 2, 4, 8] and unroll in [1, 2, 4] and
     K > 0 and K mod (Fp4SubgroupWidth * 8 * unroll) == 0 and
     N > 0 and N mod (rows * (tg div Fp4SubgroupWidth)) == 0
 
-proc fp4KmGemvSubgroupRowsPerTg*(tg, rows: int): int = rows * (tg div Fp4SubgroupWidth)
+proc fp4KmGemvSubgroupRowsPerTg*(tg, rows: int): int  {.apiHooked.}= rows * (tg div Fp4SubgroupWidth)
 
-proc fp4KmGemvSubgroupTgBytes*(lutConst: bool): int = (if lutConst: 16 else: 16 * 4)
+proc fp4KmGemvSubgroupTgBytes*(lutConst: bool): int  {.apiHooked.}= (if lutConst: 16 else: 16 * 4)
 
 proc buildFp4KmGemvSubgroupProgram*(K, N, tg, rows, unroll: int; lutConst = false;
-                                    accumulate = false): VmProgram =
+                                    accumulate = false): VmProgram  {.apiHooked.}=
   ## FP4-KM decode GEMV with one 32-lane subgroup per `rows` output rows, the structure of the
   ## Llama/DeepSeek decode GEMV: the lanes of a subgroup split K, every lane keeps its partial sums
   ## in registers and one subgroup sum per row finishes the dot product. No threadgroup reduction
@@ -858,7 +859,7 @@ proc buildFp4KmGemvSubgroupProgram*(K, N, tg, rows, unroll: int; lutConst = fals
   p.emitHalt()
   p
 
-proc buildFp4KmGemmTunedProgram*(K, N, tg, batchRows: int): VmProgram =
+proc buildFp4KmGemmTunedProgram*(K, N, tg, batchRows: int): VmProgram  {.apiHooked.}=
   ## Batched variant: decode one packed word/scale for all input rows.
   doAssert tg in [32, 64, 128, 256, 512, 1024] and batchRows in [4, 8]
   doAssert K > 0 and K mod (tg * 8) == 0 and N > 0
@@ -890,7 +891,7 @@ proc buildFp4KmGemmTunedProgram*(K, N, tg, batchRows: int): VmProgram =
   p.emitKmReduceDynamic(acc.toOpenArray(0, batchRows - 1), tg, true, N)
   p
 
-proc buildFp4KmGemmUnrollProgram*(K, N, tg, unroll, rows: int): VmProgram =
+proc buildFp4KmGemmUnrollProgram*(K, N, tg, unroll, rows: int): VmProgram  {.apiHooked.}=
   ## Batched FP4-KM tile that keeps `unroll` independent weight words in flight.
   ## The tuned tile issues one u32 load -> 8 LUT loads -> rows*8 FMAs as a single
   ## serial chain per iteration, so every iteration waits a full global-memory
@@ -939,9 +940,9 @@ proc buildFp4KmGemmUnrollProgram*(K, N, tg, unroll, rows: int): VmProgram =
   p.emitKmReduceDynamic(acc.toOpenArray(0, rows - 1), tg, true, N)
   p
 
-proc f32GemmV4TgBytes*(rows, tg: int): int = max((Fp4KmLutLen + rows * tg) * 4, 16)
+proc f32GemmV4TgBytes*(rows, tg: int): int  {.apiHooked.}= max((Fp4KmLutLen + rows * tg) * 4, 16)
 
-proc buildFp4KmGemmVecProgram*(K, N, tg, rows: int): VmProgram =
+proc buildFp4KmGemmVecProgram*(K, N, tg, rows: int): VmProgram  {.apiHooked.}=
   ## Batched FP4-KM tile whose input loads are 16-byte vector loads.
   ## After the two-word unroll the tile is load-issue limited: every MAC costs
   ## one scalar `inF32[...]` load, i.e. 64 loads per 8 weights for 8 rows, and
@@ -990,7 +991,7 @@ proc buildFp4KmGemmVecProgram*(K, N, tg, rows: int): VmProgram =
   p.emitKmReduceDynamic(accAll.toOpenArray(0, rows - 1), tg, true, N)
   p
 
-proc buildFp4KmGemm2ColProgram*(K, N, tg, rows: int): VmProgram =
+proc buildFp4KmGemm2ColProgram*(K, N, tg, rows: int): VmProgram  {.apiHooked.}=
   ## Batched FP4-KM tile: `rows` input rows x 2 output columns per threadgroup.
   ## One float4 input load feeds the same 4 k values to both columns, halving
   ## the input-load count per MAC - the dominant cost after the two-word unroll.
@@ -1068,7 +1069,7 @@ proc buildFp4KmGemm2ColProgram*(K, N, tg, rows: int): VmProgram =
   p.emitHalt()
   result = p
 
-proc buildFp4KmGemmM4Program*(K, N: int): VmProgram =
+proc buildFp4KmGemmM4Program*(K, N: int): VmProgram  {.apiHooked.}=
   ## FP4-KM group-32 GEMM tile MBLOCK=4: 1 output column / threadgroup, 4 input rows.
   ## Weights read once per column element, reused for 4 tokens (the matmul_q4_batched idea
   ## in nim_inference / Metal Q4). Input layout [4, K], output [4, N] row-major.
@@ -1164,9 +1165,9 @@ proc buildFp4KmGemmM4Program*(K, N: int): VmProgram =
   result = p
 
 # ── 2) FP32 GEMV (LoRA A/B, or fp32 Linear without quant) ─
-proc f32GemvTgBytes*(): int = GemvTg * 4
+proc f32GemvTgBytes*(): int  {.apiHooked.}= GemvTg * 4
 
-proc buildF32GemvProgram*(K, N: int; scale: float32; accumulate: bool): VmProgram =
+proc buildF32GemvProgram*(K, N: int; scale: float32; accumulate: bool): VmProgram  {.apiHooked.}=
   ## out[n] (+)= scale * sum_k W[n*K+k] * x[k];  W in buffer(3), x in buffer(4).
   ## Any K (the K mod 32 remainder is handled with a mask).
   var p: VmProgram
@@ -1209,9 +1210,9 @@ proc buildF32GemvProgram*(K, N: int; scale: float32; accumulate: bool): VmProgra
   result = p
 
 # ── 2b) small-rank FP32 GEMV, NO tree reduction (used for LoRA B) ──
-proc f32GemvSmallKTgBytes*(): int = 16
+proc f32GemvSmallKTgBytes*(): int  {.apiHooked.}= 16
 
-proc buildF32GemvSmallKProgram*(K, N: int; scale: float32; accumulate: bool): VmProgram =
+proc buildF32GemvSmallKProgram*(K, N: int; scale: float32; accumulate: bool): VmProgram  {.apiHooked.}=
   ## One thread = one output row, NO reduction.
   ## LoRA B has K = rank (4..16): the 32-lane kernel above pays 5 barriers
   ## for a dot product of a few elements, so it is much slower than K
@@ -1246,9 +1247,9 @@ proc buildF32GemvSmallKProgram*(K, N: int; scale: float32; accumulate: bool): Vm
   result = p
 
 # ── 2c) FP32 batched GEMM for PREFILL (unquantized Linear: sidecar block G) ──
-proc f32GemmBatchTgBytes*(rows, tg: int): int = max(rows * tg * 4, 16)
+proc f32GemmBatchTgBytes*(rows, tg: int): int  {.apiHooked.}= max(rows * tg * 4, 16)
 
-proc buildF32GemmBatchProgram*(K, N, tg, rows: int): VmProgram =
+proc buildF32GemmBatchProgram*(K, N, tg, rows: int): VmProgram  {.apiHooked.}=
   ## out[r*N + n] = sum_k W[n*K + k] * x[r*K + k], r = 0 ..< rows.
   ## W in the constF slot, x in the Input slot, out in the MemF32 slot (like buildF32Gemv).
   ## One threadgroup holds 1 output column and reads each weight only ONCE for all
@@ -1302,7 +1303,7 @@ proc buildF32GemmBatchProgram*(K, N, tg, rows: int): VmProgram =
   result = p
 
 # ── 2d) FP16-weight GEMV/GEMM (Linear++ sidecar weights stored as IEEE halves) ──
-proc f32ToF16Bits*(v: float32): uint16 =
+proc f32ToF16Bits*(v: float32): uint16  {.apiHooked.}=
   ## IEEE 754 binary32 -> binary16, round to nearest even (overflow -> inf, NaN kept).
   let bits = cast[uint32](v)
   let sign = uint16((bits shr 16) and 0x8000'u32)
@@ -1328,7 +1329,7 @@ proc f32ToF16Bits*(v: float32): uint16 =
   if rest > 0x1000'u32 or (rest == 0x1000'u32 and (half and 1) != 0): inc half   # may carry into inf
   sign or uint16(half)
 
-proc f16BitsToF32*(h: uint16): float32 =
+proc f16BitsToF32*(h: uint16): float32  {.apiHooked.}=
   ## IEEE 754 binary16 -> binary32 (exact).
   let sign = (uint32(h) and 0x8000'u32) shl 16
   var exp = (uint32(h) shr 10) and 0x1F'u32
@@ -1346,21 +1347,21 @@ proc f16BitsToF32*(h: uint16): float32 =
   else: bits = sign or ((exp + 127 - 15) shl 23) or (mant shl 13)
   cast[float32](bits)
 
-proc toF16Bits*(values: openArray[float32]): seq[uint16] =
+proc toF16Bits*(values: openArray[float32]): seq[uint16]  {.apiHooked.}=
   result = newSeq[uint16](values.len)
   for i, v in values: result[i] = f32ToF16Bits(v)
 
 const F16GemmMaxTileRows* = 16   ## rows one tile of the FP16 GEMM accumulates (R16..R31)
 
-proc f16GemmSupported*(K, N: int): bool =
+proc f16GemmSupported*(K, N: int): bool  {.apiHooked.}=
   ## One 32-lane threadgroup consumes 128 K values per step (4 halves per lane).
   K > 0 and K mod (GemvTg * 4) == 0 and N > 0
 
-proc f16GemmTileRows*(M: int): int = min(max(M, 1), F16GemmMaxTileRows)
+proc f16GemmTileRows*(M: int): int  {.apiHooked.}= min(max(M, 1), F16GemmMaxTileRows)
 
-proc f16GemmTgBytes*(M: int): int = max(f16GemmTileRows(M) * GemvTg * 4, 16)
+proc f16GemmTgBytes*(M: int): int  {.apiHooked.}= max(f16GemmTileRows(M) * GemvTg * 4, 16)
 
-proc buildF16GemmProgram*(K, N, M: int; vecInput = true): VmProgram =
+proc buildF16GemmProgram*(K, N, M: int; vecInput = true): VmProgram  {.apiHooked.}=
   ## out[r*N + n] = sum_k float(W[n*K + k]) * x[r*K + k] for r < M, FP32 accumulation.
   ## W [N, K] holds IEEE halves in the u8 slot, x the Input slot, out the MemF32 slot.
   ## Dispatch N*32 threads, threadgroup 32, f16GemmTgBytes(M) bytes of threadgroup memory.
@@ -1430,7 +1431,7 @@ proc buildF16GemmProgram*(K, N, M: int; vecInput = true): VmProgram =
   result = p
 
 # ── 3) bias (+ APFLU) element-wise: thread tid = element ────────
-proc buildBiasActProgram*(apflu: bool; alpha = 0.1'f32; beta = 1.0'f32): VmProgram =
+proc buildBiasActProgram*(apflu: bool; alpha = 0.1'f32; beta = 1.0'f32): VmProgram  {.apiHooked.}=
   ## mem[i] = act(mem[i] + bias[i]); bias in buffer(3). Dispatch exactly n threads.
   ## APFLU: x>0 ? x*(1+alpha*x) : beta*x*exp(x)  (matches cpuApflu in gpubackend.nim)
   var p: VmProgram
@@ -1460,7 +1461,7 @@ type
     C*, H*, D*: int
     offProj*, offY*, offZ*, offS*, total*: int   ## in floats, aligned to 64
 
-proc lpLayout*(C, H: int): LpLayout =
+proc lpLayout*(C, H: int): LpLayout  {.apiHooked.}=
   doAssert C mod H == 0
   result.C = C; result.H = H; result.D = C div H
   result.offProj = 0
@@ -1477,7 +1478,7 @@ proc emitPhi(p: var VmProgram; dst, src: uint32) =
   p.emitExp(15, 15)
   p.emitAdd(dst, dst, 15)
 
-proc buildEluPlus1Program*(N: int): VmProgram =
+proc buildEluPlus1Program*(N: int): VmProgram  {.apiHooked.}=
   ## GPU pointwise phi(x)=ELU(x)+1 used by Linear++ training and inference.
   ## One GPU thread handles one element; input is buffer(4), output buffer(1).
   if N <= 0: raise newException(ValueError, "buildEluPlus1Program: N must be positive")
@@ -1494,7 +1495,7 @@ proc buildEluPlus1Program*(N: int): VmProgram =
   p.emitHalt()
   result = p
 
-proc buildEluPlus1BackwardProgram*(N: int): VmProgram =
+proc buildEluPlus1BackwardProgram*(N: int): VmProgram  {.apiHooked.}=
   ## GPU pointwise derivative. Input buffer(4) = [x[N] | dPhi[N]], output dX[N].
   if N <= 0: raise newException(ValueError, "buildEluPlus1BackwardProgram: N must be positive")
   var p: VmProgram
@@ -1514,7 +1515,7 @@ proc buildEluPlus1BackwardProgram*(N: int): VmProgram =
   p.emitHalt()
   result = p
 
-proc buildLinearPlusStepProgram*(lay: LpLayout; eps: float32): VmProgram =
+proc buildLinearPlusStepProgram*(lay: LpLayout; eps: float32): VmProgram  {.apiHooked.}=
   ## Each threadgroup = 1 head (D lanes, lane = value dim vd).
   ## memF32 buffer = [proj(3C) | y(C) | z(H*D) | S(H*D*D)] (see lpLayout).
   ## S[kd][vd] += phi(k[kd])*v[vd]; z[kd] += phi(k[kd]);
@@ -1574,15 +1575,15 @@ proc buildLinearPlusStepProgram*(lay: LpLayout; eps: float32): VmProgram =
   result = p
 
 # ── 5) INT4 asymmetric GEMV (block A weights in NIMBIN4 / QLoRA4) ─────
-proc int4GemvTgBytes*(): int = GemvTg * 4
+proc int4GemvTgBytes*(): int  {.apiHooked.}= GemvTg * 4
 
-proc int4AsymSupported*(K, groupSize: int): bool =
+proc int4AsymSupported*(K, groupSize: int): bool  {.apiHooked.}=
   ## groupSize=0: per-row (1 scale/zp per row); >0: per-group (power of 2, >=64).
   if K mod 64 != 0: return false
   if groupSize == 0: return true
   groupSize >= 64 and (groupSize and (groupSize - 1)) == 0 and K mod groupSize == 0
 
-proc buildInt4AsymGemvProgram*(K, N, groupSize: int): VmProgram =
+proc buildInt4AsymGemvProgram*(K, N, groupSize: int): VmProgram  {.apiHooked.}=
   ## out[n] = sum_k x[k] * (nib(n,k) - zp[n,g]) * sc[n,g]
   ## Data layout: row n has K/2 bytes, byte b holds element 2b (low nibble) and 2b+1 (high)
   ## - matches dequantizeInt4Asymmetric. buffer(3) = [scale(N*nG) | zp(N*nG)] (fp32),
@@ -1636,7 +1637,7 @@ proc buildInt4AsymGemvProgram*(K, N, groupSize: int): VmProgram =
   result = p
 
 proc fp4KmTgCandidates*(K, rows, maxThreads, maxSharedBytes: int;
-                         setting = "auto"): seq[int] =
+                         setting = "auto"): seq[int]  {.apiHooked.}=
   ## Reduction geometry is exact: never clamp a compiled kernel at dispatch.
   for tg in [32, 64, 128, 256, 512, 1024]:
     if tg <= maxThreads and K > 0 and K mod (tg * 8) == 0 and

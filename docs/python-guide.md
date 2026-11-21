@@ -16,14 +16,17 @@ From the repository root, create an environment and build the library:
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e '.[test]'
-make build-for-python
+make build
 make python-example PYTHON=python
 ```
 
 `pip install -e '.[test]'` installs the wrapper, NumPy, and pytest; it does
-not compile Nim. `make build-for-python` produces `libnimformers.dylib` on
-macOS, `libnimformers.so` on Linux, or `nimformers.dll` on Windows. GPU work
-needs Nim, a C compiler, and a Metal/Vulkan runtime.
+not compile Nim. `make build` builds the framework's shared runtime, worker,
+and Spectron trainer. `make build-shared` builds just the shared runtime and
+worker, producing `libnimformers.dylib` on macOS, `libnimformers.so` on Linux,
+or `nimformers.dll` on Windows. GPU work needs Nim, a C compiler, and a
+Metal/Vulkan runtime. `make build-for-python` remains as a compatibility alias
+for `make build-shared`.
 
 For package use without tests, `python -m pip install -e .` is sufficient.
 See the [Python API](python-api.md) for the full reference.
@@ -235,7 +238,7 @@ make python-test PYTEST='python -m pytest' PYTEST_FLAGS=-q
 
 - `ModuleNotFoundError: nimformers`: install into the correct interpreter
   with `python -m pip install -e .`, or run from the repository root.
-- Shared library missing: run `make build-for-python`, inspect
+- Shared library missing: run `make build-shared`, inspect
   `library_path()`, or set `NIMFORMERS_LIB` to the full file path.
 - Missing `nimf_*` symbols: rebuild and check for an older selected library.
 - For CPU math kernels and native sessions, use `Context("cpu")`. For Metal

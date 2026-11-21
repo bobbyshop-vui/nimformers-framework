@@ -3,6 +3,7 @@
 
 import std/tables
 import std/bitops
+from vendor/bybylang/probe import apiHooked
 import std/math
 import std/[times, os, strformat, strutils, sequtils]
 import backend
@@ -68,7 +69,7 @@ proc getSsmAtProgram(H, D, N, G, C: int; o: LayerOff): VmProgram =
     o.offDt, o.offALog, o.offDSkip, o.offSsm, o.offY, o.offIdxH, o.offIdxG)
   gSsmAtCache[key] = result
 
-proc blit*(dst: var seq[float32]; dOff: int; src: openArray[float32]; sOff, n: int) =
+proc blit*(dst: var seq[float32]; dOff: int; src: openArray[float32]; sOff, n: int)  {.apiHooked.}=
   ## Copies a float32 block with copyMem (data marshalling, NOT computation).
   if n > 0:
     copyMem(addr dst[dOff], unsafeAddr src[sOff], n * sizeof(float32))
@@ -93,7 +94,7 @@ proc computeOff(C, cDim, H, D, N, G, K: int): LayerOff =
   result.offNormed = result.offY + max(C, HD)
   result.total = result.offNormed + C
 
-proc kernelNameFor*(ctx: Backend; program: VmProgram; tag: string): string =
+proc kernelNameFor*(ctx: Backend; program: VmProgram; tag: string): string  {.apiHooked.}=
   ## Computes the kernel name (GPU bytecode hash) OUTSIDE a session. The tag is only a namespace;
   ## Vulkan uses the same static-per-program lowering strategy as Metal, but
   ## emits GLSL/SPIR-V instead of MSL. Never hand a Metal pipeline name to it.
@@ -104,10 +105,12 @@ proc kernelNameFor*(ctx: Backend; program: VmProgram; tag: string): string =
 
 proc encodeMicroVm*(ctx: Backend; program: VmProgram; hMem: byby.SessionHandle;
                     nThreads: int; tgBytes = 4; tag = "mvm"; tgSize = 0;
-                    preKname = "") =
+                    preKname = "")  {.apiHooked.}=
   ## tgSize > 0: FORCES the lanes/threadgroup ("1 threadgroup / token" kernels need exactly this value;
   ## if the GPU cannot provide it, RAISE instead of silently lowering it).
-  if program.words.len == 0 or nThreads <= 0:
+  var activeProgram = program
+  applyMicroKernelHooks(tag, activeProgram)
+  if activeProgram.words.len == 0 or nThreads <= 0:
     raise newException(CatchableError, "encodeMicroVm: bad args")
   let be = ctx.kind.toByby()
   let tgFloats = max(1, tgBytes div 4)
@@ -117,14 +120,14 @@ proc encodeMicroVm*(ctx: Backend; program: VmProgram; hMem: byby.SessionHandle;
   # its GLSL/SPIR-V program key, never the Metal JIT name. This was previously
   # referenced before declaration and failed compilation (`kname` undeclared).
   let kname = if preKname.len > 0: preKname
-              elif be == byby.gbVulkan: kernelNameFor(ctx, program, tag)
-              else: jit_vm.dispatchProgramNoSession(gJitCache, program, tag)
+              elif be == byby.gbVulkan: kernelNameFor(ctx, activeProgram, tag)
+              else: jit_vm.dispatchProgramNoSession(gJitCache, activeProgram, tag)
 
   if be == byby.gbVulkan:
     if tg <= 0 or tg > vkDrv.vulkanMaxTgThreads():
       raise newException(CatchableError,
         "encodeMicroVm[" & tag & "]: unsupported Vulkan workgroup size " & $tg)
-    let glsl = jit_vm.lowerBytecodeToGlslCached(program, kname)
+    let glsl = jit_vm.lowerBytecodeToGlslCached(activeProgram, kname)
     if not byby.sessionJitMicroVmEnc(be, kname, glsl, hMem, nThreads, tg, tgFloats):
       raise newException(CatchableError, "encodeMicroVm[" & tag & "]: Vulkan JIT dispatch failed")
     return
@@ -146,11 +149,11 @@ proc encodeMicroVm*(ctx: Backend; program: VmProgram; hMem: byby.SessionHandle;
       discard sessionBindBuffer(2, hMem.metalHandle)
       discard sessionBindBuffer(3, hMem.metalHandle)
     else:
-      let codeKey = tag & "_" & $program.words.len
+      let codeKey = tag & "_" & $activeProgram.words.len
       if codeKey notin gCodeBufCache:
-        var codeF32 = newSeq[float32](program.words.len)
-        if program.words.len > 0:
-          copyMem(addr codeF32[0], unsafeAddr program.words[0], program.words.len * 4)
+        var codeF32 = newSeq[float32](activeProgram.words.len)
+        if activeProgram.words.len > 0:
+          copyMem(addr codeF32[0], unsafeAddr activeProgram.words[0], activeProgram.words.len * 4)
         gCodeBufCache[codeKey] = byby.sessionUploadPrivate(be, codeF32)
       let hCode = gCodeBufCache[codeKey]
       if hCode.metalHandle == nil:
@@ -159,7 +162,7 @@ proc encodeMicroVm*(ctx: Backend; program: VmProgram; hMem: byby.SessionHandle;
       discard sessionBindBuffer(1, hMem.metalHandle)
       discard sessionBindBuffer(2, hMem.metalHandle)
       discard sessionBindBuffer(3, hMem.metalHandle)
-      discard sessionBindInt(4, program.words.len)
+      discard sessionBindInt(4, activeProgram.words.len)
       discard sessionBindInt(5, tgFloats)
   discard sessionSetThreadgroupBytes(0, max(tgBytes, 4))
   when defined(macosx):
@@ -190,7 +193,7 @@ proc encodeMicroVm*(ctx: Backend; program: VmProgram; hMem: byby.SessionHandle;
 
 type MvmStep* = tuple[prog: VmProgram, nThreads, tgBytes, tgSize: int, tag: string]
 
-proc mamba2ScanStep*(L: M2Lay; ctx: Backend; forceParallel = false): MvmStep =
+proc mamba2ScanStep*(L: M2Lay; ctx: Backend; forceParallel = false): MvmStep  {.apiHooked.}=
   ## Parallel affine scan is verified/default on Metal. Vulkan uses the serial
   ## recurrence until its shared-memory/barrier path passes differential tests.
   ## The selection follows the active backend (not merely the host OS).
@@ -242,7 +245,7 @@ proc autoVmScratchLimitMiB(): int =
 
 let gAutoVmScratchLimitMiB* = autoVmScratchLimitMiB()
 
-proc checkVmScratchCapacity*(ctx: Backend; nFloats: int; label: string) =
+proc checkVmScratchCapacity*(ctx: Backend; nFloats: int; label: string)  {.apiHooked.}=
   ## Metal needs one contiguous MTLBuffer per VM chain. Intel integrated GPUs
   ## can reject a multi-GiB buffer after the host seq was already allocated.
   ## Fail with an actionable diagnostic; block callers invoke this before
@@ -311,7 +314,7 @@ proc finishVmSession(be: byby.GpuBackend; label: string; ended: var bool) =
 var gTgCapReady = false
 var gTgCapBackend: BackendKind
 
-proc ensureTgCap*(ctx: Backend) =
+proc ensureTgCap*(ctx: Backend)  {.apiHooked.}=
   ## Sets gTgCap (mamba2_full_vm) = the largest pow2 <= the REAL maxTotalThreadsPerThreadgroup of the GPU.
   ## Call before building any reduction program (rmsTg / rmsRowTg / lpPhiTg).
   ## BYBY_RMS_TG=<n> forces it. Non-Metal backends: keeps 1024.
@@ -358,7 +361,7 @@ proc ensureTgCap*(ctx: Backend) =
 
 var gRmsTgSize = initTable[string, int]()
 
-proc rmsTgSizeFor*(ctx: Backend; C: int): int =
+proc rmsTgSizeFor*(ctx: Backend; C: int): int  {.apiHooked.}=
   ## FIX for garbage tokens (bug #9). Picks the threads/threadgroup of the rmsGate kernel
   ## (the gated RMSNorm at the END of the mixer - runs in EVERY block, EVERY token) so Metal
   ## runs EXACTLY ONE threadgroup.
@@ -403,7 +406,7 @@ proc rmsTgSizeFor*(ctx: Backend; C: int): int =
   result = t
 
 proc runMicroVm*(ctx: Backend; program: VmProgram; memF32: var seq[float32];
-                 nThreads: int; tgBytes = 4; tag = "mvm"; tgSize = 0): bool =
+                 nThreads: int; tgBytes = 4; tag = "mvm"; tgSize = 0): bool  {.apiHooked.}=
   ## Host-driven microVM: one session per call (begin→encode→end→read).
   ## Timeout retries apply only to the scratch buffer uploaded from the host here;
   ## the encode APIs working directly on resident recurrent state are NOT replayed.
@@ -472,7 +475,7 @@ proc runMicroVmStepsSeparated(ctx: Backend; steps: openArray[MvmStep]; index: in
                      step.tag, step.tgSize)
   result = runMicroVmStepsSeparated(ctx, steps, index + 1, memF32)
 
-proc runMicroVmChain*(ctx: Backend; steps: openArray[MvmStep]; memF32: var seq[float32]): bool =
+proc runMicroVmChain*(ctx: Backend; steps: openArray[MvmStep]; memF32: var seq[float32]): bool  {.apiHooked.}=
   ## SEVERAL consecutive kernels on the SAME buffer in one session: upload once, read back once
   ## (no return to the host between stages). Used for the whole-layer Mamba2 forward/backward.
   ## If the command buffer times out, the whole chain is replayed from the original host scratch;
@@ -540,7 +543,7 @@ proc runMicroVmChain*(ctx: Backend; steps: openArray[MvmStep]; memF32: var seq[f
   raise newException(CatchableError, "runMicroVmChain: unreachable retry state")
 
 proc runMicroVmChainGroups*(ctx: Backend; groups: openArray[seq[MvmStep]];
-                            memF32: var seq[float32]): bool =
+                            memF32: var seq[float32]): bool  {.apiHooked.}=
   ## Calls runMicroVmChain for each group in turn, but the buffer is uploaded only once
   ## and read back once. Each group is still its own command buffer (the GPU time per
   ## command buffer stays as before -> no higher watchdog-timeout risk).
@@ -614,7 +617,7 @@ proc runMicroVmChainGroups*(ctx: Backend; groups: openArray[seq[MvmStep]];
 
 proc runMicroVmChainSparse*(ctx: Backend; steps: openArray[MvmStep]; totalLen: int;
                             head: seq[float32];
-                            reads: openArray[tuple[off, len: int]]): seq[seq[float32]] =
+                            reads: openArray[tuple[off, len: int]]): seq[seq[float32]]  {.apiHooked.}=
   ## Like runMicroVmChain but WITHOUT passing the whole buffer through the host: allocates a GPU scratch of
   ## totalLen floats (a newly allocated Metal/Vulkan buffer = 0), uploads only `head` into
   ## [0, head.len), runs the chain, then reads back only the `reads` slices (gathered into one small
@@ -680,7 +683,7 @@ proc runMicroVmChainSparse*(ctx: Backend; steps: openArray[MvmStep]; totalLen: i
     sessionFree(be, hMem)
     sessionFree(be, hHead)
 
-proc axpyGpu*(ctx: Backend; dst: var seq[float32]; src: openArray[float32]; scale: float32) =
+proc axpyGpu*(ctx: Backend; dst: var seq[float32]; src: openArray[float32]; scale: float32)  {.apiHooked.}=
   ## dst[i] += scale * src[i] on the GPU (replaces LoRA's `for i: dst[i] += src[i]*s` loop)
   let n = min(dst.len, src.len)
   if n == 0: return
@@ -716,7 +719,7 @@ proc getShapeInfo(ctx: Backend; H, D, N, G: int): Mamba2SsmShapeInfo =
   gShapeCache[key] = result
 
 proc initMamba2GpuLayer*(ctx: Backend; H, D, N, G, C, cDim, K, hidden: int;
-                         aLog, dSkip, dtBias, normW, convW, convB: seq[float32]): Mamba2GpuLayer =
+                         aLog, dSkip, dtBias, normW, convW, convB: seq[float32]): Mamba2GpuLayer  {.apiHooked.}=
   let be = ctx.kind.toByby()
   let HD = H * D
   let off = computeOff(C, cDim, H, D, N, G, K)
@@ -742,13 +745,13 @@ proc initMamba2GpuLayer*(ctx: Backend; H, D, N, G, C, cDim, K, hidden: int;
   result.ready = true
 
 proc ensureGpuLayer*(ctx: Backend; blockIdx, H, D, N, G, C, cDim, K, hidden: int;
-                     aLog, dSkip, dtBias, normW, convW, convB: seq[float32]): Mamba2GpuLayer =
+                     aLog, dSkip, dtBias, normW, convW, convB: seq[float32]): Mamba2GpuLayer  {.apiHooked.}=
   if blockIdx notin gGpuLayers:
     gGpuLayers[blockIdx] = initMamba2GpuLayer(ctx, H, D, N, G, C, cDim, K, hidden,
       aLog, dSkip, dtBias, normW, convW, convB)
   result = gGpuLayers[blockIdx]
 
-proc resetGpuLayerState*(ctx: Backend; blockIdx: int): bool =
+proc resetGpuLayerState*(ctx: Backend; blockIdx: int): bool  {.apiHooked.}=
   ## FIX for garbage tokens (bug #12): zeroes the RESIDENT STATE of one layer
   ## (convState + ssmState in hWork). Must be called after warmup, because
   ## warmupJambaKernelsOnce runs encodeLayerStepByIdx ON the REAL
@@ -777,7 +780,7 @@ proc resetGpuLayerState*(ctx: Backend; blockIdx: int): bool =
 
 proc mamba2StepGpu*(ctx: Backend; H, D, N, G: int;
                     xPart, bMat, cMat, dt, aLogArr, dSkipArr: seq[float32];
-                    ssmStateInOut: var seq[float32]): seq[float32] =
+                    ssmStateInOut: var seq[float32]): seq[float32]  {.apiHooked.}=
   let info = getShapeInfo(ctx, H, D, N, G)
   let HD = H * D
   var buf = newSeq[float32](info.totalLen)
@@ -797,7 +800,7 @@ proc mamba2StepGpu*(ctx: Backend; H, D, N, G: int;
 
 proc mamba2StepGpuFromXbc*(ctx: Backend; H, D, N, G, C: int;
                            xBCConv, dt, aLogArr, dSkipArr: seq[float32];
-                           ssmStateInOut: var seq[float32]): seq[float32] =
+                           ssmStateInOut: var seq[float32]): seq[float32]  {.apiHooked.}=
   var bMat = newSeq[float32](G * N)
   var cMat = newSeq[float32](G * N)
   var xP = newSeq[float32](C)
@@ -807,7 +810,7 @@ proc mamba2StepGpuFromXbc*(ctx: Backend; H, D, N, G, C: int;
     copyMem(addr cMat[0], unsafeAddr xBCConv[C + G * N], G * N * sizeof(float32))
   mamba2StepGpu(ctx, H, D, N, G, xP, bMat, cMat, dt, aLogArr, dSkipArr, ssmStateInOut)
 
-proc softplusDtGpu*(ctx: Backend; H: int; dtPre, dtBias: seq[float32]): seq[float32] =
+proc softplusDtGpu*(ctx: Backend; H: int; dtPre, dtBias: seq[float32]): seq[float32]  {.apiHooked.}=
   var buf = newSeq[float32](3 * H)
   buf.blit(0, dtPre, 0, H)
   buf.blit(H, dtBias, 0, H)
@@ -816,7 +819,7 @@ proc softplusDtGpu*(ctx: Backend; H: int; dtPre, dtBias: seq[float32]): seq[floa
   result.blit(0, buf, 2 * H, H)
 
 proc conv1dIncGpu*(ctx: Backend; cDim, K: int; xBCPre: seq[float32];
-                   convState: var seq[float32]; convWeight, convBias: seq[float32]): seq[float32] =
+                   convState: var seq[float32]; convWeight, convBias: seq[float32]): seq[float32]  {.apiHooked.}=
   let offState = cDim
   let offW = offState + cDim * (K - 1)
   let offBias = offW + cDim * K
@@ -832,7 +835,7 @@ proc conv1dIncGpu*(ctx: Backend; cDim, K: int; xBCPre: seq[float32];
   convState.blit(0, buf, offState, convState.len)
 
 proc splitProjGpu*(ctx: Backend; C, cDim, H: int; proj: seq[float32]):
-    tuple[z, xBC, dt: seq[float32]] =
+    tuple[z, xBC, dt: seq[float32]]  {.apiHooked.}=
   let Ptot = C + cDim + H
   var buf = newSeq[float32](Ptot + C + cDim + H)
   buf.blit(0, proj, 0, Ptot)
@@ -845,7 +848,7 @@ proc splitProjGpu*(ctx: Backend; C, cDim, H: int; proj: seq[float32]):
   result.dt.blit(0, buf, Ptot + C + cDim, H)
 
 proc rmsGateGpu*(ctx: Backend; C: int; eps: float32; yPre, z, w: seq[float32];
-                 nGroups = 1): seq[float32] =
+                 nGroups = 1): seq[float32]  {.apiHooked.}=
   if nGroups <= 0 or C mod nGroups != 0:
     raise newException(ValueError, "rmsGateGpu: C must be divisible by nGroups")
   var buf = newSeq[float32](4 * C)
@@ -859,7 +862,7 @@ proc rmsGateGpu*(ctx: Backend; C: int; eps: float32; yPre, z, w: seq[float32];
   result.blit(0, buf, 3 * C, C)
 
 proc rmsGateGpuLarge*(ctx: Backend; C: int; eps: float32; yPre, z, w: seq[float32];
-                      nGroups = 1): seq[float32] =
+                      nGroups = 1): seq[float32]  {.apiHooked.}=
   rmsGateGpu(ctx, C, eps, yPre, z, w, nGroups)
 
 var gPatchMarkerV3Printed = false
@@ -868,7 +871,7 @@ proc encodeLayerStep*(ctx: Backend; layer: var Mamba2GpuLayer;
                       hX: byby.SessionHandle;
                       fp4InName, fp4OutName: string;
                       hResidual: byby.SessionHandle;
-                      hOut: var byby.SessionHandle) =
+                      hOut: var byby.SessionHandle)  {.apiHooked.}=
   if not gPatchMarkerV3Printed:
     stderr.writeLine "[PATCH_MARKER_V3] encodeLayerStep FIX (convState slide) RUNNING"
     gPatchMarkerV3Printed = true
@@ -961,14 +964,14 @@ proc encodeLayerStepByIdx*(ctx: Backend; blockIdx: int;
                            hX: byby.SessionHandle;
                            fp4InName, fp4OutName: string;
                            hResidual: byby.SessionHandle;
-                           hOut: var byby.SessionHandle) =
+                           hOut: var byby.SessionHandle)  {.apiHooked.}=
   doAssert blockIdx in gGpuLayers
   encodeLayerStep(ctx, gGpuLayers[blockIdx], hX, fp4InName, fp4OutName, hResidual, hOut)
 
 proc profileLayerStepByIdx*(ctx: Backend; blockIdx: int;
                             hX: byby.SessionHandle;
                             fp4InName, fp4OutName: string;
-                            hResidual: byby.SessionHandle): byby.SessionHandle =
+                            hResidual: byby.SessionHandle): byby.SessionHandle  {.apiHooked.}=
   ## NEW - FOR MEASUREMENT ONLY (runs ONCE, NOT for the normal hot path):
   ## repeats EXACTLY the steps of encodeLayerStep, but inserts a
   ## sessionEnd() (a REAL wait, measuring REAL GPU time) + sessionBegin() again between
@@ -1072,7 +1075,7 @@ proc profileLayerStepByIdx*(ctx: Backend; blockIdx: int;
   discard sessionEnd(be)
   result = hOut
 
-proc fp4GemvGpuHandle*(ctx: Backend; name: string; x: seq[float32]; M: int): byby.SessionHandle =
+proc fp4GemvGpuHandle*(ctx: Backend; name: string; x: seq[float32]; M: int): byby.SessionHandle  {.apiHooked.}=
   let be = ctx.kind.toByby()
   let hX = sessionUpload(be, x)
   doAssert name in gFp4CacheGpu
@@ -1085,7 +1088,7 @@ proc fp4GemvGpuHandle*(ctx: Backend; name: string; x: seq[float32]; M: int): byb
 
 proc backwardRmsGateGpu*(ctx: Backend; C: int; eps: float32;
                           yPre, z, w, dNormedOut: seq[float32]):
-    tuple[dYpre, dZ, dNormWeight: seq[float32]] =
+    tuple[dYpre, dZ, dNormWeight: seq[float32]]  {.apiHooked.}=
   ## RMSNorm + SiLU gate backward - one micro-kernel, one dispatch. All the math
   ## (sigmoid, gated, 2 sum/dot reductions, dGated, dSilu...) runs on the GPU; the host only
   ## copies data into/out of the buffer (copyMem).
@@ -1099,7 +1102,7 @@ proc backwardRmsGateGpu*(ctx: Backend; C: int; eps: float32;
   result.dNormWeight = buf[6 * C ..< 7 * C]
 
 proc backwardSoftplusDtGpu*(ctx: Backend; H: int; dtPre, dtBias, dDt: seq[float32]):
-    tuple[dDtPre, dDtBias: seq[float32]] =
+    tuple[dDtPre, dDtBias: seq[float32]]  {.apiHooked.}=
   ## Backward for dt = softplus(dtPre + dtBias)
   ## dDtPre = dDt * sigmoid(dtPre + dtBias)
   ## dDtBias = dDtPre (same gradient)
@@ -1115,7 +1118,7 @@ proc backwardSoftplusDtGpu*(ctx: Backend; H: int; dtPre, dtBias, dDt: seq[float3
 proc selectiveScanBackwardGpu*(ctx: Backend; B, T, H, D, N, G: int;
                                 xPart, bMat, cMat, dt, aLog, dSkip,
                                 states, dYpre: seq[float32]):
-    tuple[dXPart, dBMat, dCMat, dDt, dALog, dDSkip: seq[float32]] =
+    tuple[dXPart, dBMat, dCMat, dDt, dALog, dDSkip: seq[float32]]  {.apiHooked.}=
   ## GPU-accelerated backward selective scan using microVM kernel.
   ## Runs 100% on GPU - single dispatch for ALL timesteps.
   
@@ -1208,11 +1211,11 @@ proc selectiveScanBackwardGpu*(ctx: Backend; B, T, H, D, N, G: int;
 # ═════════════════════════════════════════════════════════════
 # TRAINING KERNEL HOST WRAPPERS (RMSNorm, Linear++, softmax-CE, fused Adam)
 # ═════════════════════════════════════════════════════════════
-proc isGpuCtx*(ctx: Backend): bool =
+proc isGpuCtx*(ctx: Backend): bool  {.apiHooked.}=
   ctx.kind in {bkMetal, bkCuda, bkVulkan}
 
 proc rmsNormForwardGpu*(ctx: Backend; x, gamma: seq[float32]; rows, C: int;
-                        eps: float32): seq[float32] =
+                        eps: float32): seq[float32]  {.apiHooked.}=
   ensureTgCap(ctx)
   let L = rmsLayout(rows, C, eps)
   var buf = newSeq[float32](L.total)
@@ -1223,7 +1226,7 @@ proc rmsNormForwardGpu*(ctx: Backend; x, gamma: seq[float32]; rows, C: int;
   result = buf[L.y ..< L.y + rows * C]
 
 proc rmsNormBackwardGpu*(ctx: Backend; x, gamma, dOut: seq[float32]; rows, C: int;
-                         eps: float32): tuple[dX, dGamma: seq[float32]] =
+                         eps: float32): tuple[dX, dGamma: seq[float32]]  {.apiHooked.}=
   ensureTgCap(ctx)
   let L = rmsLayout(rows, C, eps)
   var buf = newSeq[float32](L.total)          # dGamma region = 0 for the atomics
@@ -1237,7 +1240,7 @@ proc rmsNormBackwardGpu*(ctx: Backend; x, gamma, dOut: seq[float32]; rows, C: in
 proc lpTag(L: LpLay): string =
   $L.B & "_" & $L.T & "_" & $L.H & "_" & $L.D & "_" & $lpPhiTg(L)
 
-proc linearPlusForwardSteps*(L: LpLay): seq[MvmStep] =
+proc linearPlusForwardSteps*(L: LpLay): seq[MvmStep]  {.apiHooked.}=
   ## Use bounded timestep-parallel prefix scans when T fits one legal
   ## threadgroup. Longer sequences (or BYBY_LP_SCAN_SERIAL=1) retain the
   ## original recurrence as a correctness/reference fallback.
@@ -1270,7 +1273,7 @@ proc linearPlusForwardSteps*(L: LpLay): seq[MvmStep] =
     (buildLpFinalizeProgram(L), L.BT * L.C, 4, 0,
       "@lp_finalize_" & tag)]
 
-proc linearPlusForwardGpu*(ctx: Backend; qkv: seq[float32]; B, T, H, D: int): seq[float32] =
+proc linearPlusForwardGpu*(ctx: Backend; qkv: seq[float32]; B, T, H, D: int): seq[float32]  {.apiHooked.}=
   ensureTgCap(ctx)
   ## qkv: [B*T, 3C] (q|k|v per token). Returns y [B*T, C].
   let L = lpLayout(B, T, H, D)
@@ -1279,7 +1282,7 @@ proc linearPlusForwardGpu*(ctx: Backend; qkv: seq[float32]; B, T, H, D: int): se
   discard runMicroVmChain(ctx, linearPlusForwardSteps(L), buf)
   result = buf[L.y ..< L.y + L.BT * L.C]
 
-proc linearPlusBackwardGpu*(ctx: Backend; qkv, dY: seq[float32]; B, T, H, D: int): seq[float32] =
+proc linearPlusBackwardGpu*(ctx: Backend; qkv, dY: seq[float32]; B, T, H, D: int): seq[float32]  {.apiHooked.}=
   ensureTgCap(ctx)
   ## Rebuilds the forward in the same session, then a 2-pass backward. Returns dQKV [B*T, 3C]
   ## (exactly the dProj layout for qkvProj.backward).
@@ -1296,7 +1299,7 @@ proc linearPlusBackwardGpu*(ctx: Backend; qkv, dY: seq[float32]; B, T, H, D: int
   result = buf[L.dQKV ..< L.dQKV + L.BT * 3 * L.C]
 
 proc softmaxCrossEntropyGpu*(ctx: Backend; logits: seq[float32]; targets: seq[float32];
-                             rows, V, nValid: int): tuple[loss: float32, dLogits: seq[float32]] =
+                             rows, V, nValid: int): tuple[loss: float32, dLogits: seq[float32]]  {.apiHooked.}=
   ## targets[r] < 0 => skipped. nValid = number of valid rows (loss/gradient divided by nValid).
   if nValid == 0: return (0'f32, newSeq[float32](rows * V))
   ensureTgCap(ctx)
@@ -1315,7 +1318,7 @@ const AdamChunk = 8 * 1024 * 1024     ## elements per dispatch (a multiple of Ad
 proc adamStepFusedGpu*(ctx: Backend; param: var seq[float32]; grad: seq[float32];
                        m, v: var seq[float32]; step: int; lr: float32;
                        b1: float32 = 0.9'f32; b2: float32 = 0.999'f32;
-                       eps: float32 = 1e-8'f32) =
+                       eps: float32 = 1e-8'f32)  {.apiHooked.}=
   ## Adam, 1 kernel per chunk (replacing ~14 separate be* ops). `step` is already incremented (>=1) before the call.
   let n = param.len
   let ibc1 = 1'f32 / (1'f32 - pow(b1, float32(step)))
@@ -1337,7 +1340,7 @@ proc adamStepFusedGpu*(ctx: Backend; param: var seq[float32]; grad: seq[float32]
 
 proc apfAdamStepFused*(ctx: Backend; param: var Tensor; grad: Tensor; state: var ApfAdamState;
                        lr: float32 = 1e-3'f32; b1: float32 = 0.9'f32; b2: float32 = 0.999'f32;
-                       eps: float32 = 1e-8'f32; requantizeEvery: int = 1): CustomFloat =
+                       eps: float32 = 1e-8'f32; requantizeEvery: int = 1): CustomFloat  {.apiHooked.}=
   ## Drop-in for apfAdamStepGpu: Adam as one micro-kernel. With a finite requantizeEvery (APF
   ## CustomFloat requantization) the old path is kept because requantization is outside this kernel.
   if requantizeEvery > 0 and requantizeEvery != int.high:

@@ -9,10 +9,12 @@ This guide describes how to interface BybyLang scripts with the compiled `libnim
 The C ABI shared library must be built from the repository root:
 
 ```bash
-make build-for-python
+make build
 ```
 
-This command generates the shared library file in the project root.
+This general build also compiles the Spectron trainer and shared worker. The
+shared library is generated in the project root. Use `make build-shared` when
+you only need the C ABI shared runtime and worker.
 
 ---
 

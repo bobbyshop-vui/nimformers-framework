@@ -31,15 +31,15 @@ var
   hadData, hadDataMax = false
   traceOwnsEnv = false
 
-proc traceActive*(): bool =
+proc traceActive*(): bool  {.apiHooked.}=
   ## True while a trace is being recorded.
   fprobe.firProbeOn
 
-proc traceFile*(): string =
+proc traceFile*(): string  {.apiHooked.}=
   ## Path of the trace being recorded ("" when none was started in this process).
   fprobe.probeDebugPath()
 
-proc traceStop*() =
+proc traceStop*()  {.apiHooked.}=
   ## Flush the trace file and close the exact-bytes sidecar (`<path>.data`).  Safe to call twice.
   fprobe.firProbeStop()
   if traceOwnsEnv:
@@ -47,7 +47,7 @@ proc traceStop*() =
     if hadDataMax: putEnv(TraceDataMaxEnv, savedDataMax) else: delEnv(TraceDataMaxEnv)
     traceOwnsEnv = false
 
-proc traceStart*(path: string; steps = ""; data = true; dataMax = 0) =
+proc traceStart*(path: string; steps = ""; data = true; dataMax = 0)  {.apiHooked.}=
   ## Start recording to `path` (an existing directory is required).
   ##
   ## * `steps`   which host steps to record, e.g. `"decode:2"` or `"prefill:8,decode:2"`.
@@ -73,11 +73,11 @@ proc traceStart*(path: string; steps = ""; data = true; dataMax = 0) =
     traceStop()
     raise
 
-proc traceBegin*(kind: TraceStepKind; index, position, token: int; tokens = 1) =
+proc traceBegin*(kind: TraceStepKind; index, position, token: int; tokens = 1)  {.apiHooked.}=
   ## Open one host step (a prefill chunk or a decode token).  No-op when no trace is active.
   fprobe.probeStepBegin(if kind == tsPrefill: "prefill" else: "decode", index, position, token, tokens)
 
-proc traceEnd*() =
+proc traceEnd*()  {.apiHooked.}=
   ## Close the step opened by `traceBegin`.  No-op when no trace is active.
   fprobe.probeStepEnd()
 

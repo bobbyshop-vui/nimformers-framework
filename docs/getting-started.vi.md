@@ -42,8 +42,9 @@ nim c -r -d:release --mm:arc --opt:speed \
 ```
 
 Module backend đã cung cấp chỉ thị linker theo nền tảng. Với chương trình
-có sẵn, dùng [hướng dẫn lệnh Make](make-commands.vi.md). `make build` tạo trainer
-Spectron tại `test/spectron/test_nimformer`; `make run` còn bắt đầu train.
+có sẵn, dùng [hướng dẫn lệnh Make](make-commands.vi.md). `make build` tạo
+shared runtime, worker và trainer Spectron tại `test/spectron/test_nimformer`;
+`make build-shared` chỉ tạo shared runtime và worker. `make run` bắt đầu train.
 Chỉ chạy `make` cũng bắt đầu training.
 
 

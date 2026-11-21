@@ -84,8 +84,12 @@ The shared binding also exposes `newProcessGroup`, `partition`, `vmRun`,
 `generateBatch`, and `generateIdsBatch` over the native parallel C ABI. The
 batch methods launch the configured `formers-cli` executable once per prompt;
 they return text or space-separated token IDs in prompt order.
-All high-level model `forward` APIs also support customizable before/after
-hooks; see the [forward hook reference](forward-hooks.md).
+Model, Tensor, backend/session, micro-VM/JIT, and distributed APIs support
+custom hooks; generated micro-kernels can also be replaced. See the
+[API hook reference](forward-hooks.md). The package includes the importable
+[`token_hook_plugin.nim`](../examples/nim/plugins/token_hook_plugin.nim)
+example; from a repository checkout, run `make hook-plugin-test` to compile
+it with a host program and exercise its custom API and `sessionRead` hook.
 
 ```nim
 var group = newProcessGroup(["cpu", "vulkan:0"])

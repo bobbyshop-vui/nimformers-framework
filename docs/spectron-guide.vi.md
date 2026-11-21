@@ -20,7 +20,9 @@ make build
 ```
 
 Dòng đầu tải sáu JSONL code. Nếu đã có dữ liệu thì bắt đầu từ `make build`.
-`make build` chỉ check/compile. Binary mới train khi được chạy.
+Target này build shared runtime và worker, rồi check/compile trainer Spectron;
+binary mới train khi được chạy. Dùng `make build-shared` để chỉ build shared
+runtime và worker.
 Cách gộp trên macOS:
 
 ```sh
@@ -58,6 +60,14 @@ Hiện binary chat không đọc `ARGS`; sửa constants rồi build lại để
 4. Load checkpoint hiện có, hoặc khởi tạo model mới.
 5. Encode corpus, lấy các cửa sổ ngẫu nhiên, train next-token với Adam.
 6. Lưu checkpoint định kỳ, lưu lần cuối và sinh thử.
+
+Trong lúc train, `RawTokenMemory` giữ token ID BPE của corpus và ghi lại từng
+cửa sổ input được lấy mẫu: step, hàng trong batch, vị trí trong corpus và độ
+dài. Cùng các input ID đó được đưa vào cả Linear++ attention lẫn Mamba2
+parallel scan. `rawTokenAt` và `rawTokensForWindow` khôi phục ID BPE cùng mảnh
+byte thô để xem lại hoặc replay; chuỗi token được dựng khi cần để không nhân
+bản các chuỗi trong toàn corpus. Bộ nhớ này chỉ tồn tại trong tiến trình train,
+không được ghi vào checkpoint model.
 
 
 ## Dữ liệu đầu vào

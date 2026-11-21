@@ -81,6 +81,11 @@ Change the backend line to `gpu backend is "metal"` or `"vulkan"` explicitly.
 
 ## Sessions and micro-kernels
 
+Use [Nim API hooks](forward-hooks.md) to observe public BybyLang session and
+micro-VM calls, or replace a generated micro-kernel before JIT/dispatch.
+Run `make hook-plugin-test` to compile and exercise an importable Nim plugin
+that changes `sessionRead`; the plugin is compiled into the same host process.
+
 Group supported operations in a session:
 
 ```bybylang

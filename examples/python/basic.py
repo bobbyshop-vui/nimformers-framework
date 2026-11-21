@@ -1,8 +1,9 @@
 """Small tour of the Nimformers Python API.
 
-Run after building the shared library:
+Run after building the framework (or just its shared runtime):
 
-    make build-for-python
+    make build
+    # Or run `make build-shared` to build only the shared runtime and worker.
     python3 examples/python/basic.py
 """
 import sys

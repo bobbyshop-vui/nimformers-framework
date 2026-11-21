@@ -15,6 +15,7 @@
 import std/[strformat]
 import bybylang / gpubackend
 import bybylang / backends / metal / metal_backend
+from vendor/bybylang/probe import apiHooked
 
 # ── raw importc encoder ──────────────────────────────────────
 when defined(macosx):
@@ -41,70 +42,70 @@ when defined(macosx):
 
 # ── Variables = MTLBuffers (reusing the existing upload/alloc) ──────────────
 
-proc sessionVarF32*(be: GpuBackend; data: openArray[float32]): SessionHandle =
+proc sessionVarF32*(be: GpuBackend; data: openArray[float32]): SessionHandle  {.apiHooked.}=
   ## newBuffer from host float32 (Shared) — activations / small LUTs.
   sessionUpload(be, @data)
 
-proc sessionVarF32Private*(be: GpuBackend; data: openArray[float32]): SessionHandle =
+proc sessionVarF32Private*(be: GpuBackend; data: openArray[float32]): SessionHandle  {.apiHooked.}=
   ## Private/upload for resident weights — little CPU traffic.
   result.kind = be
   when defined(macosx):
     result.metalHandle = metalUploadPrivate(@data)
 
-proc sessionVarU8*(be: GpuBackend; data: openArray[uint8]): SessionHandle =
+proc sessionVarU8*(be: GpuBackend; data: openArray[uint8]): SessionHandle  {.apiHooked.}=
   ## fp4/fp8/int4 pack bytes.
   result.kind = be
   when defined(macosx):
     var d = @data
     result.metalHandle = metalUploadBytes(d)
 
-proc sessionVarU8Private*(be: GpuBackend; data: openArray[uint8]): SessionHandle =
+proc sessionVarU8Private*(be: GpuBackend; data: openArray[uint8]): SessionHandle  {.apiHooked.}=
   result.kind = be
   when defined(macosx):
     var d = @data
     result.metalHandle = metalUploadBytesPrivate(d)
 
-proc sessionVarI32*(be: GpuBackend; data: openArray[int32]): SessionHandle =
+proc sessionVarI32*(be: GpuBackend; data: openArray[int32]): SessionHandle  {.apiHooked.}=
   sessionUploadIndices(be, @data)
 
-proc sessionVarAlloc*(be: GpuBackend; nFloats: int): SessionHandle =
+proc sessionVarAlloc*(be: GpuBackend; nFloats: int): SessionHandle  {.apiHooked.}=
   ## Scratch output — metal_alloc_scratch.
   sessionAllocScratch(be, nFloats)
 
 # ── Encoder: pipeline / bind / dispatch / barrier ────────────
 
-proc sessionPipeline*(be: GpuBackend; kernelName: string): bool =
+proc sessionPipeline*(be: GpuBackend; kernelName: string): bool  {.apiHooked.}=
   ## setComputePipelineState — the kernel MUST already be in the Metal library.
   when defined(macosx):
     if be == gbMetal or be == gbAuto:
       return metal_enc_pipeline(kernelName.cstring) != 0
   return false
 
-proc sessionBind*(be: GpuBackend; index: int; v: SessionHandle; offsetBytes = 0): bool =
+proc sessionBind*(be: GpuBackend; index: int; v: SessionHandle; offsetBytes = 0): bool  {.apiHooked.}=
   ## setBuffer:atIndex:
   when defined(macosx):
     if v.metalHandle == nil: return false
     return metal_enc_bind_buffer(cint(index), v.metalHandle, cint(offsetBytes)) != 0
   return false
 
-proc sessionBindInt*(be: GpuBackend; index: int; v: int): bool =
+proc sessionBindInt*(be: GpuBackend; index: int; v: int): bool  {.apiHooked.}=
   when defined(macosx):
     return metal_enc_bind_int(cint(index), cint(v)) != 0
   return false
 
-proc sessionBindF32*(be: GpuBackend; index: int; v: float32): bool =
+proc sessionBindF32*(be: GpuBackend; index: int; v: float32): bool  {.apiHooked.}=
   when defined(macosx):
     return metal_enc_bind_float(cint(index), cfloat(v)) != 0
   return false
 
-proc sessionBindBytes*(be: GpuBackend; index: int; data: pointer; nBytes: int): bool =
+proc sessionBindBytes*(be: GpuBackend; index: int; data: pointer; nBytes: int): bool  {.apiHooked.}=
   when defined(macosx):
     return metal_enc_bind_bytes(cint(index), data, cint(nBytes)) != 0
   return false
 
 proc sessionDispatch*(be: GpuBackend;
                       gridX: int; gridY = 1; gridZ = 1;
-                      tgX = 0; tgY = 1; tgZ = 1): bool =
+                      tgX = 0; tgY = 1; tgZ = 1): bool  {.apiHooked.}=
   ## dispatchThreadgroups. tgX=0 → simd width of the current pipeline.
   when defined(macosx):
     return metal_enc_dispatch(cint(gridX), cint(gridY), cint(gridZ),
@@ -113,23 +114,23 @@ proc sessionDispatch*(be: GpuBackend;
 
 proc sessionDispatchThreads*(be: GpuBackend;
                              threadsX: int; threadsY = 1; threadsZ = 1;
-                             tgX = 0; tgY = 1; tgZ = 1): bool =
+                             tgX = 0; tgY = 1; tgZ = 1): bool  {.apiHooked.}=
   when defined(macosx):
     return metal_enc_dispatch_threads(cint(threadsX), cint(threadsY), cint(threadsZ),
                                       cint(tgX), cint(tgY), cint(tgZ)) != 0
   return false
 
-proc sessionBarrier*(be: GpuBackend): bool =
+proc sessionBarrier*(be: GpuBackend): bool  {.apiHooked.}=
   when defined(macosx):
     return metal_enc_barrier() != 0
   return false
 
-proc sessionSimdWidth*(be: GpuBackend): int =
+proc sessionSimdWidth*(be: GpuBackend): int  {.apiHooked.}=
   when defined(macosx):
     return int(metal_enc_simd_width())
   return 32
 
-proc sessionMaxTgThreads*(be: GpuBackend): int =
+proc sessionMaxTgThreads*(be: GpuBackend): int  {.apiHooked.}=
   when defined(macosx):
     return int(metal_enc_max_tg_threads())
   return 256
@@ -138,7 +139,7 @@ proc sessionMaxTgThreads*(be: GpuBackend): int =
 
 proc sessionCallFp4LutMatmul*(be: GpuBackend;
                               hA, hWq, hLut, hC: SessionHandle;
-                              M, K, N: int): bool =
+                              M, K, N: int): bool  {.apiHooked.}=
   ## Not a "high-level" API — just a sample of composing a low-level session.
   ## Kernel: matmul_fp4_lut_kernel_ndst2_paired (already in vecop_matmul.metal)
   ## Layout: a[M,K] f32, wq[N,K] u8, lut[256] f32, c[M,N] f32

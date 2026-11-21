@@ -1,6 +1,7 @@
 ## REFERENCE interpreter for micro-VM bytecode (used ONLY in tests).
 import std/math
 import session_vm
+from vendor/bybylang/probe import apiHooked
 
 type Th = object
   pc: int
@@ -104,7 +105,7 @@ proc stepUntilBarrier(t: var Th; p: VmProgram; mem: var seq[float32];
     of OP_R_TO_U: U[a] = uint32(R[b])
     else: doAssert false, "op not supported by the test interpreter: " & $op
 
-proc runGrid*(p: VmProgram; mem: var seq[float32]; nThreads, tgSize: int; tgFloats = 4096) =
+proc runGrid*(p: VmProgram; mem: var seq[float32]; nThreads, tgSize: int; tgFloats = 4096)  {.apiHooked.}=
   let nTg = nThreads div tgSize
   for g in 0 ..< nTg:
     var tg = newSeq[float32](tgFloats)

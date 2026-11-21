@@ -6,6 +6,10 @@
 ## No main/test here — a pure library, imported elsewhere.
 
 import std/math
+from vendor/bybylang/probe import apiHooked, bybyApiHooksActive,
+    runBybyApiHooks, bybyApiBefore, bybyApiAfter, bybyHookValue,
+    bybyApiValueHooksActive, runBybyApiValueHooks, BybyApiCall, BybyApiArg,
+    bybyHookTypeName
 import mapped_weights
 export mapped_weights
 import customfloat
@@ -45,7 +49,7 @@ type
 template bytes*(qt: QuantTensor): untyped =
   weightValues(qt.data, qt.mappedData)
 
-proc clearPayload*(qt: var QuantTensor) =
+proc clearPayload*(qt: var QuantTensor) {.apiHooked.} =
   qt.data = @[]
   qt.mappedData = default(MappedView[uint8])
 
@@ -63,7 +67,7 @@ proc maxAbs(arr: openArray[float32]): float32 =
     let a = abs(v)
     if a > result: result = a
 
-proc quantizeInt8*(arr: openArray[float32], shape: seq[int]): QuantTensor =
+proc quantizeInt8*(arr: openArray[float32], shape: seq[int]): QuantTensor {.apiHooked.} =
   let m = maxAbs(arr)
   let scale = if m == 0'f32: 1'f32 else: m / 127'f32
   result.kind = qkInt8
@@ -75,13 +79,13 @@ proc quantizeInt8*(arr: openArray[float32], shape: seq[int]): QuantTensor =
     let q = clamp(int(round(v / scale)), -127, 127)
     result.data[i] = cast[uint8](int8(q))
 
-proc dequantizeInt8*(qt: QuantTensor): seq[float32] =
+proc dequantizeInt8*(qt: QuantTensor): seq[float32] {.apiHooked.} =
   let sc = qt.scale[0]
   result = newSeq[float32](qt.bytes.len)
   for i, b in qt.bytes:
     result[i] = float32(cast[int8](b)) * sc
 
-proc quantizeInt4*(arr: openArray[float32], shape: seq[int]): QuantTensor =
+proc quantizeInt4*(arr: openArray[float32], shape: seq[int]): QuantTensor {.apiHooked.} =
   let m = maxAbs(arr)
   let scale = if m == 0'f32: 1'f32 else: m / 7'f32
   result.kind = qkInt4
@@ -99,7 +103,7 @@ proc quantizeInt4*(arr: openArray[float32], shape: seq[int]): QuantTensor =
     else:
       result.data[byteIdx] = (result.data[byteIdx] and 0x0F'u8) or (nibble shl 4)
 
-proc dequantizeInt4*(qt: QuantTensor): seq[float32] =
+proc dequantizeInt4*(qt: QuantTensor): seq[float32] {.apiHooked.} =
   ## ADDED LUT: this path (not Q4_K_M/asymmetric-per-group, see
   ## dequantizeInt4Asymmetric below which already has a LUT) uses ONE
   ## scale for the whole tensor -> the LUT is built only ONCE for the whole function (not
@@ -125,7 +129,7 @@ proc dequantizeInt4*(qt: QuantTensor): seq[float32] =
 # THÊM: asymmetric int4 (Q4_K_M style)
 # ─────────────────────────────────────────────────────────────
 
-proc quantizeInt4Asymmetric*(arr: openArray[float32], shape: seq[int]): QuantTensor =
+proc quantizeInt4Asymmetric*(arr: openArray[float32], shape: seq[int]): QuantTensor {.apiHooked.} =
   var minVal = float32.high
   var maxVal = -float32.high
   for v in arr:
@@ -153,7 +157,7 @@ proc quantizeInt4Asymmetric*(arr: openArray[float32], shape: seq[int]): QuantTen
       result.data[byteIdx] = (result.data[byteIdx] and 0x0F'u8) or (nibble shl 4)
 
 proc quantizeInt4AsymmetricGrouped*(arr: openArray[float32], shape: seq[int],
-                                    groupSize = 32): QuantTensor =
+                                    groupSize = 32): QuantTensor {.apiHooked.} =
   ## Resident Q4 ABI: [out,in], low nibble first, rows padded to whole bytes,
   ## and one floating scale/zero point per contiguous input group.
   if shape.len != 2 or shape[0] <= 0 or shape[1] <= 0 or
@@ -179,7 +183,7 @@ proc quantizeInt4AsymmetricGrouped*(arr: openArray[float32], shape: seq[int],
       for i, value in blockQ.data:
         result.data[row * rowBytes + first div 2 + i] = value
 
-proc dequantizeInt4Asymmetric*(qt: QuantTensor): seq[float32] =
+proc dequantizeInt4Asymmetric*(qt: QuantTensor): seq[float32] {.apiHooked.} =
   ## Per-row support: if qt.scale.len > 1 (== shape[0]), each row uses its own
   ## scale/zero_point (the packed data is per row too: each row rounds up to
   ## its own bytes - see quantize_int4_asymmetric_per_row in export_to_nimq.py).
@@ -259,7 +263,7 @@ proc customFloatMaxMagnitude(cf: CustomFloat): float32 =
   let maxMantissa = 2'f32 - pow(2'f32, -float32(cf.mantissaBits))  # the maximum 1.mantissa (implicit leading bit)
   result = pow(2'f32, float32(maxRealExp)) * maxMantissa
 
-proc quantizeFloatDtype*(arr: openArray[float32], shape: seq[int], cf: CustomFloat, kind: QuantKind): QuantTensor =
+proc quantizeFloatDtype*(arr: openArray[float32], shape: seq[int], cf: CustomFloat, kind: QuantKind): QuantTensor {.apiHooked.} =
   ## CHANGED: REALLY computes the scale (it used to hard-code scale=[1.0] and do NOTHING
   ## - narrow-exponent formats like fp4 quantized almost all real weights to 0, see
   ## the explanation in customFloatMaxMagnitude). Now: scale = maxAbs(arr) /
@@ -286,7 +290,7 @@ proc quantizeFloatDtype*(arr: openArray[float32], shape: seq[int], cf: CustomFlo
   result.data = encodeArray(buf, cf)
 
 proc quantizeAuto*(arr: openArray[float32], shape: seq[int],
-                    gradArr: openArray[float32] = []): QuantTensor =
+                    gradArr: openArray[float32] = []): QuantTensor {.apiHooked.} =
   ## APF: builds a CustomFloat from the tensor itself (+gradient if any)
   var buf: seq[float32]
   for v in arr: buf.add(v)
@@ -297,7 +301,7 @@ proc quantizeAuto*(arr: openArray[float32], shape: seq[int],
 # Dispatcher chung
 # ─────────────────────────────────────────────────────────────
 
-proc quantizeRaw*(arr: openArray[float32], shape: seq[int]): QuantTensor =
+proc quantizeRaw*(arr: openArray[float32], shape: seq[int]): QuantTensor {.apiHooked.} =
   result.kind = qkFp32Raw
   result.shape = shape
   result.scale = @[1'f32]
@@ -307,7 +311,7 @@ proc quantizeRaw*(arr: openArray[float32], shape: seq[int]): QuantTensor =
     var vv = v
     copyMem(addr result.data[i*4], addr vv, 4)
 
-proc dequantizeRaw*(qt: QuantTensor): seq[float32] =
+proc dequantizeRaw*(qt: QuantTensor): seq[float32] {.apiHooked.} =
   let n = qt.bytes.len div 4
   result = newSeq[float32](n)
   for i in 0 ..< n:
@@ -347,7 +351,7 @@ proc dequantizeRaw*(qt: QuantTensor): seq[float32] =
 const Fp4kmMags*: array[8, float32] =
   [0'f32, 0.5'f32, 1.0'f32, 1.5'f32, 2.0'f32, 3.0'f32, 4.0'f32, 6.0'f32]
 
-proc fp4kmDecodeLut*(): array[16, float32] =
+proc fp4kmDecodeLut*(): array[16, float32] {.apiHooked.} =
   ## nibble = (sign shl 3) or magIdx.  magIdx = (e shl 1) or m of standard E2M1.
   for i in 0 ..< 8:
     result[i] = Fp4kmMags[i]
@@ -410,7 +414,7 @@ proc fp4kmBestScaleByte(g: openArray[float32], n: int, globalScale: float32,
   (bestB, bestS)
 
 proc quantizeFp4KM*(arr: openArray[float32], shape: seq[int],
-                    groupSize: int = 32, searchSteps: int = 8): QuantTensor =
+                    groupSize: int = 32, searchSteps: int = 8): QuantTensor {.apiHooked.} =
   doAssert shape.len == 2, "quantizeFp4KM: only for 2D tensors [rows, cols]"
   let R = shape[0]
   let C = shape[1]
@@ -480,7 +484,7 @@ proc quantizeFp4KM*(arr: openArray[float32], shape: seq[int],
   result.cf = FP8_E4M3            # records the codec used for the scale
   result.data = data
 
-proc dequantizeFp4KM*(qt: QuantTensor): seq[float32] =
+proc dequantizeFp4KM*(qt: QuantTensor): seq[float32] {.apiHooked.} =
   doAssert qt.shape.len == 2, "dequantizeFp4KM: needs a 2D tensor"
   let R = qt.shape[0]
   let C = qt.shape[1]
@@ -506,7 +510,7 @@ proc dequantizeFp4KM*(qt: QuantTensor): seq[float32] =
         result[off + t + half] = lut[int(b shr 4)] * s
 
 proc quantizeTensor*(arr: openArray[float32], shape: seq[int], kind: QuantKind,
-                      customCf: CustomFloat = FP24, gradArr: openArray[float32] = []): QuantTensor =
+                      customCf: CustomFloat = FP24, gradArr: openArray[float32] = []): QuantTensor {.apiHooked.} =
   case kind
   of qkFp32Raw: quantizeRaw(arr, shape)
   of qkInt8:    quantizeInt8(arr, shape)
@@ -518,7 +522,7 @@ proc quantizeTensor*(arr: openArray[float32], shape: seq[int], kind: QuantKind,
   of qkAuto:    quantizeAuto(arr, shape, gradArr)
   of qkFp4KM:   quantizeFp4KM(arr, shape)
 
-proc dequantizeTensor*(qt: QuantTensor): seq[float32] =
+proc dequantizeTensor*(qt: QuantTensor): seq[float32] {.apiHooked.} =
   case qt.kind
   of qkFp32Raw: dequantizeRaw(qt)
   of qkInt8:    dequantizeInt8(qt)
@@ -539,7 +543,7 @@ proc dequantizeTensor*(qt: QuantTensor): seq[float32] =
       for i in 0 ..< raw.len: res[i] = raw[i] * s
       res
 
-proc dequantizeTensorTransposed*(qt: QuantTensor): seq[float32] =
+proc dequantizeTensorTransposed*(qt: QuantTensor): seq[float32] {.apiHooked.} =
   ## ADDED: dequant + transpose MERGED INTO ONE PASS, written directly into the target layout
   ## [nCols, nRows] (transposed) instead of dequantizeTensor() (giving [nRows,nCols])
   ## and a separate transpose() — the old way allocated 2 full-size fp32 arrays at once
@@ -724,7 +728,7 @@ proc readQuantTensor(f: File): QuantTensor =
   if dlen > 0:
     discard f.readBuffer(addr result.data[0], dlen)
 
-proc rawFloatView*(qt: QuantTensor): MappedView[float32] =
+proc rawFloatView*(qt: QuantTensor): MappedView[float32] {.apiHooked.} =
   ## The float32 payload of a mapped qkFp32Raw tensor, read in place (NIMQ2
   ## payloads may be unaligned; callers copy rows with copyMem).
   ## owner == nil when the tensor is not mapped raw fp32.
@@ -733,7 +737,7 @@ proc rawFloatView*(qt: QuantTensor): MappedView[float32] =
       qt.mappedData.len div 4)
 
 proc readMappedQuantTensor*(c: var WeightCursor; mapped = true;
-                            payloadAlign = 0): QuantTensor =
+                            payloadAlign = 0): QuantTensor {.apiHooked.} =
   let kind = readValue[uint8](c)
   if kind > uint8(high(QuantKind)): raise newException(IOError, "Invalid quant kind")
   result.kind = QuantKind(kind)
@@ -763,7 +767,7 @@ proc readMappedQuantTensor*(c: var WeightCursor; mapped = true;
     result.data = readSeq[uint8](c, n)
 
 proc saveQuantStateDict*(path: string, arch: array[5, int], sd: seq[(string, QuantTensor)];
-                         payloadAlign = 0) =
+                         payloadAlign = 0) {.apiHooked.} =
   ## payloadAlign > 0 writes NIMQ3 (payloads aligned for in-place GPU use);
   ## 0 keeps the NIMQ2 layout that export_to_nimq.py produces.
   if payloadAlign < 0 or payloadAlign > (1 shl 24) or
@@ -796,7 +800,7 @@ proc saveQuantStateDict*(path: string, arch: array[5, int], sd: seq[(string, Qua
       discard f.writeBuffer(addr zeros[0], pad)
 
 proc loadQuantStateDict*(path: string; mapped = false): tuple[arch: array[5, int],
-    sd: seq[(string, QuantTensor)], payloadAlign: int] =
+    sd: seq[(string, QuantTensor)], payloadAlign: int] {.apiHooked.} =
   ## Reads NIMQ2 and NIMQ3. payloadAlign is 0 for NIMQ2.
   var c = WeightCursor(owner: mapWeights(path))
   let magic = c.readString()

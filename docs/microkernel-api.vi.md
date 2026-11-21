@@ -3,6 +3,10 @@
 
 [English](microkernel-api.md) | [Tiếng Việt](microkernel-api.vi.md)
 
+`registerBybyApiHook` quan sát lời gọi bytecode/JIT; `registerMicroKernelHook`
+thay một `VmProgram` theo tag trước khi lower hoặc dispatch. Xem
+[tài liệu hook API Nim](forward-hooks.vi.md).
+
 Bytecode micro-VM nằm trong `vendor/bybylang/micro_kernel/session_vm.nim`;
 encode GPU ở `session_vm_dispatch.nim`; lower sang Metal/Vulkan và cache
 JIT ở `jit_vm.nim`. Các file cùng tên ở thư mục gốc là lớp tương thích.

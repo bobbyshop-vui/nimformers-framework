@@ -115,6 +115,33 @@ type
     byteEncoder*: array[256, string]  # raw byte -> unicode char (bytes_to_unicode)
     byteDecoder*: Table[string, int]  # unicode char -> raw byte (reverse direction)
 
+  RawTokenRecord* = object
+    ## One recoverable byte-level BPE token from the original corpus stream.
+    id*: int
+    corpusIndex*: int
+    text*: string
+
+  RawTokenWindow* = object
+    ## A sampled contiguous input window. Its tokens are the exact inputs sent
+    ## through both Linear++ attention and the Mamba2 parallel scan.
+    step*: int
+    batchRow*: int
+    corpusStart*: int
+    tokenCount*: int
+
+  RawTokenBatch* = object
+    ## Training tensors plus the raw-corpus spans that produced each row.
+    ids*: seq[seq[int]]
+    targets*: seq[seq[int]]
+    windows*: seq[RawTokenWindow]
+
+  RawTokenMemory* = object
+    ## The complete encoded corpus and a per-run ledger of windows sampled from
+    ## it. Raw token text is reconstructed losslessly from each BPE id on demand.
+    tokenIds: seq[int]
+    tokenizer: BPETokenizer
+    windows*: seq[RawTokenWindow]
+
 proc newGpt2ByteEncoder(): array[256, string] =
   ## Exactly bytes_to_unicode() in OpenAI GPT-2's original encoder.py: every
   ## "printable" byte (33..126, 161..172, 174..255) maps to itself, the
@@ -342,6 +369,70 @@ proc decodeBPE*(tok: BPETokenizer, ids: seq[int]): seq[uint8] =
   let s = decodeBPEStr(tok, ids)
   result = newSeq[uint8](s.len)
   for i in 0 ..< s.len: result[i] = uint8(s[i])
+
+proc newRawTokenMemory*(tok: BPETokenizer, tokenIds: sink seq[int]): RawTokenMemory =
+  ## Keep the full tokenized corpus as the source for training windows. The
+  ## tokenizer is retained so a stored id can be inspected as its raw byte
+  ## piece without duplicating decoded strings for every corpus occurrence.
+  result.tokenIds = tokenIds
+  result.tokenizer = tok
+  result.windows = @[]
+
+proc tokenCount*(memory: RawTokenMemory): int = memory.tokenIds.len
+
+proc rawTokenAt*(memory: RawTokenMemory, corpusIndex: int): RawTokenRecord =
+  ## Recover one original BPE token and its corpus position. `text` contains
+  ## the token's exact decoded bytes; an individual BPE piece can end midway
+  ## through a multi-byte UTF-8 character, just as in the source stream.
+  doAssert corpusIndex >= 0 and corpusIndex < memory.tokenIds.len,
+    "raw token memory corpus index is out of range"
+  let id = memory.tokenIds[corpusIndex]
+  result = RawTokenRecord(id: id, corpusIndex: corpusIndex,
+    text: decodeBPEStr(memory.tokenizer, @[id]))
+
+proc rawTokensForWindow*(memory: RawTokenMemory,
+                         window: RawTokenWindow): seq[RawTokenRecord] =
+  ## Materialize the raw token records for a sampled attention/scan window.
+  doAssert window.corpusStart >= 0 and window.tokenCount >= 0 and
+    window.corpusStart + window.tokenCount <= memory.tokenIds.len,
+    "raw token window is outside the corpus memory"
+  result = newSeqOfCap[RawTokenRecord](window.tokenCount)
+  for i in 0 ..< window.tokenCount:
+    result.add(memory.rawTokenAt(window.corpusStart + i))
+
+proc rawTextForWindow*(memory: RawTokenMemory,
+                       window: RawTokenWindow): string =
+  ## Reconstruct the complete UTF-8 byte sequence for one sampled window.
+  doAssert window.corpusStart >= 0 and window.tokenCount >= 0 and
+    window.corpusStart + window.tokenCount <= memory.tokenIds.len,
+    "raw token window is outside the corpus memory"
+  var ids = newSeq[int](window.tokenCount)
+  for i in 0 ..< window.tokenCount:
+    ids[i] = memory.tokenIds[window.corpusStart + i]
+  result = decodeBPEStr(memory.tokenizer, ids)
+
+proc sampleRawTokenBatch*(memory: var RawTokenMemory, B, T, step: int,
+                          rng: var Rand): RawTokenBatch =
+  ## Sample next-token windows through RawTokenMemory and record every input
+  ## span. The resulting `ids` are consumed unchanged by Spectron's Linear++
+  ## attention and Mamba2 parallel-scan branches.
+  doAssert B > 0 and T > 0, "raw token batch dimensions must be positive"
+  doAssert memory.tokenIds.len > T + 1,
+    "raw token corpus is too short for the requested sequence length"
+  result.ids = newSeq[seq[int]](B)
+  result.targets = newSeq[seq[int]](B)
+  result.windows = newSeqOfCap[RawTokenWindow](B)
+  for b in 0 ..< B:
+    let start = rng.rand(memory.tokenIds.len - T - 1)
+    let window = RawTokenWindow(step: step, batchRow: b,
+      corpusStart: start, tokenCount: T)
+    memory.windows.add(window)
+    result.windows.add(window)
+    result.ids[b] = newSeq[int](T)
+    result.targets[b] = newSeq[int](T)
+    for t in 0 ..< T:
+      result.ids[b][t] = memory.tokenIds[start + t]
+      result.targets[b][t] = memory.tokenIds[start + t + 1]
 
 proc saveBPE*(tok: BPETokenizer, path: string) =
   ## Saves EXACTLY the real HF/tokenizers tokenizer.json schema (BPE model):
@@ -1603,8 +1694,12 @@ when isMainModule:
     echo "  [resume] Adam moments were not saved; the optimizer restarts from step 0"
 
   # Encode the whole corpus once with the trained BPE, shared by sampling.
-  let corpusIds = encodeBPE(tok, rawCorpus)
-  doAssert corpusIds.len > CFG_SEQ_LEN + 1, "The corpus is too short for the training demo"
+  var corpusIds = encodeBPE(tok, rawCorpus)
+  var rawTokenMemory = newRawTokenMemory(tok, move(corpusIds))
+  doAssert rawTokenMemory.tokenCount > CFG_SEQ_LEN + 1,
+    "The corpus is too short for the training demo"
+  echo &"[raw-token-memory] indexed {rawTokenMemory.tokenCount} raw BPE tokens; " &
+       "Linear++ and Mamba2 scan batches will retain their corpus windows"
 
   proc lrAt(step, startStep: int): float32 =
     ## Warmup + cosine schedule. The decay follows the global step, so a resumed run continues
@@ -1626,20 +1721,6 @@ when isMainModule:
     let warm = if CFG_WARMUP_STEPS > 0: min(1.0, float64(local) / float64(CFG_WARMUP_STEPS)) else: 1.0
     float32(decayed * warm)
 
-  proc sampleBatch(ids: seq[int], B, T: int, rng: var Rand):
-      tuple[ids, targets: seq[seq[int]]] =
-    result.ids = newSeq[seq[int]](B)
-    result.targets = newSeq[seq[int]](B)
-    for b in 0 ..< B:
-      let start = rng.rand(ids.len - T - 2)
-      var xIds = newSeq[int](T)
-      var tgt = newSeq[int](T)
-      for t in 0 ..< T:
-        xIds[t] = ids[start + t]
-        tgt[t] = ids[start + t + 1]
-      result.ids[b] = xIds
-      result.targets[b] = tgt
-
   # Seeded by the resume point: a fixed seed made every resumed run train on the same batches.
   var rng = initRand(42 + startStep)
   echo &"== Starting demo training: {CFG_N_STEPS} steps (from step {startStep + 1}), batch={CFG_BATCH_SIZE}, seq={CFG_SEQ_LEN} =="
@@ -1648,9 +1729,10 @@ when isMainModule:
   var lossSum = 0.0
   var lossCount = 0
   for step in (startStep + 1) .. (startStep + CFG_N_STEPS):
-    let (ids, targets) = sampleBatch(corpusIds, CFG_BATCH_SIZE, CFG_SEQ_LEN, rng)
+    let tokenBatch = rawTokenMemory.sampleRawTokenBatch(
+      CFG_BATCH_SIZE, CFG_SEQ_LEN, step, rng)
     let lr = lrAt(step, startStep)
-    let loss = trainStep(model, adam, ids, targets, ctx, lr = lr,
+    let loss = trainStep(model, adam, tokenBatch.ids, tokenBatch.targets, ctx, lr = lr,
                           requantizeEvery = CFG_REQUANTIZE_EVERY)
     lossSum += float64(loss)
     inc lossCount
@@ -1667,6 +1749,9 @@ when isMainModule:
 
   saveCheckpoint(model, CFG_CHECKPOINT_PATH, startStep + CFG_N_STEPS)
   echo &"== Saved the final checkpoint: {CFG_CHECKPOINT_PATH} =="
+  echo "[raw-token-memory] captured ", rawTokenMemory.windows.len,
+       " training windows (", rawTokenMemory.windows.len * CFG_SEQ_LEN,
+       " Linear++/scan input-token uses)"
 
   echo "== Test generation (greedy) from a new sentence =="
   let promptIds = encodeBPE(tok, CFG_GEN_PROMPT)

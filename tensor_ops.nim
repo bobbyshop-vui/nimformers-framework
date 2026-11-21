@@ -20,6 +20,10 @@
 ## gpubackend.nim.
 
 import std/[math, sequtils]
+from vendor/bybylang/probe import apiHooked, bybyApiHooksActive,
+    runBybyApiHooks, bybyApiBefore, bybyApiAfter, bybyHookValue,
+    bybyApiValueHooksActive, runBybyApiValueHooks, BybyApiCall, BybyApiArg,
+    bybyHookTypeName
 import backend
 import nimformer  # Tensor, numel-style helpers (flatten2D, newTensor, ...)
 
@@ -43,21 +47,33 @@ import nimformer  # Tensor, numel-style helpers (flatten2D, newTensor, ...)
 ## NOT redefined here - the `import backend` above brings these procs
 ## into scope.
 
-proc expT*(ctx: Backend, x: Tensor): Tensor =
-  result.shape = x.shape
-  result.data = beExp(ctx, x.data)
+proc expT*(ctx: Backend, x: Tensor): Tensor {.apiHooked.} =
+  var inputs = @[x]
+  applyApiBefore("expt", ctx, inputs)
+  result.shape = inputs[0].shape
+  result.data = beExp(ctx, inputs[0].data)
+  result = applyApiAfter("expt", ctx, inputs, result)
 
-proc logT*(ctx: Backend, x: Tensor): Tensor =
-  result.shape = x.shape
-  result.data = beLog(ctx, x.data)
+proc logT*(ctx: Backend, x: Tensor): Tensor {.apiHooked.} =
+  var inputs = @[x]
+  applyApiBefore("logt", ctx, inputs)
+  result.shape = inputs[0].shape
+  result.data = beLog(ctx, inputs[0].data)
+  result = applyApiAfter("logt", ctx, inputs, result)
 
-proc sqrtT*(ctx: Backend, x: Tensor): Tensor =
-  result.shape = x.shape
-  result.data = beSqrt(ctx, x.data)
+proc sqrtT*(ctx: Backend, x: Tensor): Tensor {.apiHooked.} =
+  var inputs = @[x]
+  applyApiBefore("sqrtt", ctx, inputs)
+  result.shape = inputs[0].shape
+  result.data = beSqrt(ctx, inputs[0].data)
+  result = applyApiAfter("sqrtt", ctx, inputs, result)
 
-proc powT*(ctx: Backend, x: Tensor, p: float32): Tensor =
-  result.shape = x.shape
-  result.data = bePow(ctx, x.data, p)
+proc powT*(ctx: Backend, x: Tensor, p: float32): Tensor {.apiHooked.} =
+  var inputs = @[x]
+  applyApiBefore("powt", ctx, inputs)
+  result.shape = inputs[0].shape
+  result.data = bePow(ctx, inputs[0].data, p)
+  result = applyApiAfter("powt", ctx, inputs, result)
 
 # ─────────────────────────────────────────────────────────────
 # 2. VIEW / RESHAPE - no data copy (shares the seq through Nim's ref semantics
@@ -69,8 +85,12 @@ proc numelShape(shape: seq[int]): int =
   result = 1
   for s in shape: result *= s
 
-proc view*(x: Tensor, newShape: seq[int]): Tensor =
+proc view*(x: Tensor, newShape: seq[int]): Tensor {.apiHooked.} =
   ## A plain reshape (no copy) - supports one "-1" dimension (inferred) like torch.
+  let ctx = Backend(kind: bkCpu)
+  var inputs = @[x]
+  applyApiBefore("view", ctx, inputs)
+  let input = inputs[0]
   var shape = newShape
   var inferIdx = -1
   var known = 1
@@ -81,15 +101,21 @@ proc view*(x: Tensor, newShape: seq[int]): Tensor =
     else:
       known *= s
   if inferIdx >= 0:
-    doAssert known != 0 and x.data.len mod known == 0,
-      "view: cannot infer the -1 dimension from shape " & $x.shape & " -> " & $newShape
-    shape[inferIdx] = x.data.len div known
-  doAssert numelShape(shape) == x.data.len,
-    "view: element count mismatch (" & $x.data.len & " vs " & $numelShape(shape) & ")"
+    doAssert known != 0 and input.data.len mod known == 0,
+      "view: cannot infer the -1 dimension from shape " & $input.shape & " -> " & $newShape
+    shape[inferIdx] = input.data.len div known
+  doAssert numelShape(shape) == input.data.len,
+    "view: element count mismatch (" & $input.data.len & " vs " & $numelShape(shape) & ")"
   result.shape = shape
-  result.data = x.data   # Nim seq = copy-on-write: reading costs no copy.
+  result.data = input.data   # Nim seq = copy-on-write: reading costs no copy.
+  result = applyApiAfter("view", ctx, inputs, result)
 
-proc reshape*(x: Tensor, newShape: seq[int]): Tensor = view(x, newShape)
+proc reshape*(x: Tensor, newShape: seq[int]): Tensor {.apiHooked.} =
+  let ctx = Backend(kind: bkCpu)
+  var inputs = @[x]
+  applyApiBefore("reshape", ctx, inputs)
+  result = view(inputs[0], newShape)
+  result = applyApiAfter("reshape", ctx, inputs, result)
 
 # ─────────────────────────────────────────────────────────────
 # 3. PERMUTE - reorders dimensions (e.g. attention [B,T,H,D] -> [B,H,T,D]).
@@ -105,16 +131,19 @@ proc strides(shape: seq[int]): seq[int] =
     result[i] = acc
     acc *= shape[i]
 
-proc permute*(ctx: Backend, x: Tensor, dims: seq[int]): Tensor =
+proc permute*(ctx: Backend, x: Tensor, dims: seq[int]): Tensor {.apiHooked.} =
   ## LIKE TORCH: only the strides are computed (O(rank), rank<=8, independent of n) on
   ## the CPU and sent to the permute_strided kernel (CUDA/Vulkan/Metal) - each GPU
   ## thread decodes its own source index right on the device. No more
   ## O(n) CPU loop building an index array like the previous version.
-  doAssert dims.len == x.shape.len, "permute: the number of dims must match the shape"
+  var inputs = @[x]
+  applyApiBefore("permute", ctx, inputs)
+  let input = inputs[0]
+  doAssert dims.len == input.shape.len, "permute: the number of dims must match the shape"
   doAssert dims.len <= 8, "permute: rank > 8 not supported (fixed 8-entry push-constant table/kernel)"
   var newShape = newSeq[int](dims.len)
-  for i, d in dims: newShape[i] = x.shape[d]
-  let oldStrides = strides(x.shape)
+  for i, d in dims: newShape[i] = input.shape[d]
+  let oldStrides = strides(input.shape)
   let newStrides = strides(newShape)
   var newStridesI32 = newSeq[int32](dims.len)
   var oldStridesI32 = newSeq[int32](dims.len)
@@ -124,7 +153,8 @@ proc permute*(ctx: Backend, x: Tensor, dims: seq[int]): Tensor =
     oldStridesI32[i] = int32(oldStrides[i])
     dimsMapI32[i] = int32(dims[i])
   result.shape = newShape
-  result.data = bePermuteGpu(ctx, x.data, newStridesI32, oldStridesI32, dimsMapI32, x.data.len)
+  result.data = bePermuteGpu(ctx, input.data, newStridesI32, oldStridesI32, dimsMapI32, input.data.len)
+  result = applyApiAfter("permute", ctx, inputs, result)
 
 # ─────────────────────────────────────────────────────────────
 # 4. REDUCTION: sum / mean / max / argmax along one dimension (the last dim is the most
@@ -187,22 +217,22 @@ proc gpuMaxCombine(ctx: Backend, a, b: openArray[float32]): seq[float32] =
   let reluDiff = beRelu(ctx, diff)
   result = beAdd(ctx, reluDiff, b)
 
-proc beSum*(ctx: Backend, x: openArray[float32], shape: seq[int], dim: int): seq[float32] =
+proc beSum*(ctx: Backend, x: openArray[float32], shape: seq[int], dim: int): seq[float32] {.apiHooked.} =
   let (outer, dimSize, inner) = reduceShapes(shape, dim)
   result = gpuTreeReduce(ctx, x, outer, dimSize, inner, beAdd)
 
-proc beMean*(ctx: Backend, x: openArray[float32], shape: seq[int], dim: int): seq[float32] =
+proc beMean*(ctx: Backend, x: openArray[float32], shape: seq[int], dim: int): seq[float32] {.apiHooked.} =
   let (outer, dimSize, inner) = reduceShapes(shape, dim)
   let summed = gpuTreeReduce(ctx, x, outer, dimSize, inner, beAdd)
   # Divides with one GPU command (beMul by 1/d) instead of a CPU division loop.
   let invD = newSeq[float32](summed.len).mapIt(1'f32 / float32(dimSize))
   result = beMul(ctx, summed, invD)
 
-proc beMax*(ctx: Backend, x: openArray[float32], shape: seq[int], dim: int): seq[float32] =
+proc beMax*(ctx: Backend, x: openArray[float32], shape: seq[int], dim: int): seq[float32] {.apiHooked.} =
   let (outer, dimSize, inner) = reduceShapes(shape, dim)
   result = gpuTreeReduce(ctx, x, outer, dimSize, inner, gpuMaxCombine)
 
-proc beArgMax*(ctx: Backend, x: openArray[float32], shape: seq[int], dim: int): seq[int] =
+proc beArgMax*(ctx: Backend, x: openArray[float32], shape: seq[int], dim: int): seq[int] {.apiHooked.} =
   ## REAL GPU PORT: both the value AND the index computed on the GPU in one command through
   ## beArgmaxIndexGpu (argmax_kernel.cu/.comp/.metal - a tree reduce keeping the
   ## (value, index) pair in shared/threadgroup memory right on the device),
@@ -212,7 +242,7 @@ proc beArgMax*(ctx: Backend, x: openArray[float32], shape: seq[int], dim: int): 
   result = newSeq[int](idx.len)
   for i in 0 ..< idx.len: result[i] = int(idx[i])
 
-proc beArgMax*(ctx: Backend, x: openArray[float32]): int =
+proc beArgMax*(ctx: Backend, x: openArray[float32]): int {.apiHooked.} =
   ## Utility: flat argmax over a whole 1D array (e.g. the logits of one token, greedy
   ## sampling) - value + index computed together on the GPU (see the note above).
   doAssert x.len > 0
@@ -223,30 +253,32 @@ proc beArgMax*(ctx: Backend, x: openArray[float32]): int =
 # 5. CONCAT / STACK / SPLIT
 # ─────────────────────────────────────────────────────────────
 
-proc concat*(ctx: Backend, tensors: openArray[Tensor], dim: int): Tensor =
+proc concat*(ctx: Backend, tensors: openArray[Tensor], dim: int): Tensor {.apiHooked.} =
   ## LIKE TORCH: the host only concatenates the data flat (sequential memcpy - NO
   ## per-element index computation) + prepares a small O(numTensors) table (base offset
   ## in the flat buffer, size along dim, prefix offset along dim) and
   ## lets the concat_gather kernel (CUDA/Vulkan/Metal) pick the right source for
   ## each element right on the GPU.
-  doAssert tensors.len > 0, "concat: needs at least 1 tensor"
-  let baseShape = tensors[0].shape
-  for t in tensors:
+  var inputs = @tensors
+  applyApiBefore("concat", ctx, inputs)
+  doAssert inputs.len > 0, "concat: needs at least 1 tensor"
+  let baseShape = inputs[0].shape
+  for t in inputs:
     for i, s in t.shape:
       if i != dim: doAssert s == baseShape[i], "concat: shapes differ outside dimension dim"
   var newShape = baseShape
   var totalDim = 0
-  for t in tensors: totalDim += t.shape[dim]
+  for t in inputs: totalDim += t.shape[dim]
   newShape[dim] = totalDim
   var inner = 1
   for i in dim + 1 ..< baseShape.len: inner *= baseShape[i]
 
   var flatSrc = newSeq[float32]()
-  var srcBase = newSeq[int32](tensors.len)
-  var srcDimSize = newSeq[int32](tensors.len)
-  var srcDimOffset = newSeq[int32](tensors.len)
+  var srcBase = newSeq[int32](inputs.len)
+  var srcDimSize = newSeq[int32](inputs.len)
+  var srcDimOffset = newSeq[int32](inputs.len)
   var dOff = 0
-  for i, t in tensors:
+  for i, t in inputs:
     srcBase[i] = int32(flatSrc.len)
     srcDimSize[i] = int32(t.shape[dim])
     srcDimOffset[i] = int32(dOff)
@@ -255,37 +287,44 @@ proc concat*(ctx: Backend, tensors: openArray[Tensor], dim: int): Tensor =
 
   result.shape = newShape
   result.data = beConcatGpu(ctx, flatSrc, srcBase, srcDimSize, srcDimOffset, totalDim, inner, numelShape(newShape))
+  result = applyApiAfter("concat", ctx, inputs, result)
 
-proc stack*(ctx: Backend, tensors: openArray[Tensor], dim: int = 0): Tensor =
+proc stack*(ctx: Backend, tensors: openArray[Tensor], dim: int = 0): Tensor {.apiHooked.} =
   ## stack adds a NEW dimension at position `dim` (unlike concat - it does not join along an
   ## existing dimension). Implemented by reshaping each tensor with an extra dimension of 1, then concat
   ## (the concat path is really on the GPU, see above).
-  doAssert tensors.len > 0, "stack: needs at least 1 tensor"
-  var reshaped = newSeq[Tensor](tensors.len)
-  for i, t in tensors:
+  var inputs = @tensors
+  applyApiBefore("stack", ctx, inputs)
+  doAssert inputs.len > 0, "stack: needs at least 1 tensor"
+  var reshaped = newSeq[Tensor](inputs.len)
+  for i, t in inputs:
     var s = t.shape
     s.insert(1, dim)
     reshaped[i] = view(t, s)
   result = concat(ctx, reshaped, dim)
+  result = applyApiAfter("stack", ctx, inputs, result)
 
-proc split*(ctx: Backend, x: Tensor, splitSize: int, dim: int): seq[Tensor] =
+proc split*(ctx: Backend, x: Tensor, splitSize: int, dim: int): seq[Tensor] {.apiHooked.} =
   ## LIKE TORCH: each piece is a contiguous slice - the host passes only 5
   ## integers (dimTotal/thisSize/offset/inner/n), the split_slice kernel computes
   ## each element's source index right on the GPU, no CPU loop.
-  let dimTotal = x.shape[dim]
+  var inputs = @[x]
+  applyApiBefore("split", ctx, inputs)
+  let input = inputs[0]
+  let dimTotal = input.shape[dim]
   var outer = 1
-  for i in 0 ..< dim: outer *= x.shape[i]
+  for i in 0 ..< dim: outer *= input.shape[i]
   var inner = 1
-  for i in dim + 1 ..< x.shape.len: inner *= x.shape[i]
+  for i in dim + 1 ..< input.shape.len: inner *= input.shape[i]
   var offset = 0
   while offset < dimTotal:
     let thisSize = min(splitSize, dimTotal - offset)
-    var newShape = x.shape
+    var newShape = input.shape
     newShape[dim] = thisSize
     var piece: Tensor
     piece.shape = newShape
-    piece.data = beSplitSliceGpu(ctx, x.data, dimTotal, thisSize, offset, inner, numelShape(newShape))
-    result.add(piece)
+    piece.data = beSplitSliceGpu(ctx, input.data, dimTotal, thisSize, offset, inner, numelShape(newShape))
+    result.add(applyApiAfter("split", ctx, inputs, piece))
     offset += thisSize
 
 # ─────────────────────────────────────────────────────────────
@@ -297,7 +336,7 @@ proc split*(ctx: Backend, x: Tensor, splitSize: int, dim: int): seq[Tensor] =
 # ─────────────────────────────────────────────────────────────
 
 proc beDropout*(ctx: Backend, x: openArray[float32], p: float32, training: bool,
-                 seed: uint32): seq[float32] =
+                 seed: uint32): seq[float32] {.apiHooked.} =
   ## Inverted dropout (like torch.nn.Dropout): returns x unchanged in eval, in
   ## training multiplies by a mask generated on the GPU (0 or 1/(1-p)) through beMul (GPU).
   if not training or p <= 0'f32:
@@ -308,7 +347,7 @@ proc beDropout*(ctx: Backend, x: openArray[float32], p: float32, training: bool,
   let mask = beDropoutMaskGpu(ctx, x.len, p, seed)
   result = beMul(ctx, @x, mask)
 
-proc dropoutMask*(ctx: Backend, n: int, p: float32, seed: uint32): seq[float32] =
+proc dropoutMask*(ctx: Backend, n: int, p: float32, seed: uint32): seq[float32] {.apiHooked.} =
   ## Returns the mask (0 or 1/(1-p)), generated directly on the GPU (beDropoutMaskGpu), so
   ## it is reused for BOTH forward and backward (multiplying by the same mask during
   ## backprop instead of drawing again - required for correct training: same seed
@@ -334,39 +373,50 @@ proc dropoutMask*(ctx: Backend, n: int, p: float32, seed: uint32): seq[float32] 
 ## see compare_kernel.cu/.comp/.metal) producing the bitmask directly, no more
 ## intermediate sub/relu + host readback as in the previous version.
 
-proc beGt*(ctx: Backend, a, b: openArray[float32]): seq[bool] =
+proc beGt*(ctx: Backend, a, b: openArray[float32]): seq[bool] {.apiHooked.} =
   doAssert a.len == b.len
   result = beCompareGpuOp(ctx, @a, @b, 0)
 
-proc beLt*(ctx: Backend, a, b: openArray[float32]): seq[bool] =
+proc beLt*(ctx: Backend, a, b: openArray[float32]): seq[bool] {.apiHooked.} =
   doAssert a.len == b.len
   result = beCompareGpuOp(ctx, @a, @b, 1)
 
-proc beEq*(ctx: Backend, a, b: openArray[float32]): seq[bool] =
+proc beEq*(ctx: Backend, a, b: openArray[float32]): seq[bool] {.apiHooked.} =
   doAssert a.len == b.len
   result = beCompareGpuOp(ctx, @a, @b, 2)
 
-proc beGe*(ctx: Backend, a, b: openArray[float32]): seq[bool] =
+proc beGe*(ctx: Backend, a, b: openArray[float32]): seq[bool] {.apiHooked.} =
   doAssert a.len == b.len
   result = beCompareGpuOp(ctx, @a, @b, 3)
 
-proc beLe*(ctx: Backend, a, b: openArray[float32]): seq[bool] =
+proc beLe*(ctx: Backend, a, b: openArray[float32]): seq[bool] {.apiHooked.} =
   doAssert a.len == b.len
   result = beCompareGpuOp(ctx, @a, @b, 4)
 
-proc maskedFill*(x: Tensor, mask: openArray[bool], value: float32): Tensor =
-  doAssert mask.len == x.data.len
-  result.shape = x.shape
-  result.data = newSeq[float32](x.data.len)
-  for i in 0 ..< x.data.len:
-    result.data[i] = if mask[i]: value else: x.data[i]
+proc maskedFill*(x: Tensor, mask: openArray[bool], value: float32): Tensor {.apiHooked.} =
+  let ctx = Backend(kind: bkCpu)
+  var inputs = @[x]
+  applyApiBefore("maskedfill", ctx, inputs)
+  let input = inputs[0]
+  doAssert mask.len == input.data.len
+  result.shape = input.shape
+  result.data = newSeq[float32](input.data.len)
+  for i in 0 ..< input.data.len:
+    result.data[i] = if mask[i]: value else: input.data[i]
+  result = applyApiAfter("maskedfill", ctx, inputs, result)
 
-proc whereT*(cond: openArray[bool], a, b: Tensor): Tensor =
-  doAssert cond.len == a.data.len and a.data.len == b.data.len
-  result.shape = a.shape
-  result.data = newSeq[float32](a.data.len)
-  for i in 0 ..< a.data.len:
-    result.data[i] = if cond[i]: a.data[i] else: b.data[i]
+proc whereT*(cond: openArray[bool], a, b: Tensor): Tensor {.apiHooked.} =
+  let ctx = Backend(kind: bkCpu)
+  var inputs = @[a, b]
+  applyApiBefore("wheret", ctx, inputs)
+  if inputs.len != 2:
+    raise newException(ValueError, "whereT hooks must preserve both Tensor operands")
+  doAssert cond.len == inputs[0].data.len and inputs[0].data.len == inputs[1].data.len
+  result.shape = inputs[0].shape
+  result.data = newSeq[float32](inputs[0].data.len)
+  for i in 0 ..< inputs[0].data.len:
+    result.data[i] = if cond[i]: inputs[0].data[i] else: inputs[1].data[i]
+  result = applyApiAfter("wheret", ctx, inputs, result)
 
 # ─────────────────────────────────────────────────────────────
 # 8. PARALLEL SCAN (Hillis-Steele, log-depth) - torch.cumsum/cumprod along any
@@ -420,7 +470,7 @@ proc applyHillisSteeleGpu(ctx: Backend, data: var seq[float32], outer, dimSize, 
         data[curIdx[j]] = combined[j]
     offset = offset shl 1
 
-proc beCumsum*(ctx: Backend, x: openArray[float32], shape: seq[int], dim: int): seq[float32] =
+proc beCumsum*(ctx: Backend, x: openArray[float32], shape: seq[int], dim: int): seq[float32] {.apiHooked.} =
   ## Equivalent to torch.cumsum(x, dim): an INCLUSIVE prefix sum,
   ## keeping the shape. Each Hillis-Steele step runs through beAdd (real GPU).
   let (outer, dimSize, inner) = reduceShapes(shape, dim)
@@ -428,11 +478,14 @@ proc beCumsum*(ctx: Backend, x: openArray[float32], shape: seq[int], dim: int): 
   for i in 0 ..< x.len: result[i] = x[i]
   applyHillisSteeleGpu(ctx, result, outer, dimSize, inner, useMul = false)
 
-proc cumsumT*(ctx: Backend, x: Tensor, dim: int): Tensor =
-  result.shape = x.shape
-  result.data = beCumsum(ctx, x.data, x.shape, dim)
+proc cumsumT*(ctx: Backend, x: Tensor, dim: int): Tensor {.apiHooked.} =
+  var inputs = @[x]
+  applyApiBefore("cumsumt", ctx, inputs)
+  result.shape = inputs[0].shape
+  result.data = beCumsum(ctx, inputs[0].data, inputs[0].shape, dim)
+  result = applyApiAfter("cumsumt", ctx, inputs, result)
 
-proc beCumprod*(ctx: Backend, x: openArray[float32], shape: seq[int], dim: int): seq[float32] =
+proc beCumprod*(ctx: Backend, x: openArray[float32], shape: seq[int], dim: int): seq[float32] {.apiHooked.} =
   ## torch.cumprod(x, dim). The same Hillis-Steele structure as cumsum but
   ## combining with multiplication (still associative -> a valid parallel
   ## scan), through beMul (real GPU). Kept separate instead of "exp(cumsum(log(x)))"
@@ -443,9 +496,12 @@ proc beCumprod*(ctx: Backend, x: openArray[float32], shape: seq[int], dim: int):
   for i in 0 ..< x.len: result[i] = x[i]
   applyHillisSteeleGpu(ctx, result, outer, dimSize, inner, useMul = true)
 
-proc cumprodT*(ctx: Backend, x: Tensor, dim: int): Tensor =
-  result.shape = x.shape
-  result.data = beCumprod(ctx, x.data, x.shape, dim)
+proc cumprodT*(ctx: Backend, x: Tensor, dim: int): Tensor {.apiHooked.} =
+  var inputs = @[x]
+  applyApiBefore("cumprodt", ctx, inputs)
+  result.shape = inputs[0].shape
+  result.data = beCumprod(ctx, inputs[0].data, inputs[0].shape, dim)
+  result = applyApiAfter("cumprodt", ctx, inputs, result)
 
 type
   ScanPair* = tuple[a, b: float32]
@@ -462,7 +518,7 @@ proc combineAffine(l, r: ScanPair): ScanPair =
   (a: r.a * l.a, b: r.a * l.b + r.b)
 
 proc beAffineScan*(ctx: Backend, aCoef, bCoef: openArray[float32],
-                    shape: seq[int], dim: int): seq[float32] =
+                    shape: seq[int], dim: int): seq[float32] {.apiHooked.} =
   ## GENERAL parallel scan for the affine recurrence h_t = a_t*h_{t-1} + b_t
   ## (state space/SSM/Mamba selective scan, linear GRU, ...) along
   ## `dim`. Returns h_t (INCLUSIVE, h_{-1} = 0) for EVERY t at once. Each

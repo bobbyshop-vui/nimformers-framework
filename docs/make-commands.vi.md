@@ -35,10 +35,11 @@ make build
 ./test/spectron/test_nimformer
 ```
 
-`make build` chạy `nim check`, rồi `nim c` cho
-`test/spectron/test_nimformer.nim`. File thực thi nằm tại
-`test/spectron/test_nimformer`. Lệnh build chưa train; dòng chạy binary mới
-bắt đầu đọc corpus, load/train tokenizer và train model.
+`make build` build shared runtime và worker cho FFI, sau đó chạy `nim check`
+và `nim c` cho `test/spectron/test_nimformer.nim`. Binary trainer nằm tại
+`test/spectron/test_nimformer`. Lệnh build chưa train; chạy binary mới bắt đầu
+đọc corpus, load/train tokenizer và train model. Dùng `make build-shared` nếu
+chỉ cần shared runtime và worker.
 
 Có thể gộp build và chạy:
 
@@ -66,7 +67,9 @@ Chi tiết cấu hình, dữ liệu, loss và resume nằm trong
 
 - `make` hoặc `make all`: chạy `build`, rồi `run`, nên **có khởi động training**.
   `run` tự check/compile lại; dùng `make build` nếu chỉ muốn biên dịch.
-- `make build`: check và compile trainer; backend mặc định `auto`.
+- `make build`: build shared runtime/worker và check/compile trainer Spectron;
+  backend trainer mặc định `auto`.
+- `make build-shared`: check/build `nimformers_lib.nim` và worker, không compile trainer.
 - `make run`: check, compile và chạy trainer với backend `auto`.
 - `make run-metal`: check, compile với `-d:backend=metal`, rồi train. Ngoài
   macOS target chỉ in thông báo Metal không được hỗ trợ.
@@ -257,16 +260,21 @@ và [lift FIR cho Codestral trên Vulkan](fir-script-lift.md#codestral-on-vulkan
 ## Python, C và BybyLang
 
 ```sh
-make build-for-python
+make build
+make build-shared
 make python-example
 make python-test
 make c-example
 make bybylang-test
+make hook-plugin-test
 ```
 
-- `build-for-python`: check và build `nimformers_lib.nim` thành
+- `build`: lệnh build chung: shared runtime, worker và trainer Spectron.
+- `build-shared`: check và build `nimformers_lib.nim` thành
   `libnimformers.dylib` trên macOS, `libnimformers.so` trên Linux hoặc
-  `nimformers.dll` trên Windows. Chưa cài package Python.
+  `nimformers.dll` trên Windows.
+- `build-for-python`: bí danh tương thích cho `build-shared`; dùng `build` để
+  build toàn framework.
 - `python-example`: build shared library rồi chạy `examples/python/basic.py`.
 - `python-test`: build shared library rồi chạy `test/python_test/` bằng pytest.
 - `c-example`: build shared library, compile `examples/c/smoke.c`, rồi chạy
@@ -281,6 +289,9 @@ make bybylang-test
 make python-example PYTHON=python
 make python-test PYTEST='python -m pytest' PYTEST_FLAGS=-q
 ```
+
+`hook-plugin-test` compile và chạy plugin module Nim có hook API riêng và lời
+gọi session BybyLang cấp thấp.
 
 Xem [hướng dẫn Python](python-guide.vi.md), [Python API](python-api.vi.md),
 [hướng dẫn BybyLang](bybylang-guide.vi.md) và [BybyLang API](bybylang-api.vi.md).

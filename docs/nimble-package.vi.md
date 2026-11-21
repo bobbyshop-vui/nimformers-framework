@@ -78,8 +78,12 @@ Binding shared cũng cung cấp `newProcessGroup`, `partition`, `vmRun`,
 `generateBatch` và `generateIdsBatch` trên native parallel C ABI. Hai hàm batch
 khởi chạy executable `formers-cli` đã cấu hình một lần cho mỗi prompt; kết quả
 văn bản hoặc chuỗi token ID cách nhau bằng dấu cách được trả theo thứ tự prompt.
-Mọi API `forward` model cấp cao cũng hỗ trợ hook tùy chỉnh trước/sau; xem
-[tài liệu forward hook](forward-hooks.md).
+Model, Tensor, backend/session, micro-VM/JIT và distributed API hỗ trợ hook;
+cũng có thể thay micro-kernel đã sinh. Xem [tài liệu API hook](forward-hooks.vi.md).
+Package có ví dụ module import được
+[`token_hook_plugin.nim`](../examples/nim/plugins/token_hook_plugin.nim);
+từ checkout repo, chạy `make hook-plugin-test` để compile cùng host program
+và kiểm tra hook cho API plugin lẫn `sessionRead`.
 
 ```nim
 var group = newProcessGroup(["cpu", "vulkan:0"])

@@ -3,6 +3,9 @@
 
 [English](gpu-session-api.md) | [Tiếng Việt](gpu-session-api.vi.md)
 
+Có thể quan sát lời gọi session bằng `registerBybyApiHook` và thay micro-kernel
+VM đã sinh bằng `registerMicroKernelHook`; xem [tài liệu hook API Nim](forward-hooks.vi.md).
+
 Mỗi lệnh immediate `beXxx` thực hiện một phép và có thể upload/đọc lại dữ
 liệu riêng. **Session API**, được `backend.nim` export lại từ
 `vendor/bybylang/gpubackend.nim`, cho phép mở **một session**, encode nhiều

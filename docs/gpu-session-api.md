@@ -3,6 +3,10 @@
 
 [English](gpu-session-api.md) | [Tiếng Việt](gpu-session-api.vi.md)
 
+Observe session calls with `registerBybyApiHook` and replace generated VM
+micro-kernels with `registerMicroKernelHook`; see the
+[Nim API hook reference](forward-hooks.md).
+
 Each immediate `beXxx` call performs its own operation and may upload/read data for that call. The **Session API**, re-exported by `backend.nim` from `vendor/bybylang/gpubackend.nim`, lets you open a **single session** and encode several operations into it back-to-back, reading results back to the CPU once at the end — this is how `beAddLayernormFused`, `SwiGLUL.forward`, and fused RoPE/attention/decode paths avoid multiple GPU round-trips per layer.
 
 Available symbols (imported by using `backend`, no separate import needed):

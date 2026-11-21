@@ -4,6 +4,10 @@
 ## goes through BybyLang only, for performance and no duplicated source.
 
 import vendor/bybylang/gpubackend as byby
+from vendor/bybylang/probe import apiHooked, bybyApiHooksActive,
+    runBybyApiHooks, bybyApiBefore, bybyApiAfter, bybyHookValue,
+    bybyApiValueHooksActive, runBybyApiValueHooks, BybyApiCall, BybyApiArg,
+    bybyHookTypeName
 import customfloat
 export byby.GpuBackend, byby.SessionHandle, byby.sessionBegin, byby.sessionUpload, byby.sessionRope,
        byby.sessionUploadIndices, byby.sessionAllocScratch, byby.sessionMatmul, byby.sessionMatmulNT,
@@ -35,7 +39,7 @@ type
   Backend* = object
     kind*: BackendKind
 
-proc toByby*(bk: BackendKind): byby.GpuBackend =
+proc toByby*(bk: BackendKind): byby.GpuBackend {.apiHooked.} =
   case bk
   of bkMetal: byby.gbMetal
   # Keep bkCuda as a source-compatible legacy enum value, but never expose a
@@ -69,16 +73,16 @@ proc resolveBackendKind(want: string): BackendKind =
   else:
     raise newException(ValueError, "unsupported backend: " & want)
 
-proc newBackend*(force: string = backend): Backend =
+proc newBackend*(force: string = backend): Backend {.apiHooked.} =
   ## Creates a new backend. Picks and links the most suitable device automatically.
   let kind = resolveBackendKind(force)
   stderr.writeLine "== [Framework] Backend selected: " & $kind & " =="
   result = Backend(kind: kind)
 
-proc closeBackend*(b: Backend) =
+proc closeBackend*(b: Backend) {.apiHooked.} =
   discard
 
-proc setForbidCpuFallback*(forbid: bool) =
+proc setForbidCpuFallback*(forbid: bool) {.apiHooked.} =
   ## Default TRUE: if the chosen GPU backend (cuda/metal/opencl) fails at
   ## run time, the program raises instead of silently falling back to the CPU and
   ## continuing to train (the CPU is many times slower and users often miss it because
@@ -91,14 +95,14 @@ proc setForbidCpuFallback*(forbid: bool) =
 # ─────────────────────────────────────────────────────────────
 
 proc beMatmul*(ctx: Backend, a: openArray[float32], M, K: int,
-                b: openArray[float32], K2, N: int): seq[float32] =
+                b: openArray[float32], K2, N: int): seq[float32] {.apiHooked.} =
   let aSeq = @a
   let bSeq = @b
   result = byby.gpuMatmul(ctx.kind.toByby(), aSeq, bSeq, M, K, N)
 
 proc beMatmulQ4*(ctx: Backend, a: openArray[float32], wq: openArray[uint8],
                   scales, zeros: openArray[float32],
-                  M, K, N, groupSize, nGroupsPerRow: int): seq[float32] =
+                  M, K, N, groupSize, nGroupsPerRow: int): seq[float32] {.apiHooked.} =
   let aSeq = @a
   let wqSeq = @wq
   let scalesSeq = @scales
@@ -116,20 +120,20 @@ proc beMatmulQ4*(ctx: Backend, a: openArray[float32], wq: openArray[uint8],
     result = fixed
 
 proc beResidentUploadQ4*(ctx: Backend, wq: openArray[uint8], scales, zeros: openArray[float32],
-                          k, n, groupSize, nGroupsPerRow: int): ResidentWeightHandle =
+                          k, n, groupSize, nGroupsPerRow: int): ResidentWeightHandle {.apiHooked.} =
   ## Uploads one int4 weight to the GPU ONCE (at model load). Call once per Linear,
   ## keep the result (e.g. in Linear.residentW) for the process lifetime.
   byby.residentUploadQ4(ctx.kind.toByby(), @wq, @scales, @zeros, k, n, groupSize, nGroupsPerRow)
 
 proc beResidentUploadQ4Mapped*(ctx: Backend, wq: pointer, wqBytes: int,
                                 scales, zeros: openArray[float32],
-                                k, n, groupSize, nGroupsPerRow: int): tuple[w: ResidentWeightHandle, zeroCopy: bool] =
+                                k, n, groupSize, nGroupsPerRow: int): tuple[w: ResidentWeightHandle, zeroCopy: bool] {.apiHooked.} =
   ## beResidentUploadQ4 for packed weights inside a model mmap: the GPU wraps
   ## the mapping on unified memory, else copies straight from it.
   byby.residentUploadQ4Mapped(ctx.kind.toByby(), wq, wqBytes, scales, zeros,
     k, n, groupSize, nGroupsPerRow)
 
-proc beResidentWrapFp32*(ctx: Backend, data: pointer, bytes: int): tuple[h: SessionHandle, zeroCopy: bool, offsetElems: int] =
+proc beResidentWrapFp32*(ctx: Backend, data: pointer, bytes: int): tuple[h: SessionHandle, zeroCopy: bool, offsetElems: int] {.apiHooked.} =
   ## Resident fp32 weight that lives in a model mmap: wrapped in place on
   ## unified memory (the weight starts offsetElems floats into the buffer),
   ## else copied straight from the mapping to GPU memory.
@@ -145,7 +149,7 @@ proc beResidentWrapFp32*(ctx: Backend, data: pointer, bytes: int): tuple[h: Sess
   else:
     result.h = byby.sessionUploadPrivatePtr(be, data, bytes)
 
-proc beResidentLinearQ4*(ctx: Backend, x: openArray[float32], w: ResidentWeightHandle, M: int): seq[float32] =
+proc beResidentLinearQ4*(ctx: Backend, x: openArray[float32], w: ResidentWeightHandle, M: int): seq[float32] {.apiHooked.} =
   ## Linear forward with an ALREADY resident weight (w from beResidentUploadQ4): each
   ## call uploads only the activation `x` (small, changes every token) - the weight
   ## bytes are NOT touched again. Returns an empty seq if the backend does not support it
@@ -165,7 +169,7 @@ proc beResidentLinearQ4*(ctx: Backend, x: openArray[float32], w: ResidentWeightH
   sessionFree(be, hA)
   sessionFree(be, hC)
 
-proc beResidentFreeQ4*(w: var ResidentWeightHandle) =
+proc beResidentFreeQ4*(w: var ResidentWeightHandle) {.apiHooked.} =
   byby.residentFreeQ4(w)
 
 # ─────────────────────────────────────────────────────────────
@@ -182,7 +186,7 @@ proc beResidentFreeQ4*(w: var ResidentWeightHandle) =
 # residentUploadQ4 does for its "fallbackFp32" path), upload straight to the GPU and keep it
 # resident through a normal sessionUpload; each token uploads only the (small) activation
 # + sessionMatmul - the weight bytes are not touched again.
-proc beResidentUploadFp32*(ctx: Backend, wT: openArray[float32]): SessionHandle =
+proc beResidentUploadFp32*(ctx: Backend, wT: openArray[float32]): SessionHandle {.apiHooked.} =
   ## wT: the weight already dequantized + transposed, flat [K, N]. Call ONCE
   ## per Linear at model load (see uploadResident in nimformer.nim),
   ## NOT inside the decode loop.
@@ -196,7 +200,7 @@ proc beResidentUploadFp32*(ctx: Backend, wT: openArray[float32]): SessionHandle 
   result = byby.sessionUploadPrivate(ctx.kind.toByby(), wTSeq)
 
 proc beResidentLinearFp32*(ctx: Backend, x: openArray[float32], w: SessionHandle,
-                            M, K, N: int): seq[float32] =
+                            M, K, N: int): seq[float32] {.apiHooked.} =
   ## Linear forward with an ALREADY resident fp32 weight (w from beResidentUploadFp32):
   ## each call uploads only the activation `x` (small, changes every token) - the weight
   ## bytes are NOT touched again. Returns an empty seq if the backend cannot open a session
@@ -216,35 +220,35 @@ proc beResidentLinearFp32*(ctx: Backend, x: openArray[float32], w: SessionHandle
   byby.sessionFree(be, hA)
   byby.sessionFree(be, hC)
 
-proc beResidentFreeFp32*(ctx: Backend, w: var SessionHandle) =
+proc beResidentFreeFp32*(ctx: Backend, w: var SessionHandle) {.apiHooked.} =
   byby.sessionFree(ctx.kind.toByby(), w)
 
 proc beMatmul2*(ctx: Backend,
                  a1: openArray[float32], M1, K1: int, b1: openArray[float32], K1b, N1: int,
                  a2: openArray[float32], M2, K2: int, b2: openArray[float32], K2b, N2: int):
-                 tuple[y1, y2: seq[float32]] =
+                 tuple[y1, y2: seq[float32]] {.apiHooked.} =
   let a1S = @a1; let b1S = @b1
   let a2S = @a2; let b2S = @b2
   let r = byby.gpuMatmul2(ctx.kind.toByby(), a1S, b1S, M1, K1, N1, a2S, b2S, M2, K2, N2)
   return (r.c1, r.c2)
 
-proc beAdd*(ctx: Backend, a, b: openArray[float32]): seq[float32] =
+proc beAdd*(ctx: Backend, a, b: openArray[float32]): seq[float32] {.apiHooked.} =
   let aSeq = @a; let bSeq = @b
   result = byby.gpuOp("add", ctx.kind.toByby(), aSeq, bSeq)
 
-proc beSub*(ctx: Backend, a, b: openArray[float32]): seq[float32] =
+proc beSub*(ctx: Backend, a, b: openArray[float32]): seq[float32] {.apiHooked.} =
   let aSeq = @a; let bSeq = @b
   result = byby.gpuOp("sub", ctx.kind.toByby(), aSeq, bSeq)
 
-proc beMul*(ctx: Backend, a, b: openArray[float32]): seq[float32] =
+proc beMul*(ctx: Backend, a, b: openArray[float32]): seq[float32] {.apiHooked.} =
   let aSeq = @a; let bSeq = @b
   result = byby.gpuOp("mul", ctx.kind.toByby(), aSeq, bSeq)
 
-proc beDiv*(ctx: Backend, a, b: openArray[float32]): seq[float32] =
+proc beDiv*(ctx: Backend, a, b: openArray[float32]): seq[float32] {.apiHooked.} =
   let aSeq = @a; let bSeq = @b
   result = byby.gpuOp("div", ctx.kind.toByby(), aSeq, bSeq)
 
-proc beRelu*(ctx: Backend, x: openArray[float32]): seq[float32] =
+proc beRelu*(ctx: Backend, x: openArray[float32]): seq[float32] {.apiHooked.} =
   result = byby.gpuRelu(ctx.kind.toByby(), @x)
 
 # ─────────────────────────────────────────────────────────────
@@ -257,57 +261,57 @@ proc beRelu*(ctx: Backend, x: openArray[float32]): seq[float32] =
 # no more host-side std/random.
 # ─────────────────────────────────────────────────────────────
 
-proc beGatherGpu*(ctx: Backend, src: seq[float32], idx: seq[int32]): seq[float32] =
+proc beGatherGpu*(ctx: Backend, src: seq[float32], idx: seq[int32]): seq[float32] {.apiHooked.} =
   byby.gpuGather(ctx.kind.toByby(), src, idx)
 
-proc beArgmaxIndexGpu*(ctx: Backend, x: seq[float32], outer, dimSize, inner: int): tuple[val: seq[float32], idx: seq[int32]] =
+proc beArgmaxIndexGpu*(ctx: Backend, x: seq[float32], outer, dimSize, inner: int): tuple[val: seq[float32], idx: seq[int32]] {.apiHooked.} =
   byby.gpuArgmaxIndex(ctx.kind.toByby(), x, outer, dimSize, inner)
 
-proc beCompareGpuOp*(ctx: Backend, a, b: seq[float32], op: int): seq[bool] =
+proc beCompareGpuOp*(ctx: Backend, a, b: seq[float32], op: int): seq[bool] {.apiHooked.} =
   byby.gpuCompare(ctx.kind.toByby(), a, b, op)
 
-proc beDropoutMaskGpu*(ctx: Backend, n: int, p: float32, seed: uint32): seq[float32] =
+proc beDropoutMaskGpu*(ctx: Backend, n: int, p: float32, seed: uint32): seq[float32] {.apiHooked.} =
   byby.gpuDropoutMask(ctx.kind.toByby(), n, p, seed)
 
-proc bePermuteGpu*(ctx: Backend, src: seq[float32], newStrides, oldStrides, dimsMap: seq[int32], n: int): seq[float32] =
+proc bePermuteGpu*(ctx: Backend, src: seq[float32], newStrides, oldStrides, dimsMap: seq[int32], n: int): seq[float32] {.apiHooked.} =
   byby.gpuPermute(ctx.kind.toByby(), src, newStrides, oldStrides, dimsMap, n)
 
-proc beSplitSliceGpu*(ctx: Backend, src: seq[float32], dimTotal, thisSize, offset, inner, n: int): seq[float32] =
+proc beSplitSliceGpu*(ctx: Backend, src: seq[float32], dimTotal, thisSize, offset, inner, n: int): seq[float32] {.apiHooked.} =
   byby.gpuSplitSlice(ctx.kind.toByby(), src, dimTotal, thisSize, offset, inner, n)
 
 proc beConcatGpu*(ctx: Backend, flatSrc: seq[float32], srcBase, srcDimSize, srcDimOffset: seq[int32],
-                   totalDim, inner, n: int): seq[float32] =
+                   totalDim, inner, n: int): seq[float32] {.apiHooked.} =
   byby.gpuConcat(ctx.kind.toByby(), flatSrc, srcBase, srcDimSize, srcDimOffset, totalDim, inner, n)
 
-proc beSqrt*(ctx: Backend, x: openArray[float32]): seq[float32] =
+proc beSqrt*(ctx: Backend, x: openArray[float32]): seq[float32] {.apiHooked.} =
   ## NEW: element-wise sqrt (used for the Adam optimizer bias correction
   ## in nimformer.nim, not an inference hot path). See gpuSqrt/
   ## cpuSqrt in gpubackend.nim.
   result = byby.gpuSqrt(ctx.kind.toByby(), @x)
 
-proc beExp*(ctx: Backend, x: openArray[float32]): seq[float32] =
+proc beExp*(ctx: Backend, x: openArray[float32]): seq[float32] {.apiHooked.} =
   result = byby.gpuExp(ctx.kind.toByby(), @x)
 
-proc beLog*(ctx: Backend, x: openArray[float32]): seq[float32] =
+proc beLog*(ctx: Backend, x: openArray[float32]): seq[float32] {.apiHooked.} =
   result = byby.gpuLog(ctx.kind.toByby(), @x)
 
-proc bePow*(ctx: Backend, x: openArray[float32], p: float32): seq[float32] =
+proc bePow*(ctx: Backend, x: openArray[float32], p: float32): seq[float32] {.apiHooked.} =
   result = byby.gpuPow(ctx.kind.toByby(), @x, p)
 
-proc beSigmoid*(ctx: Backend, x: openArray[float32]): seq[float32] =
+proc beSigmoid*(ctx: Backend, x: openArray[float32]): seq[float32] {.apiHooked.} =
   result = byby.gpuSigmoid(ctx.kind.toByby(), @x)
 
-proc beTanh*(ctx: Backend, x: openArray[float32]): seq[float32] =
+proc beTanh*(ctx: Backend, x: openArray[float32]): seq[float32] {.apiHooked.} =
   result = byby.gpuTanh(ctx.kind.toByby(), @x)
 
-proc beSoftmax*(ctx: Backend, x: openArray[float32], rows, cols: int): seq[float32] =
+proc beSoftmax*(ctx: Backend, x: openArray[float32], rows, cols: int): seq[float32] {.apiHooked.} =
   result = byby.gpuSoftmax(ctx.kind.toByby(), @x, rows, cols)
 
-proc beLayernorm*(ctx: Backend, x: openArray[float32], gamma, beta: openArray[float32], rows, cols: int, eps: float32): seq[float32] =
+proc beLayernorm*(ctx: Backend, x: openArray[float32], gamma, beta: openArray[float32], rows, cols: int, eps: float32): seq[float32] {.apiHooked.} =
   result = byby.gpuLayernorm(ctx.kind.toByby(), @x, @gamma, @beta, rows, cols, eps)
 
 proc beAddLayernormFused*(ctx: Backend, a, b: openArray[float32], gamma, beta: openArray[float32],
-                           rows, cols: int, eps: float32): tuple[summed, normed: seq[float32]] =
+                           rows, cols: int, eps: float32): tuple[summed, normed: seq[float32]] {.apiHooked.} =
   ## Merges "residual add then layernorm right after" (the pattern repeated 2
   ## times/layer in TransformerBlock.forward) into one GPU session -
   ## one upload/commit/wait instead of two (beAdd then
@@ -343,24 +347,24 @@ proc beAddLayernormFused*(ctx: Backend, a, b: openArray[float32], gamma, beta: o
   result.summed = beAdd(ctx, a, b)
   result.normed = beLayernorm(ctx, result.summed, gamma, beta, rows, cols, eps)
 
-proc beEmbeddingLookup*(ctx: Backend, table: openArray[float32], indices: openArray[int32], vocab, dim: int): seq[float32] =
+proc beEmbeddingLookup*(ctx: Backend, table: openArray[float32], indices: openArray[int32], vocab, dim: int): seq[float32] {.apiHooked.} =
   result = byby.gpuEmbeddingLookup(ctx.kind.toByby(), @table, @indices, vocab, dim)
 
-proc beApflu*(ctx: Backend, x: openArray[float32], alpha: float32 = 0.1'f32, beta: float32 = 0.1'f32): seq[float32] =
+proc beApflu*(ctx: Backend, x: openArray[float32], alpha: float32 = 0.1'f32, beta: float32 = 0.1'f32): seq[float32] {.apiHooked.} =
   result = byby.gpuApflu(ctx.kind.toByby(), @x, alpha, beta)
 
-proc beApfluBackward*(ctx: Backend, x, dy: openArray[float32], alpha: float32 = 0.1'f32, beta: float32 = 0.1'f32): seq[float32] =
+proc beApfluBackward*(ctx: Backend, x, dy: openArray[float32], alpha: float32 = 0.1'f32, beta: float32 = 0.1'f32): seq[float32] {.apiHooked.} =
   result = byby.gpuApfluBackward(ctx.kind.toByby(), @x, @dy, alpha, beta)
 
-proc beLayernormBackward*(ctx: Backend, dy, x, gamma, beta: openArray[float32], rows, cols: int, eps: float32): tuple[dx, dgamma, dbeta: seq[float32]] =
+proc beLayernormBackward*(ctx: Backend, dy, x, gamma, beta: openArray[float32], rows, cols: int, eps: float32): tuple[dx, dgamma, dbeta: seq[float32]] {.apiHooked.} =
   let r = byby.gpuLayernormBackward(ctx.kind.toByby(), @dy, @x, @gamma, @beta, rows, cols, eps)
   return (r.dx, r.dgamma, r.dbeta)
 
-proc beAttentionFused*(ctx: Backend, q, k, v, mask: openArray[float32], B, H, S, D: int, scale: float32): tuple[o, s_matrix: seq[float32]] =
+proc beAttentionFused*(ctx: Backend, q, k, v, mask: openArray[float32], B, H, S, D: int, scale: float32): tuple[o, s_matrix: seq[float32]] {.apiHooked.} =
   let r = byby.gpuAttentionFused(ctx.kind.toByby(), @q, @k, @v, @mask, B, H, S, D, scale)
   return (r.o, r.s_matrix)
 
-proc beAttentionFusedBackward*(ctx: Backend, q, k, v, s_matrix, dy: openArray[float32], B, H, S, D: int, scale: float32): tuple[dq, dk, dv: seq[float32]] =
+proc beAttentionFusedBackward*(ctx: Backend, q, k, v, s_matrix, dy: openArray[float32], B, H, S, D: int, scale: float32): tuple[dq, dk, dv: seq[float32]] {.apiHooked.} =
   let r = byby.gpuAttentionFusedBackward(ctx.kind.toByby(), @q, @k, @v, @s_matrix, @dy, B, H, S, D, scale)
   return (r.dq, r.dk, r.dv)
 
@@ -368,13 +372,13 @@ proc beAttentionFusedBackward*(ctx: Backend, q, k, v, s_matrix, dy: openArray[fl
 # APF & Custom Float helpers (fully backward compatible)
 # ─────────────────────────────────────────────────────────────
 
-proc beCustomfloatEncode*(ctx: Backend, arr: openArray[float32], cf: CustomFloat): seq[uint8] =
+proc beCustomfloatEncode*(ctx: Backend, arr: openArray[float32], cf: CustomFloat): seq[uint8] {.apiHooked.} =
   return customfloat.encodeArray(arr, cf)
 
-proc beCustomfloatDecode*(ctx: Backend, buf: openArray[uint8], cf: CustomFloat): seq[float32] =
+proc beCustomfloatDecode*(ctx: Backend, buf: openArray[uint8], cf: CustomFloat): seq[float32] {.apiHooked.} =
   return customfloat.decodeArray(buf, cf)
 
 proc beApfCastForTraining*(ctx: Backend, arr: openArray[float32], gradArr: openArray[float32] = [],
                            relErrorTol = APF_DEFAULT_REL_ERROR_TOL,
-                           expMargin = APF_EXP_MARGIN_BITS): tuple[data: seq[uint8], cf: CustomFloat] =
+                           expMargin = APF_EXP_MARGIN_BITS): tuple[data: seq[uint8], cf: CustomFloat] {.apiHooked.} =
   return customfloat.apfCastForTraining(arr, gradArr, relErrorTol, expMargin)

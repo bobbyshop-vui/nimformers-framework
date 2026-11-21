@@ -27,7 +27,8 @@ và output của từng target.
 ## Build
 
 ```sh
-make build-for-python      # checks and builds the shared library
+make build                 # build shared runtime, worker và trainer Spectron
+make build-shared          # chỉ build shared runtime và worker
 make python-test           # builds, then runs the pytest suite
 make python-example        # runs examples/python/basic.py
 make c-example             # builds and runs examples/c/smoke.c
@@ -39,14 +40,15 @@ Cài source trong môi trường riêng:
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e '.[test]'
-make build-for-python
+make build
 make python-test PYTEST='python -m pytest' PYTEST_FLAGS=-q
 ```
 
 `pip install .` chỉ cài lớp Python, không build thư viện Nim. Chạy
-`make build-for-python` trước, rồi sao chép shared library vào `nimformers/`,
-đặt `NIMFORMERS_LIB=/path/to/libnimformers`, hoặc giữ thư mục gốc repo
-trong đường tìm thư viện.
+`make build` trước, hoặc `make build-shared` nếu chỉ cần FFI runtime, rồi sao
+chép shared library vào `nimformers/`, đặt `NIMFORMERS_LIB=/path/to/libnimformers`,
+hoặc giữ thư mục gốc repo trong đường tìm thư viện. `make build-for-python`
+vẫn là bí danh tương thích của `make build-shared`.
 
 Tên output theo nền tảng:
 
@@ -305,7 +307,7 @@ trước khi đóng context.
 Dùng `with ctx.session() as sess:` để gom các phép toán. Session submit khi
 thoát, sau đó `Buffer.read()` chép kết quả về NumPy. Các phép toán dưới đây
 gọi API session của BybyLang trên CPU, Metal hoặc Vulkan. Chạy
-`make build-for-python` để dùng các symbol mới trong ABI v2.
+`make build-shared` để dùng các symbol mới trong ABI v2.
 
 | Phương thức Python | Hàm Nim / BybyLang |
 | --- | --- |

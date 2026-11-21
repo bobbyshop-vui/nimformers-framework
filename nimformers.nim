@@ -49,8 +49,18 @@ import customfloat
 import quant
 import tensor_ops
 import trace
+import vendor/bybylang/probe as bybyProbe
 
 export trace
+export bybyProbe.BybyApiHook, bybyProbe.BybyApiHookPhase,
+       bybyProbe.BybyApiHookId, bybyProbe.registerBybyApiHook,
+       bybyProbe.removeBybyApiHook, bybyProbe.clearBybyApiHooks,
+       bybyProbe.apiHooked,
+       bybyProbe.BybyApiArg, bybyProbe.BybyApiCall,
+       bybyProbe.BybyApiValueHook, bybyProbe.BybyApiValueHookId,
+       bybyProbe.registerBybyApiValueHook,
+       bybyProbe.removeBybyApiValueHook, bybyProbe.clearBybyApiValueHooks,
+       bybyProbe.apiArg
 export nimformer
 export backend
 export customfloat

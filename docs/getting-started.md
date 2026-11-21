@@ -40,8 +40,10 @@ nim c -r -d:release --mm:arc --opt:speed \
 
 The backend modules provide their platform linker directives. For the supplied
 programs, use the [Make command guide](make-commands.md). `make build` builds
-the Spectron trainer at `test/spectron/test_nimformer`; `make run` also starts
-training. Running bare `make` starts training as well.
+the shared runtime and worker plus the Spectron trainer at
+`test/spectron/test_nimformer`; `make build-shared` builds only the shared
+runtime and worker. `make run` starts training. Running bare `make` starts
+training as well.
 
 
 ## Backend names
