@@ -2,10 +2,10 @@
 
 [English](nimble-package.md) | [Tiếng Việt](nimble-package.vi.md)
 
-The Nimble package installs the Nim facade, its source dependencies, the
-BybyLang runtime and backend shader files, plus `nimformers_shared` bindings for
-loading the C ABI dynamically. It does not include model weights, checkpoints,
-datasets, generated binaries, or build caches.
+The Nimble package installs the Nim facade and its source dependencies, the
+BybyLang runtime and backend shader files, and a target-built C ABI shared
+library with its parallel worker. It does not include model weights,
+checkpoints, datasets, or build caches.
 
 ## Install directly from GitHub
 
@@ -20,29 +20,29 @@ Nimble accepts Git repository URLs as package sources. Once the package is
 registered in the official index, the shorter `nimble install nimformers`
 command will also work.
 
-## Check out and install
+During installation Nimble builds the shared library and worker for the target
+machine and installs both under the package's `lib/` directory. There is no
+separate build command in the install flow.
 
-The BybyLang runtime is a Git submodule. Initialize it before building or
-installing from a source checkout:
+## Install from a checkout
+
+If you already cloned the repository, install everything with one Nimble
+command. The install hook builds the platform shared library and worker before
+Nimble copies the package:
 
 ```sh
 git clone --recurse-submodules <repository-url> nimformers-framework
 cd nimformers-framework
-nimble develop
-nimble buildShared
+nimble install
 ```
 
-For an existing checkout that lacks the submodule contents, run
-`git submodule update --init --recursive` first. `nimble buildShared` builds
-`libnimformers.dylib` (macOS), `libnimformers.so` (Linux), or `nimformers.dll`
-(Windows), along with the sibling `nimformers-worker` executable. Model files
-remain separate runtime inputs and are not part of the Nimble package.
-
-`nimble develop` makes the checkout's package available to Nimble projects.
-After a release is listed in the Nimble package registry, install it in a
-consumer project with `nimble install nimformers`. `nimformers.nim` exposes
-the native Nim API; the application still needs the C shared library only if
-it uses `nimformers_shared`.
+The direct GitHub command in the previous section does the same end-to-end
+installation. The shared library is installed as `lib/libnimformers.dylib`
+(macOS), `lib/libnimformers.so` (Linux), or `lib/nimformers.dll` (Windows),
+along with `lib/nimformers-worker`. Model files remain separate runtime inputs.
+`nimformers.nim` exposes the source-level Nim API; use `nimformers_shared` to
+call the installed C shared library without compiling the framework
+implementation into the application.
 
 ## Use the Nim facade or dynamic bindings
 
@@ -64,20 +64,24 @@ The runnable minimal example is
 implementation into the application:
 
 ```nim
-import bindings/nimformers_shared as nimformers_shared
+import nimformers_shared
 
 var ctx = newContext("cpu")
 defer: close(ctx)
+echo "shared library: ", findLibrary()
 echo add(ctx, [1'f32, 2], [10'f32, 20])
 ```
 
-Set `NIMFORMERS_LIB` to the full shared-library path when it is not on the
-dynamic loader's search path. The complete example is
+`findLibrary()` returns the full path from the installed package. Set
+`NIMFORMERS_LIB` to override automatic discovery. The wrapper also resolves the
+parallel worker beside the library. The complete example is
 [`examples/nim/shared_library.nim`](../examples/nim/shared_library.nim).
 The shared binding also exposes `newProcessGroup`, `partition`, `vmRun`,
 `generateBatch`, and `generateIdsBatch` over the native parallel C ABI. The
 batch methods launch the configured `formers-cli` executable once per prompt;
 they return text or space-separated token IDs in prompt order.
+All high-level model `forward` APIs also support customizable before/after
+hooks; see the [forward hook reference](forward-hooks.md).
 
 ```nim
 var group = newProcessGroup(["cpu", "vulkan:0"])
@@ -100,7 +104,7 @@ echo group.partition(12)
 BybyLang can also load the shared-library bindings with `nimformers_shared`:
 
 ```bybylang
-import nim "bindings/nimformers_shared"
+import nim "nimformers_shared"
 
 ctx = nimformers_shared.newContext("cpu")
 group = nimformers_shared.newProcessGroup(@["cpu"])
@@ -116,7 +120,6 @@ run the script:
 
 ```sh
 make -C vendor/bybylang build
-export NIMFORMERS_LIB="/absolute/path/to/libnimformers.dylib"
 ./vendor/bybylang/bybylang examples/bybylang/shared_library.bybylang \
   --aot=/tmp/nimformers-shared-example
 /tmp/nimformers-shared-example
@@ -124,14 +127,13 @@ export NIMFORMERS_LIB="/absolute/path/to/libnimformers.dylib"
 
 On Linux use `libnimformers.so`; on Windows use `nimformers.dll`. Make the
 installed Nimble package visible to Nim when compiling the generated program,
-for example with `BYBYLANG_NIM_FLAGS="--path:/path/to/nimble/package"`. The same
-`NIMFORMERS_LIB` environment variable selects the library at runtime.
+for example with `BYBYLANG_NIM_FLAGS="--path:/path/to/nimble/package"`.
+`NIMFORMERS_LIB` overrides automatic library discovery at runtime.
 
 ## Package contents and platform support
 
-`nimble install` installs only the allowlisted Nim modules and BybyLang runtime
-sources/assets required by those modules. The GPU kernels' source and compiled
-shader files are runtime dependencies, so they are included. Checkpoints,
-tokenizers, model downloads, generated executables, caches, and benchmark
-artifacts are excluded. Install and build on the target operating system to
-produce its native shared library and worker executable.
+`nimble install` installs the allowlisted Nim modules and BybyLang runtime
+sources/assets, plus the shared library and worker built for the target OS.
+The GPU kernels' source and compiled shader files are runtime dependencies, so
+they are included. Checkpoints, tokenizers, model downloads, build caches, and
+benchmark artifacts are excluded.

@@ -2,9 +2,9 @@
 
 [English](nimble-package.md) | [Tiếng Việt](nimble-package.vi.md)
 
-Package Nimble cài facade Nim, các source phụ thuộc, runtime BybyLang cùng file
-shader backend, và binding `nimformers_shared` để load C ABI động. Package
-không chứa trọng số model, checkpoint, dataset, binary sinh ra hoặc build cache.
+Package Nimble cài facade Nim cùng source phụ thuộc, runtime BybyLang và shader
+backend, kèm shared library C ABI và worker được build cho máy đích. Package
+không chứa trọng số model, checkpoint, dataset hoặc build cache.
 
 ## Cài trực tiếp từ GitHub
 
@@ -18,28 +18,26 @@ nimble install https://github.com/bobbyshop-vui/nimformers-framework
 Nimble chấp nhận URL Git làm nguồn package. Sau khi package được đăng ký trong
 index chính thức, lệnh ngắn `nimble install nimformers` cũng sẽ dùng được.
 
-## Checkout và cài đặt
+Trong lúc cài, Nimble build shared library và worker cho máy hiện tại rồi đặt
+cả hai trong thư mục `lib/` của package. Luồng cài không cần lệnh build riêng.
 
-Runtime BybyLang là Git submodule. Khởi tạo submodule trước khi build hoặc cài
-từ source checkout:
+## Cài từ checkout
+
+Nếu đã clone repository, cài toàn bộ bằng một lệnh Nimble. Hook cài đặt tự build
+shared library và worker cho nền tảng hiện tại trước khi Nimble chép package:
 
 ```sh
 git clone --recurse-submodules <repository-url> nimformers-framework
 cd nimformers-framework
-nimble develop
-nimble buildShared
+nimble install
 ```
 
-Với checkout hiện tại chưa có nội dung submodule, chạy
-`git submodule update --init --recursive` trước. `nimble buildShared` tạo
-`libnimformers.dylib` (macOS), `libnimformers.so` (Linux) hoặc
-`nimformers.dll` (Windows), cùng executable `nimformers-worker` bên cạnh.
-File model vẫn là đầu vào runtime riêng và không thuộc package Nimble.
-
-`nimble develop` thêm checkout hiện tại vào các project Nimble. Sau khi phát
-hành và được đưa vào registry Nimble, cài trong project consumer bằng
-`nimble install nimformers`. `nimformers.nim` cung cấp API Nim native; ứng dụng
-chỉ cần C shared library nếu dùng `nimformers_shared`.
+Lệnh cài trực tiếp từ GitHub ở phần trước cũng cài từ đầu đến cuối như vậy.
+Shared library được cài tại `lib/libnimformers.dylib` (macOS),
+`lib/libnimformers.so` (Linux) hoặc `lib/nimformers.dll` (Windows), cùng
+`lib/nimformers-worker`. File model vẫn là đầu vào runtime riêng. `nimformers.nim`
+cung cấp API Nim ở tầng source; dùng `nimformers_shared` để gọi C shared library
+đã cài mà không compile phần implementation của framework vào ứng dụng.
 
 ## Dùng facade Nim hoặc binding động
 
@@ -61,20 +59,24 @@ Ví dụ tối thiểu có thể chạy ở
 implementation vào ứng dụng:
 
 ```nim
-import bindings/nimformers_shared as nimformers_shared
+import nimformers_shared
 
 var ctx = newContext("cpu")
 defer: close(ctx)
+echo "shared library: ", findLibrary()
 echo add(ctx, [1'f32, 2], [10'f32, 20])
 ```
 
-Đặt `NIMFORMERS_LIB` thành đường dẫn đầy đủ của shared library nếu thư viện
-không nằm trong đường dẫn tìm kiếm của dynamic loader. Ví dụ hoàn chỉnh ở
+`findLibrary()` trả về đường dẫn đầy đủ trong package đã cài. Đặt
+`NIMFORMERS_LIB` để ghi đè việc tự tìm. Wrapper cũng tự tìm worker chạy micro-VM
+cạnh shared library. Ví dụ hoàn chỉnh ở
 [`examples/nim/shared_library.nim`](../examples/nim/shared_library.nim).
 Binding shared cũng cung cấp `newProcessGroup`, `partition`, `vmRun`,
 `generateBatch` và `generateIdsBatch` trên native parallel C ABI. Hai hàm batch
 khởi chạy executable `formers-cli` đã cấu hình một lần cho mỗi prompt; kết quả
 văn bản hoặc chuỗi token ID cách nhau bằng dấu cách được trả theo thứ tự prompt.
+Mọi API `forward` model cấp cao cũng hỗ trợ hook tùy chỉnh trước/sau; xem
+[tài liệu forward hook](forward-hooks.md).
 
 ```nim
 var group = newProcessGroup(["cpu", "vulkan:0"])
@@ -97,7 +99,7 @@ echo group.partition(12)
 BybyLang cũng có thể load binding shared library qua `nimformers_shared`:
 
 ```bybylang
-import nim "bindings/nimformers_shared"
+import nim "nimformers_shared"
 
 ctx = nimformers_shared.newContext("cpu")
 group = nimformers_shared.newProcessGroup(@["cpu"])
@@ -112,7 +114,6 @@ Build compiler BybyLang từ submodule đã khởi tạo, rồi compile và ch�
 
 ```sh
 make -C vendor/bybylang build
-export NIMFORMERS_LIB="/absolute/path/to/libnimformers.dylib"
 ./vendor/bybylang/bybylang examples/bybylang/shared_library.bybylang \
   --aot=/tmp/nimformers-shared-example
 /tmp/nimformers-shared-example
@@ -120,13 +121,13 @@ export NIMFORMERS_LIB="/absolute/path/to/libnimformers.dylib"
 
 Trên Linux dùng `libnimformers.so`; Windows dùng `nimformers.dll`. Khi compile
 chương trình Nim sinh ra, cần để Nim thấy package Nimble đã cài, ví dụ đặt
-`BYBYLANG_NIM_FLAGS="--path:/path/to/nimble/package"`. Biến `NIMFORMERS_LIB`
-chọn thư viện khi chạy chương trình.
+`BYBYLANG_NIM_FLAGS="--path:/path/to/nimble/package"`.
+`NIMFORMERS_LIB` ghi đè việc tự tìm thư viện lúc chạy.
 
 ## Nội dung package và hỗ trợ nền tảng
 
-`nimble install` chỉ cài các module Nim trong allowlist và source/asset runtime
-BybyLang mà chúng cần. Source GPU kernel và shader đã compile là dependency
-runtime nên được đóng gói. Checkpoint, tokenizer, model tải về, executable sinh
-ra, cache và artifact benchmark đều bị loại trừ. Hãy cài và build trên hệ điều
-hành đích để tạo shared library và worker executable tương ứng.
+`nimble install` cài các module Nim trong allowlist, source/asset runtime
+BybyLang, cùng shared library và worker được build cho hệ điều hành đích.
+Source GPU kernel và shader đã compile là dependency runtime nên được đóng gói.
+Checkpoint, tokenizer, model tải về, build cache và artifact benchmark đều bị
+loại trừ.

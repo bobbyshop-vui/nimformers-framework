@@ -1,4 +1,4 @@
-import nim "bindings/nimformers_shared"
+import nim "nimformers_shared"
 
 ctx = nimformers_shared.newContext("cpu")
 group = nimformers_shared.newProcessGroup(@["cpu"])

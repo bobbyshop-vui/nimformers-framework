@@ -53,6 +53,7 @@ test/codestral/models/hf/
 */.DS_Store
 
 # C ABI shared library and Python artifacts
+/lib/
 libnimformers.dylib
 libnimformers.so
 nimformers.dll

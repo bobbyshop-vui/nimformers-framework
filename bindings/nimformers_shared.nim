@@ -24,6 +24,36 @@ type
 const defaultLibrary = when defined(windows): "nimformers.dll"
   elif defined(macosx): "libnimformers.dylib"
   else: "libnimformers.so"
+const defaultWorker = when defined(windows): "nimformers-worker.exe"
+  else: "nimformers-worker"
+
+proc libraryCandidates(): seq[string] =
+  let packageRoot = currentSourcePath().parentDir.parentDir
+  result = @[
+    packageRoot / "lib" / defaultLibrary,
+    packageRoot / defaultLibrary,
+    getAppDir() / "lib" / defaultLibrary,
+    getAppDir() / defaultLibrary,
+    getCurrentDir() / "lib" / defaultLibrary,
+    getCurrentDir() / defaultLibrary,
+  ]
+
+proc findLibrary*(explicitPath = ""): string =
+  ## Find the platform library in the Nimble package or return an explicit path.
+  ## `NIMFORMERS_LIB` takes precedence over package-relative lookup.
+  let requested = if explicitPath.len > 0: explicitPath else: getEnv("NIMFORMERS_LIB")
+  if requested.len > 0:
+    let path = absolutePath(requested)
+    if fileExists(path):
+      return path
+    raise newException(NimformersSharedError,
+      fmt"Nimformers shared library not found at {path}")
+  for candidate in libraryCandidates():
+    if fileExists(candidate):
+      return absolutePath(candidate)
+  raise newException(NimformersSharedError,
+    fmt"cannot find {defaultLibrary} beside the installed Nimble package; " &
+      "build/install the shared library or set NIMFORMERS_LIB to its full path")
 
 var libraryHandle: LibHandle
 var contextCreateNameImpl: ContextCreateNameProc
@@ -42,19 +72,25 @@ var parallelVmRunImpl: ParallelVmRunProc
 proc loadLibrary() =
   if libraryHandle != nil:
     return
-  var candidates: seq[string]
   let configured = getEnv("NIMFORMERS_LIB")
   if configured.len > 0:
-    candidates.add(configured)
-  candidates.add(getAppDir() / defaultLibrary)
-  candidates.add(defaultLibrary)
-  for candidate in candidates:
-    libraryHandle = loadLib(candidate)
-    if libraryHandle != nil:
-      break
+    libraryHandle = loadLib(findLibrary(configured))
+  else:
+    for candidate in libraryCandidates():
+      libraryHandle = loadLib(candidate)
+      if libraryHandle != nil:
+        break
+    if libraryHandle == nil:
+      # Also permit libraries installed in the platform's loader search path.
+      libraryHandle = loadLib(defaultLibrary)
   if libraryHandle == nil:
+    var resolved = "not found"
+    try:
+      resolved = findLibrary()
+    except NimformersSharedError:
+      discard
     raise newException(NimformersSharedError,
-      fmt"cannot load {defaultLibrary}; set NIMFORMERS_LIB to its full path")
+      fmt"cannot load {defaultLibrary} (searched {resolved}); set NIMFORMERS_LIB to its full path")
   contextCreateNameImpl = cast[ContextCreateNameProc](symAddr(libraryHandle, "nimf_context_create_name"))
   contextDestroyImpl = cast[ContextDestroyProc](symAddr(libraryHandle, "nimf_context_destroy"))
   contextBackendNameImpl = cast[ContextBackendNameProc](symAddr(libraryHandle, "nimf_context_backend_name"))
@@ -182,6 +218,13 @@ proc vmRun*(group: ParallelGroupHandle; words: openArray[uint32];
   result = newSeq[float32](memory.len)
   let ratioText = ratioJson(ratios)
   var workerName = workerPath
+  if workerName.len == 0:
+    try:
+      let sibling = findLibrary().parentDir / defaultWorker
+      if fileExists(sibling):
+        workerName = sibling
+    except NimformersSharedError:
+      discard
   checkStatus(parallelVmRunImpl(cast[pointer](group), unsafeAddr words[0],
     int64(words.len), (if memory.len == 0: nil else: unsafeAddr memory[0]),
     int64(memory.len), int64(itemSize), int64(threadsPerItem), int64(tgFloats),

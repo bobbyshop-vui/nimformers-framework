@@ -1,9 +1,10 @@
-import bindings/nimformers_shared as nimformers_shared
+import nimformers_shared
 
 var ctx = newContext("cpu")
 var group = newProcessGroup(["cpu"])
 try:
   doAssert abiVersion() == 2
+  echo "shared library: ", findLibrary()
   echo "backend: ", backendName(ctx)
   echo add(ctx, [1'f32, 2, 3], [10'f32, 20, 30])
   echo "partition: ", partition(group, 12)
