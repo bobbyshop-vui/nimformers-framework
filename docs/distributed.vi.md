@@ -7,6 +7,14 @@ cùng một máy. Nim và `.bybylang` gọi trực tiếp qua `nimformers`. Pyth
 cùng bộ điều phối qua shared library. Trên macOS và Linux, mỗi thiết bị đang
 làm việc có một tiến trình riêng tại một thời điểm.
 
+## Cấu trúc mã nguồn
+
+- `parallel/` chứa API Nim để chia batch, chia VM và chạy worker.
+- `vendor/bybylang/distributed.nim` chọn thiết bị và điều phối process.
+- `bindings/nimformers_shared.nim` chứa binding Nim cho C ABI động.
+- `nimformers/distributed.py` cung cấp API scheduler cho Python.
+- `other/formers.n/` chứa phần tích hợp vào `formers-cli`.
+
 ## Chọn thiết bị và tỷ lệ chia
 
 Dùng `cpu`, `vulkan[:ordinal]` hoặc `metal[:ordinal]`. Tên GPU thiếu ordinal

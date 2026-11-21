@@ -1,4 +1,4 @@
-import nimformers_shared
+import bindings/nimformers_shared as nimformers_shared
 
 var ctx = newContext("cpu")
 var group = newProcessGroup(["cpu"])

@@ -1,6 +1,7 @@
 ## Private local worker for shared-library and native parallel micro-VM calls.
 import std/[os, strutils]
-import backend, mamba2_ssm_gpu, parallel_vm
+import backend, mamba2_ssm_gpu
+import parallel/vm
 import vendor/bybylang/micro_kernel
 
 proc main() =

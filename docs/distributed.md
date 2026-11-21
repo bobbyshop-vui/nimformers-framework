@@ -7,6 +7,14 @@ Nim and `.bybylang` programs can import it through `nimformers`. The Python
 package calls the same scheduler through the shared library. The scheduler
 can run one child per available device at a time on macOS and Linux.
 
+## Source layout
+
+- `parallel/` contains the Nim batch scheduler, VM sharding API, and worker.
+- `vendor/bybylang/distributed.nim` contains device selection and process scheduling.
+- `bindings/nimformers_shared.nim` contains the Nim dynamic C ABI binding.
+- `nimformers/distributed.py` exposes the shared scheduler to Python.
+- `other/formers.n/` contains the `formers-cli` integration.
+
 ## Pick devices and split the work
 
 Use `cpu`, `vulkan[:ordinal]`, or `metal[:ordinal]`. GPU names without an

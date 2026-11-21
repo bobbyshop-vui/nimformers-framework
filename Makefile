@@ -308,7 +308,7 @@ build-spectron:
 build-shared:
 	$(NIM) check $(NIMFLAGS) --nimcache:$(C_API_CHECK_NIMCACHE) $(C_API_SRC)
 	$(NIM) c $(NIMFLAGS) --app:lib --nimcache:$(C_API_NIMCACHE) -o:$(C_API_LIB) $(C_API_SRC)
-	$(NIM) c $(NIMFLAGS) --nimcache:nimcache/shared-worker -o:nimformers-worker$(EXE_EXT) nimformers_worker.nim
+	$(NIM) c $(NIMFLAGS) --nimcache:nimcache/shared-worker -o:nimformers-worker$(EXE_EXT) parallel/worker.nim
 	@echo "Built $(C_API_LIB) (C ABI v2) and nimformers-worker$(EXE_EXT); header: include/nimformers.h"
 
 # Compatibility alias; Python is one consumer of the common shared runtime.

@@ -9,7 +9,7 @@ requires "nim >= 2.0.0"
 # Keep the package allowlisted: tests, model weights, checkpoints, generated
 # binaries, and repository build output are deliberately not shipped.
 installFiles = @[
-  "LICENSE", "nimformers.nim", "nimformers_shared.nim", "nimformers_worker.nim",
+  "LICENSE", "nimformers.nim", "bindings/nimformers_shared.nim",
   "lib_c_api.nim", "include/nimformers.h",
   "examples/nim/native_process_group.nim", "examples/nim/shared_library.nim",
   "examples/bybylang/shared_library.bybylang",
@@ -18,7 +18,8 @@ installFiles = @[
   "fp4_gemv_vm.nim", "mamba2_vm_kernels.nim", "mamba2_full_vm.nim",
   "prefill_profile.nim",
   "session_vm.nim", "session_vm_dispatch.nim", "jit_vm.nim",
-  "parallel_vm.nim", "formers_parallel.nim", "mamba2_ssm_gpu.nim",
+  "parallel/vm.nim", "parallel/formers_batch.nim", "parallel/worker.nim",
+  "mamba2_ssm_gpu.nim",
   "kernelfortest/fp4_gemv_gpu.nim", "kernelfortest/fp4_gemv_vm.nim",
   "test/codestral/prefill_profile.nim", "test/codestral/mamba2_vm_kernels.nim",
   "test/codestral/mamba2_full_vm.nim", "test/codestral/sentencepiece_native.nim",
@@ -48,4 +49,4 @@ task buildShared, "Build the Nimformers shared library and worker executable":
   exec "nim c " & nimFlags & " --app:lib --nimcache:nimcache/c-api -o:" &
     sharedLibrary & " lib_c_api.nim"
   exec "nim c " & nimFlags & " --nimcache:nimcache/shared-worker -o:" &
-    workerExecutable & " nimformers_worker.nim"
+    workerExecutable & " parallel/worker.nim"
