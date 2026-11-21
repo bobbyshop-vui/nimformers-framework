@@ -264,7 +264,7 @@ make c-example
 make bybylang-test
 ```
 
-- `build-for-python`: check và build `lib_c_api.nim` thành
+- `build-for-python`: check và build `nimformers_lib.nim` thành
   `libnimformers.dylib` trên macOS, `libnimformers.so` trên Linux hoặc
   `nimformers.dll` trên Windows. Chưa cài package Python.
 - `python-example`: build shared library rồi chạy `examples/python/basic.py`.
@@ -272,7 +272,7 @@ make bybylang-test
 - `c-example`: build shared library, compile `examples/c/smoke.c`, rồi chạy
   `examples/c/smoke`. Recipe dùng tùy chọn linker kiểu Unix.
 - `bybylang-test`: gọi runner build và chạy hai script native DSL/C ABI.
-  Runner dùng compiler vendored và compile `lib_c_api.nim` vào AOT test;
+  Runner dùng compiler vendored và compile `nimformers_lib.nim` vào AOT test;
   không cần cài package Python hoặc build shared library trước.
 
 Để dùng đúng Python trong virtualenv:

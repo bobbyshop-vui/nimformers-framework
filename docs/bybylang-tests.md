@@ -13,7 +13,7 @@ and C ABI tests. See the language and GPU API references for the full surface.
   uses native `gpu ...` commands and a `micro kernel ...:` block. It tests
   vector addition, matrix multiplication, softmax, ReLU, and micro-VM dispatch.
 - [`capi_test.bybylang`](../test/bybylang_test/capi_test.bybylang) imports
-  `../../lib_c_api` as a Nim module. It tests the ABI version, backend context,
+  `../../nimformers_lib` as a Nim module. It tests the ABI version, backend context,
   addition, matmul, softmax, LayerNorm, INT8 quantization, micro-VM dispatch,
   and fused attention.
 - [`cpu_test.bybylang`](../test/bybylang_test/cpu_test.bybylang) explicitly
@@ -22,7 +22,7 @@ and C ABI tests. See the language and GPU API references for the full surface.
   kernel results. The runner lists the exact test order.
   [`run.sh`](../test/bybylang_test/run.sh)
 - [`nim.cfg`](../test/bybylang_test/nim.cfg) supplies the repository search paths
-  required by generated Nim code that imports `lib_c_api.nim`.
+  required by generated Nim code that imports `nimformers_lib.nim`.
 
 Generated `native_gpu_test_bin`, `capi_test_bin`, and their `.nim` sources are
 build artifacts. They are ignored by Git and can be regenerated at any time.
@@ -88,7 +88,7 @@ the generated source or executable location.
 
 The output path matters for `capi_test.bybylang`: keeping generated output in
 `test/bybylang_test` lets Nim find that directory's `nim.cfg`, while the import
-`../../lib_c_api` resolves back to the repository root.
+`../../nimformers_lib` resolves back to the repository root.
 
 
 ## How native GPU DSL lines are translated
@@ -180,11 +180,11 @@ writes the same output positions. Register IDs are limited to the micro-VM's
 The C ABI test starts with:
 
 ```bybylang
-import nim "../../lib_c_api"
+import nim "../../nimformers_lib"
 ```
 
 BybyLang places this as a real Nim `import` at the top of generated source.
-It compiles `lib_c_api.nim` into the AOT executable; it does not dynamically
+It compiles `nimformers_lib.nim` into the AOT executable; it does not dynamically
 load `libnimformers.dylib`. The test then uses Nim expressions such as `@[]`,
 `newSeq`, `addr`, `nil`, `discard`, and numeric suffixes like `1'f32` directly.
 Lines that are not special BybyLang commands are largely emitted as Nim code.

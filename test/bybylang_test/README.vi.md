@@ -11,7 +11,7 @@ giải thích theo từng dòng cho DSL và các lời gọi C ABI.
 - `syntax_test.bybylang` — cú pháp ngôn ngữ: function có tham số và kiểu trả
   về, khối type/const, `case`/`try`, gán field/index/toán tử gộp và dòng trống
   trong khối.
-- `capi_test.bybylang`: import `../../lib_c_api` qua `import nim` và gọi C
+- `capi_test.bybylang`: import `../../nimformers_lib` qua `import nim` và gọi C
   ABI: context/backend, cộng từng phần tử, matmul, softmax, LayerNorm,
   lượng tử int8, dispatch micro-VM và fused attention.
 - `native_gpu_test.bybylang`: lệnh native DSL `gpu ...` trên cùng runtime
@@ -21,7 +21,7 @@ giải thích theo từng dòng cho DSL và các lời gọi C ABI.
   CPU được chọn bằng `gpu backend is "cpu"`.
 - `trace_test.bybylang`, `diag_test.bybylang` và `cpu_kernel_regression.nim`:
   kiểm tra core trace, chẩn đoán lỗi nguồn và kết quả kernel CPU.
-- `nim.cfg`: search path Nim khi executable sinh ra import `lib_c_api`,
+- `nim.cfg`: search path Nim khi executable sinh ra import `nimformers_lib`,
   gồm module gốc và đường dẫn các module model cần dùng.
 - `run.sh`: compile AOT, chạy các chương trình tích hợp và kiểm tra chẩn đoán.
 

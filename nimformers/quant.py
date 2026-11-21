@@ -9,7 +9,7 @@ from ._lib import F32, I64, NimformersError
 
 __all__ = ["QuantTensor", "QuantKind"]
 
-# Must match the QK_* constants in lib_c_api.nim / QuantKind in quant.nim.
+# Must match the QK_* constants in nimformers_lib.nim / QuantKind in quant.nim.
 KIND_NAMES = (
     "fp32",
     "int8",

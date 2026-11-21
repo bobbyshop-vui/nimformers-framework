@@ -3,7 +3,7 @@
 
 [English](python-api.md) | [Tiếng Việt](python-api.vi.md)
 
-`lib_c_api.nim` cung cấp phần core Nimformers dưới dạng shared library chỉ
+`nimformers_lib.nim` cung cấp phần core Nimformers dưới dạng shared library chỉ
 có ABI C ổn định: `libnimformers.dylib`, `libnimformers.so` hoặc
 `nimformers.dll`. Package Python `nimformers/` là lớp `ctypes`/NumPy mỏng
 trên ABI đó. Các symbol cũng dùng được từ C, C++, Rust, Go hoặc FFI gọi C.
@@ -482,7 +482,7 @@ Kiểm tra các nhóm phép toán với NumPy, round-trip lượng tử hóa, sa
 NIMQ (gồm checkpoint Spectron thật khi có), micro-VM run/save/load/lower/merge,
 resident weights, tokenizer và sinh Llama nhỏ từ checkpoint tổng hợp.
 
-Còn có test tích hợp BybyLang import `lib_c_api` từ `.bybylang`, gọi C ABI
+Còn có test tích hợp BybyLang import `nimformers_lib` từ `.bybylang`, gọi C ABI
 trực tiếp cùng các kiểm tra native DSL `gpu ...`:
 
 ```sh

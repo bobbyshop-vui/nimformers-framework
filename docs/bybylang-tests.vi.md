@@ -14,7 +14,7 @@ xem [API BybyLang](bybylang-api.vi.md) và
   dùng lệnh native `gpu ...` và block `micro kernel ...:`. File kiểm tra cộng
   vector, nhân ma trận, softmax, ReLU và dispatch micro-VM.
 - [`capi_test.bybylang`](../test/bybylang_test/capi_test.bybylang) import
-  `../../lib_c_api` như một module Nim. File kiểm tra ABI version, backend
+  `../../nimformers_lib` như một module Nim. File kiểm tra ABI version, backend
   context, phép cộng, matmul, softmax, LayerNorm, lượng tử INT8, dispatch
   micro-VM và fused attention.
 - [`cpu_test.bybylang`](../test/bybylang_test/cpu_test.bybylang) chọn trực tiếp
@@ -22,7 +22,7 @@ xem [API BybyLang](bybylang-api.vi.md) và
 - Bộ test còn kiểm tra cú pháp ngôn ngữ, core trace, chẩn đoán lỗi và kết quả
   kernel CPU. Thứ tự chạy nằm trong runner. [`run.sh`](../test/bybylang_test/run.sh)
 - [`nim.cfg`](../test/bybylang_test/nim.cfg) cung cấp search path trong repo cho
-  mã Nim sinh ra khi import `lib_c_api.nim`.
+  mã Nim sinh ra khi import `nimformers_lib.nim`.
 
 Các file sinh ra `native_gpu_test_bin`, `capi_test_bin` và source `.nim` của
 chúng là build artifact. Git bỏ qua các file này và có thể sinh lại bất cứ lúc nào.
@@ -88,7 +88,7 @@ sinh ra hay executable.
 
 Đường dẫn output rất quan trọng với `capi_test.bybylang`: giữ output trong
 `test/bybylang_test` giúp Nim tìm `nim.cfg` của thư mục đó, còn import
-`../../lib_c_api` trỏ ngược về thư mục gốc repo.
+`../../nimformers_lib` trỏ ngược về thư mục gốc repo.
 
 
 ## Cách lệnh native GPU DSL được chuyển đổi
@@ -179,11 +179,11 @@ unsigned register `U0..U15` của micro-VM.
 Test C ABI bắt đầu bằng:
 
 ```bybylang
-import nim "../../lib_c_api"
+import nim "../../nimformers_lib"
 ```
 
 BybyLang đặt lệnh này thành một `import` Nim thật ở đầu source sinh ra. Nó
-compile `lib_c_api.nim` vào executable AOT; không load động
+compile `nimformers_lib.nim` vào executable AOT; không load động
 `libnimformers.dylib`. Sau đó test dùng trực tiếp các biểu thức Nim như `@[]`,
 `newSeq`, `addr`, `nil`, `discard` và hậu tố số như `1'f32`. Những dòng không
 phải lệnh BybyLang đặc biệt phần lớn được phát ra như mã Nim.

@@ -11,7 +11,7 @@ For a line-by-line explanation of the DSL and C ABI calls, see the
 - `syntax_test.bybylang` — language features: functions with parameters and
   return types, type/const sections, `case`/`try`, field/index/compound
   assignments and blank lines inside blocks.
-- `capi_test.bybylang` — `import nim "../../lib_c_api"` and calls the C ABI
+- `capi_test.bybylang` — `import nim "../../nimformers_lib"` and calls the C ABI
   from BybyLang: context/backend, elementwise add, matmul, softmax,
   layernorm, int8 quantization, micro-VM dispatch, and fused attention.
 - `native_gpu_test.bybylang` — native `gpu ...` DSL commands backed by the
@@ -22,7 +22,7 @@ For a line-by-line explanation of the DSL and C ABI calls, see the
   backend (`gpu backend is "cpu"`), including a CPU `session:` block; no GPU
   required.
 - `nim.cfg` — extra Nim search paths needed when the generated executable
-  imports `lib_c_api` (root modules plus the model-specific paths it uses).
+  imports `nimformers_lib` (root modules plus the model-specific paths it uses).
 - `trace_test.bybylang`, `diag_test.bybylang` and `cpu_kernel_regression.nim`
   cover core tracing, source diagnostics and CPU kernel results.
 - `run.sh` — AOT-compiles and runs the integration programs and checks their

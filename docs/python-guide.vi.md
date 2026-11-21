@@ -4,7 +4,7 @@
 [English](python-guide.md) | [Tiếng Việt](python-guide.vi.md)
 
 Package `nimformers/` dùng `ctypes` gọi shared library được build từ
-`lib_c_api.nim`. API thao tác với NumPy, tensor có sở hữu bộ nhớ, quantization,
+`nimformers_lib.nim`. API thao tác với NumPy, tensor có sở hữu bộ nhớ, quantization,
 NIMQ, resident weights, micro-VM, tokenizer và Llama inference.
 
 

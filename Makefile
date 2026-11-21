@@ -8,7 +8,7 @@ INFER_LORA_NIMCACHE := nimcache/infer-lora
 INFER_LORA_NIMFLAGS := $(NIMFLAGS) -d:codestralInference
 NIM_INFER_NIMCACHE := nimcache/nim-inference
 BYBYLANG_TEST_BINS := test/bybylang_test/native_gpu_test_bin test/bybylang_test/cpu_test_bin test/bybylang_test/capi_test_bin
-C_API_SRC := lib_c_api.nim
+C_API_SRC := nimformers_lib.nim
 C_API_NIMCACHE := nimcache/c-api
 C_API_CHECK_NIMCACHE := nimcache/c-api-check
 

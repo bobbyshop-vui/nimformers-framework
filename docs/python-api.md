@@ -3,7 +3,7 @@
 
 [English](python-api.md) | [Tiếng Việt](python-api.vi.md)
 
-`lib_c_api.nim` exposes the Nimformers core as a stable, C-only shared
+`nimformers_lib.nim` exposes the Nimformers core as a stable, C-only shared
 library (`libnimformers.dylib` / `libnimformers.so` / `nimformers.dll`).
 The Python package in `nimformers/` is a thin `ctypes`/NumPy layer over that
 ABI; the same symbols are usable from C, C++, Rust, Go, or any FFI that can
@@ -493,7 +493,7 @@ NIMQ save/load (including a real Spectron checkpoint when present), the
 micro-VM (run/save/load/lower/merge), resident weights, tokenizers, and an
 end-to-end tiny Llama generation from a synthetic checkpoint.
 
-There is also a BybyLang integration suite that imports `lib_c_api` from a
+There is also a BybyLang integration suite that imports `nimformers_lib` from a
 `.bybylang` script and calls the C ABI directly, alongside native `gpu ...`
 DSL checks:
 

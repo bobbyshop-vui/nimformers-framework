@@ -85,4 +85,5 @@ export micro_kernel
 
 import vendor/bybylang/distributed
 import parallel/[vm, formers_batch]
-export distributed, vm, formers_batch
+import bindings/nimformers_shared
+export distributed, vm, formers_batch, nimformers_shared

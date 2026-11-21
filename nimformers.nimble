@@ -10,7 +10,7 @@ requires "nim >= 2.0.0"
 # binaries, and repository build output are deliberately not shipped.
 installFiles = @[
   "LICENSE", "nimformers.nim", "bindings/nimformers_shared.nim",
-  "lib_c_api.nim", "include/nimformers.h",
+  "nimformers_lib.nim", "include/nimformers.h",
   "examples/nim/native_process_group.nim", "examples/nim/shared_library.nim",
   "examples/bybylang/shared_library.bybylang",
   "nimformer.nim", "backend.nim", "customfloat.nim", "quant.nim",
@@ -45,8 +45,10 @@ const workerExecutable = when defined(windows): "nimformers-worker.exe"
   else: "nimformers-worker"
 
 task buildShared, "Build the Nimformers shared library and worker executable":
-  exec "nim check " & nimFlags & " --nimcache:nimcache/c-api-check lib_c_api.nim"
   exec "nim c " & nimFlags & " --app:lib --nimcache:nimcache/c-api -o:" &
-    sharedLibrary & " lib_c_api.nim"
+    sharedLibrary & " nimformers_lib.nim"
   exec "nim c " & nimFlags & " --nimcache:nimcache/shared-worker -o:" &
     workerExecutable & " parallel/worker.nim"
+
+before build:
+  buildSharedTask()
