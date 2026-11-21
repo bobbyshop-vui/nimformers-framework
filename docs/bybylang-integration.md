@@ -16,16 +16,32 @@ This command generates the shared library file in the project root.
 
 ---
 
-## 2. Using Nim Modules in BybyLang (`import nim`)
+## 2. Dynamic Loading via Nim Wrapper
 
-BybyLang scripts can access the C ABI by importing Nim modules. This compiles the Nim code Ahead-of-Time (AOT) into the final binary.
+BybyLang DSL does not support direct `dlopen` or library loading. To use a pre-compiled shared library (e.g., `libnimformers.dylib`), you must create a Nim wrapper module that imports the library's symbols and then `import nim` that wrapper into your BybyLang script.
 
-Example of calling C ABI functions (`script.bybylang`):
+### Step 1: Create a Nim Wrapper (`loader.nim`)
+
+Create a file named `loader.nim` that uses Nim's `importc` and `dynlib` pragmas to link against the compiled library:
+
+```nim
+# loader.nim
+const libName = "libnimformers.dylib" # or .so / .dll
+
+proc nimf_context_create*(backendKind: int32): pointer {.importc: "nimf_context_create", cdecl, dynlib: libName.}
+proc nimf_context_destroy*(handle: pointer): int32 {.importc: "nimf_context_destroy", cdecl, dynlib: libName.}
+proc nimf_add*(ctx: pointer, a, b, outData: ptr float32, n: int64): int32 {.importc: "nimf_add", cdecl, dynlib: libName.}
+proc nimf_last_error*(): cstring {.importc: "nimf_last_error", cdecl, dynlib: libName.}
+```
+
+### Step 2: Import into BybyLang (`script.bybylang`)
+
+Use `import nim` to bring the wrapper's functions into the BybyLang environment:
 
 ```bybylang
-import nim "../../lib_c_api"
+import nim "./loader"
 
-# Initialize context (0 = NIMF_BACKEND_AUTO)
+# Use the functions from the dylib
 ctx = nimf_context_create(0)
 if ctx == nil:
   print $nimf_last_error()
@@ -35,7 +51,6 @@ A = @[1'f32, 2, 3, 4]
 B = @[10'f32, 20, 30, 40]
 C = newSeq[float32](4)
 
-# Call C ABI function
 if nimf_add(ctx, addr A[0], addr B[0], addr C[0], 4) != 0:
   print $nimf_last_error()
   discard nimf_context_destroy(ctx)
@@ -45,20 +60,21 @@ print C
 discard nimf_context_destroy(ctx)
 ```
 
-This approach links the symbols directly during the AOT compilation process, rather than using dynamic FFI at runtime.
-
 ---
 
-## 3. Dynamic Loading of Shared Libraries in BybyLang
+## 3. Alternative: Source-level Integration
 
-BybyLang does not support dynamic FFI (e.g., runtime `dlopen` of arbitrary `.dylib` or `.so` files) within its DSL. To interface with a specific compiled library file at runtime, the library must be imported via a Nim module (`import nim`) that implements the required FFI wrappers in Nim.
+If you prefer to compile the Nim source directly into your AOT binary instead of loading a library file at runtime, you can import the framework's internal API directly:
 
-The `lib_c_api.nim` module serves as the primary interface for this purpose. 
+```bybylang
+import nim "../../lib_c_api"
+# ... rest of script ...
+```
 
-If additional functionality from a custom dynamic library is required, create a Nim wrapper module that loads the library and export its procedures, then import that Nim module into BybyLang.
+This approach does not require a pre-compiled `.dylib` file as the code is linked statically during the AOT process.
 
 ---
 
 ## C ABI Signatures
 
-All exported functions in the shared library follow the standard C ABI defined in [`include/nimformers.h`](../include/nimformers.h).
+Refer to [`include/nimformers.h`](../include/nimformers.h) for the complete list of function signatures and their parameter types.
