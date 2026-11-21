@@ -93,14 +93,49 @@ let (arch, sd) = loadQuantStateDict("model.nimq")
 
 ## 9. Xuất từ Hugging Face sang `.nimq`
 
-```
-python export_to_nimq.py --model TheBloke/deepseek-coder-6.7B-instruct-GPTQ --output model.nimq --int8
+`export_to_nimq.py` nhận checkpoint Hugging Face thông thường và GPTQ. Việc
+chọn dtype nguồn độc lập với định dạng lượng tử hóa NIMQ. `auto` theo dtype
+trong checkpoint/config; có thể ghi đè bằng `fp16`, `bf16` hoặc `fp32`. Trọng
+số được chuyển thành tensor torch FP32 để lượng tử hóa, nhờ đó BF16 không cần
+chuyển trực tiếp sang NumPy.
+
+```sh
+# Mặc định xuất INT8 đối xứng và tự chọn quantization device.
+python export_to_nimq.py --model <hf-model-or-path> --output model.nimq \
+  --source-dtype auto --int8 --quant-device auto
+
+# Q4_K_M-style INT4 chia nhóm từ checkpoint BF16.
+python export_to_nimq.py --model <hf-model-or-path> --output model-q4km.nimq \
+  --source-dtype bf16 --q4km --group-size 128 --quant-device cuda
+
+# FP4-KM từ checkpoint FP32 trên bản PyTorch ROCm.
+python export_to_nimq.py --model <hf-model-or-path> --output model-fp4km.nimq \
+  --source-dtype fp32 --fp4-km --quant-device rocm
 ```
 
-Hỗ trợ model tiêu chuẩn và GPTQ. Dùng
-`test/deepseek-inference/verify_gptq_dequant.py` để đối chiếu phép giải lượng
-tử GPTQ và `test/deepseek-inference/dump_reference_states.py` để xuất
-activation tham chiếu từ PyTorch, so với `test/deepseek-inference/nim_inference.nim`.
+Chọn một định dạng đầu ra: `--int8` (mặc định), `--q4km`, `--fp4-km`
+(`--fp4km` là alias), `--int4` cho INT4 đối xứng hoặc `--raw` để ghi tensor
+NIMQ chưa lượng tử hóa. Tensor raw NIMQ được lưu ở FP32. Cờ đầu ra cũ
+`--fp16` vẫn là alias của `--raw`; muốn chọn trọng số nguồn FP16, dùng
+`--source-dtype fp16` cùng định dạng đầu ra mong muốn.
+
+`--q4km` dùng INT4 bất đối xứng theo nhóm, mặc định 128 giá trị mỗi nhóm;
+`--group-size` phải là số chẵn dương. `--fp4-km` dùng nhóm cố định 32, giá trị
+OCP E2M1, scale nhóm E4M3 và một scale FP32 cho toàn tensor. FP4-KM yêu cầu
+ma trận 2D có số cột chia hết cho 32. Tensor không phù hợp, embedding,
+`lm_head` và normalization được giữ ở raw FP32.
+
+`--quant-device auto` tự chọn thiết bị PyTorch đang có. Có thể chỉ định `cpu`,
+`mps`, `cuda`, `rocm`, `xpu` hoặc device string PyTorch đã đăng ký, ví dụ
+`cuda:1`. ROCm dùng device API CUDA của PyTorch. Nếu backend không chạy được
+một phép toán hoặc hết bộ nhớ, exporter thử lại trên CPU và tiếp tục các
+tensor còn lại bằng CPU. `--no-accelerator` buộc dùng CPU; `--no-mps` vẫn được
+giữ làm alias tương thích.
+
+Để kiểm tra riêng GPTQ, dùng `test/deepseek-inference/verify_gptq_dequant.py`
+đối chiếu phép giải lượng tử và
+`test/deepseek-inference/dump_reference_states.py` xuất activation tham chiếu
+từ PyTorch để so với `test/deepseek-inference/nim_inference.nim`.
 
 ---
 

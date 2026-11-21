@@ -90,11 +90,49 @@ let (arch, sd) = loadQuantStateDict("model.nimq")
 
 ## 9. Exporting from Hugging Face → `.nimq`
 
-```
-python export_to_nimq.py --model TheBloke/deepseek-coder-6.7B-instruct-GPTQ --output model.nimq --int8
+`export_to_nimq.py` accepts standard Hugging Face checkpoints and GPTQ
+checkpoints. Source dtype selection is independent of the NIMQ quantization
+format. `auto` follows the checkpoint/config dtype; specify `fp16`, `bf16`, or
+`fp32` to override it. Values are converted to FP32 torch tensors for
+quantization, so BF16 tensors are supported without NumPy BF16 conversion.
+
+```sh
+# Default output is symmetric INT8; default quantization device is auto.
+python export_to_nimq.py --model <hf-model-or-path> --output model.nimq \
+  --source-dtype auto --int8 --quant-device auto
+
+# Grouped asymmetric Q4_K_M-style INT4 from a BF16 checkpoint.
+python export_to_nimq.py --model <hf-model-or-path> --output model-q4km.nimq \
+  --source-dtype bf16 --q4km --group-size 128 --quant-device cuda
+
+# FP4-KM from an FP32 checkpoint on a ROCm PyTorch build.
+python export_to_nimq.py --model <hf-model-or-path> --output model-fp4km.nimq \
+  --source-dtype fp32 --fp4-km --quant-device rocm
 ```
 
-Supports both standard and GPTQ models. Use `test/deepseek-inference/verify_gptq_dequant.py` to double-check GPTQ dequant math, and `test/deepseek-inference/dump_reference_states.py` to dump reference activations from PyTorch to compare against `test/deepseek-inference/nim_inference.nim`.
+Choose one output format: `--int8` (the default), `--q4km`, `--fp4-km`
+(`--fp4km` is an alias), `--int4` for symmetric INT4, or `--raw` for
+unquantized NIMQ tensors. NIMQ raw tensors are stored as FP32. The old
+`--fp16` output flag remains as an alias for `--raw`; to choose FP16 source
+weights, use `--source-dtype fp16` with the desired output format.
+
+`--q4km` uses grouped asymmetric INT4 and defaults to 128 values per group;
+`--group-size` must be a positive even number. `--fp4-km` uses fixed groups of
+32, OCP E2M1 values, E4M3 group scales, and a tensor-wide FP32 scale. FP4-KM
+requires a 2D matrix whose column count is divisible by 32. Unsupported tensor
+shapes, embeddings, `lm_head`, and normalization tensors are kept raw FP32.
+
+The default `--quant-device auto` selects an available PyTorch device. Explicit
+choices include `cpu`, `mps`, `cuda`, `rocm`, `xpu`, and any registered PyTorch
+device string such as `cuda:1`. ROCm uses PyTorch's CUDA device API. If a backend
+cannot run an operation or runs out of memory, the exporter retries on CPU and
+uses CPU for the remaining tensors. `--no-accelerator` forces CPU; `--no-mps`
+remains as a compatibility alias.
+
+For GPTQ-specific checks, use `test/deepseek-inference/verify_gptq_dequant.py`
+to double-check dequantization math and
+`test/deepseek-inference/dump_reference_states.py` to dump PyTorch reference
+activations for comparison with `test/deepseek-inference/nim_inference.nim`.
 
 ---
 
