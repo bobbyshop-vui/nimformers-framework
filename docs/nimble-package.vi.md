@@ -12,8 +12,11 @@ Có thể cài package trực tiếp từ repository công khai này mà không 
 thêm vào package index của Nimble:
 
 ```sh
-nimble install https://github.com/bobbyshop-vui/nimformers-framework
+nimble install https://github.com/bobbyshop-vui/nimformers-framework@#head
 ```
+
+Hậu tố `@#head` chọn revision hiện tại trên nhánh GitHub, bao gồm install hook
+build shared library và worker. Nimble chạy hook này ngay trong cùng lệnh cài.
 
 Nimble chấp nhận URL Git làm nguồn package. Sau khi package được đăng ký trong
 index chính thức, lệnh ngắn `nimble install nimformers` cũng sẽ dùng được.

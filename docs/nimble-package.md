@@ -13,8 +13,12 @@ You can install the package from this public repository without waiting for it
 to be added to the Nimble package index:
 
 ```sh
-nimble install https://github.com/bobbyshop-vui/nimformers-framework
+nimble install https://github.com/bobbyshop-vui/nimformers-framework@#head
 ```
+
+The `@#head` suffix selects the current GitHub branch revision, including the
+install hook that builds the shared library and worker. Nimble runs that hook
+as part of this single install command.
 
 Nimble accepts Git repository URLs as package sources. Once the package is
 registered in the official index, the shorter `nimble install nimformers`

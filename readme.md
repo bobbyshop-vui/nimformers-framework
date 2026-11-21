@@ -25,8 +25,12 @@ Start with the [documentation index](docs/README.md), then see [Getting Started]
 Install the Nim package directly from GitHub:
 
 ```sh
-nimble install https://github.com/bobbyshop-vui/nimformers-framework
+nimble install https://github.com/bobbyshop-vui/nimformers-framework@#head
 ```
+
+The `@#head` suffix installs the current GitHub branch revision. Nimble runs
+the package install hook, which builds and installs the shared library and
+worker as part of this same command.
 
 Practical guides:
 
