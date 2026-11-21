@@ -9,6 +9,8 @@ import vendor/bybylang/gpubackend as byby
 import fp4_gemv_gpu  # gFp4CacheGpu, fp4GemmGpuRows (prefill FP4-KM)
 import prefill_profile  # BYBY_PREFILL_PROFILE: pfTime
 
+type ForwardHook* = proc(ctx: Backend, input: Tensor): Tensor {.nimcall.}
+
 # ===================================================================
 # Tensor utilities (unchanged)
 # ===================================================================
@@ -84,6 +86,8 @@ proc transpose*(x: Tensor): Tensor =
 type
   Linear* = object
     weight*: Tensor      ## small fp32 fallback (only for random init before real weights are loaded)
+    # ...
+
     weightQ*: QuantTensor ## the REAL weight kept COMPRESSED (int4/int8...) for the whole
                            ## process lifetime, the way llama.cpp keeps quantized weights in RAM -
                            ## NEVER expanded to fp32 all at once and kept (that was
@@ -111,6 +115,7 @@ type
     mappedLoraA*, mappedLoraB*: MappedView[float32]
     loraR*: int                   ## rank r; 0 = NO LoRA attached (default, old code unchanged)
     loraScale*: float32           ## alpha / r
+    preForwardHook*: ForwardHook  ## Hook for custom layer logic
     tensorName*: string           ## checkpoint tensor name, given to the FIR recorder at upload
     gpuCacheName*: string         ## name in gFp4CacheGpu after prepareGpuLinForLinear (FP4-KM)
 
@@ -256,22 +261,25 @@ proc residentLinearNt(l: Linear; x: seq[float32]; rows: int; ctx: Backend): seq[
     byby.sessionFree(be, hy)
 
 proc forward*(l: Linear, x: Tensor, ctx: Backend): Tensor =
-  let (rows, cols) = flatten2D(x.shape)
+  var input = x
+  if l.preForwardHook != nil:
+    input = l.preForwardHook(ctx, input)
+  let (rows, cols) = flatten2D(input.shape)
   assert cols == l.inF
-  var outShape = x.shape
+  var outShape = input.shape
   outShape[^1] = l.outF
   result = newTensor(outShape)
 
   var y: seq[float32]
   pfTime("lin.gemm"):
     if l.residentReady:
-      y = beResidentLinearQ4(ctx, x.data, l.residentW, rows)  # uploads only the activation, weight already resident
+      y = beResidentLinearQ4(ctx, input.data, l.residentW, rows)  # uploads only the activation, weight already resident
     elif l.residentFp32Ready:
       # int8/int4-symmetric/plain fp32 weights are ALREADY resident (see
       # uploadResident) - only the small activation is uploaded per token, the
       # whole weight is NOT dequantized again.
-      y = if l.residentFp32NT: residentLinearNt(l, x.data, rows, ctx)
-          else: beResidentLinearFp32(ctx, x.data, l.residentFp32, rows, l.inF, l.outF)
+      y = if l.residentFp32NT: residentLinearNt(l, input.data, rows, ctx)
+          else: beResidentLinearFp32(ctx, input.data, l.residentFp32, rows, l.inF, l.outF)
 
     if y.len == 0:
       # Not resident, or the current backend has no resident path (e.g.
@@ -280,10 +288,10 @@ proc forward*(l: Linear, x: Tensor, ctx: Backend): Tensor =
          l.gpuCacheName in gFp4CacheGpu and gFp4CacheGpu[l.gpuCacheName].residentReady and
          ctx.kind.toByby() in {byby.gbMetal, byby.gbVulkan}:
         # Parallel prefill: GPU resident FP4-KM + MBLOCK=4 (no CPU dequant).
-        y = fp4GemmGpuRows(ctx, l.gpuCacheName, x.data, rows)
+        y = fp4GemmGpuRows(ctx, l.gpuCacheName, input.data, rows)
       elif l.useQuant and l.weightQ.kind == qkInt4Asymmetric and l.weightQ.groupSize > 0:
         let nGroupsPerRow = (l.inF + l.weightQ.groupSize - 1) div l.weightQ.groupSize
-        y = beMatmulQ4(ctx, x.data, @(l.weightQ.bytes), l.weightQ.scale, l.weightQ.zero_point,
+        y = beMatmulQ4(ctx, input.data, @(l.weightQ.bytes), l.weightQ.scale, l.weightQ.zero_point,
                         rows, l.inF, l.outF, l.weightQ.groupSize, nGroupsPerRow)
       else:
         var wT: seq[float32]
@@ -291,7 +299,7 @@ proc forward*(l: Linear, x: Tensor, ctx: Backend): Tensor =
           wT = dequantizeTensorTransposed(l.weightQ)
         else:
           wT = transpose(l.weight).data
-        y = beMatmul(ctx, x.data, rows, l.inF, wT, l.inF, l.outF)
+        y = beMatmul(ctx, input.data, rows, l.inF, wT, l.inF, l.outF)
 
   # === ALWAYS MAKE SURE THE SIZE IS RIGHT ===
   let expectedSize = rows * l.outF
