@@ -147,7 +147,7 @@ discard nimf_context_destroy(ctx)
 ```
 
 Ở đây `import nim` compile module `lib_c_api.nim` vào chương trình AOT; nó
-không load `libnimformers.dylib` bằng dynamic FFI như wrapper Python.
+không load `libnimformers.dylib` bằng dynamic FFI như wrapper Python (xem chi tiết cách load dylib trong Python tại [Hướng dẫn tích hợp dylib](bybylang-integration.md)).
 Các symbol/signatures dùng chung C ABI, xem [public header](../include/nimformers.h).
 `nimf_context_create(0)` chọn auto; status `0` là thành công; các handle cần
 hàm destroy tương ứng. Lỗi chi tiết lấy từ `nimf_last_error()`.
