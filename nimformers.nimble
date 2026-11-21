@@ -55,7 +55,13 @@ const workerExecutablePath = "lib/" & workerExecutable
 installFiles.add(sharedLibraryPath)
 installFiles.add(workerExecutablePath)
 
+proc prepareBybyLang() =
+  ## Check out the exact BybyLang revision pinned by this framework commit.
+  ## Git clones made by Nimble do not initialize submodules automatically.
+  exec "git submodule update --init --recursive vendor/bybylang"
+
 task buildShared, "Build the Nimformers shared library and worker executable":
+  prepareBybyLang()
   when defined(windows):
     exec "if not exist lib mkdir lib"
   else:

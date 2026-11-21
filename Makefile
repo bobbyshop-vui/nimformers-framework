@@ -85,6 +85,7 @@ CLEAN_BINS      := $(TEST_BIN) $(GRAFT_BIN) $(FINETUNE_BIN) $(INFER_LORA_BIN) $(
         download-models download-fir-models download-datasets download-codestral-tokenizer \
         build-graft build-finetune build-infer-lora build-compact-lora \
         build-migrate-lora build-nim-inference build-spectron build-shared build-for-python \
+        init-submodules \
         python-test python-example c-example bybylang-test hook-plugin-test bench-gflops \
         graft finetune-mamba hf-train build-hf-train infer-lora infer-mamba infer-deepseek run-spectron mamba-pipeline \
         build-formers build-formers-arm64 formers-cli firlift formers flash-attention-test q4-gemv-test q4-gemm-test formers-test formers-fir-test formers-smoke formers-clean
@@ -309,7 +310,12 @@ build-spectron:
 	$(NIM) check $(NIMFLAGS) $(SPECTRON_SRC)
 	$(NIM) c $(NIMFLAGS) -o:$(SPECTRON_BIN) $(SPECTRON_SRC)
 
-build-shared:
+# Ensure the vendored runtime is checked out at the commit pinned by this
+# framework revision. A normal `git pull` does not update submodule contents.
+init-submodules:
+	git submodule update --init --recursive vendor/bybylang
+
+build-shared: init-submodules
 	$(NIM) check $(NIMFLAGS) --nimcache:$(C_API_CHECK_NIMCACHE) $(C_API_SRC)
 	$(NIM) c $(NIMFLAGS) --app:lib --nimcache:$(C_API_NIMCACHE) -o:$(C_API_LIB) $(C_API_SRC)
 	$(NIM) c $(NIMFLAGS) --nimcache:nimcache/shared-worker -o:nimformers-worker$(EXE_EXT) parallel/worker.nim

@@ -32,13 +32,25 @@ separate build command in the install flow.
 
 If you already cloned the repository, install everything with one Nimble
 command. The install hook builds the platform shared library and worker before
-Nimble copies the package:
+Nimble copies the package. Run it without a `.` argument; Nimble detects the
+package from the current directory:
 
 ```sh
 git clone --recurse-submodules <repository-url> nimformers-framework
 cd nimformers-framework
 nimble install
 ```
+
+On Linux, including Fedora, the same commands apply. The build and Nimble
+install hooks initialize `vendor/bybylang` at the exact commit pinned by the
+framework checkout. If you need to repair the submodule manually, run:
+
+```sh
+git submodule update --init --recursive
+```
+
+This is needed after pulling a framework revision that changes the submodule
+pointer when the local clone does not update submodules automatically.
 
 The direct GitHub command in the previous section does the same end-to-end
 installation. The shared library is installed as `lib/libnimformers.dylib`
