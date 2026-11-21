@@ -1,26 +1,26 @@
-# BybyLang and Python Integration Guide
+# BybyLang and Dynamic Library Integration
 
-This guide describes how to interface BybyLang scripts and Python code with the compiled `libnimformers` shared library (`libnimformers.dylib` on macOS, `libnimformers.so` on Linux, `nimformers.dll` on Windows).
+This guide describes how to interface BybyLang scripts with the compiled `libnimformers` shared library (`libnimformers.dylib` on macOS, `libnimformers.so` on Linux, `nimformers.dll` on Windows).
 
 ---
 
 ## 1. Build the Shared Library
 
-Before importing or loading the library, you must build the C ABI shared library from the repository root:
+The C ABI shared library must be built from the repository root:
 
 ```bash
 make build-for-python
 ```
 
-This command generates `libnimformers.dylib` (or the equivalent for your platform) in the project root.
+This command generates the shared library file in the project root.
 
 ---
 
 ## 2. Using Nim Modules in BybyLang (`import nim`)
 
-When writing `.bybylang` scripts, you can import Nim modules directly to access the C ABI. This compiles Nim code Ahead-of-Time (AOT) into your final binary.
+BybyLang scripts can access the C ABI by importing Nim modules. This compiles the Nim code Ahead-of-Time (AOT) into the final binary.
 
-Example (`script.bybylang`):
+Example of calling C ABI functions (`script.bybylang`):
 
 ```bybylang
 import nim "../../lib_c_api"
@@ -45,69 +45,20 @@ print C
 discard nimf_context_destroy(ctx)
 ```
 
+This approach links the symbols directly during the AOT compilation process, rather than using dynamic FFI at runtime.
+
 ---
 
-## 3. Loading and Using `libnimformers.dylib` in Python
+## 3. Dynamic Loading of Shared Libraries in BybyLang
 
-You can load the compiled shared library in Python using the `nimformers` package or directly with `ctypes`.
+BybyLang does not support dynamic FFI (e.g., runtime `dlopen` of arbitrary `.dylib` or `.so` files) within its DSL. To interface with a specific compiled library file at runtime, the library must be imported via a Nim module (`import nim`) that implements the required FFI wrappers in Nim.
 
-### Method 1: Using the `nimformers` package
+The `lib_c_api.nim` module serves as the primary interface for this purpose. 
 
-The `nimformers` package attempts to automatically locate and load `libnimformers.dylib` / `.so`:
-
-```python
-import numpy as np
-from nimformers import Context
-
-# Automatically load libnimformers.dylib / .so and initialize context
-ctx = Context(backend="auto")
-
-a = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
-b = np.array([10.0, 20.0, 30.0, 40.0], dtype=np.float32)
-
-# Call operations via C ABI wrapper
-c = ctx.add(a, b)
-print(c)  # Output: [11. 22. 33. 44.]
-```
-
-### Method 2: Loading the file directly with `ctypes`
-
-You can manually load the specific shared library file:
-
-```python
-import ctypes as ct
-from nimformers._lib import load_library
-
-# Load library using helper
-lib = load_library("./libnimformers.dylib") # Or libnimformers.so on Linux
-
-# Call C ABI function
-ctx = lib.nimf_context_create(0) # 0 = NIMF_BACKEND_AUTO
-if not ctx:
-    error_msg = lib.nimf_last_error().decode('utf-8')
-    print(f"Error: {error_msg}")
-    exit(1)
-
-print("Successfully loaded libnimformers.dylib")
-lib.nimf_context_destroy(ctx)
-
-# Alternative: Load with raw ctypes
-dylib_path = "./libnimformers.dylib"
-raw_lib = ct.CDLL(dylib_path)
-
-raw_lib.nimf_context_create.argtypes = [ct.c_int]
-raw_lib.nimf_context_create.restype = ct.c_void_p
-
-raw_lib.nimf_context_destroy.argtypes = [ct.c_void_p]
-raw_lib.nimf_context_destroy.restype = ct.c_int
-
-ctx_raw = raw_lib.nimf_context_create(0)
-print("Raw ctypes load success:", ctx_raw)
-raw_lib.nimf_context_destroy(ctx_raw)
-```
+If additional functionality from a custom dynamic library is required, create a Nim wrapper module that loads the library and export its procedures, then import that Nim module into BybyLang.
 
 ---
 
 ## C ABI Signatures
 
-All exported functions in `libnimformers.dylib` / `.so` follow the standard C ABI defined in [`include/nimformers.h`](../include/nimformers.h).
+All exported functions in the shared library follow the standard C ABI defined in [`include/nimformers.h`](../include/nimformers.h).
