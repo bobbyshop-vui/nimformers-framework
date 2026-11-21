@@ -84,5 +84,5 @@ import vendor/bybylang/micro_kernel
 export micro_kernel
 
 import vendor/bybylang/distributed
-import parallel_vm, formers_parallel
-export distributed, parallel_vm, formers_parallel
+import parallel/[vm, formers_batch]
+export distributed, vm, formers_batch

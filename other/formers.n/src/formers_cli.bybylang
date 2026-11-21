@@ -8,7 +8,7 @@
 
 import nim "std/[os, strutils]"
 import nim "nimformers"
-import nim "formers_parallel"
+import nim "parallel/formers_batch"
 import "formers/cli/options.bybylang"
 import "formers/arch/detect.bybylang"
 import "formers/runtime/signals.bybylang"

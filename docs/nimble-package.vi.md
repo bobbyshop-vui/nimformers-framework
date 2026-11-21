@@ -61,7 +61,7 @@ Ví dụ tối thiểu có thể chạy ở
 implementation vào ứng dụng:
 
 ```nim
-import nimformers_shared
+import bindings/nimformers_shared as nimformers_shared
 
 var ctx = newContext("cpu")
 defer: close(ctx)
@@ -97,7 +97,7 @@ echo group.partition(12)
 BybyLang cũng có thể load binding shared library qua `nimformers_shared`:
 
 ```bybylang
-import nim "nimformers_shared"
+import nim "bindings/nimformers_shared"
 
 ctx = nimformers_shared.newContext("cpu")
 group = nimformers_shared.newProcessGroup(@["cpu"])
