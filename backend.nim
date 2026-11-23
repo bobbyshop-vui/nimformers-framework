@@ -100,6 +100,53 @@ proc beMatmul*(ctx: Backend, a: openArray[float32], M, K: int,
   let bSeq = @b
   result = byby.gpuMatmul(ctx.kind.toByby(), aSeq, bSeq, M, K, N)
 
+proc beMatmulNT*(ctx: Backend, a: openArray[float32], M, K: int,
+                  bNt: openArray[float32], N: int): seq[float32] {.apiHooked.} =
+  ## Training GEMM for a right-hand matrix already stored in [N, K] order.
+  ## Vulkan tries its FP16/cooperative-matrix route (FP32 accumulation) and falls
+  ## back to the exact FP32 session kernel when unavailable. Metal uses its
+  ## register-blocked SIMD NT kernel, with the existing Metal kernel fallback.
+  if M <= 0 or K <= 0 or N <= 0 or a.len < M * K or bNt.len < N * K:
+    raise newException(ValueError,
+      "beMatmulNT: invalid shape or short input (M=" & $M & ", K=" & $K &
+      ", N=" & $N & ", A=" & $a.len & ", B=" & $bNt.len & ")")
+  let be = ctx.kind.toByby()
+  if be == byby.gbCpu:
+    var b = newSeq[float32](K * N)
+    for n in 0 ..< N:
+      for k in 0 ..< K:
+        b[k * N + n] = bNt[n * K + k]
+    return byby.gpuMatmul(be, @a, b, M, K, N)
+
+  var ha = byby.sessionUpload(be, @a)
+  var hb = byby.sessionUpload(be, @bNt)
+  var hc = byby.sessionAllocScratch(be, M * N)
+  var opened = false
+  try:
+    if not byby.sessionBegin(be):
+      raise newException(CatchableError, "beMatmulNT: sessionBegin failed")
+    opened = true
+    let encoded =
+      if be == byby.gbVulkan:
+        byby.sessionMatmulNTAccelerated(be, ha, hb, hc, M, K, N)
+      else:
+        byby.sessionMatmulNT(be, ha, hb, hc, M, K, N)
+    if not encoded:
+      raise newException(CatchableError, "beMatmulNT: backend rejected NT GEMM")
+    if not byby.sessionEnd(be):
+      opened = false
+      discard byby.sessionRecoverQueue(be)
+      raise newException(CatchableError, "beMatmulNT: sessionEnd failed")
+    opened = false
+    result = byby.sessionRead(be, hc, M * N)
+  finally:
+    if opened:
+      discard byby.sessionEnd(be)
+      discard byby.sessionRecoverQueue(be)
+    byby.sessionFree(be, ha)
+    byby.sessionFree(be, hb)
+    byby.sessionFree(be, hc)
+
 proc beMatmulQ4*(ctx: Backend, a: openArray[float32], wq: openArray[uint8],
                   scales, zeros: openArray[float32],
                   M, K, N, groupSize, nGroupsPerRow: int): seq[float32] {.apiHooked.} =

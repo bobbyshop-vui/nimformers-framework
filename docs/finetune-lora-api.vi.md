@@ -3,10 +3,48 @@
 
 [English](finetune-lora-api.md) | [Tiếng Việt](finetune-lora-api.vi.md)
 
-Module chứa các tiện ích training/resume lưu trạng thái trên đĩa cho
+Module chứa các tiện ích training cho
 `NimformerModelJamba` và `JambaLora`. Entry point chính được build/chạy
 thành chương trình; chỉ import type/hàm export khi viết trainer riêng.
 Các phép adapter cơ bản ở [API LoRA](lora-api.vi.md).
+
+## Fine-tune Codestral chỉ dùng RAM
+
+`make finetune-mamba` mặc định chạy chế độ chỉ dùng RAM. Activation, Adam
+moment và trọng số attention trainable dạng full-precision được giữ trong
+bộ nhớ. Chế độ này không ghi activation scratch, Adam sidecar hay snapshot
+resume từng layer. Checkpoint LoRA `.bin` vẫn được ghi sau mỗi training
+step hoàn tất (`CFG_CHECKPOINT_EVERY = 1`). Log gọi mỗi step là epoch; mỗi
+step thực tế chỉ xử lý một batch được stream, không phải một lượt đầy đủ qua
+corpus.
+
+```sh
+make finetune-codestral-vulkan  # chọn Vulkan; dùng cooperative matrix nếu thiết bị hỗ trợ
+make finetune-codestral-metal   # chọn Metal register-blocked SIMD GEMM
+
+# Chọn backend trực tiếp:
+make finetune-mamba FINETUNE_BACKEND=auto FINETUNE_RAM_ONLY=1
+
+# Dùng lại chế độ cũ lưu activation/Adam/layer-resume trên đĩa:
+make finetune-mamba FINETUNE_RAM_ONLY=0
+```
+
+Các biến runtime tương ứng: `BYBY_FINETUNE_RAM_ONLY=1|0`,
+`BYBY_FINETUNE_BACKEND=auto|vulkan|metal` và
+`BYBY_FINETUNE_ACCELERATED_GEMM=1|0`. Make target bật accelerated GEMM mặc
+định. Trên Vulkan, NT GEMM dùng matrix input FP16 và tích lũy FP32 qua
+cooperative matrix khi thiết bị cùng shape hỗ trợ; nếu không, BybyLang dùng
+đường FP32 chính xác. `BYBY_VULKAN_TENSOR_CORES=0` tắt đường cooperative.
+Trên Metal, NT GEMM dùng kernel SIMD register-blocked;
+`BYBY_METAL_GEMM_RB=0` tắt kernel này. Metal không chạy đường Vulkan Tensor
+Core.
+
+Khi khởi động lại, RAM-only nạp trọng số từ checkpoint `.bin` mới nhất nhưng
+khởi tạo Adam từ đầu và bỏ qua layer-resume cũ. Nếu bị ngắt giữa step, step
+đó bị bỏ; checkpoint hoàn tất gần nhất vẫn dùng được. Chế độ này cần nhiều
+RAM hơn đáng kể vì Adam moments và trọng số trainable full-precision luôn ở
+trong bộ nhớ. Checkpoint `.bin` và sidecar tham chiếu tokenizer vẫn được ghi
+ra đĩa.
 
 
 ## Batch dạng stream
@@ -65,13 +103,14 @@ hóa; metadata chuẩn hóa không tương thích sẽ bị từ chối khi resu
 thái tạm từng layer được mô tả ở [định dạng checkpoint](checkpoint-formats.vi.md).
 
 
-## Trạng thái optimizer trên đĩa
+## Store trạng thái optimizer
 
 ```nim
 type AdamDiskStore* = object
   root*: string
+  ramOnly*: bool
 
-proc initAdamDiskStore*(root: string): AdamDiskStore
+proc initAdamDiskStore*(root: string, ramOnly = false): AdamDiskStore
 proc has*(store: AdamDiskStore, name: string, paramLen: int): bool
 proc init*(store: AdamDiskStore, name: string, paramLen: int)
 proc load*(store: AdamDiskStore, name: string, paramLen: int): ApfAdamState
@@ -80,15 +119,17 @@ proc cleanup*(store: var AdamDiskStore)
 proc clearAdamState*(st: var ApfAdamState)
 ```
 
-Moment Adam (`m`, `v`, `step`) nằm trên đĩa để train model lớn không phải
-giữ mọi tensor optimizer trong RAM. Store kiểm tra độ dài payload trước
-khi chấp nhận snapshot.
+`AdamDiskStore` hỗ trợ cả lưu đĩa và lưu RAM. Chế độ đĩa ghi moment Adam
+(`m`, `v`, `step`) ra file để không phải giữ mọi tensor optimizer trong
+RAM. Chế độ RAM giữ state trong bộ nhớ và không tạo thư mục store. Cả hai
+chế độ đều kiểm tra kích thước parameter khi load.
 
 
 ## Bước train và helper kiểm tra tính toàn vẹn
 
-`trainStepGraftStreaming` train block mới/graft trong khi stream activation
-và Adam state ra đĩa. Các helper resume/toàn vẹn export khác gồm
+`trainStepGraftStreaming` train block mới/graft, giữ activation và trọng số
+full-precision trong RAM hoặc lưu chúng ra đĩa tùy cấu hình. Các helper
+resume/toàn vẹn export khác gồm
 `saveLoraAdamStates`, `restoreLoraAdamStates`, `resetAdamParameters`,
 `adamFileStep`, `adamStoreAllAtStep`, `adamStoreAllAtStepOrNext`,
 `syncLoraAdamFromStore`, `forceLoraAdamToStep`, `forceAdamStoreToStep`,

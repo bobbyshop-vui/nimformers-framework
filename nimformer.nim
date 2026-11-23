@@ -1,7 +1,7 @@
 ## nimformer.nim
 ## Full Transformer with backward for attention + custom transformer blocks
 
-import std/[math, random, strformat, algorithm, tables, strutils]
+import std/[math, random, strformat, algorithm, tables, strutils, os]
 import customfloat
 import backend  # Imports Backend and its helpers
 import quant     # QuantTensor, dequantizeTensor - keeps int4-compressed weights in RAM
@@ -494,6 +494,13 @@ proc forward*(l: Linear, x: Tensor, ctx: Backend): Tensor {.apiHooked.} =
         let nGroupsPerRow = (l.inF + l.weightQ.groupSize - 1) div l.weightQ.groupSize
         y = beMatmulQ4(ctx, input.data, @(l.weightQ.bytes), l.weightQ.scale, l.weightQ.zero_point,
                         rows, l.inF, l.outF, l.weightQ.groupSize, nGroupsPerRow)
+      elif getEnv("BYBY_FINETUNE_ACCELERATED_GEMM", "0") != "0" and
+           ctx.kind.toByby() in {byby.gbMetal, byby.gbVulkan} and
+           l.weight.data.len == l.outF * l.inF:
+        # Keep the trainable weight in its native [outF,inF] layout. Vulkan
+        # can lower this NT GEMM to cooperative FP16 matrix instructions with
+        # FP32 accumulation; Metal uses its register-blocked SIMD NT kernel.
+        y = beMatmulNT(ctx, input.data, rows, l.inF, l.weight.data, l.outF)
       else:
         var wT: seq[float32]
         if l.useQuant:
@@ -530,10 +537,16 @@ proc forward*(l: Linear, x: Tensor, ctx: Backend): Tensor {.apiHooked.} =
   # caused OOM/Killed - see the comment on the Linear/loraA definition above.
   if l.loraR > 0 and l.loraAValues.len == l.loraR * l.inF and l.loraBValues.len == l.outF * l.loraR:
     pfTime("lin.lora"):
-      let At = transpose(Tensor(shape: @[l.loraR, l.inF], data: @(l.loraAValues)))   # [inF, r]
-      let Bt = transpose(Tensor(shape: @[l.outF, l.loraR], data: @(l.loraBValues)))  # [r, outF]
-      let xA = beMatmul(ctx, input.data, rows, l.inF, At.data, l.inF, l.loraR)   # [rows, r]
-      let delta = beMatmul(ctx, xA, rows, l.loraR, Bt.data, l.loraR, l.outF)     # [rows, outF]
+      var xA, delta: seq[float32]
+      if getEnv("BYBY_FINETUNE_ACCELERATED_GEMM", "0") != "0" and
+         ctx.kind.toByby() in {byby.gbMetal, byby.gbVulkan}:
+        xA = beMatmulNT(ctx, input.data, rows, l.inF, l.loraAValues, l.loraR)
+        delta = beMatmulNT(ctx, xA, rows, l.loraR, l.loraBValues, l.outF)
+      else:
+        let At = transpose(Tensor(shape: @[l.loraR, l.inF], data: @(l.loraAValues)))   # [inF, r]
+        let Bt = transpose(Tensor(shape: @[l.outF, l.loraR], data: @(l.loraBValues)))  # [r, outF]
+        xA = beMatmul(ctx, input.data, rows, l.inF, At.data, l.inF, l.loraR)   # [rows, r]
+        delta = beMatmul(ctx, xA, rows, l.loraR, Bt.data, l.loraR, l.outF)     # [rows, outF]
       for i in 0 ..< result.data.len:
         result.data[i] += delta[i] * l.loraScale
   elif l.loraR > 0:
@@ -566,12 +579,19 @@ proc backward*(l: Linear, x: Tensor, dOut: Tensor, ctx: Backend): tuple[dX, dW, 
   let xT = transpose(x)  # [inF, rows]
   let dOutFlat = dOut.data  # [rows * outF]
 
-  # dW and dX are INDEPENDENT (neither needs the other's result),
-  # so both go into 1 command buffer (metalMatmul2) instead of calling metalMatmul
-  # twice — halves the GPU dispatch+wait count per Linear.backward.
-  let (dWRawFlat, dXFlat) = beMatmul2(ctx,
-    xT.data, l.inF, rows, dOutFlat, rows, l.outF,
-    dOutFlat, rows, l.outF, l.weight.data, l.outF, l.inF)
+  # dW and dX are independent. The optional fine-tune route sends dW through
+  # the backend's NT GEMM (Vulkan cooperative matrices / Metal SIMD); dX keeps
+  # the regular exact GEMM. Other callers retain the fused pair operation.
+  var dWRawFlat, dXFlat: seq[float32]
+  if getEnv("BYBY_FINETUNE_ACCELERATED_GEMM", "0") != "0" and
+     ctx.kind.toByby() in {byby.gbMetal, byby.gbVulkan}:
+    let dOutT = transpose(dOut)  # [outF, rows] for C = xT @ dOut
+    dWRawFlat = beMatmulNT(ctx, xT.data, l.inF, rows, dOutT.data, l.outF)
+    dXFlat = beMatmul(ctx, dOutFlat, rows, l.outF, l.weight.data, l.outF, l.inF)
+  else:
+    (dWRawFlat, dXFlat) = beMatmul2(ctx,
+      xT.data, l.inF, rows, dOutFlat, rows, l.outF,
+      dOutFlat, rows, l.outF, l.weight.data, l.outF, l.inF)
 
   var dWRaw: Tensor
   dWRaw.shape = @[l.inF, l.outF]

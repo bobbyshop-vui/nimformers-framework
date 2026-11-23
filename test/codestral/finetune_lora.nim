@@ -40,7 +40,7 @@ import prefill_profile   # pfTime/pfReport - reused for BYBY_TRAIN_PROFILE
 proc cRename(oldPath, newPath: cstring): cint {.importc: "rename", header: "<stdio.h>".}
 proc cLink(oldPath, newPath: cstring): cint {.importc: "link", header: "<unistd.h>".}
 
-# Safe Ctrl+C: the 1st press only sets a flag; break AFTER the current layer's Adam+SSD. The 2nd forces quit.
+# Safe Ctrl+C: first press sets a flag; finish the current layer update before stopping. Second press forces quit.
 var gStopRequested* = false
 var gTrainStepFullyDone* = true
 
@@ -53,7 +53,7 @@ proc onTrainCtrlC() {.noconv.} =
     quit(130)
   gStopRequested = true
   try:
-    stderr.write("\n[finetune_lora] Ctrl+C: stopping SAFELY after the current layer's Adam+SSD (press again to force).\n")
+    stderr.write("\n[finetune_lora] Ctrl+C: stopping SAFELY after the current layer update (press again to force).\n")
     stderr.flushFile()
   except CatchableError: discard
 
@@ -173,7 +173,10 @@ const
   CFG_BPE_MERGES* = 500
   CFG_CHECKPOINT_EVERY* = 1   # 1 - save a checkpoint every training step.
   CFG_LOG_EVERY* = 20
-  CFG_KEEP_RESUME_STATE* = true # keep Adam + the FP32 new blocks on the SSD to resume without a reset
+  CFG_KEEP_RESUME_STATE* = true # disk-backed mode only: keep Adam + FP32 sidecars for layer resume
+
+let CFG_FINETUNE_RAM_ONLY* = getEnv("BYBY_FINETUNE_RAM_ONLY", "1") != "0"
+let CFG_FINETUNE_BACKEND* = getEnv("BYBY_FINETUNE_BACKEND", "auto")
 
 let CFG_CODESTRAL_PATTERN* = getEnv("BYBY_CODESTRAL_PATTERN", CFG_CODESTRAL_PATTERN_DEFAULT)
 
@@ -558,18 +561,30 @@ proc numelShape(shape: seq[int]): int =
   result = 1
   for s in shape: result *= s
 
+proc cloneFloat32Data(src: seq[float32]): seq[float32] =
+  ## Dedicated allocation, even under ARC/ORC or shared seq assignment.
+  result = newSeq[float32](src.len)
+  for j in 0 ..< src.len:
+    result[j] = src[j]
+
 type
   AttnWeightDiskStore* = object
-    ## NEW - mirrors AdamDiskStore: the FULL-PRECISION weights of the
-    ## Attention blocks ('A', ~3.5GB raw for 12 blocks) live on the SSD, only 1 block
-    ## is loaded into RAM exactly when forward/backward/checkpoint-save needs it.
+    ## The FULL-PRECISION weights of trainable Attention blocks can stay in RAM
+    ## or use a disk-backed store. Disk mode loads one block when needed.
     ## File format (.attnw): same spirit as AdamDiskStore - a small header
     ## (magic+n) then raw float32, NO JSON/JsonNode.
     root*: string
+    ramOnly*: bool
+    ramWeights: ref Table[string, seq[float32]]
 
-proc initAttnWeightDiskStore*(root: string): AttnWeightDiskStore =
-  createDir(root)
+proc initAttnWeightDiskStore*(root: string, ramOnly = false): AttnWeightDiskStore =
+  if not ramOnly:
+    createDir(root)
   result.root = root
+  result.ramOnly = ramOnly
+  if ramOnly:
+    new(result.ramWeights)
+    result.ramWeights[] = initTable[string, seq[float32]]()
 
 proc attnSafeName(name: string): string =
   result = newStringOfCap(name.len + 6)
@@ -586,6 +601,9 @@ proc attnPath(store: AttnWeightDiskStore, name: string): string =
 const AttnWeightMagic = 0x4E5442594157544D'u64   # "ATTNW"-ish, different from the AdamDiskStore magic
 
 proc hasW*(store: AttnWeightDiskStore, name: string, paramLen: int): bool =
+  if store.ramOnly:
+    return not store.ramWeights.isNil and name in store.ramWeights[] and
+      store.ramWeights[][name].len == paramLen
   let path = attnPath(store, name)
   if not fileExists(path): return false
   var f: File
@@ -598,7 +616,13 @@ proc hasW*(store: AttnWeightDiskStore, name: string, paramLen: int): bool =
     return false
   result = magic == AttnWeightMagic and n == int64(paramLen)
 
-proc saveW*(store: AttnWeightDiskStore, name: string, data: seq[float32]) =
+proc saveW*(store: var AttnWeightDiskStore, name: string, data: seq[float32]) =
+  if store.ramOnly:
+    if store.ramWeights.isNil:
+      new(store.ramWeights)
+      store.ramWeights[] = initTable[string, seq[float32]]()
+    store.ramWeights[][name] = cloneFloat32Data(data)
+    return
   let path = attnPath(store, name)
   let tmp = path & ".tmp"
   var f: File
@@ -623,6 +647,10 @@ proc saveW*(store: AttnWeightDiskStore, name: string, data: seq[float32]) =
     raise newException(IOError, "Could not commit the attn weight atomically: " & tmp)
 
 proc loadW*(store: AttnWeightDiskStore, name: string, paramLen: int): seq[float32] =
+  if store.ramOnly:
+    if not store.hasW(name, paramLen):
+      raise newException(IOError, "Attn weight is missing or has the wrong size: " & name)
+    return cloneFloat32Data(store.ramWeights[][name])
   let path = attnPath(store, name)
   var f: File
   if not open(f, path, fmRead):
@@ -643,6 +671,10 @@ proc loadW*(store: AttnWeightDiskStore, name: string, paramLen: int): seq[float3
 
 proc cleanupAttn*(store: var AttnWeightDiskStore) =
   ## Only called after the LAST checkpoint (exactly like adamStore.cleanup).
+  if store.ramOnly:
+    if not store.ramWeights.isNil:
+      store.ramWeights[].clear()
+    return
   try:
     for f in walkFiles(store.root / "*.attnw"):
       removeFile(f)
@@ -663,7 +695,7 @@ proc saveCheckpointLoraBin*(m: var NimformerModelJamba, lora: JambaLora, path: s
   ## LoRA-only checkpoint for inference / fallback resume — written as QLoRA 4-bit to save disk.
   ## The Mamba base is only referenced through the nimqPath meta, not copied into the .bin.
   ## Adapter A/B stay fp32; newBlock is quantized to 4-bit.
-  ## Training resume prefers the FP32 Attention + Adam on the SSD; NIMBIN4 is the portable fallback.
+  ## The FP32 Attention weights and Adam use the selected store; NIMBIN4 is the portable checkpoint.
 
   var meta = initTable[string, string]()
   meta["format"] = "nimformers-lora-v1-qlora4"
@@ -746,7 +778,7 @@ proc saveCheckpointLoraBin*(m: var NimformerModelJamba, lora: JambaLora, path: s
     let expected = numelShape(p[].shape)
     var values: seq[float32]
     if lora.quantBase.len > 0 and attnStore.hasW(name, expected):
-      # Streaming training: the SSD sidecar is the MAIN copy (trainStep loads from it and writes back after
+      # Streaming training: the configured sidecar is the MAIN copy (trainStep loads from it and writes back after
       # the update). p[].data may still hold the OLD .bin value (the resume backward skips this block
       # in this process; [resume-layer]/COMMIT_ONLY run no step) -> do NOT use it.
       values = attnStore.loadW(name, expected)
@@ -754,7 +786,7 @@ proc saveCheckpointLoraBin*(m: var NimformerModelJamba, lora: JambaLora, path: s
       values = p[].data
       if values.len == 0:
         if not attnStore.hasW(name, expected):
-          raise newException(IOError, "New block weight missing from RAM/SSD: " & name)
+          raise newException(IOError, "New block weight missing from RAM/configured store: " & name)
         values = attnStore.loadW(name, expected)
     if expected <= 0 or values.len != expected:
       raise newException(IOError,
@@ -1326,15 +1358,26 @@ proc loadCheckpointLora*(path: string): tuple[model: NimformerModelJamba, lora: 
   result = (m, lo, epoch)
 
 type
-  ## Adam state backing store: the m/v/step of EVERY parameter live on the SSD,
-  ## only 1 state is loaded into RAM per update. The .adam files are kept
-  ## between training steps; the .tmp files are only scratch and are deleted after saving.
+  ## Adam state backing store. Disk mode reads one parameter state at a time;
+  ## RAM-only mode keeps cloned m/v states in memory for the current process.
   AdamDiskStore* = object
     root*: string
+    ramOnly*: bool
+    ramStates: ref Table[string, ApfAdamState]
 
-proc initAdamDiskStore*(root: string): AdamDiskStore =
-  createDir(root)
+proc initAdamDiskStore*(root: string, ramOnly = false): AdamDiskStore =
+  if not ramOnly:
+    createDir(root)
   result.root = root
+  result.ramOnly = ramOnly
+  if ramOnly:
+    new(result.ramStates)
+    result.ramStates[] = initTable[string, ApfAdamState]()
+
+proc cloneAdamSnapshot(st: ApfAdamState): ApfAdamState =
+  result.step = st.step
+  result.m = cloneFloat32Data(st.m)
+  result.v = cloneFloat32Data(st.v)
 
 proc adamSafeName(name: string): string =
   result = newStringOfCap(name.len + 5)
@@ -1349,7 +1392,7 @@ proc adamPath(store: AdamDiskStore, name: string): string =
   store.root / adamSafeName(name)
 
 proc clearAdamState*(st: var ApfAdamState) =
-  ## Frees the m/v in RAM right after the SSD save.
+  ## Releases a local m/v snapshot after it has been returned to its configured store.
   st.m.setLen(0)
   st.v.setLen(0)
   st.m = @[]
@@ -1357,6 +1400,10 @@ proc clearAdamState*(st: var ApfAdamState) =
   st.step = 0
 
 proc has*(store: AdamDiskStore, name: string, paramLen: int): bool =
+  if store.ramOnly:
+    return not store.ramStates.isNil and name in store.ramStates[] and
+      store.ramStates[][name].m.len == paramLen and
+      store.ramStates[][name].v.len == paramLen
   let path = adamPath(store, name)
   if not fileExists(path):
     return false
@@ -1379,6 +1426,11 @@ proc has*(store: AdamDiskStore, name: string, paramLen: int): bool =
   result = magic == 0x425942594144414D'u64 and version == 1'u32 and n == int64(paramLen)
 
 proc init*(store: AdamDiskStore, name: string, paramLen: int) =
+  if store.ramOnly:
+    if store.ramStates.isNil:
+      raise newException(ValueError, "RAM Adam store was not initialized with initAdamDiskStore")
+    store.ramStates[][name] = newApfAdamState(paramLen)
+    return
   ## Initialises a zero state on the SSD. Does NOT create a paramLen-sized seq[float32],
   ## avoiding a large RAM spike when a new file is created. Only a 1 MiB buffer is used.
   let path = adamPath(store, name)
@@ -1413,6 +1465,10 @@ proc init*(store: AdamDiskStore, name: string, paramLen: int) =
     raise newException(IOError, "Could not commit the Adam state atomically: " & tmp)
 
 proc load*(store: AdamDiskStore, name: string, paramLen: int): ApfAdamState =
+  if store.ramOnly:
+    if not store.has(name, paramLen):
+      store.init(name, paramLen)
+    return cloneAdamSnapshot(store.ramStates[][name])
   if not store.has(name, paramLen):
     store.init(name, paramLen)
   let path = adamPath(store, name)
@@ -1443,6 +1499,11 @@ proc load*(store: AdamDiskStore, name: string, paramLen: int): ApfAdamState =
 proc save*(store: AdamDiskStore, name: string, st: ApfAdamState) =
   if st.m.len != st.v.len or st.step < 0:
     raise newException(ValueError, "Adam state has an invalid m/v length or step: " & name)
+  if store.ramOnly:
+    if store.ramStates.isNil:
+      raise newException(ValueError, "RAM Adam store was not initialized with initAdamDiskStore")
+    store.ramStates[][name] = cloneAdamSnapshot(st)
+    return
   let path = adamPath(store, name)
   let tmp = path & ".tmp"
   var f: File
@@ -1471,6 +1532,10 @@ proc save*(store: AdamDiskStore, name: string, st: ApfAdamState) =
 proc cleanup*(store: var AdamDiskStore) =
   ## Only called when the optimizer state is no longer needed (after the last checkpoint).
   ## Deletes both .adam and .tmp, so the SSD does not fill up after a run.
+  if store.ramOnly:
+    if not store.ramStates.isNil:
+      store.ramStates[].clear()
+    return
   try:
     for f in walkFiles(store.root / "*.adam"):
       removeFile(f)
@@ -1525,16 +1590,19 @@ proc resetAdamParameters*(store: AdamDiskStore, model: var NimformerModelJamba,
   for (name, t) in paramList(model): byName[name] = t
   for name in names:
     if name notin byName: continue
-    let path = adamPath(store, name)
-    try: removeFile(path)
-    except OSError: discard
-    try: removeFile(path & ".tmp")
-    except OSError: discard
+    if not store.ramOnly:
+      let path = adamPath(store, name)
+      try: removeFile(path)
+      except OSError: discard
+      try: removeFile(path & ".tmp")
+      except OSError: discard
     store.init(name, numelShape(byName[name][].shape))
 
 proc adamFileStep*(store: AdamDiskStore, name: string, paramLen: int): int =
   ## Reads only the Adam header to check the step, without loading m/v.
   if not store.has(name, paramLen): return -1
+  if store.ramOnly:
+    return store.ramStates[][name].step
   let path = adamPath(store, name)
   var f: File
   if not open(f, path, fmRead): return -1
@@ -1578,7 +1646,7 @@ proc adamStoreAllAtStepOrNext*(store: AdamDiskStore, model: var NimformerModelJa
   result = true
 
 proc syncLoraAdamFromStore*(store: AdamDiskStore, state: var LoraTrainState, lora: JambaLora) =
-  ## Merges the LoRA Adam state from the SSD. Do NOT let an old step=0 file overwrite a higher step in RAM
+  ## Merges LoRA Adam state from the configured store. Do NOT let an old step=0 snapshot overwrite a higher step in RAM
   ## (old bug: the sync overwrote with step=0 -> the checkpoint failed even though training had finished).
   for name, ad in lora.adapters:
     let ka = loraAdamKey(name, "A")
@@ -1593,17 +1661,6 @@ proc syncLoraAdamFromStore*(store: AdamDiskStore, state: var LoraTrainState, lor
       let ramStep = if name in state.adamB: state.adamB[name].step else: -1
       if disk.step >= ramStep:
         state.adamB[name] = disk
-
-proc cloneFloat32Data(src: seq[float32]): seq[float32] =
-  ## Dedicated allocation, even under ARC/ORC or shared seq assignment.
-  result = newSeq[float32](src.len)
-  for j in 0 ..< src.len:
-    result[j] = src[j]
-
-proc cloneAdamSnapshot(st: ApfAdamState): ApfAdamState =
-  result.step = st.step
-  result.m = cloneFloat32Data(st.m)
-  result.v = cloneFloat32Data(st.v)
 
 proc adamNeverUpdated(st: ApfAdamState): bool =
   ## m = v = 0 exactly: never received any gradient (fresh init / reset).
@@ -1914,22 +1971,28 @@ proc rssMB(): string =
 
 type
   DiskActivationStore = object
-    ## Instead of keeping `xs: seq[Tensor]` (64 activations) ALIVE for the whole forward+
-    ## backward in RAM, EACH activation is written to a scratch file on the SSD
-    ## right after it is computed (forward), keeping ONLY (offset, len, shape) -
-    ## a few dozen bytes per block - in RAM. When the backward needs an activation it
-    ## seeks+reads EXACTLY that segment from the file, and drops it after use (not kept).
-    ## Slower than keeping it in RAM (disk I/O per block) but in exchange it NEVER
-    ## OOMs because of this part - the requested "use RAM only up to a level, spill the rest to the
-    ## SSD", applied to the largest RAM-permanent-within-1-step structure
-    ## (xs) rather than the whole model (weights are still handled separately through
-    ## quant-resident + mergeInOne/restoreBaseOne as before).
+    ## Disk mode stores forward activations as offsets in a scratch file.
+    ## RAM-only mode retains independent Tensor copies for the step and drops them on return.
     f: File
     path: string
     writeClosed: bool
     offsets: seq[tuple[pos, count: int64, shape: seq[int]]]
+    ramOnly: bool
+    ramActivations: seq[Tensor]
+
+proc cloneActivationTensor(t: Tensor): Tensor =
+  result.data = cloneFloat32Data(t.data)
+  result.shape = newSeq[int](t.shape.len)
+  for i, dim in t.shape:
+    result.shape[i] = dim
 
 proc openDiskActivationStore(path: string): DiskActivationStore =
+  if CFG_FINETUNE_RAM_ONLY:
+    result.path = path
+    result.ramOnly = true
+    result.writeClosed = false
+    result.ramActivations = @[]
+    return
   createDir(getScratchDir())
   result.path = path
   if not open(result.f, result.path, fmWrite):
@@ -1943,6 +2006,8 @@ proc openDiskActivationStore(path: string): DiskActivationStore =
     raise newException(IOError, "openDiskActivationStore: writing the slot header failed")
 
 proc openResumeActivationStore(path: string): DiskActivationStore =
+  if CFG_FINETUNE_RAM_ONLY:
+    raise newException(IOError, "RAM-only fine-tuning does not load layer-resume activations")
   if not open(result.f, path, fmRead):
     raise newException(IOError, "Could not open the resume activations: " & path)
   # Read the 8-byte header-offset pointer at position 0.
@@ -1975,6 +2040,8 @@ proc openResumeActivationStore(path: string): DiskActivationStore =
   result.writeClosed = true
 
 proc openForwardResumeActivationStore(path: string, nAct: int, shape: seq[int]): DiskActivationStore =
+  if CFG_FINETUNE_RAM_ONLY:
+    raise newException(IOError, "RAM-only fine-tuning does not resume a partial forward pass")
   ## Reopens the activation file of an unfinished forward (no header yet): activation
   ## i is at 8 + i*bytes (every activation has the same shape [B,T,H]). Keeps the first nAct
   ## activations and appends after them.
@@ -2018,9 +2085,10 @@ proc writeActivationHeader(s: var DiskActivationStore) =
     raise newException(IOError, "writeActivationHeader: patching the offset failed")
 
 proc pushActivation(s: var DiskActivationStore, t: Tensor) =
-  ## Writes DIRECTLY to disk, keeping NO copy in RAM after the write
-  ## (t still lives in the caller's outer scope for a short moment to
-  ## continue the forward, but this function creates no new reference to it).
+  ## Stores a copy in RAM-only mode or writes the activation directly to disk.
+  if s.ramOnly:
+    s.ramActivations.add(cloneActivationTensor(t))
+    return
   let pos = s.f.getFilePos()
   if t.data.len > 0:
     let n = t.data.len * sizeof(float32)
@@ -2029,6 +2097,8 @@ proc pushActivation(s: var DiskActivationStore, t: Tensor) =
   s.offsets.add((pos, int64(t.data.len), t.shape))
 
 proc finalizeActivationStore(s: var DiskActivationStore) =
+  if s.ramOnly:
+    return
   s.f.flushFile()
   writeActivationHeader(s)  # appends header trailer, patches offset slot at pos 0
   s.f.flushFile()
@@ -2224,6 +2294,10 @@ proc layerProgressStepState*(step, cursorLayer, nBlocks: int,
 proc readActivation(s: DiskActivationStore, i: int): Tensor =
   ## Opens a SEPARATE READ file handle (not sharing the write handle above, avoiding
   ## disturbing the write cursor) - reads exactly 1 segment and closes RIGHT AFTER.
+  if s.ramOnly:
+    if i < 0 or i >= s.ramActivations.len:
+      raise newException(IndexDefect, "RAM activation index out of range: " & $i)
+    return cloneActivationTensor(s.ramActivations[i])
   let (pos, count, shape) = s.offsets[i]
   var rf: File
   if not open(rf, s.path, fmRead):
@@ -2241,6 +2315,10 @@ proc closeAndDelete(s: var DiskActivationStore, keep = false) =
   ## "Thorough cleanup": closes the file if still open, then DELETES the scratch RIGHT AWAY.
   ## The defer in trainStepGraftStreaming calls this if an exception happens mid-step,
   ## so the scratch is not left behind on the SSD.
+  if s.ramOnly:
+    s.ramActivations.setLen(0)
+    s.writeClosed = true
+    return
   if not s.writeClosed:
     try: s.f.close()
     except: discard
@@ -2524,15 +2602,14 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
     $(totalBootBytes div (1024*1024)) & "MB, bootstrap attnStore (1 dong refresh + MB/s)"
 
   # Bootstrap: the FIRST time this function is called in the whole training, p[].data
-  # holds the REAL values (from a resume checkpoint or a fresh init) - saved once
-  # to the SSD. In LATER steps, p[].data is always EMPTY on entry (freed at
+  # holds the REAL values (from a checkpoint or fresh init) - saved once
+  # to the configured store. In LATER steps, p[].data is always EMPTY on entry (freed at
   # the end of the previous step) so attnStore.hasW is true, and an empty value is never written
   # over the right file by mistake (numelShape(p[].shape) is used - STABLE, UNLIKE
   # .data.len which may be 0 - as the trusted "paramLen").
-  # The FIRST time may take MANY MINUTES on a slow volume (exFAT/network/USB) -
+  # Disk mode may take MANY MINUTES on a slow volume (exFAT/network/USB) -
   # each G tensor (qkv/out) can be hundreds of MB of FP32.
-  # Progress: 1 refreshing \r line + MB/s + ETA to measure the disk throughput.
-  var bootProg = progressStart("bootstrap→SSD", totalItems = nFullPrec,
+  var bootProg = progressStart("bootstrap→" & (if attnStore.ramOnly: "RAM" else: "SSD"), totalItems = nFullPrec,
                                totalBytes = totalBootBytes)
   for bi, names in fullPrecNamesByBlock:
     for name in names:
@@ -2544,7 +2621,7 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
           attnStore.saveW(name, p[].data)
         elif name in lo.quantBase:
           # Resume fallback: NIMBIN4 keeps the newBlock weights quantized with data=[]
-          # in the Linear. 1 tensor is dequantized here to create an FP32 working copy on the SSD;
+          # in the Linear. 1 tensor is dequantized here to create an FP32 working copy in the configured store;
           # the whole model is NOT dequantized.
           let dq = dequantizeTensor(lo.quantBase[name])
           if dq.len != plen:
@@ -2563,8 +2640,8 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
   # ---- FORWARD: block by block, merge first (dequant through the LUT if quant-resident), forward, restore/free right away ----
   var x: Tensor
   var xstore: DiskActivationStore
-  # Forward resume: the "forward" state next=n means activations 0..n have been
-  # flushed to the SSD (blocks 0..n-1 forwarded). Written AFTER the activations are flushed.
+  # Forward resume in disk-backed mode: state next=n means activations 0..n have
+  # been flushed to the activation store (blocks 0..n-1 forwarded).
   template saveForwardState(nDone: int) =
     if stepIndex >= 0:
       xstore.f.flushFile()
@@ -2582,9 +2659,8 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
     xstore = openDiskActivationStore(actPath)
     xstore.pushActivation(x)
     saveForwardState(0)
-  # Keep the scratch file whenever we are inside a checkpoint-able step: a
-  # crash during backward must leave the activations on disk for resume. The
-  # file is removed explicitly after the step commits.
+  # Keep the scratch file in disk-backed mode: a crash during backward must
+  # leave activations on disk for layer resume. RAM-only drops them on return.
   defer: xstore.closeAndDelete(keep = stepIndex >= 0)
   if canResumeBackward or resumeForwardFrom >= 0:
     # The stored activations MUST belong to this batch: activation 0 = embed(ids) (a copy of
@@ -2642,7 +2718,7 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
       saveForwardState(i + 1)
       let tfEnd = getMonoTime()
       stderr.writeLine &"[time] fwd block {i}: merge+load={dsec(tf0, tfMerge):.1f}s " &
-        &"forward={dsec(tfMerge, tfFwd):.1f}s spill={dsec(tfFwd, tfEnd):.1f}s total={dsec(tf0, tfEnd):.1f}s"
+        &"forward={dsec(tfMerge, tfFwd):.1f}s store={dsec(tfFwd, tfEnd):.1f}s total={dsec(tf0, tfEnd):.1f}s"
       trainProfEnd(&"fwd block {i}", tf0)
       GC_fullCollect()
       dlog &"block {i}: forward done"
@@ -2735,7 +2811,7 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
         if auditMode: p[].data = graftInitForStep0(name, p[].data)
 
     let tbMerge = getMonoTime()
-    let xi = xstore.readActivation(i)   # reads EXACTLY 1 activation from the SSD, out of scope after backwardBlock
+    let xi = xstore.readActivation(i)   # loads 1 activation; it goes out of scope after backwardBlock
     var dXBeforeBlock = dX  # gradient entering i, needed unchanged on retry
     dXBeforeBlock.data = cloneFloat32Data(dX.data)
     var blockGrads = initTable[string, Tensor]()   # for this block only, NOT accumulated
@@ -2940,8 +3016,8 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
       for name in namesByBlock[i]: restoreBaseOne(m, lo, name)
 
     # Uses the paramByName built at the top of the function, does NOT call paramList(m) again.
-    # The Adam m/v do not stay in RAM across steps: 1 state is read from the SSD, updated on the GPU,
-    # written back to the SSD and freed right away.
+    # Disk mode streams Adam m/v through the store one parameter at a time;
+    # RAM-only mode keeps the states in its in-memory table.
     # (a real bug, causing the IndexDefect "container is empty"): parameters ALREADY
     # in lo.adapters ('R' blocks, handled through LoRA in the loop
     # above) MUST be skipped - restoreBaseOne() has just run for those names, making
@@ -2977,7 +3053,7 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
       clearAdamState(st)
       if name in fullPrecNamesByBlock.getOrDefault(i, @[]):
         # apfAdamStepGpu has just updated p[].data IN PLACE (the NEW weight values) -
-        # save them to the SSD right away, then free them from RAM - do NOT leave ~3.5GB around for
+        # save them to the configured store, then free the working copy from RAM - do NOT leave ~3.5GB around for
         # the next block (exactly the missing piece compared with the 'R' blocks).
         attnStore.saveW(name, p[].data)
         p[].data = @[]
@@ -3207,7 +3283,7 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
         rescueTriggered = true
       GC_fullCollect()
     let tbCheck = getMonoTime()
-    dlog &"backward block {i}: adam update + SSD spill done"
+    dlog &"backward block {i}: Adam update + parameter store done"
     if rescueTriggered:
       # The update was rolled back. Never write layer i as completed or move
       # the progress cursor to i: that would skip i, especially for i == 0.
@@ -3240,8 +3316,8 @@ proc trainStepGraftStreaming*(m: var NimformerModelJamba, lo: var JambaLora,
     let tbEnd = getMonoTime()
     stderr.writeLine &"[time] bwd block {i}: merge+load={dsec(tb0, tbMerge):.1f}s " &
       &"backwardBlock={dsec(tbMerge, tbBwd):.1f}s grad+check={dsec(tbBwd, tbGrad):.1f}s " &
-      &"adam+SSD={dsec(tbGrad, tbUpd):.1f}s safety+probe={dsec(tbUpd, tbCheck):.1f}s " &
-      &"spill={dsec(tbCheck, tbEnd):.1f}s total={dsec(tb0, tbEnd):.1f}s"
+      &"adam+store={dsec(tbGrad, tbUpd):.1f}s safety+probe={dsec(tbUpd, tbCheck):.1f}s " &
+      &"store={dsec(tbCheck, tbEnd):.1f}s total={dsec(tb0, tbEnd):.1f}s"
     trainProfEnd(&"bwd block {i}", tb0)
     # blockGrads goes out of scope right here -> the GC reclaims it, it does NOT leak into the next block
     GC_fullCollect()   # runs for EVERY block, like the forward above
@@ -3316,7 +3392,7 @@ proc fillUntrainedLoraBlocks*(m: var NimformerModelJamba, lo: var JambaLora,
   let ckpt = getCheckpointPath()
   let marker = fillMarkerPath(ckpt)
   if k < 0:
-    if fileExists(marker):
+    if not CFG_FINETUNE_RAM_ONLY and fileExists(marker):
       # The .bin already holds the fill result (crash after writing the .bin, before cleanup) -> clean up the fill progress.
       echo "[fill] The .bin already has all 128 adapters; cleaning up leftover fill progress."
       checkpoint.clearLayerProgress(ckpt)
@@ -3336,14 +3412,14 @@ proc fillUntrainedLoraBlocks*(m: var NimformerModelJamba, lo: var JambaLora,
   # RESUME: the fill runs with stepIndex = FillStepIndex so it shares the
   # forward/backward resume + layer-progress mechanism of regular training. The marker file
   # (holding K) tells fill progress apart from the progress of a regular training step.
-  let resuming = fileExists(marker)
+  let resuming = not CFG_FINETUNE_RAM_ONLY and fileExists(marker)
   if resuming:
     let savedK = readFile(marker).strip
     if savedK != $k:
       raise newException(IOError,
         &"[fill] The fill progress records K={savedK} but the current checkpoint has B = 0 in blocks 0..{k}. " &
         &"Delete {checkpoint.progressDir(ckpt)} to fill again from scratch.")
-  else:
+  elif not CFG_FINETUNE_RAM_ONLY:
     # Drop all old progress/activations of step FillStepIndex (not part of this fill).
     checkpoint.clearLayerProgress(ckpt)
     removeActivationResume(FillStepIndex)
@@ -3413,7 +3489,8 @@ proc fillUntrainedLoraBlocks*(m: var NimformerModelJamba, lo: var JambaLora,
     let (idsB, _, tgtMaskB) = fillBatcher.nextBatch()
     let gLrScale = min(1.0'f32, 1.0'f32 / float32(CFG_G_LR_WARMUP_STEPS))
     loss = trainStepGraftStreaming(m, lo, loState, adamStore, attnStore, CFG_NEWBLOCK_LR,
-      idsB, tgtMaskB, ctx, gLrScale, stepIndex = FillStepIndex, updateMaxBlock = k)
+      idsB, tgtMaskB, ctx, gLrScale,
+      stepIndex = (if CFG_FINETUNE_RAM_ONLY: -1 else: FillStepIndex), updateMaxBlock = k)
     if gStopRequested and not gTrainStepFullyDone:
       stderr.writeLine "[fill] Stopped safely - the fill progress is on the SSD (" & checkpoint.progressDir(ckpt) &
         "). Run again to continue the fill, NOTHING done is lost."
@@ -3447,7 +3524,7 @@ proc auditStep0Core*(m: var NimformerModelJamba, lo: var JambaLora,
     return false
   let ckpt = getCheckpointPath()
   let marker = auditMarkerPath(ckpt)
-  let resuming = fileExists(marker)
+  let resuming = not CFG_FINETUNE_RAM_ONLY and fileExists(marker)
   if resuming: recoverPreparedResumeState(FillStepIndex, m.blocks.len, lo)
   if gLoadedCkptMeta.getOrDefault(Step0AuditMetaKey) == "ok":
     if resuming:
@@ -3468,7 +3545,7 @@ proc auditStep0Core*(m: var NimformerModelJamba, lo: var JambaLora,
         &"[audit] '{name}' still has B = 0 - it must be filled (fillUntrainedLoraBlocks) before the step 0 check.")
   if resuming:
     echo "[audit] TIEP TUC kiem/sua update step 0 do (" & marker & ")."
-  else:
+  elif not CFG_FINETUNE_RAM_ONLY:
     echo "[audit] The step 1 checkpoint has no confirmed step 0 update -> recomputing step 0 " &
          "(forward through 64 blocks + backward from the top block to the first correct block)."
     checkpoint.clearLayerProgress(ckpt)
@@ -3506,7 +3583,8 @@ proc auditStep0Core*(m: var NimformerModelJamba, lo: var JambaLora,
   else:
     let gLrScale = min(1.0'f32, 1.0'f32 / float32(CFG_G_LR_WARMUP_STEPS))
     loss = trainStepGraftStreaming(m, lo, loState, adamStore, attnStore, CFG_NEWBLOCK_LR,
-      idsB, tgtMaskB, ctx, gLrScale, stepIndex = FillStepIndex,
+      idsB, tgtMaskB, ctx, gLrScale,
+      stepIndex = (if CFG_FINETUNE_RAM_ONLY: -1 else: FillStepIndex),
       updateMaxBlock = m.blocks.len - 1, auditRefB = refB)
     if gStopRequested and not gTrainStepFullyDone:
       stderr.writeLine "[audit] Stopped safely - the progress is on the SSD (" & checkpoint.progressDir(ckpt) &
@@ -3675,7 +3753,17 @@ when isMainModule:
   # "must be 100% GPU". To force a specific backend: newBackend("cuda"/"metal"/...).
   # Allow CPU fallback for OOM recovery on memory-constrained GPUs.
   setForbidCpuFallback(false)
-  let ctx = newBackend()
+  if getEnv("BYBY_FINETUNE_ACCELERATED_GEMM", "").len == 0:
+    putEnv("BYBY_FINETUNE_ACCELERATED_GEMM", "1")
+  let ctx = newBackend(CFG_FINETUNE_BACKEND)
+  echo &"[finetune_lora] backend={ctx.kind}, RAM-only={CFG_FINETUNE_RAM_ONLY}, " &
+    "accelerated GEMM=" & getEnv("BYBY_FINETUNE_ACCELERATED_GEMM", "1")
+  if ctx.kind == bkVulkan and getEnv("BYBY_VULKAN_TENSOR_CORES", "1") != "0":
+    echo "[finetune_lora] Vulkan cooperative matrix GEMM enabled when supported; FP32 accumulation, FP16 matrix inputs"
+  elif ctx.kind == bkMetal:
+    echo "[finetune_lora] Metal register-blocked SIMD GEMM enabled (set BYBY_METAL_GEMM_RB=0 to disable)"
+  if CFG_FINETUNE_RAM_ONLY:
+    echo "[finetune_lora] RAM-only: no activation scratch, Adam cache, or layer-resume files; portable checkpoint saved every completed step."
 
   # FAIL-FAST: initialise the GPU + JIT RIGHT AWAY (before loading the model, which takes ~hours). Before,
   # initMicroVmJit/warmupMicroVmJit ran AFTER loading the weights -> the "[metal_jit] gDevice nil" error
@@ -3713,15 +3801,18 @@ when isMainModule:
     var recoveryStep = -1
     var recoverySeqLen, recoveryBatch = 0
     var recoveryPattern, recoveryDatasetSig, recoveryTokenizerDir = ""
-    let recoveryHasCommit = readResumeCommit(getCheckpointPath(), recoveryStep,
-      recoverySeqLen, recoveryBatch, recoveryPattern, recoveryDatasetSig,
-      recoveryTokenizerDir)
-    let recoveryInProgress = fileExists(getCheckpointPath() & ".resume.inprogress")
-    if recoveryInProgress and oldStep > 0 and not recoveryHasCommit:
+    let recoveryHasCommit =
+      if CFG_FINETUNE_RAM_ONLY: false
+      else: readResumeCommit(getCheckpointPath(), recoveryStep,
+        recoverySeqLen, recoveryBatch, recoveryPattern, recoveryDatasetSig,
+        recoveryTokenizerDir)
+    let recoveryInProgress = not CFG_FINETUNE_RAM_ONLY and
+      fileExists(getCheckpointPath() & ".resume.inprogress")
+    if not CFG_FINETUNE_RAM_ONLY and recoveryInProgress and oldStep > 0 and not recoveryHasCommit:
       raise newException(IOError,
         "[resume] There is a step>0 checkpoint and .resume.inprogress but no commit marker. " &
         "Cannot prove the model/Adam/dataset cursor are at the same step; stopping safely to avoid a skewed resume.")
-    if recoveryHasCommit and oldStep != recoveryStep:
+    if not CFG_FINETUNE_RAM_ONLY and recoveryHasCommit and oldStep != recoveryStep:
       let backupPath = getCheckpointPath() & ".prev"
       if not fileExists(backupPath):
         raise newException(IOError,
@@ -3901,9 +3992,11 @@ when isMainModule:
   # Separate Adam for the parameters of the new blocks (A/S) - ONLY the blocks in
   # newBlockIndices, not touching the M blocks (LoRA-ified) or embed/outProj
   # (kept as is, in the spirit of "freeze as much as possible, only learn what must be learned").
-  var adamStore = initAdamDiskStore(CFG_ADAM_DIR)
+  var adamStore = initAdamDiskStore(CFG_ADAM_DIR, ramOnly = CFG_FINETUNE_RAM_ONLY)
   let commitOnlyMode = getEnv("BYBY_COMMIT_ONLY", "0") != "0"
-  if not resumed and step0RepairInProgress(getCheckpointPath()):
+  if CFG_FINETUNE_RAM_ONLY and commitOnlyMode:
+    raise newException(ValueError, "BYBY_COMMIT_ONLY uses layer-resume files and is unavailable in RAM-only mode")
+  if not CFG_FINETUNE_RAM_ONLY and not resumed and step0RepairInProgress(getCheckpointPath()):
     # Step 0 FILL/CHECK progress exists (computed on an old .bin) but the .bin is gone. If .prev remains ->
     # the .bin was most likely deleted by mistake: do NOT delete the progress (hours of work), stop + explain.
     if fileExists(getCheckpointPath() & ".prev"):
@@ -3917,18 +4010,18 @@ when isMainModule:
     echo "[fill] No .bin/.prev checkpoint left but unfinished fill progress remains -> dropping the fill progress, training anew from scratch."
     checkpoint.clearLayerProgress(getCheckpointPath())
     removeActivationResume(FillStepIndex)
-  let hasInprogress = dirExists(checkpoint.progressDir(getCheckpointPath()))
+  let hasInprogress = not CFG_FINETUNE_RAM_ONLY and dirExists(checkpoint.progressDir(getCheckpointPath()))
   # A step 0 fill/check is in progress (fillUntrainedLoraBlocks / auditStep0LoraBlocks interrupted): the
   # progress is in <ckpt>.inprogress with stepIndex = FillStepIndex, NOT a regular training step.
-  var fillInProgress = resumed and step0RepairInProgress(getCheckpointPath())
-  if oldStep == 0 and not commitOnlyMode and not hasInprogress:
+  var fillInProgress = not CFG_FINETUNE_RAM_ONLY and resumed and step0RepairInProgress(getCheckpointPath())
+  if not CFG_FINETUNE_RAM_ONLY and oldStep == 0 and not commitOnlyMode and not hasInprogress:
     # Only clean up Adam on a real new run (no inprogress left to recover).
     adamStore.cleanup()
     adamStore = initAdamDiskStore(CFG_ADAM_DIR)
-  elif hasInprogress:
+  elif not CFG_FINETUNE_RAM_ONLY and hasInprogress:
     echo "[finetune_lora] Found inprogress — KEEPING the Adam disk state (no cleanup)."
-  var attnStore = initAttnWeightDiskStore(CFG_ATTN_WEIGHTS_DIR)
-  if oldStep == 0 and not commitOnlyMode and not hasInprogress:
+  var attnStore = initAttnWeightDiskStore(CFG_ATTN_WEIGHTS_DIR, ramOnly = CFG_FINETUNE_RAM_ONLY)
+  if not CFG_FINETUNE_RAM_ONLY and oldStep == 0 and not commitOnlyMode and not hasInprogress:
     # New run: old 'A' weights (if any) left over from a previous run are not used -
     # the bootstrap in trainStepGraftStreaming rewrites them from the current m.
     attnStore.cleanupAttn()
@@ -3965,10 +4058,13 @@ when isMainModule:
   var committedPattern = ""
   var committedDatasetSig = ""
   var committedTokenizerDir = ""
-  let hasCommit = readResumeCommit(getCheckpointPath(), committedStep, committedSeqLen, committedBatch, committedPattern, committedDatasetSig, committedTokenizerDir)
-  let inProgress = fileExists(getCheckpointPath() & ".resume.inprogress")
-  var attnStoreTrusted = false
-  if resumed and (oldStep > 0 or hasCommit or inProgress):
+  let hasCommit =
+    if CFG_FINETUNE_RAM_ONLY: false
+    else: readResumeCommit(getCheckpointPath(), committedStep, committedSeqLen, committedBatch,
+      committedPattern, committedDatasetSig, committedTokenizerDir)
+  let inProgress = not CFG_FINETUNE_RAM_ONLY and fileExists(getCheckpointPath() & ".resume.inprogress")
+  var attnStoreTrusted = CFG_FINETUNE_RAM_ONLY
+  if not CFG_FINETUNE_RAM_ONLY and resumed and (oldStep > 0 or hasCommit or inProgress):
     if not hasCommit or committedStep != oldStep:
       echo "[resume] WARNING: no commit marker at the right step -> the FP32 resume sidecar is not trusted."
     elif committedSeqLen != CFG_SEQ_LEN or committedBatch != CFG_BATCH_SIZE or committedPattern != m.pattern:
@@ -4026,7 +4122,7 @@ when isMainModule:
       echo "[resume] New-block Adam m/v is untrusted (missing/wrong step or untrusted FP32 sidecar) -> " &
            "RESETTING ALL new-block Adam; the weights continue from the portable checkpoint."
       resetAdamParameters(adamStore, m, newBlockNames)
-  elif oldStep == 0:
+  elif not CFG_FINETUNE_RAM_ONLY and oldStep == 0:
     clearResumeInProgress(getCheckpointPath())
 
   # Per-layer in-progress files describe an *incomplete* training step. They
@@ -4038,7 +4134,8 @@ when isMainModule:
   # Step/cursor mismatch -> load the weights + FORCE commit (nothing deleted, no training lost).
   block inspectLayerProgress:
     var pStep, pLayer: int
-    if not fillInProgress and checkpoint.readProgressCursor(getCheckpointPath(), pStep, pLayer):
+    if not CFG_FINETUNE_RAM_ONLY and not fillInProgress and
+       checkpoint.readProgressCursor(getCheckpointPath(), pStep, pLayer):
       if pStep == oldStep:
         echo &"[checkpoint] Resuming step {pStep} from layer {pLayer}; keeping inprogress, continuing the backward."
       else:
@@ -4047,25 +4144,30 @@ when isMainModule:
 
   var layerProgressUsable = false
   var layerProgressStep, layerProgressLayer: int
-  if checkpoint.readProgressCursor(getCheckpointPath(), layerProgressStep, layerProgressLayer):
+  if not CFG_FINETUNE_RAM_ONLY and
+     checkpoint.readProgressCursor(getCheckpointPath(), layerProgressStep, layerProgressLayer):
     layerProgressUsable = true  # always try it; not cleared on a mismatch
     echo &"[checkpoint] layer-progress usable: step={layerProgressStep} layer={layerProgressLayer}"
 
-  if fillInProgress and not attnStoreTrusted:
+  if not CFG_FINETUNE_RAM_ONLY and fillInProgress and not attnStoreTrusted:
     # The FP32 weights of filled G blocks only live in the sidecar; if the sidecar is broken the fill
     # progress is no longer consistent -> dropped, filled again from scratch (the sidecar is bootstrapped again from the .bin).
     echo "[fill] The G block FP32 sidecar is untrusted -> DROPPING the unfinished fill progress, filling again from scratch."
     checkpoint.clearLayerProgress(getCheckpointPath())
     removeActivationResume(FillStepIndex)
     fillInProgress = false
-  if not attnStoreTrusted and oldStep > 0:
+  if not CFG_FINETUNE_RAM_ONLY and not attnStoreTrusted and oldStep > 0:
     # The FP32 sidecar may be in the middle of a step -> not used. Bootstrapped from the current
     # QLoRA4 checkpoint; safer than mixing weights/optimizer state of different versions.
     attnStore.cleanupAttn()
 
   echo &"[finetune_lora] {lo.adapters.len} LoRA adapters, {newBlockNames.len} new-block parameters trained in full"
-  echo &"[finetune_lora] activation scratch (spill-to-disk) will be written to: {CFG_SCRATCH_DIR}"
-  echo &"[finetune_lora] Adam state swapped to the SSD: {CFG_ADAM_DIR} (m/v/step read 1 param -> GPU -> written to SSD -> RAM freed)"
+  if CFG_FINETUNE_RAM_ONLY:
+    echo "[finetune_lora] activations, Adam states, and FP32 trainable attention weights stay in RAM."
+    echo "[finetune_lora] restarting from the checkpoint resets Adam; no partial layer state is loaded."
+  else:
+    echo &"[finetune_lora] activation scratch (spill-to-disk) will be written to: {CFG_SCRATCH_DIR}"
+    echo &"[finetune_lora] Adam state swapped to the SSD: {CFG_ADAM_DIR} (m/v/step read 1 param -> GPU -> written to SSD -> RAM freed)"
 
   var bpeTok: BPETokenizer
   var hfTok: HfTokenizer
@@ -4146,7 +4248,8 @@ when isMainModule:
     batcher.skipSteps(epoch)
   block:
     var cs, cl: int
-    if not fillInProgress and checkpoint.readProgressCursor(getCheckpointPath(), cs, cl):
+    if not CFG_FINETUNE_RAM_ONLY and not fillInProgress and
+       checkpoint.readProgressCursor(getCheckpointPath(), cs, cl):
       echo &"[resume-layer] phat hien {getCheckpointPath()}.inprogress cursor step={cs} layer={cl}"
       # (the "102/128 adapters B=0" bug): this branch used to FORCE commit step
       # cs+1 wherever the cursor stopped. A step interrupted (Ctrl+C / crash) after
@@ -4294,7 +4397,8 @@ when isMainModule:
     var cs, cl: int
     if not resumed or epoch != oldStep:
       break fillHoles
-    if not fillInProgress and checkpoint.readProgressCursor(getCheckpointPath(), cs, cl):
+    if not CFG_FINETUNE_RAM_ONLY and not fillInProgress and
+       checkpoint.readProgressCursor(getCheckpointPath(), cs, cl):
       break fillHoles   # a regular training step is unfinished: the [resume-layer] block above handles it
     if fillUntrainedLoraBlocks(m, lo, loState, adamStore, attnStore, newBlockNames,
                                bpeTok, hfTok, usingHfTok, ctx, epoch):
@@ -4303,25 +4407,25 @@ when isMainModule:
       if newBlockNames.len > 0 and not adamStoreAllAtStep(adamStore, m, newBlockNames, epoch):
         forceAdamStoreToStep(adamStore, m, newBlockNames, epoch)
       let ckpt = getCheckpointPath()
-      # The backup is only secondary: the file may have been deleted/renamed during the fill (hours) -
-      # a backup error must NOT lose the fill result (bug: copyFile of a deleted .bin ->
-      # OSError -> died before writing the .bin).
-      for suffix in ["", ".resume.commit"]:
-        if fileExists(ckpt & suffix):
-          try: copyFile(ckpt & suffix, ckpt & suffix & ".before_fill")
-          except OSError as e:
-            stderr.writeLine &"[fill] WARNING: could not back up {ckpt}{suffix}: {e.msg} - still writing the fill result."
-        else:
-          stderr.writeLine &"[fill] WARNING: {ckpt}{suffix} is no longer on disk - skipping the backup, still writing the fill result."
+      if not CFG_FINETUNE_RAM_ONLY:
+        # The backup is only secondary: a backup error must not lose the fill result.
+        for suffix in ["", ".resume.commit"]:
+          if fileExists(ckpt & suffix):
+            try: copyFile(ckpt & suffix, ckpt & suffix & ".before_fill")
+            except OSError as e:
+              stderr.writeLine &"[fill] WARNING: could not back up {ckpt}{suffix}: {e.msg} - still writing the fill result."
+          else:
+            stderr.writeLine &"[fill] WARNING: {ckpt}{suffix} is no longer on disk - skipping the backup, still writing the fill result."
       saveCheckpointLoraBin(m, lo, ckpt, epoch, newBlockNames, attnStore)
-      saveLoraAdamStates(adamStore, loState)
-      writeResumeCommit(ckpt, epoch, CFG_SEQ_LEN, CFG_BATCH_SIZE, m.pattern, currentDatasetSig,
-        (if CFG_INIT_MODE == "codestral": CFG_HF_DIR else: ""))
-      # The fill progress is only deleted AFTER the .bin + Adam + commit marker are written.
-      checkpoint.clearLayerProgress(ckpt)
-      removeActivationResume(FillStepIndex)
+      if not CFG_FINETUNE_RAM_ONLY:
+        saveLoraAdamStates(adamStore, loState)
+        writeResumeCommit(ckpt, epoch, CFG_SEQ_LEN, CFG_BATCH_SIZE, m.pattern, currentDatasetSig,
+          (if CFG_INIT_MODE == "codestral": CFG_HF_DIR else: ""))
+        # The fill progress is only deleted AFTER the .bin + Adam + commit marker are written.
+        checkpoint.clearLayerProgress(ckpt)
+        removeActivationResume(FillStepIndex)
       fillInProgress = false
-      echo &"[fill] Wrote {ckpt} step={epoch} (backup: {ckpt}.before_fill)"
+      echo &"[fill] Wrote {ckpt} step={epoch}"
 
   # AUTOMATICALLY checks the step 0 update (after the fill): blocks with a wrong step 0 update (e.g. computed through
   # a random lm_head) -> recomputed; the flag is written into the .bin so it is not checked again next time.
@@ -4329,7 +4433,7 @@ when isMainModule:
     var cs, cl: int
     if not resumed or epoch != oldStep:
       break step0Audit
-    if not step0RepairInProgress(getCheckpointPath()) and
+    if not CFG_FINETUNE_RAM_ONLY and not step0RepairInProgress(getCheckpointPath()) and
        checkpoint.readProgressCursor(getCheckpointPath(), cs, cl):
       break step0Audit   # a regular training step is unfinished
     if auditStep0LoraBlocks(m, lo, loState, adamStore, attnStore,
@@ -4339,28 +4443,31 @@ when isMainModule:
       if newBlockNames.len > 0 and not adamStoreAllAtStep(adamStore, m, newBlockNames, epoch):
         forceAdamStoreToStep(adamStore, m, newBlockNames, epoch)
       let ckpt = getCheckpointPath()
-      # Keep the .bin from before the fix (hard link, O(1)): .prev CANNOT keep it since the final save right
-      # after overwrites it. A backup error must not lose the check result.
-      let backup = ckpt & ".before_audit"
-      try:
-        if fileExists(backup): removeFile(backup)
-        if fileExists(ckpt) and cLink(ckpt.cstring, backup.cstring) != 0:
-          copyFile(ckpt, backup)
-      except OSError as e:
-        stderr.writeLine &"[audit] WARNING: could not back up {ckpt}: {e.msg} - still writing the result."
+      var backup = ""
+      if not CFG_FINETUNE_RAM_ONLY:
+        # Keep a copy of the pre-audit checkpoint for disk-backed recovery mode.
+        backup = ckpt & ".before_audit"
+        try:
+          if fileExists(backup): removeFile(backup)
+          if fileExists(ckpt) and cLink(ckpt.cstring, backup.cstring) != 0:
+            copyFile(ckpt, backup)
+        except OSError as e:
+          stderr.writeLine &"[audit] WARNING: could not back up {ckpt}: {e.msg} - still writing the result."
       saveCheckpointLoraBin(m, lo, ckpt, epoch, newBlockNames, attnStore)
-      saveLoraAdamStates(adamStore, loState)
-      writeResumeCommit(ckpt, epoch, CFG_SEQ_LEN, CFG_BATCH_SIZE, m.pattern, currentDatasetSig,
-        (if CFG_INIT_MODE == "codestral": CFG_HF_DIR else: ""))
-      checkpoint.clearLayerProgress(ckpt)
-      removeActivationResume(FillStepIndex)
+      if not CFG_FINETUNE_RAM_ONLY:
+        saveLoraAdamStates(adamStore, loState)
+        writeResumeCommit(ckpt, epoch, CFG_SEQ_LEN, CFG_BATCH_SIZE, m.pattern, currentDatasetSig,
+          (if CFG_INIT_MODE == "codestral": CFG_HF_DIR else: ""))
+        checkpoint.clearLayerProgress(ckpt)
+        removeActivationResume(FillStepIndex)
       fillInProgress = false
-      echo &"[audit] Wrote {ckpt} step={epoch} ({Step0AuditMetaKey}=ok; previous version: {backup})"
+      echo &"[audit] Wrote {ckpt} step={epoch} ({Step0AuditMetaKey}=ok)"
 
   var runningLoss = 0'f32
   var prevStepLoss = -1'f32
   while epoch < CFG_EPOCHS:
-    markResumeInProgress(getCheckpointPath(), epoch + 1)
+    if not CFG_FINETUNE_RAM_ONLY:
+      markResumeInProgress(getCheckpointPath(), epoch + 1)
     # `idsB`/`tgtB` only live for 1 loop iteration - out of scope the GC reclaims them
     # RIGHT AWAY, nothing accumulates across steps (unlike the old version keeping the whole seq
     # `batches` from start to end of training).
@@ -4381,7 +4488,8 @@ when isMainModule:
                  # stepIndex = epoch: tells trainStepGraftStreaming which step this is so it
                  # writes the per-layer in-progress files (<ckpt>.inprogress/step-<n>/layer-<i>.*).
                  trainStepGraftStreaming(m, lo, loState, adamStore, attnStore,
-                   CFG_NEWBLOCK_LR, idsB, tgtMaskB, ctx, gLrScale, stepIndex = epoch)
+                   CFG_NEWBLOCK_LR, idsB, tgtMaskB, ctx, gLrScale,
+                   stepIndex = (if CFG_FINETUNE_RAM_ONLY: -1 else: epoch))
                else:
                  # this path goes through jamba_hybrid.computeLossAndGrads ->
                  # the ORIGINAL test_nimformer.softmaxCrossEntropy (which does not understand TargetIgnore)
@@ -4389,8 +4497,11 @@ when isMainModule:
                  trainStepGraft(m, lo, loState, adamStore, CFG_NEWBLOCK_LR, idsB, tgtRawB, ctx)
     runningLoss += loss
     if gStopRequested and not gTrainStepFullyDone:
-      # Unfinished step: the resume/layer progress is on the SSD — epoch NOT incremented, the full ckpt NOT committed.
-      stderr.writeLine "[finetune_lora] Exiting safely (step unfinished). Run make finetune-mamba again to resume the layer."
+      # RAM-only intentionally drops an interrupted step; the last complete .bin stays intact.
+      if CFG_FINETUNE_RAM_ONLY:
+        stderr.writeLine "[finetune_lora] RAM-only step interrupted; discarding this partial step. The last complete checkpoint remains intact."
+      else:
+        stderr.writeLine "[finetune_lora] Exiting safely (step unfinished). Run make finetune-mamba again to resume the layer."
       quit(130)
     if epoch == 0 and gTrainStepFullyDone and gLastStepForwardRan:
       # Step 0: the loss + gradient were computed entirely in this process (lm_head bound, preflight)
@@ -4405,14 +4516,15 @@ when isMainModule:
         if newBlockNames.len == 0 or adamStoreAllAtStep(adamStore, m, newBlockNames, epoch):
           if not (CFG_INIT_MODE == "codestral" and newBlockNames.len > 0 and not attnStoreAllValid(attnStore, m, newBlockNames)):
             saveCheckpointLoraBin(m, lo, getCheckpointPath(), epoch, newBlockNames, attnStore)
-            saveLoraAdamStates(adamStore, loState)
-            writeResumeCommit(getCheckpointPath(), epoch, CFG_SEQ_LEN, CFG_BATCH_SIZE, m.pattern, currentDatasetSig, (if CFG_INIT_MODE == "codestral": CFG_HF_DIR else: ""))
-            clearResumeInProgress(getCheckpointPath())
-            checkpoint.clearLayerProgress(getCheckpointPath())
-            removeActivationResume(epoch - 1)
+            if not CFG_FINETUNE_RAM_ONLY:
+              saveLoraAdamStates(adamStore, loState)
+              writeResumeCommit(getCheckpointPath(), epoch, CFG_SEQ_LEN, CFG_BATCH_SIZE, m.pattern, currentDatasetSig, (if CFG_INIT_MODE == "codestral": CFG_HF_DIR else: ""))
+              clearResumeInProgress(getCheckpointPath())
+              checkpoint.clearLayerProgress(getCheckpointPath())
+              removeActivationResume(epoch - 1)
             stderr.writeLine &"[finetune_lora] Committed checkpoint step={epoch} before exiting."
             quit(130)
-      stderr.writeLine "[finetune_lora] Could not commit (Adam/sidecar mismatch); the layer resume is still on the SSD. Exiting."
+      stderr.writeLine "[finetune_lora] Could not commit (Adam/sidecar mismatch); exiting with the previous checkpoint intact."
       quit(130)
 
     # CLEAN UP after EVERY batch (like a reuse allocator on ESP32: actively
@@ -4461,12 +4573,13 @@ when isMainModule:
             &"[checkpoint] FP32 Attention sidecar is incomplete at step {epoch}. NOT committing the checkpoint.")
       # COMMIT ORDER: checkpoint weights -> LoRA Adam -> commit marker -> delete in-progress.
       saveCheckpointLoraBin(m, lo, getCheckpointPath(), epoch, newBlockNames, attnStore)
-      saveLoraAdamStates(adamStore, loState)
-      writeResumeCommit(getCheckpointPath(), epoch, CFG_SEQ_LEN, CFG_BATCH_SIZE, m.pattern, currentDatasetSig, (if CFG_INIT_MODE == "codestral": CFG_HF_DIR else: ""))
-      clearResumeInProgress(getCheckpointPath())
-      # Layer progress is only deleted AFTER the .bin commit succeeds.
-      checkpoint.clearLayerProgress(getCheckpointPath())
-      removeActivationResume(epoch - 1)
+      if not CFG_FINETUNE_RAM_ONLY:
+        saveLoraAdamStates(adamStore, loState)
+        writeResumeCommit(getCheckpointPath(), epoch, CFG_SEQ_LEN, CFG_BATCH_SIZE, m.pattern, currentDatasetSig, (if CFG_INIT_MODE == "codestral": CFG_HF_DIR else: ""))
+        clearResumeInProgress(getCheckpointPath())
+        # Layer progress is only deleted AFTER the .bin commit succeeds.
+        checkpoint.clearLayerProgress(getCheckpointPath())
+        removeActivationResume(epoch - 1)
       GC_fullCollect()
 
     # REQUIRED: the loss went up compared with the previous step -> STOP training to check (this step
@@ -4477,7 +4590,7 @@ when isMainModule:
       break
     prevStepLoss = loss
 
-  if epoch > 0:
+  if epoch > 0 and not CFG_FINETUNE_RAM_ONLY:
     let strictFinal = getEnv("BYBY_STRICT_ADAM_STEP", "0") != "0"
     let forceFinal = getEnv("BYBY_FORCE_CHECKPOINT", "1") != "0"
     syncLoraAdamFromStore(adamStore, loState, lo)
@@ -4503,20 +4616,21 @@ when isMainModule:
         raise newException(ValueError,
           &"[checkpoint-final] FP32 Attention sidecar is incomplete at step {epoch}. NOT committing the checkpoint.")
   saveCheckpointLoraBin(m, lo, getCheckpointPath(), epoch, newBlockNames, attnStore)
-  saveLoraAdamStates(adamStore, loState)
-  writeResumeCommit(getCheckpointPath(), epoch, CFG_SEQ_LEN, CFG_BATCH_SIZE, m.pattern, currentDatasetSig, (if CFG_INIT_MODE == "codestral": CFG_HF_DIR else: ""))
-  clearResumeInProgress(getCheckpointPath())
-  # The `.bin` + commit marker for the final step are durable now, so the
-  # per-layer in-progress files and the activation scratch for it are no
-  # longer needed either.
-  checkpoint.clearLayerProgress(getCheckpointPath())
-  removeActivationResume(epoch - 1)
-  if not CFG_KEEP_RESUME_STATE:
+  if not CFG_FINETUNE_RAM_ONLY:
+    saveLoraAdamStates(adamStore, loState)
+    writeResumeCommit(getCheckpointPath(), epoch, CFG_SEQ_LEN, CFG_BATCH_SIZE, m.pattern, currentDatasetSig, (if CFG_INIT_MODE == "codestral": CFG_HF_DIR else: ""))
+    clearResumeInProgress(getCheckpointPath())
+    # The `.bin` + commit marker for the final step are durable now, so the
+    # per-layer in-progress files and the activation scratch for it are no
+    # longer needed either.
+    checkpoint.clearLayerProgress(getCheckpointPath())
+    removeActivationResume(epoch - 1)
+  if not CFG_FINETUNE_RAM_ONLY and not CFG_KEEP_RESUME_STATE:
     adamStore.cleanup()
     attnStore.cleanupAttn()
     echo &"[finetune_lora] Cleaned up the Adam disk cache: {CFG_ADAM_DIR}"
     echo &"[finetune_lora] Cleaned up the Attn-weight disk cache: {CFG_ATTN_WEIGHTS_DIR}"
-  else:
+  elif not CFG_FINETUNE_RAM_ONLY:
     echo "[finetune_lora] KEEPING the resume state on the SSD: Adam + FP32 Attention. No retraining needed on resume."
   # The tokenizer sidecar (.hf_tokenizer_dir / .bpe.json) is written EARLY, right
   # after the tokenizer is ready, BEFORE the training loop (see above) - it is NOT

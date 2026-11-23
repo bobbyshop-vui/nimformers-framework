@@ -71,6 +71,9 @@ MAMBA3_FINETUNE_SRC := test/mamba3/finetune_lora.nim
 
 GRAFT_BIN       := graft_attention_bin$(EXE_EXT)
 FINETUNE_BIN    := finetune_lora_bin$(EXE_EXT)
+FINETUNE_RAM_ONLY ?= 1
+FINETUNE_BACKEND ?= auto
+FINETUNE_ACCELERATED_GEMM ?= 1
 INFER_LORA_BIN  := infer_lora_bin$(EXE_EXT)
 COMPACT_LORA_BIN := compact_lora_checkpoint$(EXE_EXT)
 MIGRATE_LORA_BIN := migrate_lora_json_to_bin$(EXE_EXT)
@@ -87,7 +90,7 @@ CLEAN_BINS      := $(TEST_BIN) $(GRAFT_BIN) $(FINETUNE_BIN) $(INFER_LORA_BIN) $(
         build-migrate-lora build-nim-inference build-spectron build-shared build-for-python \
         init-submodules \
         python-test python-example c-example bybylang-test hook-plugin-test bench-gflops \
-        graft finetune-mamba hf-train build-hf-train infer-lora infer-mamba infer-deepseek run-spectron mamba-pipeline \
+        graft finetune-mamba finetune-codestral-vulkan finetune-codestral-metal hf-train build-hf-train infer-lora infer-mamba infer-deepseek run-spectron mamba-pipeline \
         build-formers build-formers-arm64 formers-cli firlift formers flash-attention-test q4-gemv-test q4-gemm-test formers-test formers-fir-test formers-smoke formers-clean
 
 all: build run
@@ -384,11 +387,25 @@ finetune-mamba: build-finetune
 ifeq ($(strip $(ARGS)),)
 	@echo "[finetune-mamba] No ARGS -> using the fixed config in finetune_lora.nim (CFG_*_DEFAULT)."
 	@echo "[finetune-mamba] Running: $(RUN_PREFIX)$(FINETUNE_BIN)"
-	$(RUN_PREFIX)$(FINETUNE_BIN)
+	$(FINETUNE_ENV) $(RUN_PREFIX)$(FINETUNE_BIN)
 else
 	@echo "[finetune-mamba] Running with the given ARGS: $(RUN_PREFIX)$(FINETUNE_BIN) $(ARGS)"
-	$(RUN_PREFIX)$(FINETUNE_BIN) $(ARGS)
+	$(FINETUNE_ENV) $(RUN_PREFIX)$(FINETUNE_BIN) $(ARGS)
 endif
+
+# RAM-only Codestral runs. Vulkan uses cooperative matrices when the device
+# exposes them; Metal uses the register-blocked SIMD GEMM path.
+ifeq ($(IS_WINDOWS),yes)
+FINETUNE_ENV = set BYBY_FINETUNE_RAM_ONLY=$(FINETUNE_RAM_ONLY)&& set BYBY_FINETUNE_BACKEND=$(FINETUNE_BACKEND)&& set BYBY_FINETUNE_ACCELERATED_GEMM=$(FINETUNE_ACCELERATED_GEMM)&&
+else
+FINETUNE_ENV = env BYBY_FINETUNE_RAM_ONLY=$(FINETUNE_RAM_ONLY) BYBY_FINETUNE_BACKEND=$(FINETUNE_BACKEND) BYBY_FINETUNE_ACCELERATED_GEMM=$(FINETUNE_ACCELERATED_GEMM)
+endif
+
+finetune-codestral-vulkan: FINETUNE_BACKEND = vulkan
+finetune-codestral-vulkan: finetune-mamba
+
+finetune-codestral-metal: FINETUNE_BACKEND = metal
+finetune-codestral-metal: finetune-mamba
 
 # ── infer-lora: no ARGS -> the INFER_LORA_DEFAULT_* defaults.
 # If the default checkpoint does not exist, prints help and stops. ──
