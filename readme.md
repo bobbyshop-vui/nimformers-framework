@@ -109,7 +109,7 @@ The following model developers are acknowledged. Their GitHub handles are linked
 
 - **Mistral AI** ([@mistralai](https://github.com/mistralai)): Devstral, Codestral, Mistral Large
 - **RWKV** ([@RWKV](https://github.com/RWKV)): RWKV-3
-- **Anthropic** ([@anthropics](https://github.com/anthropics), [@claude](https://github.com/claude)): Claude Sonnet 4.6, Claude Sonnet 5, Claude Sonnet 5.5, Claude Opus 4.6, Claude Opus 5, Claude Opus 5.5, Claude Fable 5
+- **Anthropic** ([@anthropics](https://github.com/anthropics), [@claude](https://github.com/claude)): Claude Sonnet 4.6, Claude Sonnet 5, Claude Sonnet 5.5, Claude Haiku 4.5, Claude Haiku 5.5, Claude Opus 4.5, Claude Opus 4.6, Claude Opus 5, Claude Opus 5.5, Claude Fable 5
 - **Google DeepMind** ([@google-deepmind](https://github.com/google-deepmind)): Gemini 3.8 Flash, Gemini 3.7 Flash
 - **Moonshot AI** ([@MoonshotAI](https://github.com/MoonshotAI)): Kimi K3
 - **Allen Institute for AI (Ai2)** ([@allenai](https://github.com/allenai)): SERA-8B
@@ -118,7 +118,7 @@ The following model developers are acknowledged. Their GitHub handles are linked
 - **Meta** ([@facebookresearch](https://github.com/facebookresearch), [@meta-llama](https://github.com/meta-llama)): Muse Spark, Llama 3.2
 - **Alibaba / Qwen team** ([@QwenLM](https://github.com/QwenLM)): Qwen-Coder-Next
 - **TinyLlama** ([@TinyLlama](https://github.com/TinyLlama)): TinyLlama 1.1B
-- **OpenAI** ([@openai](https://github.com/openai)): GPT-6 Luna, GPT-5.6 Luna, GPT-6.1 Sol
+- **OpenAI** ([@openai](https://github.com/openai)): GPT-6 Luna, GPT-5.6 Luna, GPT-6.1 Sol, GPT-6.2 Sol
 - **xAI** ([@xai-org](https://github.com/xai-org)): Grok 4.6, Grok 4.7
 
 This is an AI model and developer acknowledgement list; it does not replace individual human authorship or imply endorsement by the developers.
