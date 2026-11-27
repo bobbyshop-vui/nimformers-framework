@@ -180,6 +180,118 @@ khi resume vì chúng chỉ đổi lượng tính toán. `--hrm-l-layers` phải
 checkpoint. Checkpoint lưu khi chưa bật HRM không thể thêm HRM lúc resume;
 hãy tạo `--checkpoint` mới kèm `--init-checkpoint`.
 
+### Giải mã song song theo block
+
+`test/spectron/block_decode.nim` giải mã một lúc một block gồm K vị trí. Mỗi
+block bắt đầu từ các token nháp ngẫu nhiên. Mỗi lượt chạy model một lần trên
+cửa sổ ngữ cảnh cộng K token nháp, rồi dự đoán song song mọi vị trí trong
+block. Sau đó:
+
+1. Kiểm chứng. Gọi e là vị trí đầu tiên chưa được kiểm chứng. Dự đoán ở e chỉ
+   đọc các token đã kiểm chứng nên chắc chắn đúng. Nếu token nháp ở e đã trùng
+   dự đoán đó, dự đoán kế tiếp cũng chắc chắn đúng và e đi tiếp. Ở chỗ lệch
+   đầu tiên, token nháp được thay bằng dự đoán đúng.
+2. Các vị trí sau e theo `--policy`. `jacobi` thay mọi token nháp chưa kiểm
+   chứng bằng dự đoán mới. `confidence` khoá một token nháp khi dự đoán của nó
+   có xác suất softmax từ `--tau` trở lên và giữ nguyên qua hai lượt liên tiếp.
+   Token đã khoá chỉ đổi khi model dự đoán một token khác với xác suất từ
+   `--tau` trở lên.
+3. Block xong khi mọi vị trí đã được kiểm chứng.
+
+`--tau` phải lớn hơn 0,5 và không quá 1, nên nhiều nhất một token đạt được
+ngưỡng này.
+
+Mỗi lượt kiểm chứng được ít nhất một vị trí, nên một block cần tối đa K lượt,
+bằng số lượt forward của greedy. Đầu ra chính là đầu ra greedy: một token nháp
+có confidence cao nhưng sai sẽ bị thay khi bước kiểm chứng đi tới nó, nên
+confidence chỉ ảnh hưởng tới tốc độ. Greedy ở đây dùng cùng một cửa sổ cho mọi
+vị trí trong block: `context - K` token cuối trước block cộng chính block đó.
+Model là causal nên các token phía sau một vị trí không làm đổi logit của nó.
+
+Test Metal ở cuối hướng dẫn này chạy đúng hàm cập nhật block (`applyPass`)
+trên các bảng đại diện cho mọi model causal có thể có: một token và một cờ
+confident ứng với mỗi vị trí trong block và mỗi dãy token đứng trước nó trong
+block. Với n = (V^K − 1)/(V − 1) dãy như vậy, có V^n · 2^n bảng và V^K bản
+nháp ban đầu. Với cỡ bộ từ vựng và cỡ block (V, K) = (2, 1), (2, 2), (3, 2)
+và (2, 3), test thử mọi bảng với mọi bản nháp ban đầu và cả hai policy: 8,
+256, 11.664 và 131.072 trường hợp. Với (4, 4), (8, 6) và (16, 8), test thử
+3.000 bảng ngẫu nhiên mỗi cỡ, mỗi bảng một bản nháp ban đầu ngẫu nhiên. Đầu
+ra luôn trùng greedy và không bao giờ cần quá K lượt. Bước kiểm chứng đã thay
+mọi token nháp khoá sai mà nó gặp: 4.096 token trong 131.072 trường hợp. Khi
+mỗi token bằng token trước cộng 1 theo modulo 2, bản nháp ban đầu tệ nhất cần
+đúng K lượt với K = 1..12, nên một block có thể cần đủ K lượt.
+
+```sh
+nim c -d:release --mm:arc --opt:speed -d:backend=metal \
+  --path:. --path:test/codestral --path:test/deepseek-inference \
+  --path:test/spectron --path:kernelfortest \
+  -o:/tmp/block_decode test/spectron/block_decode.nim
+/tmp/block_decode --checkpoint=test/spectron/models/finetune.nimq \
+  --block=16 --tokens=64 --context=128 --tau=0.9 --trace-blocks=1
+```
+
+Checkpoint dense, MoE và HRM đều nạp được, ví dụ
+`test/spectron/models/moe/finetune.nimq`. Khi không có `--prompt`, chương
+trình giải mã tám prompt tiếng Anh và code có sẵn trong một batch. Một batch
+cần các prompt dài bằng nhau, nên mỗi prompt giữ N token cuối, với N là độ dài
+của prompt ngắn nhất và không quá `context - K`.
+
+Các dòng `[trace]` in từng lượt của prompt đầu tiên: token đã kiểm chứng để
+nguyên, token nháp đã khoá nằm trong `{ngoặc nhọn}`, các token nháp khác bắt
+đầu bằng `?`. Dòng tổng kết đếm số lượt forward, số lượt cho mỗi prompt, số
+token nháp được chấp nhận (token nháp đã đúng sẵn khi bước kiểm chứng đi tới),
+số lần khoá đúng và khoá sai, và so mọi đầu ra với greedy.
+
+Khi nhiều prompt chung một batch, mỗi lượt phải chờ prompt chậm nhất, nên
+`forwards` chỉ giảm dưới K mỗi block khi mọi prompt trong batch đều xong block
+sớm. `row_passes` đếm riêng số lượt của từng prompt, còn `tokens_per_row_pass`
+cho biết mức lợi khi giải mã riêng từng prompt.
+
+#### Train cho giải mã theo block
+
+Model chỉ train trên văn bản sạch dự đoán rất kém khi các token nháp phía
+trước còn sai, nên đa số block cần gần K lượt. `--draft-block=K
+--draft-noise=ρ` train model cho đúng tình huống của các lượt giải mã. Cửa sổ
+được cắt thành các block K input bắt đầu từ một vị trí ngẫu nhiên. Input đầu
+mỗi block đóng vai token cuối đã kiểm chứng nên giữ sạch. Mỗi input sau đó
+đóng vai token nháp và bị thay bằng một token khác với xác suất r, trong đó
+r ~ U(0, ρ) được rút riêng cho từng block. Target vẫn là token đúng kế tiếp.
+Trung bình ρ/2 số input nháp bị thay. Với `--seq=64`, K = 16 và ρ = 0,5, mỗi
+cửa sổ có đúng 4 điểm bắt đầu block, nên tỉ lệ input bị thay theo kỳ vọng là
+(1/4)·(60/64) = 15/64 = 23,44%. Dòng log `[draft]` in tỉ lệ đo được.
+
+`--probe-text=PATH` cắt một file văn bản thành các cửa sổ `--context` token và
+coi K token cuối của mỗi cửa sổ là một block. Với mỗi mức nhiễu 0,5 và 1, nó
+dự đoán block một lần với token nháp là token đúng và một lần với mỗi token
+nháp bị thay bằng token khác theo xác suất đó. Nó in tỉ lệ dự đoán giữ nguyên
+và độ chính xác top-1 của cả hai lần. Vị trí 0 của block không đọc token nháp
+nào nên không được tính. Vì mọi checkpoint đều chạy trên cùng văn bản, đây là
+phép so sánh công bằng giữa các model.
+
+Đo trên Intel Iris Plus 640 (Metal): checkpoint dense
+`test/spectron/models/finetune.nimq` ở bước 6030 được fine-tune 200 bước trên
+corpus 5 tỷ token (`--steps=200 --batch=16 --seq=64 --lr=1e-3
+--warmup=10`), một lần có `--draft-block=16 --draft-noise=0.5` và một lần
+không. Validation đọc văn bản sạch. Sau 200 bước, perplexity validation là
+68,05 khi có nhiễu nháp và 60,50 khi không. Phép đo dùng 64 cửa sổ mỗi file
+với `--context=64 --block=16`, tức 960 vị trí block mỗi file:
+
+| Văn bản | Checkpoint | Giữ nguyên khi 50% nháp sai | Giữ nguyên khi mọi nháp sai | Top-1 khi nháp đúng |
+|---|---|---|---|---|
+| `readme.md` | bước 6030 | 30,9% | 5,9% | 9,5% |
+| `readme.md` | +200 bước, không nhiễu nháp | 35,5% | 4,9% | 9,7% |
+| `readme.md` | +200 bước, có nhiễu nháp | 44,3% | 15,3% | 8,9% |
+| `prepare_scale_data.py` | bước 6030 | 29,7% | 3,8% | 19,9% |
+| `prepare_scale_data.py` | +200 bước, không nhiễu nháp | 38,8% | 5,8% | 20,0% |
+| `prepare_scale_data.py` | +200 bước, có nhiễu nháp | 53,4% | 26,6% | 19,1% |
+
+Các dòng của mỗi checkpoint lấy từ lệnh:
+
+```sh
+/tmp/block_decode --checkpoint=PATH --context=64 --block=16 \
+  --probe-text=readme.md --probe-text=test/spectron/prepare_scale_data.py
+```
+
 ## Train với bộ dữ liệu đã đóng gói
 
 Bộ dữ liệu có **2 tỷ token huấn luyện**, chia đều giữa code Python tự sinh
@@ -484,7 +596,9 @@ nim c -r -d:release --path:. -o:/tmp/test_customfloat_range test/test_customfloa
 Test Spectron trên Metal dùng model nhỏ và checkpoint tạm, kiểm tra loss,
 gradient bằng sai phân, checkpoint cũ/mới và 110 bước train qua mốc APF 50/100.
 Với HRM, test so gradient một bước với sai phân, chạy lặp forward của lõi 2
-chu kỳ, 2 bước, 2 segment, lưu rồi nạp lại checkpoint HRM và train 110 bước:
+chu kỳ, 2 bước, 2 segment, lưu rồi nạp lại checkpoint HRM và train 110 bước.
+Test cũng kiểm hàm cập nhật block trên các bảng dự đoán, và kiểm giải mã theo
+block khớp với greedy cho model dense và HRM đã train, với cả hai policy:
 
 ```sh
 nim c -r -d:release --mm:arc --opt:speed \

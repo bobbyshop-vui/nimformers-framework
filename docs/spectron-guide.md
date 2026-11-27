@@ -187,6 +187,121 @@ change compute. `--hrm-l-layers` must match the checkpoint. A checkpoint
 saved without HRM cannot gain it on resume; start a new `--checkpoint` with
 `--init-checkpoint` instead.
 
+### Parallel block decoding
+
+`test/spectron/block_decode.nim` decodes a block of K positions at once. Each
+block starts from random draft tokens. One pass runs the model once over the
+context window plus the K drafts and predicts every block position in
+parallel. Then:
+
+1. Verification. Let e be the first unverified position. Its prediction only
+   reads verified tokens, so it is exact. While the draft at e already equals
+   that prediction, the next prediction is exact too and e moves on. At the
+   first mismatch the draft takes the exact prediction.
+2. The positions after e follow `--policy`. `jacobi` replaces every
+   unverified draft with its new prediction. `confidence` locks a draft once
+   its prediction has softmax probability of at least `--tau` and is the same
+   in two passes in a row. A locked draft changes only when the model predicts
+   another token with probability of at least `--tau`.
+3. The block is done when every position is verified.
+
+`--tau` must be above 0.5 and at most 1, so at most one token can reach it.
+
+Each pass verifies at least one position, so a block takes at most K passes,
+the same number of forward calls as greedy decoding. The output is the greedy
+output: a high-confidence draft that is wrong is replaced when verification
+reaches it, so confidence only changes the speed. Greedy decoding here uses
+the same window for every position of a block: the last `context - K` tokens
+before the block plus the block itself. The model is causal, so the tokens
+after a position do not change its logits.
+
+The Metal test at the end of this guide runs the same block update
+(`applyPass`) on tables that stand in for every possible causal model: a
+token and a confident flag for each block position and each sequence of
+earlier block tokens. With n = (V^K − 1)/(V − 1) such sequences, there are
+V^n · 2^n tables and V^K initial drafts. For vocabulary and block sizes
+(V, K) = (2, 1), (2, 2), (3, 2) and (2, 3), the test tries every table with
+every initial draft and both policies: 8, 256, 11,664 and 131,072 cases. For
+(4, 4), (8, 6) and (16, 8), it tries 3,000 random tables each with a random
+initial draft. The output always matches greedy decoding and never takes more
+than K passes. Verification replaced every wrong locked draft it reached:
+4,096 of them in the 131,072 cases. When each token is the previous token
+plus 1 modulo 2, the worst initial draft needs exactly K passes for
+K = 1..12, so a block can take the full K passes.
+
+```sh
+nim c -d:release --mm:arc --opt:speed -d:backend=metal \
+  --path:. --path:test/codestral --path:test/deepseek-inference \
+  --path:test/spectron --path:kernelfortest \
+  -o:/tmp/block_decode test/spectron/block_decode.nim
+/tmp/block_decode --checkpoint=test/spectron/models/finetune.nimq \
+  --block=16 --tokens=64 --context=128 --tau=0.9 --trace-blocks=1
+```
+
+Dense, MoE and HRM checkpoints all load, for example
+`test/spectron/models/moe/finetune.nimq`. Without `--prompt`, the program
+decodes eight built-in English and code prompts in one batch. A batch needs
+prompts of equal length, so each prompt keeps its last N tokens, where N is
+the length of the shortest prompt, at most `context - K`.
+
+The `[trace]` lines show each pass of the first prompt: verified tokens are
+plain, locked drafts are in `{braces}`, and other drafts start with `?`. The
+summary lines count forward calls, passes per prompt, accepted drafts (drafts
+that were already right when verification reached them), and right and wrong
+locks, and they check every output against greedy decoding.
+
+When several prompts share a batch, every pass waits for the slowest prompt,
+so `forwards` drops below K per block only when every prompt in the batch
+finishes the block early. `row_passes` counts the passes of each prompt
+separately, and `tokens_per_row_pass` shows the gain for a prompt decoded on
+its own.
+
+#### Train for block decoding
+
+A model trained only on clean text predicts badly when the drafts before a
+position are wrong, so most blocks need close to K passes.
+`--draft-block=K --draft-noise=ρ` trains the model for the decoding passes.
+The window is cut into blocks of K inputs at a random offset. The first input
+of each block plays the last verified token and stays clean. Each later input
+plays a draft and is replaced by a different token with probability r, where
+r ~ U(0, ρ) is drawn per block. The targets keep the true next tokens. On
+average ρ/2 of the draft inputs are replaced. With `--seq=64`, K = 16 and
+ρ = 0.5, every window has exactly 4 block starts, so the expected share of
+replaced inputs is (1/4)·(60/64) = 15/64 = 23.44%. The `[draft]` log line
+prints the measured share.
+
+`--probe-text=PATH` cuts a text file into windows of `--context` tokens and
+treats the last K tokens of each window as a block. For each noise level, 0.5
+and 1, it predicts the block once with the true tokens as drafts and once with
+each draft replaced by a different token with that probability. It prints the
+share of predictions that stay the same and the top-1 accuracy of both passes.
+Block position 0 reads no draft, so it is not counted. Because the text is the
+same for every checkpoint, this compares models fairly.
+
+Measured on an Intel Iris Plus 640 (Metal): the dense step-6030 checkpoint
+`test/spectron/models/finetune.nimq` was fine-tuned for 200 steps on the
+5-billion-token corpus (`--steps=200 --batch=16 --seq=64 --lr=1e-3
+--warmup=10`), once with `--draft-block=16 --draft-noise=0.5` and once
+without. Validation reads clean text. Its perplexity after 200 steps is 68.05
+with draft noise and 60.50 without. The probe used 64 windows per file with
+`--context=64 --block=16`, so 960 block positions per file:
+
+| Text | Checkpoint | Unchanged, 50% wrong drafts | Unchanged, all drafts wrong | Top-1 with true drafts |
+|---|---|---|---|---|
+| `readme.md` | step 6030 | 30.9% | 5.9% | 9.5% |
+| `readme.md` | +200 steps, no draft noise | 35.5% | 4.9% | 9.7% |
+| `readme.md` | +200 steps, draft noise | 44.3% | 15.3% | 8.9% |
+| `prepare_scale_data.py` | step 6030 | 29.7% | 3.8% | 19.9% |
+| `prepare_scale_data.py` | +200 steps, no draft noise | 38.8% | 5.8% | 20.0% |
+| `prepare_scale_data.py` | +200 steps, draft noise | 53.4% | 26.6% | 19.1% |
+
+Each checkpoint's rows came from:
+
+```sh
+/tmp/block_decode --checkpoint=PATH --context=64 --block=16 \
+  --probe-text=readme.md --probe-text=test/spectron/prepare_scale_data.py
+```
+
 ## Train on the packed dataset
 
 The packed dataset contains **2 billion training tokens** split evenly between
@@ -498,7 +613,10 @@ The Metal Spectron test uses a small model and temporary checkpoints. It
 checks loss, finite-difference gradients, old/new checkpoints, and 110 steps
 crossing APF boundaries 50/100. For HRM it checks the one-step gradients
 against finite differences, repeated forward passes of a 2-cycle, 2-step,
-2-segment core, an HRM checkpoint round trip, and 110 training steps:
+2-segment core, an HRM checkpoint round trip, and 110 training steps. It
+also checks the block update on table predictors, and that block decoding
+matches greedy decoding for the trained dense and HRM models with both
+policies:
 
 ```sh
 nim c -r -d:release --mm:arc --opt:speed \

@@ -36,6 +36,9 @@ Usage: test_nimformer --dataset=DIR [options]
   --hrm-l-steps=2 --hrm-l-layers=HALF --hrm-segments=1
                           Low-level steps per cycle, blocks in the low-level
                           module, and deep-supervision segments per step
+  --draft-block=16        Train for parallel block decoding: in each block of this many
+  --draft-noise=0.5       inputs, the first stays clean and each later input is replaced
+                          by another token with a per-block rate drawn from U(0, noise)
   --seed=1234
 """
 
@@ -47,7 +50,8 @@ type
     evalEvery, evalBatches, logEvery, saveEvery, requantizeEvery: int
     experts, moeHidden, moeHeads, moeLayers, expertWidth, expertDepth: int
     hrmCycles, hrmLSteps, hrmLLayers, hrmSegments: int
-    lr, gradClip, beta2: float32
+    draftBlock: int
+    lr, gradClip, beta2, draftNoise: float32
     lrSet, beta2Set: bool
 
   PackedOptimizer = object
@@ -79,7 +83,7 @@ proc packedOptions(): PackedTrainingOptions =
     warmup: 150, decaySteps: 500_000, curriculumSteps: 4000, seed: 1234,
     beta2: 0.98, gradClip: 1, evalEvery: 500, evalBatches: 8,
     logEvery: CFG_LOG_EVERY, saveEvery: 500, moeHidden: 512, moeHeads: 8, moeLayers: 4,
-    expertWidth: 7312, expertDepth: 4)
+    expertWidth: 7312, expertDepth: 4, draftNoise: 0.5)
   for kind, key, val in getopt():
     if key == "help" and kind == cmdLongOption:
       echo PackedUsage
@@ -103,6 +107,8 @@ proc packedOptions(): PackedTrainingOptions =
     of "hrm-l-steps": result.hrmLSteps = parseInt(val)
     of "hrm-l-layers": result.hrmLLayers = parseInt(val)
     of "hrm-segments": result.hrmSegments = parseInt(val)
+    of "draft-block": result.draftBlock = parseInt(val)
+    of "draft-noise": result.draftNoise = float32(parseFloat(val))
     of "backend": result.backendName = val
     of "tensor-cores":
       if val notin ["require", "off"]:
@@ -147,6 +153,10 @@ proc packedOptions(): PackedTrainingOptions =
     raise newException(ValueError, "Invalid step count or MoE dimensions")
   if min([result.hrmCycles, result.hrmLSteps, result.hrmLLayers, result.hrmSegments]) < 0:
     raise newException(ValueError, "HRM settings must be positive")
+  if result.draftBlock < 0 or result.draftBlock == 1 or result.draftBlock > result.context:
+    raise newException(ValueError, "--draft-block must be 0 (off) or between 2 and --seq")
+  if not finite32(result.draftNoise) or result.draftNoise < 0 or result.draftNoise > 1:
+    raise newException(ValueError, "--draft-noise must be in [0, 1]")
   if result.warmup < 0 or result.curriculumSteps < 0 or result.requantizeEvery < 0 or
       result.warmup >= result.decaySteps or
       result.lr.classify notin {fcNormal, fcSubnormal} or result.lr <= 0 or
@@ -244,6 +254,23 @@ proc readWindow(corpus: PackedCorpus, stream, context: int, rng: var Rand,
       ids[t - 1] = previous
       targets[t - 1] = id
     previous = id
+
+proc corruptDrafts(ids: var seq[int], blockSize: int, noise: float32, vocab: int,
+                   rng: var Rand): int =
+  ## Mimics a pass of parallel block decoding. The window is cut into blocks of
+  ## `blockSize` inputs at a random phase. A block's first input plays the last
+  ## verified token and stays clean; each later input plays a draft and is
+  ## replaced by a different token with probability r, where r ~ U(0, noise) is
+  ## drawn per block. Targets keep the true next tokens. Returns the number of
+  ## replaced inputs.
+  var start = rng.rand(blockSize - 1) - blockSize
+  while start < ids.len:
+    let rate = rng.rand(float64(noise))
+    for i in max(start + 1, 0) ..< min(start + blockSize, ids.len):
+      if rng.rand(1.0) < rate:
+        ids[i] = (ids[i] + 1 + rng.rand(vocab - 2)) mod vocab
+        inc result
+    start += blockSize
 
 proc validationLoss(model: NimformerModelSpectron, corpus: PackedCorpus,
                     options: PackedTrainingOptions, domain: PackedDomain, ctx: Backend): float64 =
@@ -573,18 +600,27 @@ proc trainPacked() =
   var lossSum, seconds, peakGradNorm, balanceSum = 0.0
   var routes = newSeq[int64](model.mixture.experts.len)
   var updates, clipped = 0
+  var draftReplaced, draftInputs = 0
+  if options.draftBlock > 0:
+    echo &"[draft] block={options.draftBlock} noise={options.draftNoise}: per-block replacement " &
+         &"rate ~ U(0, {options.draftNoise}), first input of each block kept clean"
   for step in start + 1 .. finalStep:
     let before = getMonoTime()
     var stats: SpectronTrainingStep
     var lr: float32
+    var stepReplaced = 0
     for attempt in 0 .. PackedRetryLimit:
       var rng = initRand(options.seed.int64 xor (step.int64 shl 1) xor (attempt.int64 shl 48))
+      stepReplaced = 0
       for row in 0 ..< options.batch:
         let stream =
           if not corpus.legacy: corpus.sampleShard(corpus.training, tokensPerEpoch, rng)
           elif (row + step) mod 2 == 0: options.codeLevel(step, rng)
           else: 3
         corpus.readWindow(stream, options.context, rng, ids[row], targets[row])
+        if options.draftBlock > 0:
+          stepReplaced += corruptDrafts(ids[row], options.draftBlock, options.draftNoise,
+                                        corpus.vocab, rng)
       lr = options.learningRate(optimizer.peakLr, step) * optimizer.lrScale
       if lr <= 0:
         raise newException(ValueError, "Packed learning rate rounded to zero")
@@ -605,6 +641,9 @@ proc trainPacked() =
         optimizer.lrScale *= 0.5'f32
         stderr.writeLine(&"[packed] Rejected step {step}: {error.msg}. Retrying with lr_scale={optimizer.lrScale:.4g}")
     seconds += float64((getMonoTime() - before).inNanoseconds) * 1e-9
+    if options.draftBlock > 0:
+      draftReplaced += stepReplaced
+      draftInputs += options.batch * options.context
     lossSum += float64(stats.loss)
     balanceSum += stats.balanceLoss
     for i, count in stats.routes:
@@ -631,6 +670,11 @@ proc trainPacked() =
         echo &"[moe] step={step} expert_tokens={routes} balance_loss={balanceSum / float64(updates):.5f}"
         for count in routes.mitems: count = 0
         balanceSum = 0
+      if draftInputs > 0:
+        echo &"[draft] step={step} replaced_inputs={draftReplaced}/{draftInputs} " &
+             &"({100.0 * float64(draftReplaced) / float64(draftInputs):.2f}%)"
+        draftReplaced = 0
+        draftInputs = 0
       lossSum = 0.0
       seconds = 0.0
       peakGradNorm = 0.0

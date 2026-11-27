@@ -1,7 +1,7 @@
 ## Run with the same --path flags as test_nimformer, on a Metal GPU.
 ## Uses temporary checkpoints only; never modifies the training checkpoint.
 import std/[math, os, random, strformat, tempfiles]
-import backend, nimformer, test_nimformer
+import backend, nimformer, test_nimformer, block_decode
 
 proc referenceLoss(logits: Tensor, targets: seq[seq[int]]): float64 =
   let V = logits.shape[^1]
@@ -18,6 +18,122 @@ proc referenceLoss(logits: Tensor, targets: seq[seq[int]]): float64 =
 proc maxDiff(a, b: seq[float32]): float32 =
   doAssert a.len == b.len
   for i in 0 ..< a.len: result = max(result, abs(a[i] - b[i]))
+
+# Stand-ins for a causal model in block decoding: a prediction for block
+# position j depends only on the j block tokens before it.
+type
+  TablePredictor = object
+    ## A token and a confident flag for every position j and every sequence of
+    ## j earlier block tokens; `offsets[j]` is where position j's rows start.
+    vocab: int
+    offsets: seq[int]
+    tokens: seq[int]
+    confident: seq[bool]
+  HashedPredictor = object
+    ## The same kind of table for larger sizes, derived from a hash of the prefix.
+    vocab: int
+    seed: uint64
+  # Each token is the previous token plus 1, modulo 2, always confident.
+  ChainPredictor = object
+
+proc prediction(token: int, confident: bool): Prediction =
+  (token: token, confidence: (if confident: 1'f32 else: 0'f32), margin: 1'f32)
+
+proc predictAt(t: TablePredictor, j: int, drafts: seq[int]): Prediction =
+  var key = 0
+  for i in 0 ..< j: key = key * t.vocab + drafts[i]
+  key += t.offsets[j]
+  prediction(t.tokens[key], t.confident[key])
+
+proc predictAt(h: HashedPredictor, j: int, drafts: seq[int]): Prediction =
+  var x = h.seed * 0x9E3779B97F4A7C15'u64 + uint64(j + 1)
+  for i in 0 ..< j:
+    x = (x xor (uint64(drafts[i]) + 0x632BE5AB'u64)) * 0x100000001B3'u64
+    x = x xor (x shr 29)
+  prediction(int(x mod uint64(h.vocab)), (x shr 40) mod 10 < 7)
+
+proc predictAt(c: ChainPredictor, j: int, drafts: seq[int]): Prediction =
+  prediction(if j == 0: 0 else: (drafts[j - 1] + 1) mod 2, true)
+
+proc greedyOf[P](p: P, size: int): seq[int] =
+  for j in 0 ..< size: result.add(p.predictAt(j, result).token)
+
+proc decodeWith[P](p: P, drafts: seq[int], policy: BlockPolicy,
+                   stats: var BlockDecodeStats): tuple[output: seq[int], passes: int] =
+  ## Runs the block update used by `blockDecode`, with predictions read from `p`.
+  var b = initDraftBlock(drafts)
+  var predictions = newSeq[Prediction](drafts.len)
+  while b.verified < drafts.len:
+    inc result.passes
+    for j in 0 ..< drafts.len: predictions[j] = p.predictAt(j, b.drafts)
+    b.applyPass(predictions, policy, 0.9'f32, stats)
+  result.output = b.drafts
+
+block blockDecodeLogic:
+  # Every table, with every initial draft, must give the greedy output in at most
+  # K passes; a wrong locked draft must be replaced when verification reaches it.
+  for (vocab, size, expected) in [(2, 1, 8), (2, 2, 256), (3, 2, 11664), (2, 3, 131072)]:
+    var t = TablePredictor(vocab: vocab, offsets: newSeq[int](size + 1))
+    for j in 0 ..< size: t.offsets[j + 1] = t.offsets[j] + vocab ^ j
+    let keys = t.offsets[size]
+    t.tokens = newSeq[int](keys)
+    t.confident = newSeq[bool](keys)
+    var stats: BlockDecodeStats
+    var cases, worst = 0
+    for tokenCode in 0 ..< vocab ^ keys:
+      var code = tokenCode
+      for k in 0 ..< keys:
+        t.tokens[k] = code mod vocab
+        code = code div vocab
+      for flags in 0 ..< 1 shl keys:
+        for k in 0 ..< keys: t.confident[k] = ((flags shr k) and 1) == 1
+        let greedy = t.greedyOf(size)
+        for draftCode in 0 ..< vocab ^ size:
+          var drafts = newSeq[int](size)
+          var c = draftCode
+          for i in 0 ..< size:
+            drafts[i] = c mod vocab
+            c = c div vocab
+          for policy in [bpJacobi, bpConfidence]:
+            let (output, passes) = t.decodeWith(drafts, policy, stats)
+            doAssert output == greedy and passes in 1 .. size,
+              &"vocab={vocab} block={size} drafts={drafts} {policy}: {output} in {passes} passes"
+            worst = max(worst, passes)
+          inc cases
+    # vocab^keys token tables, 2^keys flag tables and vocab^size initial drafts.
+    doAssert cases == vocab ^ keys * (1 shl keys) * vocab ^ size and cases == expected
+    doAssert stats.rightLocks + stats.wrongLocks == stats.locks
+    echo &"PASS: block update on every table, vocab={vocab} block={size}: {cases} cases, " &
+         &"worst {worst} passes, {stats.wrongLocks} wrong locks replaced by verification"
+  var rng = initRand(2026)
+  for (vocab, size) in [(4, 4), (8, 6), (16, 8)]:
+    var stats: BlockDecodeStats
+    var worst = 0
+    for _ in 1 .. 3000:
+      let h = HashedPredictor(vocab: vocab, seed: uint64(rng.rand(int.high)))
+      let greedy = h.greedyOf(size)
+      var drafts = newSeq[int](size)
+      for token in drafts.mitems: token = rng.rand(vocab - 1)
+      for policy in [bpJacobi, bpConfidence]:
+        let (output, passes) = h.decodeWith(drafts, policy, stats)
+        doAssert output == greedy and passes in 1 .. size
+        worst = max(worst, passes)
+    doAssert stats.rightLocks + stats.wrongLocks == stats.locks
+    echo &"PASS: block update on 3000 random tables, vocab={vocab} block={size}: " &
+         &"worst {worst} passes, {stats.wrongLocks} wrong locks replaced by verification"
+  for size in 1 .. 12:
+    var stats: BlockDecodeStats
+    var worst = 0
+    let greedy = ChainPredictor().greedyOf(size)
+    for draftCode in 0 ..< 1 shl size:
+      var drafts = newSeq[int](size)
+      for i in 0 ..< size: drafts[i] = (draftCode shr i) and 1
+      for policy in [bpJacobi, bpConfidence]:
+        let (output, passes) = ChainPredictor().decodeWith(drafts, policy, stats)
+        doAssert output == greedy
+        worst = max(worst, passes)
+    doAssert worst == size, &"chain block={size}: worst {worst} passes"
+  echo "PASS: the worst initial draft of the mod-2 chain takes exactly K passes for K = 1..12"
 
 randomize(42)
 setForbidCpuFallback(true)
@@ -213,5 +329,26 @@ block hrmCore:
   let final = softmaxCrossEntropy(hrm.forwardBatch(ids, ctx), targets, ctx).loss
   doAssert final < initial * 0.1'f32, &"HRM loss did not fall enough: {initial} -> {final}"
   echo &"PASS: HRM training with 2 cycles, 2 L steps and 2 segments: {initial:.4f} -> {final:.4f}"
+
+  # Parallel block decoding must reproduce greedy decoding with at most K passes per block.
+  let prompts = @[@[0, 1, 2, 3, 0, 1], @[2, 3, 0, 1, 2, 3]]
+  for (label, decoder) in [("dense", model), ("hrm", hrm)]:
+    var greedyStats: BlockDecodeStats
+    var margins: seq[seq[float32]]
+    let greedy = decoder.greedyBlocks(prompts, 8, 12, 4, ctx, greedyStats, margins)
+    doAssert greedyStats.forwards == 8
+    for policy in [bpJacobi, bpConfidence]:
+      var stats: BlockDecodeStats
+      let decoded = decoder.blockDecode(prompts, 8, 12, 4, policy, 0.6'f32, 3, ctx, stats)
+      for r in 0 ..< prompts.len:
+        let at = firstDifference(decoded[r], greedy[r])
+        doAssert at < 0 or margins[r][at - prompts[r].len] < 1e-3'f32,
+          &"{label} {policy}: row {r} differs from greedy at token {at}"
+      doAssert stats.blocks == 2 and stats.rowPasses <= 2 * 4 * prompts.len
+      doAssert stats.forwards <= greedyStats.forwards
+      doAssert stats.accepted + stats.written == 8 * prompts.len
+      echo &"PASS: {label} {policy} block decoding matches greedy with {stats.forwards} " &
+           &"forwards instead of {greedyStats.forwards} (locks={stats.locks}, " &
+           &"wrong_locks={stats.wrongLocks})"
 
 closeBackend(ctx)

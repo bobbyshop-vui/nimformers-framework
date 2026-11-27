@@ -1251,6 +1251,8 @@ type
 
 proc hrmEnabled*(m: NimformerModelSpectron): bool {.inline.} = m.hrm.cycles > 0
 
+proc expertCount*(m: NimformerModelSpectron): int {.inline.} = m.mixture.experts.len
+
 proc validateHrm*(m: NimformerModelSpectron) =
   if not m.hrmEnabled: return
   let h = m.hrm
