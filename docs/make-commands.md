@@ -113,7 +113,10 @@ make download-codestral-tokenizer
   `test/spectron/`. It **does not download** `databricks-dolly-15k.jsonl`.
 - `download-models`: downloads DeepSeek `.nimq`/config/tokenizer and Codestral
   base, adapter, config/tokenizer into `test/*/models/`. It also writes
-  `jamba_parallel_lora.bin.hf_tokenizer_dir`.
+  `jamba_parallel_lora.bin.hf_tokenizer_dir` and downloads the Math
+  SpectronNexus sequence program checkpoint to
+  `test/math_spectronnexus/models/sequence_program.nimq`, plus the
+  `test_nimformer` checkpoint and BPE tokenizer to `test/spectron/models/`.
 - `download-codestral-tokenizer`: downloads only Codestral config/tokenizer
   assets into `INFER_LORA_DEFAULT_HFDIR`, useful when weights already exist.
 

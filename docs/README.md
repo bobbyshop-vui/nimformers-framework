@@ -26,6 +26,7 @@ This directory is the user documentation for the public Nimformer APIs. Use the 
 - [LoRA API](lora-api.md): adapters, attaching/merging, GPU preparation, and generation helpers.
 - [LoRA Fine-Tuning and Resume APIs](finetune-lora-api.md): streaming batches, disk-backed optimizer state, and checkpoint recovery.
 - [Training API](training-api.md): training components, datasets, optimizer/checkpoint operations, and CLI entry points.
+- [Math SpectronNexus](math-spectronnexus.md): exact discrete-math tools, sequence exploration, far-term planning, MCP setup and research limitations.
 
 
 ## Data formats and precision

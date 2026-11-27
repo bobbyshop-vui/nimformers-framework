@@ -151,7 +151,11 @@ download-models: download-fir-models
 	@set -eu; \
 	mkdir -p test/deepseek-inference/models test/codestral/models/hf \
 	  test/mamba3/models/mamba3-siso-187m test/mamba3/models/runs/mamba3-siso-187m-gated \
-	  test/mamba3/models/mamba3-siso-1.5b test/mamba3/models/runs/mamba3-siso-1.5b-gated; \
+	  test/mamba3/models/mamba3-siso-1.5b test/mamba3/models/runs/mamba3-siso-1.5b-gated \
+	  test/math_spectronnexus/models; \
+	curl -fL --retry 3 -C - https://huggingface.co/bobbydeveloper2014/Math-SpectronNexus/resolve/main/sequence_program.nimq -o test/math_spectronnexus/models/sequence_program.nimq; \
+	curl -fL --retry 3 -C - https://huggingface.co/bobbydeveloper2014/bybyai-spectron/resolve/main/finetune.nimq -o test/spectron/models/finetune.nimq; \
+	curl -fL --retry 3 -C - https://huggingface.co/bobbydeveloper2014/bybyai-spectron/resolve/main/spectron_bpe_tokenizer.json -o test/spectron/models/spectron_bpe_tokenizer.json; \
 	for file in model.nimq config.json tokenizer.json tokenizer_config.json; do \
 	  curl -fL --retry 3 -C - "https://huggingface.co/bobbydeveloper2014/deepseek-coder-6.7b-nimq/resolve/main/$$file" -o "test/deepseek-inference/models/$$file"; \
 	done; \

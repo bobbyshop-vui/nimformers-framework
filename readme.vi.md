@@ -133,8 +133,10 @@ Các repository chứa file model dùng bởi target inference:
 | [forge-500m-chat-fir](https://huggingface.co/bobbydeveloper2014/forge-500m-chat-fir) | `model.fir`, `config.json`, trọng số và tokenizer (`models/forge-500m-chat-fir`) | [forge-500m-chat-fir](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/models/forge-500m-chat-fir) | `formers`, `download-fir-models` |
 | [gpt2-125m](https://huggingface.co/bobbydeveloper2014/gpt2-125m) | `model.safetensors`, `model.fir` và tokenizer (`models/gpt2-125m`) | [gpt2-125m](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/models/gpt2-125m) | `formers`, `download-fir-models` |
 | [huihui-moe-fir](https://huggingface.co/bobbydeveloper2014/huihui-moe-fir) | `model.fir`, trọng số và tokenizer (`models/huihui-moe-fir`) | [huihui-moe-fir](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/models/huihui-moe-fir) | `formers`, `download-fir-models` |
+| [Math-SpectronNexus](https://huggingface.co/bobbydeveloper2014/Math-SpectronNexus) | Checkpoint sequence program `sequence_program.nimq` | [Math SpectronNexus](test/math_spectronnexus/README.md) | `research_sequence`, `explore_sequence`, `download-models` |
+| [bybyai-spectron](https://huggingface.co/bobbydeveloper2014/bybyai-spectron) | Checkpoint `test_nimformer` `finetune.nimq` và tokenizer BPE đi kèm | [Trainer Spectron](docs/spectron-guide.vi.md) | `run-spectron`, `download-models` |
 
-`make download-models` tải toàn bộ các repo trên về đúng các đường dẫn đó (`make download-fir-models` chỉ tải nhóm FIR; cần CLI `hf` từ `pip install -U huggingface_hub`).
+`make download-models` tải toàn bộ các repo trên về đúng các đường dẫn đó, gồm checkpoint SpectronNexus vào `test/math_spectronnexus/models/sequence_program.nimq` và checkpoint/tokenizer `test_nimformer` vào `test/spectron/models/` (`make download-fir-models` chỉ tải nhóm FIR; cần CLI `hf` từ `pip install -U huggingface_hub`).
 
 Để các công cụ Hugging Face tự nhận token từ file môi trường cục bộ đã được Git bỏ qua, nạp file trong shell trước khi dùng `hf` hoặc `huggingface_hub`:
 
@@ -217,7 +219,7 @@ Dùng `--detect-only` cùng `-m`, `--config` và `--tokenizer` của từng mode
 
 ### Tải model
 
-Cả năm repo Hugging Face ở trên đều công khai. Từ thư mục gốc, chạy lệnh này
+Các repo Hugging Face ở trên đều công khai. Từ thư mục gốc, chạy lệnh này
 để tải trọng số, adapter, config và tokenizer vào các đường dẫn inference và
 formers.n sử dụng:
 
@@ -240,6 +242,8 @@ lẫn nhau; sidecar tokenizer LoRA được lưu đúng vị trí mà checkpoint
 | [forge-500m-chat-fir](https://huggingface.co/bobbydeveloper2014/forge-500m-chat-fir) | `models/forge-500m-chat-fir/` |
 | [gpt2-125m](https://huggingface.co/bobbydeveloper2014/gpt2-125m) | `models/gpt2-125m/` |
 | [huihui-moe-fir](https://huggingface.co/bobbydeveloper2014/huihui-moe-fir) | `models/huihui-moe-fir/` |
+| [Math-SpectronNexus](https://huggingface.co/bobbydeveloper2014/Math-SpectronNexus) | `test/math_spectronnexus/models/sequence_program.nimq` |
+| [bybyai-spectron](https://huggingface.co/bobbydeveloper2014/bybyai-spectron) | `test/spectron/models/finetune.nimq` và `test/spectron/models/spectron_bpe_tokenizer.json` |
 
 Bốn model cuối là model FIR. Mỗi repo là cả thư mục (weights, tokenizer, `model.fir`), tải bằng CLI `hf` (`pip install -U huggingface_hub`); `make download-fir-models` chỉ tải riêng nhóm này.
 
