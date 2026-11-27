@@ -36,8 +36,12 @@ type
     bkVulkan = "vulkan"
     bkCpu = "cpu"
 
+  TrainingGemmStats = ref object
+    tensorCore, fp32: int
+
   Backend* = object
     kind*: BackendKind
+    trainingGemm: TrainingGemmStats
 
 proc toByby*(bk: BackendKind): byby.GpuBackend {.apiHooked.} =
   case bk
@@ -126,11 +130,20 @@ proc beMatmulNT*(ctx: Backend, a: openArray[float32], M, K: int,
     if not byby.sessionBegin(be):
       raise newException(CatchableError, "beMatmulNT: sessionBegin failed")
     opened = true
-    let encoded =
-      if be == byby.gbVulkan:
-        byby.sessionMatmulNTAccelerated(be, ha, hb, hc, M, K, N)
+    var encoded, cooperative = false
+    if ctx.trainingGemm != nil:
+      cooperative = byby.sessionMatmulNTFp16Coop(be, ha, hb, hc, M, K, N)
+      if cooperative:
+        encoded = true
+      elif M >= 8 and K >= 64 and N >= 16:
+        raise newException(CatchableError, "Tensor Core dispatch failed for GEMM " &
+          $M & "x" & $K & "x" & $N & ". Check the NVIDIA Vulkan ICD and glslc support.")
       else:
-        byby.sessionMatmulNT(be, ha, hb, hc, M, K, N)
+        encoded = byby.sessionMatmulNT(be, ha, hb, hc, M, K, N)
+    elif be == byby.gbVulkan:
+      encoded = byby.sessionMatmulNTAccelerated(be, ha, hb, hc, M, K, N)
+    else:
+      encoded = byby.sessionMatmulNT(be, ha, hb, hc, M, K, N)
     if not encoded:
       raise newException(CatchableError, "beMatmulNT: backend rejected NT GEMM")
     if not byby.sessionEnd(be):
@@ -139,6 +152,9 @@ proc beMatmulNT*(ctx: Backend, a: openArray[float32], M, K: int,
       raise newException(CatchableError, "beMatmulNT: sessionEnd failed")
     opened = false
     result = byby.sessionRead(be, hc, M * N)
+    if ctx.trainingGemm != nil:
+      if cooperative: inc ctx.trainingGemm.tensorCore
+      else: inc ctx.trainingGemm.fp32
   finally:
     if opened:
       discard byby.sessionEnd(be)
@@ -146,6 +162,39 @@ proc beMatmulNT*(ctx: Backend, a: openArray[float32], M, K: int,
     byby.sessionFree(be, ha)
     byby.sessionFree(be, hb)
     byby.sessionFree(be, hc)
+
+proc usesTrainingTensorCores*(ctx: Backend): bool = ctx.trainingGemm != nil
+
+proc takeTrainingGemmStats*(ctx: Backend): tuple[tensorCore, fp32: int] =
+  if ctx.trainingGemm != nil:
+    result = (ctx.trainingGemm.tensorCore, ctx.trainingGemm.fp32)
+    ctx.trainingGemm[] = default(typeof(ctx.trainingGemm[]))
+
+proc enableTrainingTensorCores*(ctx: var Backend) =
+  if ctx.kind != bkVulkan:
+    raise newException(ValueError, "--tensor-cores=require needs the Vulkan backend")
+  let be = ctx.kind.toByby()
+  if not byby.sessionCooperativeGemmEnabled(be):
+    raise newException(ValueError,
+      "No Vulkan FP16 cooperative matrices available. Check the NVIDIA Vulkan ICD and glslc.")
+  byby.sessionSetF32GemmTiled(be, true)
+  var accelerated = ctx
+  accelerated.trainingGemm = TrainingGemmStats()
+  const size = 64
+  var a, b = newSeq[float32](size * size)
+  for row in 0 ..< size:
+    for k in 0 ..< size:
+      a[row * size + k] = float32(row mod 7 + 1) * 0.125'f32
+      b[row * size + k] = float32(row mod 3 + 1) * 0.25'f32
+  let y = accelerated.beMatmulNT(a, size, size, b, size)
+  if y.len != size * size or accelerated.takeTrainingGemmStats().tensorCore != 1:
+    raise newException(ValueError, "Tensor Core probe failed")
+  for row in 0 ..< size:
+    for col in 0 ..< size:
+      let expected = float32(2 * (row mod 7 + 1) * (col mod 3 + 1))
+      if not (abs(y[row * size + col] - expected) <= 1e-4'f32):
+        raise newException(ValueError, "Tensor Core probe returned incorrect results")
+  ctx = move(accelerated)
 
 proc beMatmulQ4*(ctx: Backend, a: openArray[float32], wq: openArray[uint8],
                   scales, zeros: openArray[float32],

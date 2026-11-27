@@ -1,4 +1,4 @@
-import std/[math, random, strformat, os, strutils, terminal]
+import std/[math, random, os, parseopt, strutils]
 import backend
 import test_nimformer  # Imports the whole test_nimformer module
 
@@ -65,24 +65,37 @@ proc generateWithHistory(
 # MAIN CHAT LOOP
 # =============================================================================
 when isMainModule:
+  var checkpointPath = CHECKPOINT_PATH
+  var tokenizerPath = BPE_TOKENIZER_PATH
+  for kind, key, val in getopt():
+    if kind == cmdLongOption and key == "help":
+      quit("Usage: test_inferencespectron [--checkpoint=PATH] [--tokenizer=PATH]", 0)
+    if kind != cmdLongOption or val.len == 0:
+      quit("Expected --checkpoint=PATH or --tokenizer=PATH", 1)
+    case key
+    of "checkpoint": checkpointPath = val
+    of "tokenizer": tokenizerPath = val
+    else: quit("Unknown option --" & key, 1)
   randomize(SEED)
   let ctx = newBackend()
 
   # Load the tokenizer from test_nimformer
-  if not fileExists(BPE_TOKENIZER_PATH):
-    stderr.writeLine("ERROR: Tokenizer file not found: " & BPE_TOKENIZER_PATH)
+  if not fileExists(tokenizerPath):
+    stderr.writeLine("ERROR: Tokenizer file not found: " & tokenizerPath)
     quit(1)
 
-  let tok = test_nimformer.loadBPE(BPE_TOKENIZER_PATH)
+  let tok = test_nimformer.loadBPE(tokenizerPath)
   echo "Tokenizer loaded: vocab_size = ", tok.vocabSize
 
   # Load model checkpoint
-  if not fileExists(CHECKPOINT_PATH):
-    stderr.writeLine("ERROR: Checkpoint file not found: " & CHECKPOINT_PATH)
+  if not fileExists(checkpointPath):
+    stderr.writeLine("ERROR: Checkpoint file not found: " & checkpointPath)
     quit(1)
 
-  echo "Loading model from checkpoint: ", CHECKPOINT_PATH
-  let (model, step) = test_nimformer.loadCheckpoint(CHECKPOINT_PATH)
+  echo "Loading model from checkpoint: ", checkpointPath
+  let (model, step) = test_nimformer.loadCheckpoint(checkpointPath)
+  if model.vocab != tok.vocabSize:
+    quit("Checkpoint vocabulary size differs from the tokenizer", 1)
   echo "Model loaded (trained for ", step, " steps)"
   echo ""
   echo "Type your message and press Enter to chat (Ctrl+C or 'exit' to quit)"

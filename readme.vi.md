@@ -590,6 +590,18 @@ Chi tiết hơn (cấu trúc mã nguồn, luật nhận diện, phần chưa là
 
 ### Train Spectron bằng `test/spectron/test_nimformer.nim`
 
+Spectron hỗ trợ MoE với khoảng 30 triệu tham số mỗi expert và corpus 5 tỷ
+token BPE, gồm Python nguyên văn và hội thoại distill có lượt gọi tool.
+`make download` tải corpus này, và notebook
+[`spectron_moe_colab_t4.ipynb`](notebooks/spectron_moe_colab_t4.ipynb) train
+trên Colab T4 bằng Tensor Core, upload checkpoint mỗi 20 bước.
+[Hướng dẫn train Spectron MoE](docs/spectron-guide.vi.md#train-moe-với-5-tỷ-token)
+
+Trainer hỗ trợ corpus `uint16` gồm một tỷ token Python tự sinh và một tỷ
+token tiếng Anh. Xem cách tạo corpus, khởi tạo từ trọng số đã công bố và
+train tiếp với trạng thái Adam.
+[Hướng dẫn train Spectron với corpus đóng gói](docs/spectron-guide.vi.md#train-với-bộ-dữ-liệu-đã-đóng-gói)
+
 Đây là chương trình training Spectron. `make run` compile/chạy, đọc Dolly
 và sáu JSONL Python/Nim dưới `test/spectron/`, train/load BPE byte-level,
 train model và lưu checkpoint/tokenizer dưới `test/spectron/models/`.

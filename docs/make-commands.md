@@ -91,26 +91,48 @@ See the [Spectron guide](spectron-guide.md) for configuration, data, loss, and r
 Despite its name, `test_nimformer` is the trainer. `test_inferencespectron` is
 inference. The two binaries have different output locations.
 
-`make run-vulkan` runs the Spectron trainer with its `CFG_*` settings. It is
-not Mamba3 inference.
-
-The Spectron trainer and chat currently do not read CLI options for steps,
-batch size, prompts, or checkpoint paths. `make run ARGS='--steps 100'` does
-not change trainer configuration. `run-spectron` forwards `ARGS`, but the
-binary does not read them yet.
+The trainer uses its `CFG_*` settings for the demo corpus. Pass
+`ARGS='--dataset=test/spectron/data/packed --steps=6000'` to a trainer
+target to train on the packed corpus. The chat target accepts
+`--checkpoint=PATH` and `--tokenizer=PATH` in `ARGS`.
+[Spectron training guide](spectron-guide.md#train-on-the-packed-dataset)
 
 
 ## Download data and models
 
 ```sh
+make download
+make download-spectron-scale-data
 make download-datasets
+make prepare-spectron-data
+make prepare-spectron-scale-data
 make download-models
 make download-codestral-tokenizer
+make build-spectron-trainer SPECTRON_TRAIN_BACKEND=vulkan
 ```
 
-- `download-datasets`: downloads `python_code_dataset_1.jsonl` through
-  `python_code_dataset_5.jsonl` and `nim_python_code_dataset_mega.jsonl` into
-  `test/spectron/`. It **does not download** `databricks-dolly-15k.jsonl`.
+- `download` is an alias for `download-datasets`.
+- `download-spectron-scale-data` installs the 5-billion-token packed corpus
+  from `data/scale5b/` in `bobbydeveloper2014/bybyai-spectron` into
+  `test/spectron/data/scale5b/`. It pins the Hub commit, resumes partial
+  files, and checks every shard against the SHA-256 hashes in the manifest.
+  Override `SPECTRON_DATA_REPO`, `SPECTRON_DATA_REVISION`, or
+  `SPECTRON_DATA_DIR` to install another copy.
+- `download-datasets`: runs `download-spectron-scale-data`, then downloads
+  `python_code_dataset_1.jsonl` through `python_code_dataset_5.jsonl` and
+  `nim_python_code_dataset_mega.jsonl` into `test/spectron/`. It **does not
+  download** `databricks-dolly-15k.jsonl`.
+- `build-spectron-trainer` compiles `test/spectron/test_nimformer` for
+  `SPECTRON_TRAIN_BACKEND` (default `vulkan`) without running it. The Colab
+  notebook uses it with `--tensor-cores=require`.
+  [Tensor Cores and checkpoint uploads](spectron-guide.md#tensor-cores-and-checkpoint-uploads)
+- `prepare-spectron-data` generates Python exercises, downloads English
+  sources and packs both into `uint16` token streams. The output is
+  `test/spectron/data/packed/`. Requires PyArrow.
+- `prepare-spectron-scale-data` packs 5 billion training tokens into byte
+  streams in `test/spectron/data/scale5b/`, including raw Python and the
+  local distillation conversations with tool calls. Requires PyArrow.
+  [Spectron MoE guide](spectron-guide.md#train-the-moe-on-5-billion-tokens)
 - `download-models`: downloads DeepSeek `.nimq`/config/tokenizer and Codestral
   base, adapter, config/tokenizer into `test/*/models/`. It also writes
   `jamba_parallel_lora.bin.hf_tokenizer_dir` and downloads the Math

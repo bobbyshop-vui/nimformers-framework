@@ -494,8 +494,8 @@ proc forward*(l: Linear, x: Tensor, ctx: Backend): Tensor {.apiHooked.} =
         let nGroupsPerRow = (l.inF + l.weightQ.groupSize - 1) div l.weightQ.groupSize
         y = beMatmulQ4(ctx, input.data, @(l.weightQ.bytes), l.weightQ.scale, l.weightQ.zero_point,
                         rows, l.inF, l.outF, l.weightQ.groupSize, nGroupsPerRow)
-      elif getEnv("BYBY_FINETUNE_ACCELERATED_GEMM", "0") != "0" and
-           ctx.kind.toByby() in {byby.gbMetal, byby.gbVulkan} and
+      elif (ctx.usesTrainingTensorCores or (getEnv("BYBY_FINETUNE_ACCELERATED_GEMM", "0") != "0" and
+           ctx.kind.toByby() in {byby.gbMetal, byby.gbVulkan})) and
            l.weight.data.len == l.outF * l.inF:
         # Keep the trainable weight in its native [outF,inF] layout. Vulkan
         # can lower this NT GEMM to cooperative FP16 matrix instructions with
@@ -580,14 +580,18 @@ proc backward*(l: Linear, x: Tensor, dOut: Tensor, ctx: Backend): tuple[dX, dW, 
   let dOutFlat = dOut.data  # [rows * outF]
 
   # dW and dX are independent. The optional fine-tune route sends dW through
-  # the backend's NT GEMM (Vulkan cooperative matrices / Metal SIMD); dX keeps
-  # the regular exact GEMM. Other callers retain the fused pair operation.
+  # the backend's NT GEMM (Vulkan cooperative matrices / Metal SIMD). Tensor Core
+  # training uses the same mixed-precision path for the input gradient.
   var dWRawFlat, dXFlat: seq[float32]
-  if getEnv("BYBY_FINETUNE_ACCELERATED_GEMM", "0") != "0" and
-     ctx.kind.toByby() in {byby.gbMetal, byby.gbVulkan}:
+  if ctx.usesTrainingTensorCores or (getEnv("BYBY_FINETUNE_ACCELERATED_GEMM", "0") != "0" and
+     ctx.kind.toByby() in {byby.gbMetal, byby.gbVulkan}):
     let dOutT = transpose(dOut)  # [outF, rows] for C = xT @ dOut
     dWRawFlat = beMatmulNT(ctx, xT.data, l.inF, rows, dOutT.data, l.outF)
-    dXFlat = beMatmul(ctx, dOutFlat, rows, l.outF, l.weight.data, l.outF, l.inF)
+    if ctx.usesTrainingTensorCores:
+      let weightT = transpose(l.weight)
+      dXFlat = beMatmulNT(ctx, dOutFlat, rows, l.outF, weightT.data, l.inF)
+    else:
+      dXFlat = beMatmul(ctx, dOutFlat, rows, l.outF, l.weight.data, l.outF, l.inF)
   else:
     (dWRawFlat, dXFlat) = beMatmul2(ctx,
       xT.data, l.inF, rows, dOutFlat, rows, l.outF,
@@ -787,7 +791,8 @@ proc forward*(ff: FeedForward, x: Tensor, ctx: Backend): Tensor {.apiHooked.} =
 proc backward*(ff: FeedForward, x: Tensor, dOut: Tensor, ctx: Backend): tuple[
     dX, dFc1W, dFc1B, dFc2W, dFc2B: Tensor] {.apiHooked.} =
   let hidden = ff.fc1.forward(x, ctx)
-  let dFc2 = ff.fc2.backward(hidden, dOut, ctx)
+  let activated = Tensor(shape: hidden.shape, data: beApflu(ctx, hidden.data, 0.1'f32, 1.0'f32))
+  let dFc2 = ff.fc2.backward(activated, dOut, ctx)
   var dHidden = dFc2.dX
   dHidden.data = beApfluBackward(ctx, hidden.data, dHidden.data, 0.1'f32, 1.0'f32)
   let dFc1 = ff.fc1.backward(x, dHidden, ctx)

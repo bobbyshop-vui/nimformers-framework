@@ -89,25 +89,47 @@ Chi tiết cấu hình, dữ liệu, loss và resume nằm trong
 `test_nimformer` là trainer dù có chữ `test` trong tên. `test_inferencespectron`
 là chương trình inference. Hai binary có vị trí output khác nhau.
 
-`make run-vulkan` chạy trainer Spectron theo các thiết lập `CFG_*`; đây không
-phải lệnh inference Mamba3.
-
-Trainer và chat Spectron hiện không đọc tham số CLI về số step, batch, prompt
-hay đường dẫn checkpoint. `make run ARGS='--steps 100'` không đổi cấu hình
-trainer; `ARGS` ở `run-spectron` được chuyển cho binary nhưng binary chưa đọc nó.
+Trainer dùng các thiết lập `CFG_*` cho corpus demo. Truyền
+`ARGS='--dataset=test/spectron/data/packed --steps=6000'` vào target train để
+dùng corpus đã đóng gói. Target chat nhận `--checkpoint=PATH` và
+`--tokenizer=PATH` qua `ARGS`.
+[Hướng dẫn train Spectron](spectron-guide.vi.md#train-với-bộ-dữ-liệu-đã-đóng-gói)
 
 
 ## Tải dữ liệu và model
 
 ```sh
+make download
+make download-spectron-scale-data
 make download-datasets
+make prepare-spectron-data
+make prepare-spectron-scale-data
 make download-models
 make download-codestral-tokenizer
+make build-spectron-trainer SPECTRON_TRAIN_BACKEND=vulkan
 ```
 
-- `download-datasets`: tải `python_code_dataset_1.jsonl` đến
-  `python_code_dataset_5.jsonl` và `nim_python_code_dataset_mega.jsonl` vào
-  `test/spectron/`. Target này **không tải** `databricks-dolly-15k.jsonl`.
+- `download` là tên gọi tắt của `download-datasets`.
+- `download-spectron-scale-data` cài corpus đóng gói 5 tỷ token từ
+  `data/scale5b/` trong `bobbydeveloper2014/bybyai-spectron` vào
+  `test/spectron/data/scale5b/`. Target ghim commit trên Hub, tải tiếp file
+  đang dở và kiểm từng shard theo mã SHA-256 trong manifest. Đặt
+  `SPECTRON_DATA_REPO`, `SPECTRON_DATA_REVISION` hoặc `SPECTRON_DATA_DIR` để
+  cài bản khác.
+- `download-datasets`: chạy `download-spectron-scale-data`, rồi tải
+  `python_code_dataset_1.jsonl` đến `python_code_dataset_5.jsonl` và
+  `nim_python_code_dataset_mega.jsonl` vào `test/spectron/`. Target này
+  **không tải** `databricks-dolly-15k.jsonl`.
+- `build-spectron-trainer` compile `test/spectron/test_nimformer` cho
+  `SPECTRON_TRAIN_BACKEND` (mặc định `vulkan`) mà không chạy. Notebook Colab
+  dùng target này cùng `--tensor-cores=require`.
+  [Tensor Core và upload checkpoint](spectron-guide.vi.md#tensor-core-và-upload-checkpoint)
+- `prepare-spectron-data` sinh bài tập Python, tải nguồn tiếng Anh và đóng
+  gói cả hai thành token `uint16` vào `test/spectron/data/packed/`. Cần PyArrow.
+- `prepare-spectron-scale-data` đóng gói 5 tỷ token huấn luyện vào
+  `test/spectron/data/scale5b/`, gồm Python nguyên văn và hội thoại distill
+  có cả lượt gọi tool. Cần PyArrow.
+  [Hướng dẫn train Spectron MoE](spectron-guide.vi.md#train-moe-với-5-tỷ-token)
 - `download-models`: tải DeepSeek `.nimq`, config/tokenizer và Codestral base,
   adapter, config/tokenizer vào các thư mục `test/*/models/`; đồng thời ghi
   sidecar `jamba_parallel_lora.bin.hf_tokenizer_dir` và tải checkpoint sequence

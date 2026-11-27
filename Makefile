@@ -58,6 +58,12 @@ endif
 TEST_BIN  := test_nimformer$(EXE_EXT)
 HOOK_PLUGIN_BIN := test_hook_plugin_bin$(EXE_EXT)
 SPECTRON_BUILD_NIMCACHE := nimcache/spectron-build
+SPECTRON_PACK_BIN := $(SPECTRON_BUILD_NIMCACHE)/pack_tokens$(EXE_EXT)
+SPECTRON_DATA_REPO ?= bobbydeveloper2014/bybyai-spectron
+SPECTRON_DATA_REPO_TYPE ?= model
+SPECTRON_DATA_REVISION ?= main
+SPECTRON_DATA_SUBDIR ?= data/scale5b
+SPECTRON_DATA_DIR ?= test/spectron/data/scale5b
 
 # ── Mamba binaries: graft / finetune (LoRA) / inference ──
 GRAFT_SRC       := test/codestral/graft_attention.nim
@@ -85,9 +91,11 @@ CLEAN_BINS      := $(TEST_BIN) $(GRAFT_BIN) $(FINETUNE_BIN) $(INFER_LORA_BIN) $(
                    $(HOOK_PLUGIN_BIN) $(BYBYLANG_TEST_BINS) $(addsuffix .nim,$(BYBYLANG_TEST_BINS))
 
 .PHONY: shaders all build run run-cpu run-metal run-vulkan run-opencl run-cuda clean \
-        download-models download-fir-models download-datasets download-codestral-tokenizer \
+        download download-models download-fir-models download-datasets download-codestral-tokenizer \
+        download-spectron-scale-data \
+        prepare-spectron-data prepare-spectron-scale-data build-spectron-packer \
         build-graft build-finetune build-infer-lora build-compact-lora \
-        build-migrate-lora build-nim-inference build-spectron build-shared build-for-python \
+        build-migrate-lora build-nim-inference build-spectron build-spectron-trainer build-shared build-for-python \
         init-submodules \
         python-test python-example c-example bybylang-test hook-plugin-test bench-gflops \
         graft finetune-mamba finetune-codestral-vulkan finetune-codestral-metal hf-train build-hf-train infer-lora infer-mamba infer-deepseek run-spectron mamba-pipeline \
@@ -104,18 +112,18 @@ build: build-shared
 run:
 	$(NIM) check $(NIMFLAGS) $(TEST_SRC)
 	$(NIM) c $(NIMFLAGS) $(TEST_SRC)
-	./test/spectron/$(TEST_BIN)
+	./test/spectron/$(TEST_BIN) $(ARGS)
 
 run-cpu:
 	$(NIM) check $(NIMFLAGS) -d:backend=cpu $(TEST_SRC)
 	$(NIM) c $(NIMFLAGS) -d:backend=cpu $(TEST_SRC)
-	./test/spectron/$(TEST_BIN)
+	./test/spectron/$(TEST_BIN) $(ARGS)
 
 run-metal:
 ifeq ($(IS_MACOS),yes)
 	$(NIM) check $(NIMFLAGS) -d:backend=metal $(TEST_SRC)
 	$(NIM) c $(NIMFLAGS) -d:backend=metal $(TEST_SRC)
-	./test/spectron/$(TEST_BIN)
+	./test/spectron/$(TEST_BIN) $(ARGS)
 else
 	@echo "Metal is only supported on macOS"
 endif
@@ -123,12 +131,12 @@ endif
 run-vulkan:
 	$(NIM) check $(NIMFLAGS) -d:backend=vulkan $(TEST_SRC)
 	$(NIM) c $(NIMFLAGS) -d:backend=vulkan $(TEST_SRC)
-	$(RUN_PREFIX)test/spectron/$(TEST_BIN)
+	$(RUN_PREFIX)test/spectron/$(TEST_BIN) $(ARGS)
 
 run-opencl:
 	$(NIM) check $(NIMFLAGS) -d:backend=opencl $(TEST_SRC)
 	$(NIM) c $(NIMFLAGS) -d:backend=opencl $(TEST_SRC)
-	./test/spectron/$(TEST_BIN)
+	./test/spectron/$(TEST_BIN) $(ARGS)
 
 clean:
 ifeq ($(IS_WINDOWS),yes)
@@ -144,7 +152,7 @@ endif
 run-cuda:
 	$(NIM) check $(NIMFLAGS) -d:backend=cuda $(TEST_SRC)
 	$(NIM) c $(NIMFLAGS) -d:backend=cuda $(TEST_SRC)
-	./test/spectron/$(TEST_BIN)
+	./test/spectron/$(TEST_BIN) $(ARGS)
 
 # Download public Hugging Face assets into the paths used by inference/training.
 download-models: download-fir-models
@@ -198,7 +206,21 @@ download-fir-models:
 download-codestral-tokenizer:
 	bash test/codestral/download_codestral_tokenizer.sh "$(INFER_LORA_DEFAULT_HFDIR)"
 
-download-datasets:
+build-spectron-packer:
+	$(NIM) c $(NIMFLAGS) --nimcache:$(SPECTRON_BUILD_NIMCACHE)/pack -o:$(SPECTRON_PACK_BIN) test/spectron/pack_tokens.nim
+
+prepare-spectron-data: build-spectron-packer
+	$(PYTHON) -B test/spectron/prepare_packed_data.py --packer "$(SPECTRON_PACK_BIN)" $(ARGS)
+
+prepare-spectron-scale-data: build-spectron-packer
+	$(PYTHON) -B test/spectron/prepare_scale_data.py --packer "$(SPECTRON_PACK_BIN)" $(ARGS)
+
+download-spectron-scale-data:
+	$(PYTHON) -B test/spectron/download_scale_data.py --repo "$(SPECTRON_DATA_REPO)" --repo-type "$(SPECTRON_DATA_REPO_TYPE)" --revision "$(SPECTRON_DATA_REVISION)" --subdir "$(SPECTRON_DATA_SUBDIR)" --output "$(SPECTRON_DATA_DIR)"
+
+download: download-datasets
+
+download-datasets: download-spectron-scale-data
 	@set -eu; \
 	mkdir -p test/spectron; \
 	for shard in 1 2 3 4 5; do \
@@ -316,6 +338,11 @@ build-nim-inference:
 build-spectron:
 	$(NIM) check $(NIMFLAGS) $(SPECTRON_SRC)
 	$(NIM) c $(NIMFLAGS) -o:$(SPECTRON_BIN) $(SPECTRON_SRC)
+
+# Build test/spectron/test_nimformer for one GPU backend without running it (Colab uses vulkan).
+SPECTRON_TRAIN_BACKEND ?= vulkan
+build-spectron-trainer:
+	$(NIM) c $(NIMFLAGS) -d:backend=$(SPECTRON_TRAIN_BACKEND) --nimcache:nimcache/spectron-$(SPECTRON_TRAIN_BACKEND) $(TEST_SRC)
 
 # Ensure the vendored runtime is checked out at the commit pinned by this
 # framework revision. A normal `git pull` does not update submodule contents.

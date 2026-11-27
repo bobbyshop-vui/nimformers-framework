@@ -1,6 +1,10 @@
 # ===== loai tru du lieu / model / nen  (2026-10-26) =====
 *.nimq
 *.bin
+/test/spectron/data/
+# Raw distill logs contain personal data; only the masked packed shard is published.
+/test/spectron/claude_distill_dataset.jsonl
+.hf-sync-*/
 *.zip
 *.prev
 *.prev.tmp

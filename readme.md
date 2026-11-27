@@ -607,6 +607,19 @@ More detail (source layout, the detection rules, what is not done yet):
 
 ### Train Spectron with `test/spectron/test_nimformer.nim`
 
+Spectron can train a modular MoE on 5 billion BPE tokens, including raw Python
+and distillation conversations with tool calls. The default layout allocates
+about 30 million parameters per expert. `make download` installs this corpus,
+and [`spectron_moe_colab_t4.ipynb`](notebooks/spectron_moe_colab_t4.ipynb)
+trains it on a Colab T4 with Tensor Cores and uploads the checkpoint every 20
+steps.
+[Spectron MoE guide](docs/spectron-guide.md#train-the-moe-on-5-billion-tokens)
+
+The trainer supports a packed `uint16` corpus with one billion synthetic
+Python tokens and one billion English tokens. See how to build the corpus,
+train from the published weights and resume with Adam state.
+[Spectron packed training guide](docs/spectron-guide.md#train-on-the-packed-dataset)
+
 `test/spectron/test_nimformer.nim` is the Spectron training program. `make run` compiles and runs it; it reads `test/spectron/databricks-dolly-15k.jsonl` and all six Python/Nim code JSONLs in `test/spectron/`, trains or loads its byte-level BPE tokenizer, trains the model, and saves the checkpoint and tokenizer under `test/spectron/models/`. It scans each code JSONL and keeps a reservoir sample of up to 4,000 valid examples per file, so it uses all six datasets without loading their combined 1.3 GB into memory. The BPE training slice samples from each source. Change the `CFG_*` constants near the top of `test/spectron/test_nimformer.nim` to adjust the datasets, sample limit, model size, step count, batch, sequence length, or learning rate.
 
 

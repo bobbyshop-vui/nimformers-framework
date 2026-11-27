@@ -1158,7 +1158,8 @@ proc buildLpBwdVProgram*(L: LpLay): VmProgram =
 # ═════════════════════════════════════════════════════════════
 # (3) Masked softmax cross-entropy: loss + dLogits in one kernel per row
 #   target < 0 => skipped (row dLogits = 0, row loss = 0).
-#   dLogits = (softmax - onehot) * invN ;  loss_row = m + ln(Σexp(x-m)) - x_tgt
+#   dLogits = (softmax - onehot) * invN
+#   rowLoss = ((m - x_tgt) + ln(Σexp(x-m))) * invN
 #   (ln through Halley iterations on the GPU because the VM has no LOG opcode)
 # ═════════════════════════════════════════════════════════════
 type
@@ -1201,69 +1202,82 @@ proc buildCeProgram*(L: CeLay): VmProgram =
   p.emitUTgid(0); p.emitULid(1)
   p.emitUToR(14, 1)
   p.emitUMulK(2, 0, uint32(V))
-  p.emitUConst(3, 0)
   p.emitLoadConstF32(3, float32(ept))
-  # ── pass 1: max ──
-  p.emitLoadConstF32(1, -1e30'f32); p.emitLoadConstF32(4, 0.0'f32)
-  sessionVmForGpu(p, 3):
-    p.emitMulConst(5, 4, float32(tg)); p.emitAdd(5, 5, 14); p.emitRToU(4, 5)
-    p.emitUAdd(5, 2, 4); p.emitULoadF32(6, 5, uint32(L.logits))
-    p.emitCmpLt(7, 1, 6)
-    sessionVmIfGpu(p, 7):
-      p.emitAddConst(1, 6, 0.0'f32)
-    p.emitAddConst(4, 4, 1.0'f32)
-  p.emitTgStoreF32(1, 14, 0); p.emitBarrierTg()
-  p.emitTgTreeReduceMax(14, tg, 6, 7, 8, 9, 10)
-  p.emitLoadConstF32(11, 0.0'f32); p.emitTgLoadF32(13, 11, 0); p.emitBarrierTg()   # R13 = m
-  # ── pass 2: Σ exp(x-m) ──
-  p.emitLoadConstF32(1, 0.0'f32); p.emitLoadConstF32(4, 0.0'f32)
-  sessionVmForGpu(p, 3):
-    p.emitMulConst(5, 4, float32(tg)); p.emitAdd(5, 5, 14); p.emitRToU(4, 5)
-    p.emitUAdd(5, 2, 4); p.emitULoadF32(6, 5, uint32(L.logits))
-    p.emitSub(6, 6, 13); p.emitExp(6, 6); p.emitAdd(1, 1, 6)
-    p.emitAddConst(4, 4, 1.0'f32)
-  p.emitTgStoreF32(1, 14, 0); p.emitBarrierTg()
-  p.emitTgTreeReduce(14, tg, 6, 7, 8, 9, 10)
-  p.emitTgLoadF32(12, 11, 0)                                   # R12 = S
-  p.emitLoadConstF32(8, 1.0'f32); p.emitDiv(10, 8, 12)         # R10 = 1/S
-  p.emitUConst(3, 0)
-  p.emitULoadF32(15, 0, uint32(L.tgt))                         # R15 = tgt[row]
-  p.emitULoadF32(7, 3, uint32(L.scal))                         # R7 = invN
-  p.emitLoadConstF32(8, -0.5'f32); p.emitCmpLt(9, 8, 15)       # R9 = valid (tgt >= 0)
-  # ── pass 3: dLogits ──
-  p.emitLoadConstF32(4, 0.0'f32)
-  sessionVmForGpu(p, 3):
-    p.emitMulConst(5, 4, float32(tg)); p.emitAdd(5, 5, 14); p.emitRToU(4, 5)
-    p.emitUAdd(6, 2, 4); p.emitULoadF32(8, 6, uint32(L.logits))
-    p.emitSub(8, 8, 13); p.emitExp(8, 8); p.emitMul(8, 8, 10)  # p
-    p.emitAddConst(1, 15, 0.5'f32); p.emitCmpLt(1, 5, 1)       # idx < tgt+.5
-    p.emitAddConst(2, 15, -0.5'f32); p.emitCmpLt(2, 2, 5)      # tgt-.5 < idx
-    p.emitMul(1, 1, 2)                                         # onehot
-    p.emitSub(8, 8, 1); p.emitMul(8, 8, 7); p.emitMul(8, 8, 9)
-    p.emitUStoreF32(8, 6, uint32(L.dLogits))
-    p.emitAddConst(4, 4, 1.0'f32)
-  # ── loss_row = m + ln S - x_tgt  (ln S: Halley, 24 iterations) ──
-  p.emitLoadConstF32(1, 0.0'f32); p.emitLoadConstF32(4, 24.0'f32)
-  sessionVmForGpu(p, 4):
-    p.emitExp(2, 1)                                            # e = exp(y)
-    p.emitSub(5, 12, 2); p.emitAdd(6, 12, 2); p.emitDiv(5, 5, 6)
-    p.emitMulConst(5, 5, 2.0'f32); p.emitAdd(1, 1, 5)
-  p.emitMul(8, 15, 9); p.emitRToU(4, 8)                        # col = valid ? tgt : 0
-  p.emitUAdd(5, 2, 4); p.emitULoadF32(6, 5, uint32(L.logits))
-  p.emitAdd(1, 1, 13); p.emitSub(1, 1, 6); p.emitMul(1, 1, 9)
-  p.emitUStoreF32(1, 0, uint32(L.rowLoss))
+  p.emitULoadF32(15, 0, uint32(L.tgt))
+  p.emitLoadConstF32(31, -0.5'f32); p.emitCmpLt(30, 31, 15)
+  # Every lane in the row has the same target, so the barriers are uniform.
+  sessionVmIfGpu(p, 30):
+    # Pass 1: max.
+    p.emitLoadConstF32(1, -3.402823466e38'f32); p.emitLoadConstF32(4, 0.0'f32)
+    sessionVmForGpu(p, 3):
+      p.emitMulConst(5, 4, float32(tg)); p.emitAdd(5, 5, 14); p.emitRToU(4, 5)
+      p.emitUAdd(5, 2, 4); p.emitULoadF32(6, 5, uint32(L.logits))
+      p.emitCmpLt(7, 1, 6)
+      sessionVmIfGpu(p, 7):
+        p.emitAddConst(1, 6, 0.0'f32)
+      p.emitAddConst(4, 4, 1.0'f32)
+    p.emitTgStoreF32(1, 14, 0); p.emitBarrierTg()
+    p.emitTgTreeReduceMax(14, tg, 6, 7, 8, 9, 10)
+    p.emitLoadConstF32(11, 0.0'f32); p.emitTgLoadF32(13, 11, 0); p.emitBarrierTg()
+    # Pass 2: sum of exp(x - max).
+    p.emitLoadConstF32(1, 0.0'f32); p.emitLoadConstF32(4, 0.0'f32)
+    sessionVmForGpu(p, 3):
+      p.emitMulConst(5, 4, float32(tg)); p.emitAdd(5, 5, 14); p.emitRToU(4, 5)
+      p.emitUAdd(5, 2, 4); p.emitULoadF32(6, 5, uint32(L.logits))
+      p.emitSub(6, 6, 13); p.emitExp(6, 6); p.emitAdd(1, 1, 6)
+      p.emitAddConst(4, 4, 1.0'f32)
+    p.emitTgStoreF32(1, 14, 0); p.emitBarrierTg()
+    p.emitTgTreeReduce(14, tg, 6, 7, 8, 9, 10)
+    p.emitTgLoadF32(12, 11, 0)
+    p.emitLoadConstF32(8, 1.0'f32); p.emitDiv(10, 8, 12)
+    p.emitUConst(3, 0); p.emitULoadF32(7, 3, uint32(L.scal))
+    # Pass 3: dLogits.
+    p.emitLoadConstF32(4, 0.0'f32)
+    sessionVmForGpu(p, 3):
+      p.emitMulConst(5, 4, float32(tg)); p.emitAdd(5, 5, 14); p.emitRToU(4, 5)
+      p.emitUAdd(6, 2, 4); p.emitULoadF32(8, 6, uint32(L.logits))
+      p.emitSub(8, 8, 13); p.emitExp(8, 8); p.emitMul(8, 8, 10)
+      p.emitAddConst(1, 15, 0.5'f32); p.emitCmpLt(1, 5, 1)
+      p.emitAddConst(2, 15, -0.5'f32); p.emitCmpLt(2, 2, 5)
+      p.emitMul(1, 1, 2)
+      p.emitSub(8, 8, 1); p.emitMul(8, 8, 7)
+      p.emitUStoreF32(8, 6, uint32(L.dLogits))
+      p.emitAddConst(4, 4, 1.0'f32)
+    # Halley iterations for ln(S). Form max - target first to preserve ln(S)
+    # even when both logits have a large common offset.
+    p.emitLoadConstF32(31, 0.5'f32); p.emitCmpLt(29, 14, 31)
+    sessionVmIfGpu(p, 29):
+      p.emitLoadConstF32(1, 0.0'f32); p.emitLoadConstF32(4, 24.0'f32)
+      sessionVmForGpu(p, 4):
+        p.emitExp(2, 1)
+        p.emitSub(5, 12, 2); p.emitAdd(6, 12, 2); p.emitDiv(5, 5, 6)
+        p.emitMulConst(5, 5, 2.0'f32); p.emitAdd(1, 1, 5)
+      p.emitRToU(4, 15)
+      p.emitUAdd(5, 2, 4); p.emitULoadF32(6, 5, uint32(L.logits))
+      p.emitSub(6, 13, 6); p.emitAdd(1, 1, 6)
+      p.emitMul(1, 1, 7)
+      p.emitUStoreF32(1, 0, uint32(L.rowLoss))
+  p.emitLoadConstF32(31, 1.0'f32); p.emitSub(30, 31, 30)
+  sessionVmIfGpu(p, 30):
+    p.emitLoadConstF32(1, 0.0'f32); p.emitLoadConstF32(4, 0.0'f32)
+    sessionVmForGpu(p, 3):
+      p.emitMulConst(5, 4, float32(tg)); p.emitAdd(5, 5, 14); p.emitRToU(4, 5)
+      p.emitUAdd(6, 2, 4); p.emitUStoreF32(1, 6, uint32(L.dLogits))
+      p.emitAddConst(4, 4, 1.0'f32)
+    p.emitLoadConstF32(31, 0.5'f32); p.emitCmpLt(29, 14, 31)
+    sessionVmIfGpu(p, 29):
+      p.emitUStoreF32(1, 0, uint32(L.rowLoss))
   p.emitHalt()
   result = p
 
 proc buildCeSumProgram*(L: CeLay): VmProgram =
-  ## 1 thread: sum = Σ rowLoss * invN
+  ## The row kernel has already normalized each term by the valid row count.
   var p: VmProgram
   p.emitUConst(0, 0)
   p.emitLoadConstF32(3, float32(L.rows)); p.emitLoadConstF32(1, 0.0'f32)
   p.emitUConst(1, 0)
   sessionVmForGpu(p, 3):
     p.emitULoadF32(2, 1, uint32(L.rowLoss)); p.emitAdd(1, 1, 2); p.emitUAddK(1, 1, 1)
-  p.emitULoadF32(2, 0, uint32(L.scal)); p.emitMul(1, 1, 2)
   p.emitUStoreF32(1, 0, uint32(L.sum))
   p.emitHalt()
   result = p

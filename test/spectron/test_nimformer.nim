@@ -16,8 +16,8 @@
 ## RAISES (gpuFail), it is NEVER silently recomputed on the CPU. The cpu* functions
 ## below are only reference versions for the CPU backend and
 ## for comparison tests. What is left on the host is data arrangement (splitting/joining
-## per-head slices, since Tensor.data lives on the host) and APF quantization
-## (customfloat has no GPU kernel yet), not model computation.
+## per-head slices, since Tensor.data lives on the host), numerical checks,
+## gradient clipping and APF quantization (customfloat has no GPU kernel yet).
 
 import std/[math, random, strformat, os, strutils, json, tables]
 import customfloat
@@ -173,24 +173,24 @@ proc isAsciiLetter(c: char): bool = c in {'a'..'z', 'A'..'Z'}
 proc isAsciiDigit(c: char): bool = c in {'0'..'9'}
 proc isAsciiSpace(c: char): bool = c in {' ', '\t', '\n', '\r'}
 
-proc gpt2PreTokenize(s: string): seq[string] =
+iterator bpePieces*(s: string): tuple[start, stop: int] =
   ## Rough split in the spirit of the GPT-2 regex
   ## ( 's| 't| 're| 've| 'm| 'll| 'd| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+ )
   ## hand-written as an ASCII scanner (enough for the demo, no Unicode regex
   ## library needed - bytes >=128 are treated as a single "letter"/punctuation depending
   ## on context, still encoded/decoded CORRECTLY thanks to the byte-level fallback later).
-  result = @[]
   var i = 0
   let n = s.len
   const contractions = ["'s", "'t", "'re", "'ve", "'m", "'ll", "'d"]
   while i < n:
     var matched = false
-    for c in contractions:
-      if i + c.len <= n and s[i ..< i + c.len] == c:
-        result.add(c)
-        i += c.len
-        matched = true
-        break
+    if s[i] == '\'':
+      for c in contractions:
+        if s.continuesWith(c, i):
+          yield (i, i + c.len)
+          i += c.len
+          matched = true
+          break
     if matched: continue
 
     var start = i
@@ -202,25 +202,27 @@ proc gpt2PreTokenize(s: string): seq[string] =
     if i < n and isAsciiLetter(s[i]):
       if not hasLeadingSpace: start = i
       while i < n and isAsciiLetter(s[i]): inc i
-      result.add(s[start ..< i])
+      yield (start, i)
     elif i < n and isAsciiDigit(s[i]):
       if not hasLeadingSpace: start = i
       while i < n and isAsciiDigit(s[i]): inc i
-      result.add(s[start ..< i])
+      yield (start, i)
     elif i < n and isAsciiSpace(s[i]):
       start = i
       while i < n and isAsciiSpace(s[i]):
         if i + 1 < n and s[i] == ' ' and not isAsciiSpace(s[i + 1]) and i > start:
           break   # leave 1 space as the "leading space" of the next piece
         inc i
-      result.add(s[start ..< i])
+      yield (start, i)
     elif i < n:
       if not hasLeadingSpace: start = i
       # 1 non-ascii/punctuation byte = 1 piece (safe for multi-byte UTF-8 and punctuation)
       inc i
-      result.add(s[start ..< i])
-    else:
-      if hasLeadingSpace: result.add(" ")
+      yield (start, i)
+
+proc gpt2PreTokenize(s: string): seq[string] =
+  for (start, stop) in bpePieces(s):
+    result.add(s[start ..< stop])
 
 proc toByteEncodedChars(enc: array[256, string], s: string): seq[string] =
   ## Each raw BYTE of the string (not each Unicode character) -> 1 "base
@@ -324,23 +326,18 @@ proc trainBPE*(corpusText: string, numMerges: int): BPETokenizer =
 
 proc vocabSize*(tok: BPETokenizer): int = tok.id2tok.len
 
+proc encodeBpePiece*(tok: BPETokenizer, text: string): seq[int] =
+  let baseChars = toByteEncodedChars(tok.byteEncoder, text)
+  for piece in bpeMergeWord(baseChars, tok.mergeRank):
+    if piece in tok.vocab:
+      result.add(tok.vocab[piece])
+    else:
+      for base in baseChars:
+        result.add(tok.vocab.getOrDefault(base, 0))
+
 proc encodeBPE*(tok: BPETokenizer, s: string): seq[int] =
-  result = @[]
-  for pt in gpt2PreTokenize(s):
-    let baseChars = toByteEncodedChars(tok.byteEncoder, pt)
-    let merged = bpeMergeWord(baseChars, tok.mergeRank)
-    for piece in merged:
-      # piece is always in the vocab since every merge is registered at training;
-      # just in case of an unknown piece (a combination never seen in training)
-      # fall back to the original byte-encoded chars (always in the vocab).
-      if piece in tok.vocab:
-        result.add(tok.vocab[piece])
-      else:
-        for ch in toByteEncodedChars(tok.byteEncoder, ""):
-          discard ch
-        for b in 0 ..< pt.len:
-          let bc = tok.byteEncoder[uint8(pt[b]).int]
-          result.add(tok.vocab.getOrDefault(bc, 0))
+  for (start, stop) in bpePieces(s):
+    result.add(tok.encodeBpePiece(s[start ..< stop]))
 
 proc decodeBPEStr*(tok: BPETokenizer, ids: seq[int]): string =
   var unicodeStr = ""
@@ -1130,69 +1127,69 @@ proc gateMix(ctx: Backend; gate: seq[float32]; a, b: Tensor): Tensor =
   result = newTensor(a.shape)
   result.data = beAdd(ctx, b.data, beMul(ctx, gate, beSub(ctx, a.data, b.data)))
 
-proc forward*(blk: TransformerBlockSpectron, x: Tensor, ctx: Backend): Tensor =
-  let x1 = blk.ln1.forward(x, ctx)
-  let attnOut = forwardLinearPlus(blk.attn, x1, ctx)
-  let mambaOut = forwardMamba2(blk.mamba, x1, ctx)
-
-  let fuseIn = concatLastDim(attnOut, mambaOut, ctx)
-  let gateLogit = blk.fuseGate.forward(fuseIn, ctx)
-  let gate = beSigmoid(ctx, gateLogit.data)
-  let combined = gateMix(ctx, gate, attnOut, mambaOut)
-
-  let x2 = addT(ctx, x, combined)
-  let x3 = blk.ln2.forward(x2, ctx)
-  let ffOut = blk.ff.forward(x3, ctx)
-  result = addT(ctx, x2, ffOut)
-
-proc backward*(blk: TransformerBlockSpectron, x: Tensor, dOut: Tensor, ctx: Backend): tuple[
+type
+  SpectronBlockForward = object
+    x, x1, attnOut, mambaOut, fuseIn, gate, x2, x3: Tensor
+  SpectronBlockGrads = tuple[
     dX: Tensor,
     dAttnQkvW, dAttnQkvB, dAttnOutW, dAttnOutB: Tensor,
     dMambaInW, dMambaInB, dMambaOutW, dMambaOutB: Tensor,
     dFuseW, dFuseB: Tensor,
     dFf1W, dFf1B, dFf2W, dFf2B: Tensor,
-    dLn1G, dLn1B, dLn2G, dLn2B: Tensor] =
-  let C = x.shape[2]
+    dLn1G, dLn1B, dLn2G, dLn2B: Tensor]
 
-  # ---- forward again to get every intermediate activation ----
-  let x1 = blk.ln1.forward(x, ctx)
-  let attnOut = forwardLinearPlus(blk.attn, x1, ctx)
-  let mambaOut = forwardMamba2(blk.mamba, x1, ctx)
-  let fuseIn = concatLastDim(attnOut, mambaOut, ctx)
-  let gateLogit = blk.fuseGate.forward(fuseIn, ctx)
-  let gate = beSigmoid(ctx, gateLogit.data)
-  let combined = gateMix(ctx, gate, attnOut, mambaOut)
-  let x2 = addT(ctx, x, combined)
-  let x3 = blk.ln2.forward(x2, ctx)
+proc blockForward(blk: TransformerBlockSpectron, x: Tensor, ctx: Backend): SpectronBlockForward =
+  result.x = x
+  result.x1 = blk.ln1.forward(x, ctx)
+  result.attnOut = forwardLinearPlus(blk.attn, result.x1, ctx)
+  result.mambaOut = forwardMamba2(blk.mamba, result.x1, ctx)
+  result.fuseIn = concatLastDim(result.attnOut, result.mambaOut, ctx)
+  result.gate = blk.fuseGate.forward(result.fuseIn, ctx)
+  result.gate.data = beSigmoid(ctx, result.gate.data)
+  let combined = gateMix(ctx, result.gate.data, result.attnOut, result.mambaOut)
+  result.x2 = addT(ctx, x, combined)
+  result.x3 = blk.ln2.forward(result.x2, ctx)
+
+proc blockOutput(blk: TransformerBlockSpectron, activations: SpectronBlockForward,
+                 ctx: Backend): Tensor =
+  addT(ctx, activations.x2, blk.ff.forward(activations.x3, ctx))
+
+proc forward*(blk: TransformerBlockSpectron, x: Tensor, ctx: Backend): Tensor =
+  blk.blockOutput(blk.blockForward(x, ctx), ctx)
+
+proc blockBackward(blk: TransformerBlockSpectron, cache: SpectronBlockForward,
+                   dOut: Tensor, ctx: Backend): SpectronBlockGrads =
+  let C = cache.x.shape[2]
+  let gate = cache.gate.data
 
   # ---- backward FF + LN2 ----
-  let dFF = blk.ff.backward(x3, dOut, ctx)
-  let dLN2 = blk.ln2.backward(x2, dFF.dX, ctx)
+  let dFF = blk.ff.backward(cache.x3, dOut, ctx)
+  let dLN2 = blk.ln2.backward(cache.x2, dFF.dX, ctx)
   let dX2 = addT(ctx, dLN2.dX, dOut)   # residual x2 = x + combined
 
   # ---- backward gated fusion (GPU elementwise) ----
-  let dGate = beMul(ctx, dX2.data, beSub(ctx, attnOut.data, mambaOut.data))
+  let dGate = beMul(ctx, dX2.data, beSub(ctx, cache.attnOut.data, cache.mambaOut.data))
   let dAttnOutPartial = beMul(ctx, dX2.data, gate)
   let dMambaOutPartial = beSub(ctx, dX2.data, dAttnOutPartial)          # dX2*(1-gate)
 
-  var dGateLogit = newTensor(gateLogit.shape)
+  var dGateLogit = newTensor(cache.gate.shape)
   dGateLogit.data = beMul(ctx, dGate, beSub(ctx, gate, beMul(ctx, gate, gate)))   # sigmoid'
 
-  let dFuse = blk.fuseGate.backward(fuseIn, dGateLogit, ctx)
+  let dFuse = blk.fuseGate.backward(cache.fuseIn, dGateLogit, ctx)
   let (dAttnOutFuse, dMambaOutFuse) = splitLastDim(dFuse.dX, C, ctx)
 
-  var dAttnOutTotal = newTensor(attnOut.shape)
-  var dMambaOutTotal = newTensor(mambaOut.shape)
+  var dAttnOutTotal = newTensor(cache.attnOut.shape)
+  var dMambaOutTotal = newTensor(cache.mambaOut.shape)
   dAttnOutTotal.data = beAdd(ctx, dAttnOutPartial, dAttnOutFuse.data)
   dMambaOutTotal.data = beAdd(ctx, dMambaOutPartial, dMambaOutFuse.data)
 
   # ---- backward of the 2 branches (Linear++ attn and Mamba2) ----
-  let dAttn = backwardLinearPlus(blk.attn, x1, dAttnOutTotal, ctx)
-  let dMamba = backwardMamba2(blk.mamba, x1, dMambaOutTotal, ctx)
+  let dAttn = backwardLinearPlus(blk.attn, cache.x1, dAttnOutTotal, ctx)
+  let dMamba = backwardMamba2(blk.mamba, cache.x1, dMambaOutTotal, ctx)
 
   let dX1Total = addT(ctx, dAttn.dX, dMamba.dX)
 
-  let dLN1 = blk.ln1.backward(x, dX1Total, ctx)
+  let dLN1 = blk.ln1.backward(cache.x, dX1Total, ctx)
   let dX0 = addT(ctx, dLN1.dX, dX2)    # original residual x2 = x + combined
 
   result = (
@@ -1204,11 +1201,39 @@ proc backward*(blk: TransformerBlockSpectron, x: Tensor, dOut: Tensor, ctx: Back
     dLN1.dGamma, dLN1.dBeta, dLN2.dGamma, dLN2.dBeta
   )
 
+proc backward*(blk: TransformerBlockSpectron, x: Tensor, dOut: Tensor,
+               ctx: Backend): SpectronBlockGrads =
+  blk.blockBackward(blk.blockForward(x, ctx), dOut, ctx)
+
 # ═══════════════════════════════════════════════════════════════
 # NIMFORMER MODEL VỚI SPECTRON BLOCKS (embed -> N blocks -> lm head)
 # ═══════════════════════════════════════════════════════════════
 
+type SpectronNumericalError* = object of CatchableError
+
+func finite32(value: float32): bool {.inline.} =
+  (cast[uint32](value) and 0x7f800000'u32) != 0x7f800000'u32
+
+include spectron_moe
+
 type
+  HrmConfig* = object
+    ## Hierarchical Reasoning Model core (Wang et al., 2025, arXiv:2506.21734).
+    ## blocks[0 ..< lLayers] form the fast low-level module L and the remaining
+    ## blocks form the slow high-level module H. Each segment runs `cycles`
+    ## high-level updates; each one follows `lSteps` low-level updates:
+    ##   zL = L(zL + zH + embed(x))      (lSteps times)
+    ##   zH = H(zH + zL)                 (once per cycle)
+    ## Each module ends with its own LayerNorm, so zL and zH stay normalized
+    ## across iterations like the post-norm states in the paper. The injected
+    ## embeddings pass through a third LayerNorm so the token signal has the
+    ## same scale as the states (the paper scales embeddings by sqrt(d)).
+    ## Training uses the one-step gradient: only the last L and the last H
+    ## update keep activations, and earlier states are treated as constants.
+    ## `segments` repeats the whole computation from the previous segment's
+    ## detached state (deep supervision). cycles == 0 disables HRM.
+    lLayers*, cycles*, lSteps*, segments*: int
+
   NimformerModelSpectron* = object
     embed*: Embedding
     blocks*: seq[TransformerBlockSpectron]
@@ -1216,6 +1241,69 @@ type
     useFinalNorm*: bool
     outProj*: Linear
     vocab*: int
+    mixture: SpectronMixture
+    hrm*: HrmConfig
+    hrmNormL*, hrmNormH*, hrmNormX*: LayerNorm
+
+  HrmCarry = object
+    ## Recurrent HRM state between segments; empty tensors mean zero state.
+    zH, zL: Tensor
+
+proc hrmEnabled*(m: NimformerModelSpectron): bool {.inline.} = m.hrm.cycles > 0
+
+proc validateHrm*(m: NimformerModelSpectron) =
+  if not m.hrmEnabled: return
+  let h = m.hrm
+  if h.lLayers < 1 or h.lLayers >= m.blocks.len or h.lSteps < 1 or h.segments < 1:
+    raise newException(ValueError,
+      "HRM needs 1 <= l-layers < total layers, and at least one L step and one segment")
+
+const HrmResidualInitScale* = 0.1'f32
+
+proc initHrmResiduals*(m: var NimformerModelSpectron, scale = HrmResidualInitScale) =
+  ## Shrinks every block's residual branch outputs for a freshly initialized HRM
+  ## core. Unscaled random blocks make the recurrent L/H map chaotic: a 2-cycle,
+  ## 2-step, 2-segment core amplified a 1e-4 weight change into logit changes
+  ## larger than the logits themselves, so GPU rounding alone changed results.
+  ## Near-identity blocks start the recurrence contracting; training grows them.
+  for blk in m.blocks.mitems:
+    for t in [addr blk.attn.outProj.weight, addr blk.attn.outProj.bias,
+              addr blk.mamba.outProj.weight, addr blk.mamba.outProj.bias,
+              addr blk.ff.fc2.weight, addr blk.ff.fc2.bias]:
+      for w in t[].data.mitems: w *= scale
+
+proc runHrmLevel(m: NimformerModelSpectron, first, last: int, input: Tensor, ctx: Backend,
+                 cache: ptr seq[SpectronBlockForward]): Tensor =
+  result = input
+  for i in first ..< last:
+    if cache == nil:
+      result = m.blocks[i].forward(result, ctx)
+    else:
+      cache[][i] = m.blocks[i].blockForward(result, ctx)
+      result = m.blocks[i].blockOutput(cache[][i], ctx)
+
+proc hrmSegment(m: NimformerModelSpectron, embedded: Tensor, carry: var HrmCarry,
+                ctx: Backend, cache: ptr seq[SpectronBlockForward] = nil,
+                rawL, rawH: ptr Tensor = nil) =
+  ## One HRM segment. With `cache`, the final L and H updates record their
+  ## block activations and their outputs before the module norm (`rawL`,
+  ## `rawH`) for the one-step gradient; all earlier updates run forward only.
+  if carry.zH.data.len == 0:
+    carry.zH = newTensor(embedded.shape)
+    carry.zL = newTensor(embedded.shape)
+  let nL = m.hrm.lLayers
+  for cycle in 0 ..< m.hrm.cycles:
+    let lastCycle = cycle == m.hrm.cycles - 1
+    for step in 0 ..< m.hrm.lSteps:
+      let tracked = if lastCycle and step == m.hrm.lSteps - 1: cache else: nil
+      let injected = addT(ctx, addT(ctx, carry.zL, carry.zH), embedded)
+      let lOut = m.runHrmLevel(0, nL, injected, ctx, tracked)
+      if tracked != nil: rawL[] = lOut
+      carry.zL = m.hrmNormL.forward(lOut, ctx)
+    let tracked = if lastCycle: cache else: nil
+    let hOut = m.runHrmLevel(nL, m.blocks.len, addT(ctx, carry.zH, carry.zL), ctx, tracked)
+    if tracked != nil: rawH[] = hOut
+    carry.zH = m.hrmNormH.forward(hOut, ctx)
 
 proc newNimformerModelSpectron*(vocab, embedDim, nHeads, nLayers, ffMult: int,
                                  useSession: bool = true): NimformerModelSpectron =
@@ -1227,11 +1315,23 @@ proc newNimformerModelSpectron*(vocab, embedDim, nHeads, nLayers, ffMult: int,
   result.finalNorm = newLayerNorm(embedDim)
   result.useFinalNorm = true
   result.outProj = newLinear(embedDim, vocab)
+  result.hrmNormL = newLayerNorm(embedDim)
+  result.hrmNormH = newLayerNorm(embedDim)
+  result.hrmNormX = newLayerNorm(embedDim)
 
 proc forwardBatch*(m: NimformerModelSpectron, idsBatch: seq[seq[int]], ctx: Backend): Tensor =
   var x = m.embed.lookupBatch(idsBatch, ctx)
-  for blk in m.blocks:
-    x = blk.forward(x, ctx)
+  if m.hrmEnabled:
+    var carry: HrmCarry
+    let injected = m.hrmNormX.forward(x, ctx)
+    for _ in 0 ..< m.hrm.segments:
+      m.hrmSegment(injected, carry, ctx)
+    x = carry.zH
+  else:
+    for blk in m.blocks:
+      x = blk.forward(x, ctx)
+  if m.mixture.experts.len > 0:
+    x = m.mixture.forwardMixture(x, ctx, false).output
   if m.useFinalNorm:
     x = m.finalNorm.forward(x, ctx)
   result = m.outProj.forward(x, ctx)
@@ -1255,42 +1355,97 @@ type
       dFf1W, dFf1B, dFf2W, dFf2B,
       dLn1G, dLn1B, dLn2G, dLn2B: Tensor]]
     dEmbed*: Tensor
+    dHrmNormLG*, dHrmNormLB*, dHrmNormHG*, dHrmNormHB*, dHrmNormXG*, dHrmNormXB*: Tensor
+    mixture: MixtureGrad
 
-proc backwardBatch*(m: NimformerModelSpectron, idsBatch: seq[seq[int]], dLoss: Tensor,
-                     ctx: Backend): SpectronGrads =
+type SpectronForward = object
+  blocks: seq[SpectronBlockForward]
+  hidden, headInput: Tensor
+  hrmRawL, hrmRawH: Tensor   # final L/H outputs before their module norms
+  hrmEmbed: Tensor           # embeddings before the injection norm
+  mixture: MixtureForward
+
+proc forwardForBackward(m: NimformerModelSpectron, idsBatch: seq[seq[int]],
+                        ctx: Backend, carry: var HrmCarry): SpectronForward =
+  ## With HRM, `carry` enters as the previous segment's state and leaves as
+  ## this segment's state. Input injection is an addition, so in backward the
+  ## gradient at the H input is the gradient of the final zL, and the gradient
+  ## at the L input is the gradient of the embeddings (carried states are constants).
   var x = m.embed.lookupBatch(idsBatch, ctx)
-  var hiddenStates: seq[Tensor] = @[x]
-  for blk in m.blocks:
-    x = blk.forward(x, ctx)
-    hiddenStates.add(x)
+  result.blocks = newSeq[SpectronBlockForward](m.blocks.len)
+  if m.hrmEnabled:
+    result.hrmEmbed = x
+    m.hrmSegment(m.hrmNormX.forward(x, ctx), carry, ctx, addr result.blocks,
+                 addr result.hrmRawL, addr result.hrmRawH)
+    x = carry.zH
+  else:
+    for i, blk in m.blocks:
+      result.blocks[i] = blk.blockForward(x, ctx)
+      x = blk.blockOutput(result.blocks[i], ctx)
+  if m.mixture.experts.len > 0:
+    result.mixture = m.mixture.forwardMixture(x, ctx, true)
+    x = result.mixture.output
+  result.hidden = x
+  result.headInput = if m.useFinalNorm: m.finalNorm.forward(x, ctx) else: x
 
+proc forwardForBackward(m: NimformerModelSpectron, idsBatch: seq[seq[int]],
+                        ctx: Backend): SpectronForward =
+  var carry: HrmCarry
+  m.forwardForBackward(idsBatch, ctx, carry)
+
+proc backwardCached(m: NimformerModelSpectron, idsBatch: seq[seq[int]], dLoss: Tensor,
+                    cache: SpectronForward, ctx: Backend): SpectronGrads =
   # The SSM branch is unnormalized; residual magnitudes must not set the
   # softmax temperature. Backpropagate through the same final norm as forward.
-  let headInput = if m.useFinalNorm: m.finalNorm.forward(x, ctx) else: x
-  let dOutProj = m.outProj.backward(headInput, dLoss, ctx)
+  let dOutProj = m.outProj.backward(cache.headInput, dLoss, ctx)
   result.dOutProjW = dOutProj.dW
   result.dOutProjB = dOutProj.dB
   var dOut = dOutProj.dX
   if m.useFinalNorm:
-    let dNorm = m.finalNorm.backward(x, dOut, ctx)
+    let dNorm = m.finalNorm.backward(cache.hidden, dOut, ctx)
     dOut = dNorm.dX
     result.dFinalNormG = dNorm.dGamma
     result.dFinalNormB = dNorm.dBeta
+  if m.mixture.experts.len > 0:
+    result.mixture = m.mixture.backwardMixture(cache.mixture, dOut, ctx)
+    dOut = result.mixture.dx
 
   result.dBlocks = newSeq[typeof(result.dBlocks[0])](m.blocks.len)
-  for i in countdown(m.blocks.len - 1, 0):
-    let blk = m.blocks[i]
-    let xPrev = hiddenStates[i]
-    let dBlk = blk.backward(xPrev, dOut, ctx)
-    dOut = dBlk.dX
-    result.dBlocks[i] = (
-      dBlk.dAttnQkvW, dBlk.dAttnQkvB, dBlk.dAttnOutW, dBlk.dAttnOutB,
-      dBlk.dMambaInW, dBlk.dMambaInB, dBlk.dMambaOutW, dBlk.dMambaOutB,
-      dBlk.dFuseW, dBlk.dFuseB,
-      dBlk.dFf1W, dBlk.dFf1B, dBlk.dFf2W, dBlk.dFf2B,
-      dBlk.dLn1G, dBlk.dLn1B, dBlk.dLn2G, dBlk.dLn2B
-    )
+  proc blocksBackward(m: NimformerModelSpectron, first, last: int, dOut: var Tensor,
+                      grads: var SpectronGrads) =
+    for i in countdown(last - 1, first):
+      let dBlk = m.blocks[i].blockBackward(cache.blocks[i], dOut, ctx)
+      dOut = dBlk.dX
+      grads.dBlocks[i] = (
+        dBlk.dAttnQkvW, dBlk.dAttnQkvB, dBlk.dAttnOutW, dBlk.dAttnOutB,
+        dBlk.dMambaInW, dBlk.dMambaInB, dBlk.dMambaOutW, dBlk.dMambaOutB,
+        dBlk.dFuseW, dBlk.dFuseB,
+        dBlk.dFf1W, dBlk.dFf1B, dBlk.dFf2W, dBlk.dFf2B,
+        dBlk.dLn1G, dBlk.dLn1B, dBlk.dLn2G, dBlk.dLn2B
+      )
+  if m.hrmEnabled:
+    let nL = m.hrm.lLayers
+    let dNormH = m.hrmNormH.backward(cache.hrmRawH, dOut, ctx)
+    result.dHrmNormHG = dNormH.dGamma
+    result.dHrmNormHB = dNormH.dBeta
+    dOut = dNormH.dX
+    m.blocksBackward(nL, m.blocks.len, dOut, result)
+    let dNormL = m.hrmNormL.backward(cache.hrmRawL, dOut, ctx)
+    result.dHrmNormLG = dNormL.dGamma
+    result.dHrmNormLB = dNormL.dBeta
+    dOut = dNormL.dX
+    m.blocksBackward(0, nL, dOut, result)
+    let dNormX = m.hrmNormX.backward(cache.hrmEmbed, dOut, ctx)
+    result.dHrmNormXG = dNormX.dGamma
+    result.dHrmNormXB = dNormX.dBeta
+    dOut = dNormX.dX
+  else:
+    m.blocksBackward(0, m.blocks.len, dOut, result)
   result.dEmbed = m.embed.backward(idsBatch, dOut, ctx)
+
+proc backwardBatch*(m: NimformerModelSpectron, idsBatch: seq[seq[int]], dLoss: Tensor,
+                    ctx: Backend): SpectronGrads =
+  m.backwardCached(idsBatch, dLoss, m.forwardForBackward(idsBatch, ctx), ctx)
 
 proc backward*(m: NimformerModelSpectron, ids: seq[int], dLoss: Tensor, ctx: Backend): SpectronGrads =
   let dLossBatch = Tensor(data: dLoss.data, shape: @[1] & dLoss.shape)
@@ -1299,41 +1454,71 @@ proc backward*(m: NimformerModelSpectron, ids: seq[int], dLoss: Tensor, ctx: Bac
 # ═══════════════════════════════════════════════════════════════
 # LOSS: softmax cross-entropy (batch), returns the mean loss + dLogits
 # ═══════════════════════════════════════════════════════════════
-proc softmaxCrossEntropy*(logits: Tensor, targets: seq[seq[int]], ctx: Backend):
-    tuple[loss: float32, dLogits: Tensor] =
+proc checkedCrossEntropy(logits: Tensor, targets: seq[seq[int]], ctx: Backend):
+    tuple[loss: float32, dLogits: Tensor, nValid: int] =
   ## logits: [B,T,V]. A negative target skips that row on either backend.
   let B = logits.shape[0]; let T = logits.shape[1]; let V = logits.shape[2]
-  var nValid = 0
+  if targets.len != B:
+    raise newException(ValueError, "Spectron targets do not match the batch size")
+  let gpu = isGpuCtx(ctx)
+  var tgt: seq[float32]
+  if gpu: tgt = newSeq[float32](B * T)
   for b in 0 ..< B:
+    if targets[b].len != T:
+      raise newException(ValueError, "Spectron targets do not match the context length")
     for t in 0 ..< T:
-      if targets[b][t] >= 0: inc nValid
-  if nValid == 0: return (0'f32, newTensor(logits.shape))
-  if isGpuCtx(ctx):
-    # GPU: softmax + loss + dLogits in one micro-kernel chain.
-    var tgt = newSeq[float32](B * T)
+      let target = targets[b][t]
+      if target >= V:
+        raise newException(ValueError, "Spectron target is outside the vocabulary")
+      let row = b * T + t
+      if gpu: tgt[row] = float32(max(target, -1))
+      if target < 0: continue
+      inc result.nValid
+      # Validate on the host before calling the GPU. A fused GPU math operation
+      # can otherwise mask an invalid input under fast-math.
+      if gpu:
+        for i in row * V ..< (row + 1) * V:
+          if not finite32(logits.data[i]):
+            raise newException(SpectronNumericalError, "Non-finite Spectron logits at row " & $row)
+  if gpu and result.nValid > 0:
+    let ce = softmaxCrossEntropyGpu(ctx, logits.data, tgt, B * T, V, result.nValid)
+    result.loss = ce.loss
+    result.dLogits = Tensor(data: ce.dLogits, shape: logits.shape)
+  else:
+    result.dLogits = newTensor(logits.shape)
+    if result.nValid == 0: return
+    var totalLoss = 0.0
+    let invCount = 1.0 / float64(result.nValid)
     for b in 0 ..< B:
-      for t in 0 ..< T: tgt[b * T + t] = float32(targets[b][t])
-    let r = softmaxCrossEntropyGpu(ctx, logits.data, tgt, B * T, V, nValid)
-    var dLogits = newTensor(logits.shape)
-    dLogits.data = r.dLogits
-    return (r.loss, dLogits)
-  let probs = beSoftmax(ctx, logits.data, B * T, V)
-  var dLogits = newTensor(logits.shape)
-  var totalLoss = 0'f32
-  for b in 0 ..< B:
-    for t in 0 ..< T:
-      let tgt = targets[b][t]
-      if tgt < 0: continue
-      let base = (b * T + t) * V
-      totalLoss += -ln(max(probs[base + tgt], 1e-9'f32))
-      for v in 0 ..< V:
-        dLogits.data[base + v] = probs[base + v]
-      dLogits.data[base + tgt] -= 1'f32
-  let n = float32(nValid)
-  totalLoss /= n
-  for i in 0 ..< dLogits.data.len:
-    dLogits.data[i] /= n
-  result = (totalLoss, dLogits)
+      for t in 0 ..< T:
+        let target = targets[b][t]
+        if target < 0: continue
+        let row = b * T + t
+        let base = row * V
+        var peak = float64(logits.data[base])
+        for i in base ..< base + V:
+          let value = logits.data[i]
+          if not finite32(value):
+            raise newException(SpectronNumericalError, "Non-finite Spectron logits at row " & $row)
+          peak = max(peak, float64(value))
+        var expSum = 0.0
+        for i in base ..< base + V:
+          let e = exp(float64(logits.data[i]) - peak)
+          expSum += e
+          result.dLogits.data[i] = float32(e)
+        totalLoss += ((peak - float64(logits.data[base + target])) + ln(expSum)) * invCount
+        let weight = float32(invCount / expSum)
+        for i in base ..< base + V:
+          result.dLogits.data[i] *= weight
+        result.dLogits.data[base + target] -= float32(invCount)
+    result.loss = float32(totalLoss)
+  if not finite32(result.loss):
+    raise newException(SpectronNumericalError, "Non-finite Spectron cross-entropy loss")
+
+proc softmaxCrossEntropy*(logits: Tensor, targets: seq[seq[int]], ctx: Backend):
+    tuple[loss: float32, dLogits: Tensor] =
+  let ce = checkedCrossEntropy(logits, targets, ctx)
+  (ce.loss, ce.dLogits)
 
 # ═══════════════════════════════════════════════════════════════
 # ADAM STATE FOR THE WHOLE MODEL + 1 train() STEP
@@ -1349,6 +1534,8 @@ type
       ff1W, ff1B, ff2W, ff2B,
       ln1G, ln1B, ln2G, ln2B: ApfAdamState]]
     embed*: ApfAdamState
+    hrmNormLG*, hrmNormLB*, hrmNormHG*, hrmNormHB*, hrmNormXG*, hrmNormXB*: ApfAdamState
+    mixture: MixtureAdam
 
 proc newModelAdamState*(m: NimformerModelSpectron): ModelAdamState =
   result.outProjW = newApfAdamState(m.outProj.weight.data.len)
@@ -1356,6 +1543,14 @@ proc newModelAdamState*(m: NimformerModelSpectron): ModelAdamState =
   result.finalNormG = newApfAdamState(m.finalNorm.gamma.data.len)
   result.finalNormB = newApfAdamState(m.finalNorm.beta.data.len)
   result.embed = newApfAdamState(m.embed.weight.data.len)
+  result.hrmNormLG = newApfAdamState(m.hrmNormL.gamma.data.len)
+  result.hrmNormLB = newApfAdamState(m.hrmNormL.beta.data.len)
+  result.hrmNormHG = newApfAdamState(m.hrmNormH.gamma.data.len)
+  result.hrmNormHB = newApfAdamState(m.hrmNormH.beta.data.len)
+  result.hrmNormXG = newApfAdamState(m.hrmNormX.gamma.data.len)
+  result.hrmNormXB = newApfAdamState(m.hrmNormX.beta.data.len)
+  if m.mixture.experts.len > 0:
+    result.mixture = newMixtureAdam(m.mixture)
   result.blocks = newSeq[typeof(result.blocks[0])](m.blocks.len)
   for i, blk in m.blocks:
     result.blocks[i] = (
@@ -1384,10 +1579,12 @@ proc newModelAdamState*(m: NimformerModelSpectron): ModelAdamState =
 # quant.nim (saveQuantStateDict/loadQuantStateDict - the same functions export_to_nimq.py
 # uses to export model.nimq for large models). Each tensor is saved here as
 # qkFp32Raw (NOT compressed) because the demo model is small, favouring exact numbers over
-# disk space. The Adam state (m/v/step) is NOT saved yet - resuming resets
-# the Adam momentum, but the weights (the most important part, so no training
-# effort is lost) are kept 100%.
+# disk space. The mmap-backed trainer also saves its Adam state.
 # ═══════════════════════════════════════════════════════════════
+
+const
+  MoeLayoutKey = "__moe_layout"
+  HrmLayoutKey = "__hrm_layout"   # [lLayers, cycles, lSteps, segments]
 
 proc modelToStateDict(m: NimformerModelSpectron): seq[(string, QuantTensor)] =
   result = @[]
@@ -1419,6 +1616,28 @@ proc modelToStateDict(m: NimformerModelSpectron): seq[(string, QuantTensor)] =
     add(p & "ln1.beta", blk.ln1.beta)
     add(p & "ln2.gamma", blk.ln2.gamma)
     add(p & "ln2.beta", blk.ln2.beta)
+  if m.hrmEnabled:
+    let h = m.hrm
+    let layout = [float32(h.lLayers), float32(h.cycles), float32(h.lSteps), float32(h.segments)]
+    result.add((HrmLayoutKey, quantizeTensor(layout, @[layout.len], qkFp32Raw)))
+    add("hrm.normL.gamma", m.hrmNormL.gamma)
+    add("hrm.normL.beta", m.hrmNormL.beta)
+    add("hrm.normH.gamma", m.hrmNormH.gamma)
+    add("hrm.normH.beta", m.hrmNormH.beta)
+    add("hrm.normX.gamma", m.hrmNormX.gamma)
+    add("hrm.normX.beta", m.hrmNormX.beta)
+  if m.mixture.experts.len > 0:
+    let layout = [float32(m.mixture.experts.len), float32(m.mixture.width), float32(m.mixture.depth)]
+    result.add((MoeLayoutKey, quantizeTensor(layout, @[layout.len], qkFp32Raw)))
+    add("moe.norm.gamma", m.mixture.norm.gamma)
+    add("moe.norm.beta", m.mixture.norm.beta)
+    add("moe.router.weight", m.mixture.router.weight)
+    add("moe.router.bias", m.mixture.router.bias)
+    for i, expert in m.mixture.experts:
+      for j in 0 ..< expert.layers.len:
+        let key = expertLayerKey(i, j)
+        template addLayer(name: string, value: Tensor) = add(key & name, value)
+        visitExpertLayer(expert.layers[j], addLayer)
 
 proc stateDictToModel(sd: seq[(string, QuantTensor)],
                        vocab, embedDim, nHeads, nLayers, ffMult: int): NimformerModelSpectron =
@@ -1463,106 +1682,301 @@ proc stateDictToModel(sd: seq[(string, QuantTensor)],
     restore(p & "ln1.beta", result.blocks[i].ln1.beta)
     restore(p & "ln2.gamma", result.blocks[i].ln2.gamma)
     restore(p & "ln2.beta", result.blocks[i].ln2.beta)
+  if HrmLayoutKey in lookup:
+    let layout = dequantizeTensor(lookup[HrmLayoutKey])
+    if layout.len != 4:
+      raise newException(ValueError, "Invalid Spectron HRM layout")
+    for value in layout:
+      if not finite32(value) or value < 1 or value > 65_536'f32 or floor(value) != value:
+        raise newException(ValueError, "Invalid Spectron HRM setting")
+    result.hrm = HrmConfig(lLayers: int(layout[0]), cycles: int(layout[1]),
+                           lSteps: int(layout[2]), segments: int(layout[3]))
+    result.validateHrm()
+    restore("hrm.normL.gamma", result.hrmNormL.gamma)
+    restore("hrm.normL.beta", result.hrmNormL.beta)
+    restore("hrm.normH.gamma", result.hrmNormH.gamma)
+    restore("hrm.normH.beta", result.hrmNormH.beta)
+    restore("hrm.normX.gamma", result.hrmNormX.gamma)
+    restore("hrm.normX.beta", result.hrmNormX.beta)
+  if MoeLayoutKey in lookup:
+    let layout = dequantizeTensor(lookup[MoeLayoutKey])
+    if layout.len != 3:
+      raise newException(ValueError, "Invalid Spectron MoE layout")
+    for size in layout:
+      if not finite32(size) or size < 1 or size > 16_777_216'f32 or floor(size) != size:
+        raise newException(ValueError, "Invalid Spectron MoE dimension")
+    let (count, width, depth) = (int(layout[0]), int(layout[1]), int(layout[2]))
+    if int64(count) * depth > sd.len div 6:
+      raise newException(ValueError, "Missing Spectron expert tensors")
+    result.mixture = newMixture(embedDim, count, width, depth, initializeWeights = false)
+    proc restoreMoe(name: string, value: var Tensor) =
+      if name notin lookup or lookup[name].shape != value.shape:
+        raise newException(ValueError, "Missing or incorrectly shaped Spectron tensor " & name)
+      let data = dequantizeTensor(lookup[name])
+      let size = if value.shape.len == 1: value.shape[0] else: value.shape[0] * value.shape[1]
+      if data.len != size:
+        raise newException(ValueError, "Invalid Spectron tensor length for " & name)
+      value.data = data
+    restoreMoe("moe.norm.gamma", result.mixture.norm.gamma)
+    restoreMoe("moe.norm.beta", result.mixture.norm.beta)
+    restoreMoe("moe.router.weight", result.mixture.router.weight)
+    restoreMoe("moe.router.bias", result.mixture.router.bias)
+    for i, expert in result.mixture.experts:
+      for j in 0 ..< expert.layers.len:
+        let key = expertLayerKey(i, j)
+        template restoreLayer(name: string, value: var Tensor) = restoreMoe(key & name, value)
+        visitExpertLayer(expert.layers[j], restoreLayer)
 
 const MetaStepKey = "__meta_step__"
   ## A "fake" tensor name (shape [1], kind qkFp32Raw) used to hide the trained step
   ## count in the state dict - NO need to change the NIMQ2 binary format, old
   ## files (without this key) still load normally (step defaults to 0).
 
+proc checkpointArch(m: NimformerModelSpectron): array[5, int] =
+  let ffMult = m.blocks[0].ff.fc1.outF div m.embed.dim
+  [m.vocab, m.embed.dim, m.blocks[0].attn.nHeads, m.blocks.len, ffMult]
+
 proc saveCheckpoint*(m: NimformerModelSpectron, path: string, step: int = 0) =
   ## arch = [vocab, embedDim, nHeads, nLayers, ffMult] - exactly the array[5,int]
   ## saveQuantStateDict expects (no separate format needed).
   ## `step` = the number of training steps completed UP TO this checkpoint, saved
   ## alongside so resume uses the right step instead of always going back to step 1.
-  let ffMult = m.blocks[0].ff.fc1.outF div m.embed.dim
-  let arch = [m.vocab, m.embed.dim, m.blocks[0].attn.nHeads, m.blocks.len, ffMult]
   var sd = modelToStateDict(m)
   sd.add((MetaStepKey, quantizeTensor(@[float32(step)], @[1], qkFp32Raw)))
-  saveQuantStateDict(path, arch, sd)
+  saveQuantStateDict(path, m.checkpointArch(), sd)
 
 proc loadCheckpoint*(path: string): tuple[model: NimformerModelSpectron, step: int] =
-  let (arch, sd, _) = loadQuantStateDict(path)
+  let (arch, sd, _) = loadQuantStateDict(path, mapped = true)
   var step = 0
   var sdModel: seq[(string, QuantTensor)] = @[]
   for (name, qt) in sd:
     if name == MetaStepKey:
       let v = dequantizeTensor(qt)
       if v.len > 0: step = int(v[0])
-    else:
+    elif not name.startsWith("__packed."):
       sdModel.add((name, qt))
   result.model = stateDictToModel(sdModel, arch[0], arch[1], arch[2], arch[3], arch[4])
   result.step = step
 
-proc trainStep*(m: var NimformerModelSpectron, adam: var ModelAdamState,
-                 idsBatch: seq[seq[int]], targetsBatch: seq[seq[int]],
-                 ctx: Backend, lr: float32 = 3e-4'f32,
-                 requantizeEvery: int = 50): float32 =
-  ## One full training step: forward -> loss -> backward -> Adam update.
-  ## Returns the loss averaged over supervised target positions for logging.
-  ##
-  ## IMPORTANT NOTE on `requantizeEvery`: apfAdamStep (in nimformer.nim)
-  ## defaults to requantizeEvery=1, i.e. it RE-QUANTIZES the weights to CustomFloat
-  ## (APF) RIGHT AFTER EVERY Adam step. In the first few dozen steps the update magnitude is
-  ## still tiny compared to the mantissa resolution buildCustomDtypeForTensor picks
-  ## -> the update just added is rounded away IN THE SAME step, and the weights
-  ## are effectively frozen near their initial values. Result: logits ~ 0 throughout
-  ## training -> softmax ~ uniform -> loss ~ ln(vocab_size) and stuck exactly
-  ## there (e.g. vocab=756 gives ln(756)=6.628 - exactly the observed "loss stuck at
-  ## 6.62-6.63 forever" symptom). To still USE APF (as required) without
-  ## killing the gradient signal, requantization only happens every
-  ## `requantizeEvery` steps (real quantization-aware training: train in
-  ## full fp32 in between, then snap to APF to keep the weights in the
-  ## representable range for export) instead of once per step.
-  let logits = m.forwardBatch(idsBatch, ctx)
-  let (loss, dLogits) = softmaxCrossEntropy(logits, targetsBatch, ctx)
-  let grads = m.backwardBatch(idsBatch, dLogits, ctx)
+proc checkAndClipGradients(grads: var SpectronGrads, limit: float32): float64 =
+  template eachGradient(body: untyped) =
+    for gradient {.inject.} in [addr grads.dEmbed, addr grads.dOutProjW, addr grads.dOutProjB,
+                               addr grads.dFinalNormG, addr grads.dFinalNormB,
+                               addr grads.dHrmNormLG, addr grads.dHrmNormLB,
+                               addr grads.dHrmNormHG, addr grads.dHrmNormHB,
+                               addr grads.dHrmNormXG, addr grads.dHrmNormXB,
+                               addr grads.mixture.routerW, addr grads.mixture.routerB,
+                               addr grads.mixture.normG, addr grads.mixture.normB]:
+      body
+    for blockGrad in grads.dBlocks.mitems:
+      for value in fields(blockGrad):
+        let gradient {.inject.} = addr value
+        body
+    for layers in grads.mixture.expertLayers.mitems:
+      for layer in layers.mitems:
+        for value in fields(layer):
+          let gradient {.inject.} = addr value
+          body
 
+  var squaredNorm = 0.0
+  eachGradient:
+    for value in gradient[].data:
+      squaredNorm += float64(value) * float64(value)
+  if squaredNorm.classify in {fcNan, fcInf, fcNegInf}:
+    raise newException(SpectronNumericalError, "Non-finite Spectron gradient norm")
+  result = sqrt(squaredNorm)
+  if limit > 0 and result > float64(limit):
+    let scale = float64(limit) / result
+    eachGradient:
+      for value in gradient[].data.mitems:
+        value = float32(float64(value) * scale)
+
+proc applyGradients(m: var NimformerModelSpectron, adam: var ModelAdamState,
+                    grads: SpectronGrads, ctx: Backend, lr, beta2: float32, requantizeEvery: int) =
   # GPU: Adam is 1 micro-kernel / parameter (adamStepFusedGpu). Only the periodic APF
   # requantize step (every `requantizeEvery` steps) still runs on the host - customfloat has no
   # GPU kernel yet. Non-GPU backends: the original apfAdamStep.
   let gpu = isGpuCtx(ctx)
-  proc apfAdamStep(param: var Tensor, grad: Tensor, state: var ApfAdamState,
-                   lr: float32, requantizeEvery: int): CustomFloat {.used.} =
-    if not gpu:
-      return nimformer.apfAdamStep(param, grad, state, lr, requantizeEvery = requantizeEvery)
-    inc state.step
-    adamStepFusedGpu(ctx, param.data, grad.data, state.m, state.v, state.step, lr)
+  proc apfAdamStep(param: var Tensor, grad: Tensor, state: var ApfAdamState) =
+    if gpu:
+      inc state.step
+      adamStepFusedGpu(ctx, param.data, grad.data, state.m, state.v, state.step, lr, b2 = beta2)
+    else:
+      discard nimformer.apfAdamStep(param, grad, state, lr, b2 = beta2, requantizeEvery = int.high)
+    for i in 0 ..< param.data.len:
+      if not finite32(param.data[i]) or not finite32(state.m[i]) or
+          not finite32(state.v[i]) or state.v[i] < 0:
+        raise newException(SpectronNumericalError, "Non-finite weight or invalid Adam moment")
     if requantizeEvery > 0 and state.step mod requantizeEvery == 0:
       let cf = buildCustomDtypeForTensor(param.data, grad.data)
-      param.data = decodeArray(encodeArray(param.data, cf), cf)
-      result = cf
+      let quantized = decodeArray(encodeArray(param.data, cf), cf)
+      for value in quantized:
+        if not finite32(value):
+          raise newException(SpectronNumericalError, "Non-finite APF weight")
+      param.data = quantized
 
-  discard apfAdamStep(m.outProj.weight, grads.dOutProjW, adam.outProjW, lr, requantizeEvery = requantizeEvery)
-  discard apfAdamStep(m.outProj.bias, grads.dOutProjB, adam.outProjB, lr, requantizeEvery = requantizeEvery)
-  discard apfAdamStep(m.embed.weight, grads.dEmbed, adam.embed, lr, requantizeEvery = requantizeEvery)
+  apfAdamStep(m.outProj.weight, grads.dOutProjW, adam.outProjW)
+  apfAdamStep(m.outProj.bias, grads.dOutProjB, adam.outProjB)
+  apfAdamStep(m.embed.weight, grads.dEmbed, adam.embed)
   if m.useFinalNorm:
-    discard apfAdamStep(m.finalNorm.gamma, grads.dFinalNormG, adam.finalNormG, lr, requantizeEvery = requantizeEvery)
-    discard apfAdamStep(m.finalNorm.beta, grads.dFinalNormB, adam.finalNormB, lr, requantizeEvery = requantizeEvery)
+    apfAdamStep(m.finalNorm.gamma, grads.dFinalNormG, adam.finalNormG)
+    apfAdamStep(m.finalNorm.beta, grads.dFinalNormB, adam.finalNormB)
+  if m.hrmEnabled:
+    apfAdamStep(m.hrmNormL.gamma, grads.dHrmNormLG, adam.hrmNormLG)
+    apfAdamStep(m.hrmNormL.beta, grads.dHrmNormLB, adam.hrmNormLB)
+    apfAdamStep(m.hrmNormH.gamma, grads.dHrmNormHG, adam.hrmNormHG)
+    apfAdamStep(m.hrmNormH.beta, grads.dHrmNormHB, adam.hrmNormHB)
+    apfAdamStep(m.hrmNormX.gamma, grads.dHrmNormXG, adam.hrmNormXG)
+    apfAdamStep(m.hrmNormX.beta, grads.dHrmNormXB, adam.hrmNormXB)
+  if m.mixture.experts.len > 0:
+    apfAdamStep(m.mixture.norm.gamma, grads.mixture.normG, adam.mixture.normG)
+    apfAdamStep(m.mixture.norm.beta, grads.mixture.normB, adam.mixture.normB)
+    apfAdamStep(m.mixture.router.weight, grads.mixture.routerW, adam.mixture.routerW)
+    apfAdamStep(m.mixture.router.bias, grads.mixture.routerB, adam.mixture.routerB)
+  for i in 0 ..< m.mixture.experts.len:
+    if grads.mixture.expertLayers[i].len == 0: continue
+    # The candidate shares inactive experts with the previous training state.
+    # Stage only the experts participating in this step.
+    let current = m.mixture.experts[i]
+    var next: SpectronExpert
+    new(next)
+    next[] = current[]
+    var moments: ExpertAdam
+    if adam.mixture.experts[i] == nil:
+      moments = newExpertAdam(current)
+    else:
+      new(moments)
+      moments[] = adam.mixture.experts[i][]
+    for j in 0 ..< next.layers.len:
+      template layer: untyped = next.layers[j]
+      template g: untyped = grads.mixture.expertLayers[i][j]
+      template a: untyped = moments.layers[j]
+      apfAdamStep(layer.ff.fc1.weight, g.upW, a.upW)
+      apfAdamStep(layer.ff.fc1.bias, g.upB, a.upB)
+      apfAdamStep(layer.ff.fc2.weight, g.downW, a.downW)
+      apfAdamStep(layer.ff.fc2.bias, g.downB, a.downB)
+      apfAdamStep(layer.norm.gamma, g.normG, a.normG)
+      apfAdamStep(layer.norm.beta, g.normB, a.normB)
+    m.mixture.experts[i] = next
+    adam.mixture.experts[i] = moments
 
   for i in 0 ..< m.blocks.len:
-    let g = grads.dBlocks[i]
-    var a = adam.blocks[i]
-    discard apfAdamStep(m.blocks[i].attn.qkvProj.weight, g.dAttnQkvW, a.attnQkvW, lr, requantizeEvery = requantizeEvery)
-    discard apfAdamStep(m.blocks[i].attn.qkvProj.bias, g.dAttnQkvB, a.attnQkvB, lr, requantizeEvery = requantizeEvery)
-    discard apfAdamStep(m.blocks[i].attn.outProj.weight, g.dAttnOutW, a.attnOutW, lr, requantizeEvery = requantizeEvery)
-    discard apfAdamStep(m.blocks[i].attn.outProj.bias, g.dAttnOutB, a.attnOutB, lr, requantizeEvery = requantizeEvery)
-    discard apfAdamStep(m.blocks[i].mamba.inProj.weight, g.dMambaInW, a.mambaInW, lr, requantizeEvery = requantizeEvery)
-    discard apfAdamStep(m.blocks[i].mamba.inProj.bias, g.dMambaInB, a.mambaInB, lr, requantizeEvery = requantizeEvery)
-    discard apfAdamStep(m.blocks[i].mamba.outProj.weight, g.dMambaOutW, a.mambaOutW, lr, requantizeEvery = requantizeEvery)
-    discard apfAdamStep(m.blocks[i].mamba.outProj.bias, g.dMambaOutB, a.mambaOutB, lr, requantizeEvery = requantizeEvery)
-    discard apfAdamStep(m.blocks[i].fuseGate.weight, g.dFuseW, a.fuseW, lr, requantizeEvery = requantizeEvery)
-    discard apfAdamStep(m.blocks[i].fuseGate.bias, g.dFuseB, a.fuseB, lr, requantizeEvery = requantizeEvery)
-    discard apfAdamStep(m.blocks[i].ff.fc1.weight, g.dFf1W, a.ff1W, lr, requantizeEvery = requantizeEvery)
-    discard apfAdamStep(m.blocks[i].ff.fc1.bias, g.dFf1B, a.ff1B, lr, requantizeEvery = requantizeEvery)
-    discard apfAdamStep(m.blocks[i].ff.fc2.weight, g.dFf2W, a.ff2W, lr, requantizeEvery = requantizeEvery)
-    discard apfAdamStep(m.blocks[i].ff.fc2.bias, g.dFf2B, a.ff2B, lr, requantizeEvery = requantizeEvery)
-    discard apfAdamStep(m.blocks[i].ln1.gamma, g.dLn1G, a.ln1G, lr, requantizeEvery = requantizeEvery)
-    discard apfAdamStep(m.blocks[i].ln1.beta, g.dLn1B, a.ln1B, lr, requantizeEvery = requantizeEvery)
-    discard apfAdamStep(m.blocks[i].ln2.gamma, g.dLn2G, a.ln2G, lr, requantizeEvery = requantizeEvery)
-    discard apfAdamStep(m.blocks[i].ln2.beta, g.dLn2B, a.ln2B, lr, requantizeEvery = requantizeEvery)
-    adam.blocks[i] = a
+    template g: untyped = grads.dBlocks[i]
+    template a: untyped = adam.blocks[i]
+    apfAdamStep(m.blocks[i].attn.qkvProj.weight, g.dAttnQkvW, a.attnQkvW)
+    apfAdamStep(m.blocks[i].attn.qkvProj.bias, g.dAttnQkvB, a.attnQkvB)
+    apfAdamStep(m.blocks[i].attn.outProj.weight, g.dAttnOutW, a.attnOutW)
+    apfAdamStep(m.blocks[i].attn.outProj.bias, g.dAttnOutB, a.attnOutB)
+    apfAdamStep(m.blocks[i].mamba.inProj.weight, g.dMambaInW, a.mambaInW)
+    apfAdamStep(m.blocks[i].mamba.inProj.bias, g.dMambaInB, a.mambaInB)
+    apfAdamStep(m.blocks[i].mamba.outProj.weight, g.dMambaOutW, a.mambaOutW)
+    apfAdamStep(m.blocks[i].mamba.outProj.bias, g.dMambaOutB, a.mambaOutB)
+    apfAdamStep(m.blocks[i].fuseGate.weight, g.dFuseW, a.fuseW)
+    apfAdamStep(m.blocks[i].fuseGate.bias, g.dFuseB, a.fuseB)
+    apfAdamStep(m.blocks[i].ff.fc1.weight, g.dFf1W, a.ff1W)
+    apfAdamStep(m.blocks[i].ff.fc1.bias, g.dFf1B, a.ff1B)
+    apfAdamStep(m.blocks[i].ff.fc2.weight, g.dFf2W, a.ff2W)
+    apfAdamStep(m.blocks[i].ff.fc2.bias, g.dFf2B, a.ff2B)
+    apfAdamStep(m.blocks[i].ln1.gamma, g.dLn1G, a.ln1G)
+    apfAdamStep(m.blocks[i].ln1.beta, g.dLn1B, a.ln1B)
+    apfAdamStep(m.blocks[i].ln2.gamma, g.dLn2G, a.ln2G)
+    apfAdamStep(m.blocks[i].ln2.beta, g.dLn2B, a.ln2B)
 
-  result = loss
+type SpectronTrainingStep = object
+  loss: float32
+  gradNorm, balanceLoss: float64
+  routes: seq[int]
+
+proc addInto(total: var Tensor, value: Tensor) =
+  if total.data.len == 0:
+    total = value
+  elif value.data.len > 0:
+    if total.data.len != value.data.len:
+      raise newException(ValueError, "Mismatched gradient shapes across HRM segments")
+    for i in 0 ..< total.data.len: total.data[i] += value.data[i]
+
+proc addTupleInto[T: tuple](total: var T, value: T) =
+  for totalName, totalField in fieldPairs(total):
+    for valueName, valueField in fieldPairs(value):
+      when totalName == valueName and totalField is Tensor:
+        addInto(totalField, valueField)
+
+proc accumulate(total: var SpectronGrads, grads: SpectronGrads) =
+  ## Sum the gradients of one HRM segment into the step total.
+  addInto(total.dOutProjW, grads.dOutProjW)
+  addInto(total.dOutProjB, grads.dOutProjB)
+  addInto(total.dFinalNormG, grads.dFinalNormG)
+  addInto(total.dFinalNormB, grads.dFinalNormB)
+  addInto(total.dEmbed, grads.dEmbed)
+  addInto(total.dHrmNormLG, grads.dHrmNormLG)
+  addInto(total.dHrmNormLB, grads.dHrmNormLB)
+  addInto(total.dHrmNormHG, grads.dHrmNormHG)
+  addInto(total.dHrmNormHB, grads.dHrmNormHB)
+  addInto(total.dHrmNormXG, grads.dHrmNormXG)
+  addInto(total.dHrmNormXB, grads.dHrmNormXB)
+  if total.dBlocks.len == 0:
+    total.dBlocks = grads.dBlocks
+  else:
+    for i in 0 ..< total.dBlocks.len: addTupleInto(total.dBlocks[i], grads.dBlocks[i])
+  addInto(total.mixture.routerW, grads.mixture.routerW)
+  addInto(total.mixture.routerB, grads.mixture.routerB)
+  addInto(total.mixture.normG, grads.mixture.normG)
+  addInto(total.mixture.normB, grads.mixture.normB)
+  total.mixture.balanceLoss += grads.mixture.balanceLoss
+  if total.mixture.routes.len == 0:
+    total.mixture.routes = grads.mixture.routes
+  else:
+    for i, count in grads.mixture.routes: total.mixture.routes[i] += count
+  if total.mixture.expertLayers.len == 0:
+    total.mixture.expertLayers = grads.mixture.expertLayers
+  else:
+    for i, layers in grads.mixture.expertLayers:
+      if layers.len == 0: continue
+      if total.mixture.expertLayers[i].len == 0:
+        total.mixture.expertLayers[i] = layers
+      else:
+        for j in 0 ..< layers.len: addTupleInto(total.mixture.expertLayers[i][j], layers[j])
+
+proc checkedTrainStep(m: var NimformerModelSpectron, adam: var ModelAdamState,
+                      idsBatch, targetsBatch: seq[seq[int]], ctx: Backend,
+                      lr, beta2, maxGradNorm: float32, requantizeEvery: int): SpectronTrainingStep =
+  # HRM deep supervision: every segment is supervised from the previous
+  # segment's detached state. Segment gradients are averaged into one update
+  # so the optimizer step count stays equal to the training step.
+  let segments = if m.hrmEnabled: m.hrm.segments else: 1
+  var carry: HrmCarry
+  var grads: SpectronGrads
+  var lossSum = 0.0
+  for _ in 0 ..< segments:
+    let cache = m.forwardForBackward(idsBatch, ctx, carry)
+    var ce = checkedCrossEntropy(m.outProj.forward(cache.headInput, ctx), targetsBatch, ctx)
+    if ce.nValid == 0: return
+    if segments > 1:
+      let scale = 1'f32 / float32(segments)
+      for value in ce.dLogits.data.mitems: value *= scale
+    grads.accumulate(m.backwardCached(idsBatch, ce.dLogits, cache, ctx))
+    lossSum += float64(ce.loss)
+  grads.mixture.balanceLoss /= float64(segments)
+  result.loss = float32(lossSum / float64(segments))
+  result.gradNorm = grads.checkAndClipGradients(maxGradNorm)
+  result.balanceLoss = grads.mixture.balanceLoss
+  result.routes = move(grads.mixture.routes)
+
+  # Keep the current state live until the proposed update passes the numeric checks.
+  var nextModel = m
+  var nextAdam = adam
+  nextModel.applyGradients(nextAdam, grads, ctx, lr, beta2, requantizeEvery)
+  m = move(nextModel)
+  adam = move(nextAdam)
+
+proc trainStep*(m: var NimformerModelSpectron, adam: var ModelAdamState,
+                idsBatch, targetsBatch: seq[seq[int]], ctx: Backend,
+                lr: float32 = 3e-4'f32, requantizeEvery: int = 50,
+                maxGradNorm: float32 = 0): float32 =
+  ## Update only from finite loss and gradients. A failed Adam or APF update
+  ## leaves the model and optimizer at the previous step.
+  checkedTrainStep(m, adam, idsBatch, targetsBatch, ctx, lr, 0.999'f32,
+                   maxGradNorm, requantizeEvery).loss
 
 # ═══════════════════════════════════════════════════════════════
 # INFERENCE: greedy / temperature sampling, autoregressive
@@ -1614,6 +2028,14 @@ proc generate*(m: NimformerModelSpectron, promptIds: seq[int], maxNewTokens: int
 # then generate a few tokens - runs with `make run` from the repo root.
 # ═══════════════════════════════════════════════════════════════
 when isMainModule:
+  include packed_training
+  if paramCount() > 0:
+    try:
+      trainPacked()
+    except CatchableError as error:
+      quit("[packed] " & error.msg, 1)
+    quit(0)
+
   randomize(1234)
   createDir("test/spectron/models")
   let ctx = newBackend()

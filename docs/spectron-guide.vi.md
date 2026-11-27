@@ -8,8 +8,253 @@ vừa là chương trình train khi được compile làm main module. Nó dùng
 các block Spectron kết hợp Linear++ attention và Mamba2SSD, final LayerNorm,
 rồi projection ra vocabulary. Đây là model riêng với tokenizer riêng.
 
+## Train MoE với 5 tỷ token
 
-## Build, chạy và chat
+`test/spectron/data/scale5b/` có 4,5 tỷ token tiếng Anh và 500 triệu token
+cho code, distill và bài tập cú pháp. Phần tiếng Anh lấy từ
+[Wikipedia tiếng Anh](https://huggingface.co/datasets/wikimedia/wikipedia) và
+[TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories). Phần code
+chủ yếu là mã Python nguyên văn từ các repo có giấy phép permissive trong
+[CodeParrot Clean](https://huggingface.co/datasets/codeparrot/codeparrot-clean).
+Một triệu token là bài tập điền ký hiệu như `(`, `)`, `]` và `:`.
+
+Builder giữ nguyên từng hội thoại trong `test/spectron/claude_distill_dataset.jsonl`
+dưới dạng JSONL thu gọn. Mọi lượt đều đi vào dữ liệu dự đoán token tiếp theo,
+gồm `tool_calls` của assistant, tên hàm và chuỗi tham số, ID gọi tool,
+kết quả của lượt `tool` và cờ `is_error` nếu có. Manifest ghi số hội thoại,
+số lời gọi và số kết quả để kiểm tra phần distill.
+
+BPE giữ nguyên 756 ID. Mỗi ID dùng 10 bit trong luồng byte `uint8` little-endian.
+Tập train chiếm 6,25 GB, cộng 1,25 MB cho 500.000 token validation ở mỗi nhóm.
+Trainer mmap các shard và lấy mẫu theo tỷ lệ token trong manifest.
+
+Corpus đã đóng gói được công bố tại
+[bobbydeveloper2014/bybyai-spectron](https://huggingface.co/bobbydeveloper2014/bybyai-spectron/tree/main/data/scale5b)
+trong thư mục `data/scale5b/`. Để cài vào `test/spectron/data/scale5b/`, chạy
+từ gốc repo với Python 3.11 trở lên và `curl`:
+
+```sh
+make download
+```
+
+`make download` chạy `download-spectron-scale-data` cùng các bước tải dữ
+liệu khác. Chỉ cần corpus đóng gói thì chạy `make download-spectron-scale-data`.
+Trình tải ghim commit trên Hub, tải tiếp file đang dở, và kiểm số byte cùng
+mã SHA-256 của từng shard theo manifest. Shard đã có và khớp mã băm sẽ
+không bị tải lại.
+
+Trong shard distill công bố, địa chỉ email, tên người dùng và tên máy, định
+danh đường dẫn cục bộ và các mẫu khóa bí mật đã được che. Mọi hội thoại,
+lời gọi tool và kết quả tool vẫn được giữ nguyên.
+
+Nếu cần tạo lại corpus từ nguồn, cài thêm PyArrow. Tham số `--distill=PATH`
+chọn file hội thoại khác, `--sources=DIR` chọn chỗ cache các file nguồn tải
+về, còn `--redact-distill` che thông tin giống bản đã công bố.
+
+```sh
+python3 -m pip install pyarrow
+make prepare-spectron-scale-data
+```
+
+Cấu hình MoE mặc định dùng 4 block Spectron chung, hidden size 512 và 8 head.
+Router chọn một expert cho mỗi token. Mỗi expert có 4 lớp feed-forward độc
+lập với **29.985.344 tham số**, ngoài phần trọng số chung. Loss phụ cân bằng
+định tuyến và log `expert_tokens` cho biết số token được gửi đến mỗi expert.
+
+```sh
+make run-metal ARGS='--dataset=test/spectron/data/scale5b --moe-experts=2 --batch=16 --seq=128 --steps=6000'
+```
+
+Lượt train MoE lưu vào `test/spectron/models/moe/finetune.nimq` nếu không
+truyền `--checkpoint=PATH`. Nhờ vậy checkpoint dense dùng để chat,
+`test/spectron/models/finetune.nimq`, không bị ghi đè. Hãy chọn batch lớn nhất
+mà bộ nhớ chứa được; mỗi bước lấy `batch × seq` vị trí dự đoán.
+
+Chạy lại cùng lệnh để train thêm 6.000 bước từ checkpoint. Log có `step`,
+`epoch` và số token đã xử lý. Một epoch tính theo 5 tỷ vị trí dự đoán thành công.
+Checkpoint lưu router, từng expert và Adam, gồm số bước cập nhật riêng của
+từng expert. Có thể dùng `--steps=0 --moe-experts=3` trên cùng checkpoint để
+tăng tổng số expert lên 3 và lưu ngay.
+
+`--steps=0 --merge-experts=PATH` ghép các expert từ một checkpoint packed MoE
+khác dùng cùng BPE, hidden size, chiều rộng và số lớp mỗi expert. Trainer giữ
+trọng số các expert được nhập và khởi tạo các hàng router tương ứng. Dùng
+checkpoint từ cùng backbone rồi train tiếp để router học sử dụng các expert
+vừa ghép.
+
+### Tensor Core và upload checkpoint
+
+Trên GPU NVIDIA, build với Vulkan rồi truyền `--tensor-cores=require`. Khi đó
+GEMM của các lớp Linear ở cả lượt forward và backward chạy qua
+`VK_KHR_cooperative_matrix`, đầu vào FP16, cộng dồn FP32. Trọng số và trạng
+thái Adam vẫn giữ FP32. Trước khi train, trainer kiểm một GEMM 64×64 với kết
+quả đúng. Nếu driver không có cooperative matrix, trainer dừng và báo lỗi chứ
+không quay về FP32. Mỗi dòng log `[tensor-core]` đếm số GEMM đã chạy trên
+Tensor Core và số GEMM nhỏ chạy FP32.
+
+```sh
+make shaders
+make build-spectron-trainer SPECTRON_TRAIN_BACKEND=vulkan
+./test/spectron/test_nimformer --dataset=test/spectron/data/scale5b --moe-experts=2 \
+  --batch=64 --seq=128 --steps=6000 --tensor-cores=require
+```
+
+`--checkpoint-hook=PATH` chạy một file thực thi sau mỗi lần lưu, với đường
+dẫn checkpoint và số bước. `test/spectron/hf_checkpoint_sync.py` upload lên
+Hugging Face Hub ở chế độ nền nên train vẫn chạy trong lúc upload. Nếu có bản
+lưu mới trong lúc đang upload, hook chỉ giữ bản mới nhất cho lần upload kế
+tiếp. Script đọc `HF_TOKEN` và upload lên `SPECTRON_HF_REPO` (mặc định
+`bobbydeveloper2014/bybyai-spectron`) tại `SPECTRON_HF_CHECKPOINT` (mặc định
+`moe/finetune.nimq`).
+
+```sh
+export HF_TOKEN=...   # token có quyền ghi
+python3 test/spectron/hf_checkpoint_sync.py --restore test/spectron/models/moe/finetune.nimq
+./test/spectron/test_nimformer --dataset=test/spectron/data/scale5b --moe-experts=2 \
+  --batch=64 --steps=6000 --tensor-cores=require --checkpoint-every=20 \
+  --checkpoint-hook=test/spectron/hf_checkpoint_sync.py
+python3 test/spectron/hf_checkpoint_sync.py --wait test/spectron/models/moe/finetune.nimq
+```
+
+`--restore` chỉ tải checkpoint từ Hub khi chưa có file cục bộ. `--wait` trả
+về khi lượt upload cuối trong hàng đợi đã xong.
+
+### Train trên Colab T4
+
+[`notebooks/spectron_moe_colab_t4.ipynb`](../notebooks/spectron_moe_colab_t4.ipynb)
+cài Nim và các file driver Vulkan của NVIDIA, tải corpus cùng bản
+`moe/finetune.nimq` mới nhất, rồi build trainer Vulkan. Sau đó notebook chạy
+ba bước train ở từng kích thước batch, bắt đầu từ 16. Notebook đo tok/s sau
+bước đầu tiên và giữ batch nhanh nhất mà T4 và bộ nhớ của Colab chạy được.
+Lượt train dùng `--tensor-cores=require`, lưu và upload mỗi 20 bước. Khi
+Colab ngắt kết nối, chạy lại notebook để train tiếp từ checkpoint và trạng
+thái Adam đã upload gần nhất. Trước khi chạy, thêm token Hugging Face có
+quyền ghi vào Colab Secrets với tên `HF_TOKEN`.
+
+### Lõi HRM
+
+Trainer có thể chạy các block Spectron theo kiểu Hierarchical Reasoning
+Model ([HRM, arXiv:2506.21734](https://arxiv.org/abs/2506.21734)).
+`--hrm-l-layers` block đầu tạo thành module mức thấp L chạy nhanh, các block
+còn lại tạo thành module mức cao H chạy chậm. Trong mỗi chu kỳ mức cao, L cập
+nhật trạng thái `--hrm-l-steps` lần từ `zL + zH + x`, với `x` là embedding
+token đã chuẩn hoá. Sau đó H cập nhật một lần từ `zH + zL`. Sau mỗi module có
+một LayerNorm, và trạng thái H đi tiếp vào MoE và LM head.
+
+```sh
+./test/spectron/test_nimformer --dataset=test/spectron/data/scale5b --moe-experts=2 \
+  --batch=64 --seq=128 --steps=6000 --tensor-cores=require \
+  --hrm-cycles=2 --hrm-l-steps=2 --hrm-segments=1
+```
+
+- `--hrm-cycles` bật HRM và đặt số chu kỳ mức cao trong mỗi segment (mặc
+  định 2 khi có truyền một cờ HRM khác).
+- `--hrm-l-steps` đặt số bước mức thấp trong mỗi chu kỳ (mặc định 2).
+- `--hrm-l-layers` đặt số block thuộc L (mặc định một nửa số block). Các
+  block còn lại thuộc H.
+- `--hrm-segments` đặt số segment deep supervision trong mỗi bước optimizer
+  (mặc định 1). Mỗi segment bắt đầu từ trạng thái của segment trước và tính
+  loss riêng. Trainer lấy trung bình gradient của các segment rồi cập nhật
+  Adam một lần.
+
+Lượt train dùng gradient một bước như trong bài báo: chỉ lần cập nhật L cuối
+và lần cập nhật H cuối của mỗi segment lưu activation cho backward. Mỗi
+segment chạy `cycles × (l_steps × l_layers + h_layers)` lượt block, số này in
+ở dòng `[hrm]` khi khởi động. Với 4 block và cấu hình mặc định, mỗi segment
+chạy 12 lượt block thay vì 4.
+
+Lượt train HRM mới nhân 0,1 vào lớp chiếu đầu ra của nhánh attention, Mamba
+và feed-forward trong mọi block. Block ngẫu nhiên cỡ đầy đủ làm vòng lặp hỗn
+loạn. Khi chưa nhân, lõi 2 chu kỳ, 2 bước, 2 segment khuếch đại sai số làm
+tròn của GPU thành chênh lệch logit lớn hơn chính logit, nên cùng một
+checkpoint cho loss validation khác nhau ở mỗi lần chạy. Sau khi nhân, các
+lượt forward lặp lại khớp nhau tới khoảng 2e-4, và lượt resume tái tạo đúng
+loss validation đã lưu. Trọng số từ `--init-checkpoint` không bị nhân.
+
+Checkpoint lưu bố cục HRM (`__hrm_layout`) cùng ba LayerNorm của HRM và trạng
+thái Adam của chúng. Khi resume, trainer đọc bố cục từ checkpoint nên có thể
+bỏ các cờ HRM. `--hrm-cycles`, `--hrm-l-steps` và `--hrm-segments` được đổi
+khi resume vì chúng chỉ đổi lượng tính toán. `--hrm-l-layers` phải khớp với
+checkpoint. Checkpoint lưu khi chưa bật HRM không thể thêm HRM lúc resume;
+hãy tạo `--checkpoint` mới kèm `--init-checkpoint`.
+
+## Train với bộ dữ liệu đã đóng gói
+
+Bộ dữ liệu có **2 tỷ token huấn luyện**, chia đều giữa code Python tự sinh
+và văn bản tiếng Anh. Tập validation có thêm 500.000 token cho mỗi nhóm.
+Phần Python gồm 32 họ bài tập, từ vòng lặp và thao tác danh sách đến tìm kiếm,
+đồ thị và quy hoạch động. Generator thay đổi đầu vào, sinh lời giải và các
+`assert` có thể chạy. Validation dùng ví dụ riêng thuộc cùng các họ bài.
+Phần tiếng Anh gồm 750 triệu token từ [Wikipedia tiếng Anh](https://huggingface.co/datasets/wikimedia/wikipedia)
+và 250 triệu từ [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories).
+Manifest ghi phiên bản nguồn và số token.
+
+Dùng bộ đã có ở `test/spectron/data/packed/` hoặc tái tạo với Python,
+PyArrow và `curl`:
+
+```sh
+python3 -m pip install pyarrow
+make prepare-spectron-data
+```
+
+Builder dùng tokenizer BPE Spectron hiện tại. Các file nhị phân lưu ID token
+dạng `uint16` little-endian. Sáu file dữ liệu chiếm 4.002.000.000 byte
+(khoảng 3,73 GiB). Trainer dùng mmap chỉ đọc và chép các cửa sổ được lấy mẫu
+vào từng batch. Theo đường dẫn build mặc định, các file Parquet nguồn được
+cache riêng trong `test/spectron/data/sources/`.
+
+Chạy trên Metal từ trọng số Spectron sẵn có:
+
+```sh
+make run-metal ARGS='--dataset=test/spectron/data/packed --init-checkpoint=test/spectron/models/finetune.nimq --steps=6000'
+```
+
+Lượt train mới lưu vào `test/spectron/models/finetune_packed.nimq`. Khi chạy
+tiếp từ file đó, bỏ `--init-checkpoint`. Checkpoint của chế độ packed lưu
+số bước hoàn thành và trạng thái Adam. Số bước quyết định cách lấy batch và
+lịch learning rate khi resume. Dùng `--checkpoint=PATH` để chọn file khác.
+Tokenizer phải khớp với bộ dữ liệu. Trên hệ thống Vulkan dùng `make run-vulkan`
+với cùng tham số.
+
+Model tái dùng activation đã tính ở forward khi chạy backward. Chế độ
+packed dùng warmup learning rate, cosine decay và giới hạn chuẩn gradient
+toàn cục. Lượt train mới dùng learning rate đỉnh `0.0012`, hệ số moment
+bậc hai của Adam `0.98` và giữ trọng số train ở FP32.
+Truyền `--requantize-every=N` để chạy APF mỗi N
+bước optimizer. Khi resume checkpoint packed cũ, trainer dùng hệ số Adam
+đã dùng để train checkpoint đó.
+
+Trainer kiểm tra logits, loss, gradient, trọng số và moment Adam. Nếu một
+kiểm tra thất bại, trainer loại bước cập nhật. Khi gặp lỗi số học trong
+bước train, trainer thử lại tối đa hai lần bằng batch khác và giảm learning
+rate một nửa trước mỗi lần thử lại. Checkpoint lưu cả learning rate đỉnh
+và hệ số giảm. Truyền `--lr=VALUE` để đổi learning rate đỉnh khi resume. Log ghi
+chuẩn gradient lớn nhất trước clip và tỷ lệ batch bị clip.
+
+Batch chia đều giữa code và tiếng Anh. Trong 4.000 bước đầu, tỷ lệ
+code cơ bản, trung cấp và nâng cao chuyển từ 65/25/10 sang 35/35/30. Log ghi
+token/s và loss validation riêng cho code và tiếng Anh. Với mặc định
+`--batch=16 --seq=128`, 6.000 bước xử lý 12.288.000 vị trí dự đoán.
+
+Log ghi số epoch đã hoàn thành và `epoch_tokens` của epoch kế tiếp. Một
+epoch tương ứng với số vị trí dự đoán đã train thành công bằng số token
+trong corpus huấn luyện. Vì lấy mẫu ngẫu nhiên, các cửa sổ có thể trùng
+nhau trong một epoch. Với 2 tỷ token và batch, độ dài chuỗi mặc định, mốc
+đầu tiên là `[epoch] epoch=1 step=976563`. Checkpoint lưu tổng token đã
+train để vẫn tính đúng khi đổi batch hoặc độ dài chuỗi lúc resume. Với
+checkpoint cũ, trainer ước tính số token trước đó theo batch và độ dài
+chuỗi khi resume rồi ghi `epoch_estimated=true`.
+
+Chạy `./test/spectron/test_nimformer --help` để xem các tùy chọn packed.
+
+Để chat với checkpoint packed:
+
+```sh
+make run-spectron ARGS='--checkpoint=test/spectron/models/finetune_packed.nimq --tokenizer=test/spectron/data/packed/tokenizer.json'
+```
+
+
+## Build, chạy và chat với corpus demo
 
 Từ thư mục gốc repo:
 
@@ -47,7 +292,7 @@ Lệnh này compile `test/spectron/test_inferencespectron.nim` thành
 `./test_inferencespectron`, load checkpoint/tokenizer, rồi nhận prompt ở
 `>>>`. Gõ `exit` hoặc `quit` để thoát. Chat giữ lịch sử trong phiên, sinh tối
 đa 128 token/lượt với temperature 0.7 theo constants của file inference.
-Hiện binary chat không đọc `ARGS`; sửa constants rồi build lại để đổi cấu hình.
+Dùng `ARGS` để truyền `--checkpoint=PATH` và `--tokenizer=PATH`.
 
 
 ## Khi trainer khởi động
@@ -119,9 +364,9 @@ Sửa các `CFG_*` ở đầu `test/spectron/test_nimformer.nim`, rồi build l�
 - `CFG_GEN_PROMPT`, `CFG_GEN_MAX_NEW_TOKENS=40`, `CFG_GEN_TEMPERATURE=0`:
   lần sinh thử cuối training; temperature 0 dùng greedy.
 
-Ví dụ thử ít bước hơn: sửa `CFG_N_STEPS` thành `100`, batch thành `4`, seq
-thành `64`, rồi chạy `make run-metal`. Trainer chưa có `--steps`, `--batch`,
-hay `--lr`; các biến `BYBY_SEQ_LEN` của Codestral không áp dụng ở đây.
+Để thử nhanh với corpus demo, sửa `CFG_N_STEPS` thành `100`, batch thành
+`4`, seq thành `64`, rồi chạy `make run-metal`. Ở chế độ packed, truyền
+`--steps`, `--batch` và `--lr` qua `ARGS`.
 
 Khi load checkpoint, kiến trúc được lấy từ checkpoint; thay constants về
 kích thước model không tự đổi một model đã lưu.
@@ -136,7 +381,7 @@ test/spectron/models/finetune.nimq
 test/spectron/models/spectron_bpe_tokenizer.json
 ```
 
-Checkpoint chứa tham số fp32 raw, kiến trúc và số step hoàn thành. Nếu file
+Checkpoint demo chứa tham số fp32 raw, kiến trúc và số step hoàn thành. Nếu file
 đang ghi nhận 25.080 step, chạy lại sẽ bắt đầu ở step 25.081 và mặc định kết
 thúc ở step 31.080. Adam `m`, `v` và step optimizer chưa được lưu, nên resume
 là tiếp tục trọng số với optimizer mới; không tái hiện chính xác một lần
@@ -155,8 +400,8 @@ cp test/spectron/models/spectron_bpe_tokenizer.json test/spectron/models/tokeniz
 
 Muốn bắt đầu model mới, đặt `CFG_CHECKPOINT_PATH` thành một file chưa có.
 Muốn tạo cả tokenizer mới, dùng một thư mục thử riêng: cập nhật thêm
-`BPE_TOKENIZER_PATH` trong module và `createDir` tương ứng. Sau đó chỉnh
-`CHECKPOINT_PATH`/`BPE_TOKENIZER_PATH` ở binary chat nếu muốn chat với bản này.
+`BPE_TOKENIZER_PATH` trong module và `createDir` tương ứng. Khi chat với bản
+này, dùng `--checkpoint` và `--tokenizer`.
 
 Giữ checkpoint và tokenizer thành một cặp. Đổi số merge khi tokenizer đã có
 không train lại tokenizer; `getOrTrainBPE` sẽ load file hiện tại. Tokenizer
@@ -176,7 +421,8 @@ step   100 | loss = 5.1200 | mean_loss(99) = 5.4800
 tại, đo trước Adam update. `mean_loss(n)` là trung bình của `n` batch kể từ
 lần log trước; lần log đầu có một batch, nên cửa sổ sau đó có thể chưa đủ
 100 batch. Mỗi batch lấy cửa sổ khác nhau, vì vậy loss từng dòng có thể tăng
-giảm. Đây là training loss, chưa có validation split/loss trong entry point.
+giảm. Chế độ packed ghi thêm loss trên các cửa sổ validation cố định ở những
+dòng bắt đầu bằng `[val]`.
 
 Với logits đồng đều, vocab 756 cho loss khoảng `ln(756) = 6.628`; đây là mốc
 tham khảo, không phải giới hạn trên. Logits quá tự tin vào token sai có thể
@@ -234,7 +480,9 @@ nim c -r -d:release --path:. -o:/tmp/test_customfloat_range test/test_customfloa
 ```
 
 Test Spectron trên Metal dùng model nhỏ và checkpoint tạm, kiểm tra loss,
-gradient bằng sai phân, checkpoint cũ/mới và 110 bước train qua mốc APF 50/100:
+gradient bằng sai phân, checkpoint cũ/mới và 110 bước train qua mốc APF 50/100.
+Với HRM, test so gradient một bước với sai phân, chạy lặp forward của lõi 2
+chu kỳ, 2 bước, 2 segment, lưu rồi nạp lại checkpoint HRM và train 110 bước:
 
 ```sh
 nim c -r -d:release --mm:arc --opt:speed \
