@@ -127,7 +127,7 @@ cài Nim và các file driver Vulkan của NVIDIA, tải corpus cùng bản
 ba bước train ở từng kích thước batch, bắt đầu từ 16. Notebook đo tok/s sau
 bước đầu tiên và giữ batch nhanh nhất mà T4 và bộ nhớ của Colab chạy được.
 Lượt train dùng `--tensor-cores=require` và lõi HRM (`HRM_CYCLES = 2`,
-`HRM_L_STEPS = 2`, `HRM_SEGMENTS = 1` trong cell cấu hình), lưu và upload
+`HRM_L_STEPS = 2`, `HRM_SEGMENTS = 2` trong cell cấu hình), lưu và upload
 mỗi 20 bước. Bước đo batch cũng chạy với cùng cấu hình HRM. Khi
 Colab ngắt kết nối, chạy lại notebook để train tiếp từ checkpoint và trạng
 thái Adam đã upload gần nhất. Trước khi chạy, thêm token Hugging Face có

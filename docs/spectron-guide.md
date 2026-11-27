@@ -132,7 +132,7 @@ latest `moe/finetune.nimq`, and builds the Vulkan trainer. It then runs three
 training steps at each batch size from 16 upward. It measures tok/s after the
 first step and keeps the fastest batch that fits on the T4 and in Colab's
 memory. Training uses `--tensor-cores=require` and the HRM core
-(`HRM_CYCLES = 2`, `HRM_L_STEPS = 2`, `HRM_SEGMENTS = 1` in the settings
+(`HRM_CYCLES = 2`, `HRM_L_STEPS = 2`, `HRM_SEGMENTS = 2` in the settings
 cell), and saves and uploads every 20 steps. The batch probe runs with the
 same HRM settings. After a disconnect, run the notebook again to continue from the
 last uploaded checkpoint and Adam state. Add a Hugging Face write token named
