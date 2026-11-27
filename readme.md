@@ -139,8 +139,10 @@ These repositories contain the model files used by the inference targets in this
 | [forge-500m-chat-fir](https://huggingface.co/bobbydeveloper2014/forge-500m-chat-fir) | `model.fir`, `config.json`, weights, and tokenizer (`models/forge-500m-chat-fir`) | [forge-500m-chat-fir](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/models/forge-500m-chat-fir) | `formers`, `download-fir-models` |
 | [gpt2-125m](https://huggingface.co/bobbydeveloper2014/gpt2-125m) | `model.safetensors`, `model.fir`, and tokenizer files (`models/gpt2-125m`) | [gpt2-125m](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/models/gpt2-125m) | `formers`, `download-fir-models` |
 | [huihui-moe-fir](https://huggingface.co/bobbydeveloper2014/huihui-moe-fir) | `model.fir`, weights, and tokenizer files (`models/huihui-moe-fir`) | [huihui-moe-fir](https://github.com/bobbyshop-vui/nimformers-framework/tree/main/models/huihui-moe-fir) | `formers`, `download-fir-models` |
+| [Math-SpectronNexus](https://huggingface.co/bobbydeveloper2014/Math-SpectronNexus) | Sequence program checkpoint, `sequence_program.nimq` | [Math SpectronNexus](test/math_spectronnexus/README.md) | `research_sequence`, `explore_sequence`, `download-models` |
+| [bybyai-spectron](https://huggingface.co/bobbydeveloper2014/bybyai-spectron) | `test_nimformer` checkpoint `finetune.nimq` and matching BPE tokenizer | [Spectron trainer](docs/spectron-guide.md) | `run-spectron`, `download-models` |
 
-`make download-models` fetches all of the above into those paths (`make download-fir-models` fetches only the FIR ones; requires the `hf` CLI from `pip install -U huggingface_hub`).
+`make download-models` fetches all of the above into those paths, including the SpectronNexus program checkpoint at `test/math_spectronnexus/models/sequence_program.nimq` and the `test_nimformer` checkpoint/tokenizer at `test/spectron/models/` (`make download-fir-models` fetches only the FIR ones; requires the `hf` CLI from `pip install -U huggingface_hub`).
 
 To make Hugging Face tools pick up your token from the local ignored environment file, load it in the shell before using `hf` or `huggingface_hub`:
 
@@ -248,7 +250,7 @@ a Vulkan setup. Add `-cnv` for chat; the prompt comes from the model folder's ch
 
 ### Download the models
 
-All five Hugging Face repositories above are public. From the repository root, run this target to download their weights, adapters, configs, and tokenizers into the paths used by inference and formers.n:
+All Hugging Face repositories above are public. From the repository root, run this target to download their weights, adapters, configs, and tokenizers into the paths used by inference and formers.n:
 
 ```sh
 make download-models
@@ -267,6 +269,8 @@ The target creates the model directories under `test/` as needed and uses `curl`
 | [forge-500m-chat-fir](https://huggingface.co/bobbydeveloper2014/forge-500m-chat-fir) | `models/forge-500m-chat-fir/` |
 | [gpt2-125m](https://huggingface.co/bobbydeveloper2014/gpt2-125m) | `models/gpt2-125m/` |
 | [huihui-moe-fir](https://huggingface.co/bobbydeveloper2014/huihui-moe-fir) | `models/huihui-moe-fir/` |
+| [Math-SpectronNexus](https://huggingface.co/bobbydeveloper2014/Math-SpectronNexus) | `test/math_spectronnexus/models/sequence_program.nimq` |
+| [bybyai-spectron](https://huggingface.co/bobbydeveloper2014/bybyai-spectron) | `test/spectron/models/finetune.nimq` and `test/spectron/models/spectron_bpe_tokenizer.json` |
 
 The last four are FIR models. Each repo is the full folder (weights, tokenizer, `model.fir`) and is fetched with the `hf` CLI (`pip install -U huggingface_hub`); `make download-fir-models` downloads only these.
 

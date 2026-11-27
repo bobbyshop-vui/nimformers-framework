@@ -1301,14 +1301,19 @@ proc backward*(m: NimformerModelSpectron, ids: seq[int], dLoss: Tensor, ctx: Bac
 # ═══════════════════════════════════════════════════════════════
 proc softmaxCrossEntropy*(logits: Tensor, targets: seq[seq[int]], ctx: Backend):
     tuple[loss: float32, dLogits: Tensor] =
-  ## logits: [B,T,V]. targets: [B][T] next token id (next-token).
+  ## logits: [B,T,V]. A negative target skips that row on either backend.
   let B = logits.shape[0]; let T = logits.shape[1]; let V = logits.shape[2]
+  var nValid = 0
+  for b in 0 ..< B:
+    for t in 0 ..< T:
+      if targets[b][t] >= 0: inc nValid
+  if nValid == 0: return (0'f32, newTensor(logits.shape))
   if isGpuCtx(ctx):
-    # GPU: softmax + loss + dLogits in 1 micro-kernel chain (mean over B*T).
+    # GPU: softmax + loss + dLogits in one micro-kernel chain.
     var tgt = newSeq[float32](B * T)
     for b in 0 ..< B:
       for t in 0 ..< T: tgt[b * T + t] = float32(targets[b][t])
-    let r = softmaxCrossEntropyGpu(ctx, logits.data, tgt, B * T, V, B * T)
+    let r = softmaxCrossEntropyGpu(ctx, logits.data, tgt, B * T, V, nValid)
     var dLogits = newTensor(logits.shape)
     dLogits.data = r.dLogits
     return (r.loss, dLogits)
@@ -1317,13 +1322,14 @@ proc softmaxCrossEntropy*(logits: Tensor, targets: seq[seq[int]], ctx: Backend):
   var totalLoss = 0'f32
   for b in 0 ..< B:
     for t in 0 ..< T:
-      let base = (b * T + t) * V
       let tgt = targets[b][t]
+      if tgt < 0: continue
+      let base = (b * T + t) * V
       totalLoss += -ln(max(probs[base + tgt], 1e-9'f32))
       for v in 0 ..< V:
         dLogits.data[base + v] = probs[base + v]
       dLogits.data[base + tgt] -= 1'f32
-  let n = float32(B * T)
+  let n = float32(nValid)
   totalLoss /= n
   for i in 0 ..< dLogits.data.len:
     dLogits.data[i] /= n
@@ -1492,7 +1498,7 @@ proc trainStep*(m: var NimformerModelSpectron, adam: var ModelAdamState,
                  ctx: Backend, lr: float32 = 3e-4'f32,
                  requantizeEvery: int = 50): float32 =
   ## One full training step: forward -> loss -> backward -> Adam update.
-  ## Returns the loss (averaged over batch*seq) for logging.
+  ## Returns the loss averaged over supervised target positions for logging.
   ##
   ## IMPORTANT NOTE on `requantizeEvery`: apfAdamStep (in nimformer.nim)
   ## defaults to requantizeEvery=1, i.e. it RE-QUANTIZES the weights to CustomFloat

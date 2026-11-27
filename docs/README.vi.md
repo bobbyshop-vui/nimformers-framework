@@ -42,6 +42,8 @@ lượng tử hóa, backend, session và micro-VM.
   optimizer trên đĩa và phục hồi checkpoint.
 - [API training](training-api.vi.md): thành phần training, dataset,
   optimizer/checkpoint và entry point CLI.
+- [Math SpectronNexus](math-spectronnexus.vi.md): các tool toán rời rạc chính xác,
+  khám phá dãy, lập kế hoạch tính số hạng xa, cấu hình MCP và giới hạn nghiên cứu.
 
 
 ## Định dạng dữ liệu và độ chính xác

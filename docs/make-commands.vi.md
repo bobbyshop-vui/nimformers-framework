@@ -110,7 +110,9 @@ make download-codestral-tokenizer
   `test/spectron/`. Target này **không tải** `databricks-dolly-15k.jsonl`.
 - `download-models`: tải DeepSeek `.nimq`, config/tokenizer và Codestral base,
   adapter, config/tokenizer vào các thư mục `test/*/models/`; đồng thời ghi
-  sidecar `jamba_parallel_lora.bin.hf_tokenizer_dir`.
+  sidecar `jamba_parallel_lora.bin.hf_tokenizer_dir` và tải checkpoint sequence
+  program Math SpectronNexus vào `test/math_spectronnexus/models/sequence_program.nimq`,
+  cùng checkpoint `test_nimformer` và tokenizer BPE vào `test/spectron/models/`.
 - `download-codestral-tokenizer`: chỉ tải config/tokenizer Codestral vào
   `INFER_LORA_DEFAULT_HFDIR`, tiện khi đã có trọng số.
 
