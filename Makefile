@@ -64,8 +64,9 @@ SPECTRON_DATA_REPO ?= bobbydeveloper2014/bybyai-spectron
 SPECTRON_DATA_REPO_TYPE ?= model
 SPECTRON_DATA_REVISION ?= main
 SPECTRON_DATA_SUBDIR ?= data/scale5b
-SPECTRON_DATA_DIR ?= test/spectron/data/scale5b
-SPECTRON_HRM_EOS_DIR ?= test/spectron/models/hrm-eos
+# hf download keeps the repo layout, so the corpus lands in $(SPECTRON_DATA_ROOT)/$(SPECTRON_DATA_SUBDIR).
+SPECTRON_DATA_ROOT ?= test/spectron
+SPECTRON_MODELS_DIR ?= test/spectron/models
 
 # ── Mamba binaries: graft / finetune (LoRA) / inference ──
 GRAFT_SRC       := test/codestral/graft_attention.nim
@@ -196,9 +197,13 @@ download-models: download-fir-models download-spectron-hrm-eos
 	echo 'test/mamba3/models/mamba3-siso-1.5b' > test/mamba3/models/runs/mamba3-siso-1.5b-gated/lora-g1.bin.hf_tokenizer_dir
 
 download-spectron-hrm-eos:
-	SPECTRON_HF_REPO=bobbydeveloper2014/bybyai-spectron SPECTRON_HF_REPO_TYPE=model SPECTRON_HF_CHECKPOINT=hrm-eos/finetune.nimq \
-	  $(PYTHON) -B test/spectron/hf_checkpoint_sync.py --restore "$(SPECTRON_HRM_EOS_DIR)/finetune.nimq"
-	@test -s "$(SPECTRON_HRM_EOS_DIR)/finetune.nimq"
+	@command -v hf >/dev/null 2>&1 || { echo "hf not found: pip install -U huggingface_hub"; exit 1; }
+	@if [ -s "$(SPECTRON_MODELS_DIR)/hrm-eos/finetune.nimq" ]; then \
+	  echo "Using local $(SPECTRON_MODELS_DIR)/hrm-eos/finetune.nimq"; \
+	else \
+	  hf download $(SPECTRON_DATA_REPO) hrm-eos/finetune.nimq --local-dir "$(SPECTRON_MODELS_DIR)"; \
+	fi
+	@test -s "$(SPECTRON_MODELS_DIR)/hrm-eos/finetune.nimq"
 
 # FIR models used by formers-cli (weights, tokenizer and model.fir in each folder).
 # Needs the Hugging Face CLI: pip install -U huggingface_hub
@@ -227,7 +232,9 @@ prepare-spectron-eos-data: build-spectron-packer
 	$(PYTHON) -B test/spectron/prepare_eos_data.py --packer "$(SPECTRON_PACK_BIN)" $(ARGS)
 
 download-spectron-scale-data:
-	$(PYTHON) -B test/spectron/download_scale_data.py --repo "$(SPECTRON_DATA_REPO)" --repo-type "$(SPECTRON_DATA_REPO_TYPE)" --revision "$(SPECTRON_DATA_REVISION)" --subdir "$(SPECTRON_DATA_SUBDIR)" --output "$(SPECTRON_DATA_DIR)"
+	@command -v hf >/dev/null 2>&1 || { echo "hf not found: pip install -U huggingface_hub"; exit 1; }
+	hf download $(SPECTRON_DATA_REPO) --repo-type $(SPECTRON_DATA_REPO_TYPE) --revision $(SPECTRON_DATA_REVISION) \
+	  --include "$(SPECTRON_DATA_SUBDIR)/*" --local-dir "$(SPECTRON_DATA_ROOT)"
 
 download: download-datasets
 
