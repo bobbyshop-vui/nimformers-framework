@@ -598,7 +598,7 @@ shaders:
 	@for f in $(VK_KERNEL_DIR)/*.comp; do \
 		out=$${f%.comp}.spv; \
 		if [ ! -f "$$out" ] || [ "$$f" -nt "$$out" ]; then \
-			echo "[shaders] glslc $$f"; glslc "$$f" -o "$$out" || exit 1; \
+			echo "[shaders] glslc $$f"; glslc --target-env=vulkan1.1 "$$f" -o "$$out" || exit 1; \
 		fi; \
 	done
 	@echo "[shaders] done."
