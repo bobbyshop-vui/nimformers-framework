@@ -27,6 +27,7 @@ import nimformer
 import mamba2_ssm_gpu   # kernel GPU Linear++ train (forward+backward), runMicroVm, CE/Adam GPU
 from fp4_gemv_vm import buildLinearPlusStepProgram   # Linear++ 1-token GPU kernel (same kernel as infer)
 import fp4_gemv_vm as lpvm                            # lpvm.lpLayout(C, H): layout [proj|y|z|S]
+import session_vm  # micro-kernel bytecode emitters for the Mamba2 SSD scan
 import gpu_layers  # encodeEluPlus1 / encodeEluPlus1Backward for GPU-only Linear++  # Tensor, Linear, LayerNorm, FeedForward, Embedding, addT,
                    # transpose, flatten2D, newTensor, randnTensor,
                    # ApfAdamState, apfAdamStep, newLinear, newLayerNorm,
@@ -931,89 +932,212 @@ proc splitXgBC(proj: Tensor, B, T, C: int): tuple[xg, b, c, gate: seq[float32]] 
         result.c[baseOut + t * C + cc]    = proj.data[baseIn + t * 4 * C + 2 * C + cc]
         result.gate[baseOut + t * C + cc] = proj.data[baseIn + t * 4 * C + 3 * C + cc]
 
-proc mamba2SsdGpu*(ctx: Backend; xgData, bData, cData, dYData: seq[float32];
-                  B, H, T, D: int; aVals: seq[float32]):
-    tuple[y, dXg, dB, dC: seq[float32]] =
-  ## "Quadratic" SSD on the GPU, 1 session per (b, h):
-  ##   S  = M o (C B^T)          (M = decay mask a^(i-j), j <= i)
-  ##   Y  = S Xg
-  ## If dYData is not empty (backward), also:
-  ##   dXg = S^T dY,  S^T = M^T o (B C^T)
-  ##   dS  = M o (dY Xg^T)  -> dC = dS B
-  ##   dS^T = M^T o (Xg dY^T) -> dB = dS^T C
-  ## Every A B^T product uses sessionMatmulNT (no transpose on the host). Splitting [T,D]
-  ## slices per head is only data arrangement. GPU error -> raise.
-  let backend = ctx.kind.toByby()
-  let C = H * D
-  let bwd = dYData.len > 0
-  result.y = newSeq[float32](B * T * C)
-  if bwd:
-    result.dXg = newSeq[float32](B * T * C)
-    result.dB = newSeq[float32](B * T * C)
-    result.dC = newSeq[float32](B * T * C)
-  proc slice(src: seq[float32]; b, h: int): seq[float32] =
-    result = newSeq[float32](T * D)
-    for t in 0 ..< T:
-      let off = b * T * C + t * C + h * D
-      for d in 0 ..< D: result[t * D + d] = src[off + d]
-  proc scatter(dst: var seq[float32]; raw: seq[float32]; b, h: int) =
-    for t in 0 ..< T:
-      let off = b * T * C + t * C + h * D
-      for d in 0 ..< D: dst[off + d] = raw[t * D + d]
-  for h in 0 ..< H:
-    let mask = buildDecayMask(T, aVals[h])
-    var maskT = newSeq[float32](T * T)
-    if bwd:
-      for i in 0 ..< T:
-        for j in 0 ..< T: maskT[j * T + i] = mask[i * T + j]
-    for b in 0 ..< B:
-      if not sessionBegin(backend): gpuFail("sessionBegin (Mamba2SSD)", backend)
-      var owned: seq[SessionHandle]
-      proc up(v: seq[float32]): SessionHandle =
-        result = sessionUpload(backend, v); owned.add result
-      proc scratch(n: int): SessionHandle =
-        result = sessionAllocScratch(backend, n); owned.add result
-      var ok = true
-      let hM = up(mask)
-      let hC = up(slice(cData, b, h))
-      let hB = up(slice(bData, b, h))
-      let hXg = up(slice(xgData, b, h))
-      var hRaw = scratch(T * T)
-      var hS = scratch(T * T)
-      var hY = scratch(T * D)
-      ok = ok and sessionMatmulNT(backend, hC, hB, hRaw, T, D, T)        # C B^T
-      ok = ok and sessionVecOp(backend, "mul", hRaw, hM, hS, T * T)       # S
-      ok = ok and sessionMatmul(backend, hS, hXg, hY, T, T, D)            # Y
-      var hDXg, hDC, hDB: SessionHandle
-      if bwd:
-        let hMT = up(maskT)
-        let hDY = up(slice(dYData, b, h))
-        var hRawT = scratch(T * T)
-        var hST = scratch(T * T)
-        var hDSraw = scratch(T * T)
-        var hDS = scratch(T * T)
-        var hDSTraw = scratch(T * T)
-        var hDST = scratch(T * T)
-        hDXg = scratch(T * D); hDC = scratch(T * D); hDB = scratch(T * D)
-        ok = ok and sessionMatmulNT(backend, hB, hC, hRawT, T, D, T)       # B C^T
-        ok = ok and sessionVecOp(backend, "mul", hRawT, hMT, hST, T * T)   # S^T
-        ok = ok and sessionMatmul(backend, hST, hDY, hDXg, T, T, D)        # dXg
-        ok = ok and sessionMatmulNT(backend, hDY, hXg, hDSraw, T, D, T)    # dY Xg^T
-        ok = ok and sessionVecOp(backend, "mul", hDSraw, hM, hDS, T * T)   # dS
-        ok = ok and sessionMatmul(backend, hDS, hB, hDC, T, T, D)          # dC
-        ok = ok and sessionMatmulNT(backend, hXg, hDY, hDSTraw, T, D, T)   # Xg dY^T
-        ok = ok and sessionVecOp(backend, "mul", hDSTraw, hMT, hDST, T * T) # dS^T
-        ok = ok and sessionMatmul(backend, hDST, hC, hDB, T, T, D)         # dB
-      let ended = sessionEnd(backend)
-      if not ok or not ended:
-        for hd in owned.mitems: sessionFree(backend, hd)
-        gpuFail("encode/sessionEnd (Mamba2SSD)", backend)
-      scatter(result.y, sessionRead(backend, hY, T * D), b, h)
-      if bwd:
-        scatter(result.dXg, sessionRead(backend, hDXg, T * D), b, h)
-        scatter(result.dC, sessionRead(backend, hDC, T * D), b, h)
-        scatter(result.dB, sessionRead(backend, hDB, T * D), b, h)
-      for hd in owned.mitems: sessionFree(backend, hd)
+# The SSD above, y_i = sum_{j<=i} a^(i-j) (C_i . B_j) xg_j, is a decayed linear
+# recurrence, so the GPU runs it as a scan over t with a D x D state per (b, h):
+#   S_t = a S_{t-1} + B_t (x) xg_t,          y_t  = C_t S_t
+#   R_t = a R_{t+1} + C_t (x) dY_t,          dXg_t = B_t R_t,  dB_t = R_t xg_t
+#   dC_t = S_t dY_t
+# Every (b, h) runs in the same dispatch, so a call is one GPU session instead
+# of one session per (b, h).
+type
+  SsdLay = object
+    B, T, H, D, C, BT: int
+    proj, a, y, dY, dXbc: int     ## proj = [BT, 4C] (xg | B | C | gate); dXbc = [BT, 3C]
+    sF, sC, rB, rX: int           ## scan state, one D-vector per thread, starts at 0
+    total: int
+
+proc ssdLayout(B, T, H, D: int; backward: bool): SsdLay =
+  var L = SsdLay(B: B, T: T, H: H, D: D, C: H * D, BT: B * T)
+  var o = 0
+  template take(f: untyped; n: int) =
+    f = o; o += n
+  let states = B * L.C * D
+  take(L.proj, L.BT * 4 * L.C)
+  take(L.a, H)
+  if backward:
+    take(L.dY, L.BT * L.C); take(L.dXbc, L.BT * 3 * L.C)
+    take(L.sC, states); take(L.rB, states); take(L.rX, states)
+  else:
+    take(L.y, L.BT * L.C); take(L.sF, states)
+  L.total = o
+  result = L
+
+proc ssdTag(L: SsdLay): string = $L.B & "_" & $L.T & "_" & $L.H & "_" & $L.D
+
+proc vmNeg(s: int): uint32 = uint32(0) - uint32(s)
+
+proc emitSsdDecode(p: var VmProgram; L: SsdLay) =
+  ## R0 = tid = (b*H + h)*D + x  ->  U0 = tid, U1 = x, U2 = b, U3 = h.
+  p.emitAddConst(1, 0, 0.5'f32); p.emitLoadConstF32(2, float32(L.D)); p.emitDiv(1, 1, 2)
+  p.emitRToU(4, 1)                                  # U4 = bh
+  p.emitUToR(5, 4)
+  p.emitMulConst(3, 5, float32(L.D)); p.emitSub(3, 0, 3)
+  p.emitRToU(1, 3)                                  # U1 = x
+  p.emitAddConst(4, 5, 0.5'f32); p.emitLoadConstF32(2, float32(L.H)); p.emitDiv(4, 4, 2)
+  p.emitRToU(2, 4)                                  # U2 = b
+  p.emitUToR(6, 2); p.emitMulConst(6, 6, float32(L.H)); p.emitSub(6, 5, 6)
+  p.emitRToU(3, 6)                                  # U3 = h
+  p.emitRToU(0, 0)                                  # U0 = tid
+
+proc buildSsdForwardProgram(L: SsdLay): VmProgram =
+  ## 1 thread / (b,h,e), forward scan over t keeping column S[:,e]; writes y_t[e].
+  let C = L.C; let D = L.D
+  var p: VmProgram
+  p.emitSsdDecode(L)
+  p.emitULoadF32(14, 3, uint32(L.a))                               # R14 = a_h
+  p.emitLoadConstF32(7, float32(L.T)); p.emitLoadConstF32(10, float32(D))
+  p.emitUMulK(9, 3, uint32(D))                                     # h*D
+  p.emitUMulK(4, 2, uint32(L.T * 4 * C)); p.emitUAdd(4, 4, 9)      # U4 = proj row t, head h
+  p.emitUAdd(5, 4, 1)                                              # U5 = xg[e]
+  p.emitUMulK(6, 2, uint32(L.T * C)); p.emitUAdd(6, 6, 9); p.emitUAdd(6, 6, 1)   # U6 = y[e]
+  p.emitUMulK(8, 0, uint32(D))                                     # U8 = state base
+  sessionVmForGpu(p, 7):
+    p.emitULoadF32(9, 5, uint32(L.proj))                           # xg[e]
+    p.emitLoadConstF32(8, 0.0'f32)
+    p.emitUAddK(10, 4, 0); p.emitUAddK(11, 8, 0)
+    sessionVmForGpu(p, 10):
+      p.emitULoadF32(11, 10, uint32(L.proj + C))                   # B[d]
+      p.emitULoadF32(12, 11, uint32(L.sF))
+      p.emitMul(12, 12, 14); p.emitFma(12, 11, 9, 12)
+      p.emitUStoreF32(12, 11, uint32(L.sF))
+      p.emitULoadF32(11, 10, uint32(L.proj + 2 * C))               # C[d]
+      p.emitFma(8, 11, 12, 8)
+      p.emitUAddK(10, 10, 1); p.emitUAddK(11, 11, 1)
+    p.emitUStoreF32(8, 6, uint32(L.y))
+    p.emitUAddK(4, 4, uint32(4 * C)); p.emitUAddK(5, 5, uint32(4 * C))
+    p.emitUAddK(6, 6, uint32(C))
+  p.emitHalt()
+  result = p
+
+proc buildSsdGradCProgram(L: SsdLay): VmProgram =
+  ## 1 thread / (b,h,d), forward scan keeping row S[d,:]; writes dC_t[d] = S_t[d,:] . dY_t.
+  let C = L.C; let D = L.D
+  var p: VmProgram
+  p.emitSsdDecode(L)
+  p.emitULoadF32(14, 3, uint32(L.a))
+  p.emitLoadConstF32(7, float32(L.T)); p.emitLoadConstF32(10, float32(D))
+  p.emitUMulK(9, 3, uint32(D))
+  p.emitUMulK(4, 2, uint32(L.T * 4 * C)); p.emitUAdd(4, 4, 9)      # U4 = proj row t, head h
+  p.emitUAdd(13, 4, 1)                                             # U13 = proj elem d
+  p.emitUMulK(6, 2, uint32(L.T * C)); p.emitUAdd(6, 6, 9)          # U6 = dY row
+  p.emitUMulK(12, 2, uint32(L.T * 3 * C)); p.emitUAdd(12, 12, 9); p.emitUAdd(12, 12, 1)  # U12 = dXbc elem d
+  p.emitUMulK(8, 0, uint32(D))
+  sessionVmForGpu(p, 7):
+    p.emitULoadF32(8, 13, uint32(L.proj + C))                      # B[d]
+    p.emitLoadConstF32(13, 0.0'f32)
+    p.emitUAddK(10, 4, 0); p.emitUAddK(11, 6, 0); p.emitUAddK(14, 8, 0)
+    sessionVmForGpu(p, 10):
+      p.emitULoadF32(11, 10, uint32(L.proj))                       # xg[e]
+      p.emitULoadF32(12, 14, uint32(L.sC))
+      p.emitMul(12, 12, 14); p.emitFma(12, 8, 11, 12)
+      p.emitUStoreF32(12, 14, uint32(L.sC))
+      p.emitULoadF32(11, 11, uint32(L.dY)); p.emitFma(13, 11, 12, 13)
+      p.emitUAddK(10, 10, 1); p.emitUAddK(11, 11, 1); p.emitUAddK(14, 14, 1)
+    p.emitUStoreF32(13, 12, uint32(L.dXbc + 2 * C))
+    p.emitUAddK(4, 4, uint32(4 * C)); p.emitUAddK(13, 13, uint32(4 * C))
+    p.emitUAddK(6, 6, uint32(C)); p.emitUAddK(12, 12, uint32(3 * C))
+  p.emitHalt()
+  result = p
+
+proc buildSsdGradBProgram(L: SsdLay): VmProgram =
+  ## 1 thread / (b,h,d), backward scan keeping row R[d,:]; writes dB_t[d] = R_t[d,:] . xg_t.
+  let C = L.C; let D = L.D
+  let last = L.T - 1
+  var p: VmProgram
+  p.emitSsdDecode(L)
+  p.emitULoadF32(14, 3, uint32(L.a))
+  p.emitLoadConstF32(7, float32(L.T)); p.emitLoadConstF32(10, float32(D))
+  p.emitUMulK(9, 3, uint32(D))
+  p.emitUMulK(4, 2, uint32(L.T * 4 * C)); p.emitUAdd(4, 4, 9)
+  p.emitUAddK(4, 4, uint32(last * 4 * C))                         # U4 = proj row T-1, head h
+  p.emitUAdd(13, 4, 1)                                             # U13 = proj elem d
+  p.emitUMulK(6, 2, uint32(L.T * C)); p.emitUAdd(6, 6, 9)
+  p.emitUAddK(6, 6, uint32(last * C))                             # U6 = dY row T-1
+  p.emitUMulK(12, 2, uint32(L.T * 3 * C)); p.emitUAdd(12, 12, 9); p.emitUAdd(12, 12, 1)
+  p.emitUAddK(12, 12, uint32(last * 3 * C))                       # U12 = dXbc elem d, row T-1
+  p.emitUMulK(8, 0, uint32(D))
+  sessionVmForGpu(p, 7):
+    p.emitULoadF32(8, 13, uint32(L.proj + 2 * C))                  # C[d]
+    p.emitLoadConstF32(13, 0.0'f32)
+    p.emitUAddK(10, 4, 0); p.emitUAddK(11, 6, 0); p.emitUAddK(14, 8, 0)
+    sessionVmForGpu(p, 10):
+      p.emitULoadF32(11, 11, uint32(L.dY))                         # dY[e]
+      p.emitULoadF32(12, 14, uint32(L.rB))
+      p.emitMul(12, 12, 14); p.emitFma(12, 8, 11, 12)
+      p.emitUStoreF32(12, 14, uint32(L.rB))
+      p.emitULoadF32(11, 10, uint32(L.proj)); p.emitFma(13, 11, 12, 13)   # xg[e]
+      p.emitUAddK(10, 10, 1); p.emitUAddK(11, 11, 1); p.emitUAddK(14, 14, 1)
+    p.emitUStoreF32(13, 12, uint32(L.dXbc + C))
+    p.emitUAddK(4, 4, vmNeg(4 * C)); p.emitUAddK(13, 13, vmNeg(4 * C))
+    p.emitUAddK(6, 6, vmNeg(C)); p.emitUAddK(12, 12, vmNeg(3 * C))
+  p.emitHalt()
+  result = p
+
+proc buildSsdGradXProgram(L: SsdLay): VmProgram =
+  ## 1 thread / (b,h,e), backward scan keeping column R[:,e]; writes dXg_t[e] = B_t . R_t[:,e].
+  let C = L.C; let D = L.D
+  let last = L.T - 1
+  var p: VmProgram
+  p.emitSsdDecode(L)
+  p.emitULoadF32(14, 3, uint32(L.a))
+  p.emitLoadConstF32(7, float32(L.T)); p.emitLoadConstF32(10, float32(D))
+  p.emitUMulK(9, 3, uint32(D))
+  p.emitUMulK(4, 2, uint32(L.T * 4 * C)); p.emitUAdd(4, 4, 9)
+  p.emitUAddK(4, 4, uint32(last * 4 * C))                         # U4 = proj row T-1, head h
+  p.emitUMulK(6, 2, uint32(L.T * C)); p.emitUAdd(6, 6, 9); p.emitUAdd(6, 6, 1)
+  p.emitUAddK(6, 6, uint32(last * C))                             # U6 = dY[e], row T-1
+  p.emitUMulK(12, 2, uint32(L.T * 3 * C)); p.emitUAdd(12, 12, 9); p.emitUAdd(12, 12, 1)
+  p.emitUAddK(12, 12, uint32(last * 3 * C))                       # U12 = dXbc elem e, row T-1
+  p.emitUMulK(8, 0, uint32(D))
+  sessionVmForGpu(p, 7):
+    p.emitULoadF32(9, 6, uint32(L.dY))                             # dY[e]
+    p.emitLoadConstF32(13, 0.0'f32)
+    p.emitUAddK(10, 4, 0); p.emitUAddK(14, 8, 0)
+    sessionVmForGpu(p, 10):
+      p.emitULoadF32(11, 10, uint32(L.proj + 2 * C))               # C[d]
+      p.emitULoadF32(12, 14, uint32(L.rX))
+      p.emitMul(12, 12, 14); p.emitFma(12, 11, 9, 12)
+      p.emitUStoreF32(12, 14, uint32(L.rX))
+      p.emitULoadF32(11, 10, uint32(L.proj + C)); p.emitFma(13, 11, 12, 13)   # B[d]
+      p.emitUAddK(10, 10, 1); p.emitUAddK(14, 14, 1)
+    p.emitUStoreF32(13, 12, uint32(L.dXbc))
+    p.emitUAddK(4, 4, vmNeg(4 * C)); p.emitUAddK(6, 6, vmNeg(C))
+    p.emitUAddK(12, 12, vmNeg(3 * C))
+  p.emitHalt()
+  result = p
+
+proc mamba2SsdScanGpu(ctx: Backend; proj: seq[float32]; aVals, dY: seq[float32];
+                      B, T, H, D: int): seq[float32] =
+  ## proj = inProj output [B*T, 4C]. Without dY returns y [B*T, C]; with dY
+  ## returns [B*T, 3C] = dXg | dB | dC. One GPU session; a GPU error raises.
+  ensureTgCap(ctx)
+  let backward = dY.len > 0
+  let L = ssdLayout(B, T, H, D, backward)
+  checkVmScratchCapacity(ctx, L.total, "Mamba2 SSD scan")
+  var buf = newSeq[float32](L.total)
+  buf.blit(L.proj, proj, 0, L.BT * 4 * L.C)
+  buf.blit(L.a, aVals, 0, H)
+  let tag = ssdTag(L)
+  let threads = B * L.C
+  if backward:
+    buf.blit(L.dY, dY, 0, L.BT * L.C)
+    if not runMicroVmChain(ctx, [
+        (buildSsdGradXProgram(L), threads, 4, 0, "@ssd_dx_" & tag),
+        (buildSsdGradBProgram(L), threads, 4, 0, "@ssd_db_" & tag),
+        (buildSsdGradCProgram(L), threads, 4, 0, "@ssd_dc_" & tag)], buf):
+      gpuFail("Mamba2 SSD backward scan", ctx.kind.toByby())
+    result = buf[L.dXbc ..< L.dXbc + L.BT * 3 * L.C]
+  else:
+    if not runMicroVmChain(ctx, [
+        (buildSsdForwardProgram(L), threads, 4, 0, "@ssd_fwd_" & tag)], buf):
+      gpuFail("Mamba2 SSD forward scan", ctx.kind.toByby())
+    result = buf[L.y ..< L.y + L.BT * L.C]
+
+proc gateSlice(proj: Tensor, B, T, C: int): seq[float32] =
+  result = newSeq[float32](B * T * C)
+  for row in 0 ..< B * T:
+    for c in 0 ..< C:
+      result[row * C + c] = proj.data[row * 4 * C + 3 * C + c]
 
 proc forwardMamba2*(m: Mamba2SSD, x: Tensor, ctx: Backend): Tensor =
   let B = x.shape[0]; let T = x.shape[1]; let C = x.shape[2]
@@ -1021,10 +1145,14 @@ proc forwardMamba2*(m: Mamba2SSD, x: Tensor, ctx: Backend): Tensor =
   let H = m.nHeads; let D = m.headDim
 
   let proj = m.inProj.forward(x, ctx)
-  let (xgData, bData, cData, gateData) = splitXgBC(proj, B, T, C)
-
-  let yData = if isGpuCtx(ctx): mamba2SsdGpu(ctx, xgData, bData, cData, @[], B, H, T, D, m.aVals).y
-              else: cpuMamba2Forward(xgData, bData, cData, B, H, T, D, m.aVals)
+  var gateData, yData: seq[float32]
+  if isGpuCtx(ctx):
+    gateData = gateSlice(proj, B, T, C)
+    yData = mamba2SsdScanGpu(ctx, proj.data, m.aVals, @[], B, T, H, D)
+  else:
+    let (xgData, bData, cData, gate) = splitXgBC(proj, B, T, C)
+    gateData = gate
+    yData = cpuMamba2Forward(xgData, bData, cData, B, H, T, D, m.aVals)
 
   let gateAct = beSigmoid(ctx, gateData)
   let gated = beMul(ctx, yData, gateAct)
@@ -1039,11 +1167,14 @@ proc backwardMamba2*(m: Mamba2SSD, x: Tensor, dOut: Tensor, ctx: Backend): tuple
   let H = m.nHeads; let D = m.headDim
 
   let proj = m.inProj.forward(x, ctx)
-  let (xgData, bData, cData, gateData) = splitXgBC(proj, B, T, C)
-
   let gpu = isGpuCtx(ctx)
-  let yData = if gpu: mamba2SsdGpu(ctx, xgData, bData, cData, @[], B, H, T, D, m.aVals).y
-              else: cpuMamba2Forward(xgData, bData, cData, B, H, T, D, m.aVals)
+  var xgData, bData, cData, gateData, yData: seq[float32]
+  if gpu:
+    gateData = gateSlice(proj, B, T, C)
+    yData = mamba2SsdScanGpu(ctx, proj.data, m.aVals, @[], B, T, H, D)
+  else:
+    (xgData, bData, cData, gateData) = splitXgBC(proj, B, T, C)
+    yData = cpuMamba2Forward(xgData, bData, cData, B, H, T, D, m.aVals)
   let gateAct = beSigmoid(ctx, gateData)
   let gated = beMul(ctx, yData, gateAct)
   var y = newTensor(@[B, T, C]); y.data = gated
@@ -1056,13 +1187,18 @@ proc backwardMamba2*(m: Mamba2SSD, x: Tensor, dOut: Tensor, ctx: Backend): tuple
   let sPrime = beSub(ctx, gateAct, beMul(ctx, gateAct, gateAct))
   let dGateRaw = beMul(ctx, beMul(ctx, dGated, yData), sPrime)
 
-  let (dXg, dB, dC) =
-    if gpu:
-      let r = mamba2SsdGpu(ctx, xgData, bData, cData, dY, B, H, T, D, m.aVals)
-      (r.dXg, r.dB, r.dC)
-    else: cpuMamba2Backward(xgData, bData, cData, dY, B, H, T, D, m.aVals)
-
   var dProj = newTensor(proj.shape)
+  if gpu:
+    let dXbc = mamba2SsdScanGpu(ctx, proj.data, m.aVals, dY, B, T, H, D)
+    for row in 0 ..< B * T:
+      for c in 0 ..< 3 * C:
+        dProj.data[row * 4 * C + c] = dXbc[row * 3 * C + c]
+      for c in 0 ..< C:
+        dProj.data[row * 4 * C + 3 * C + c] = dGateRaw[row * C + c]
+    let dInP = m.inProj.backward(x, dProj, ctx)
+    return (dInP.dX, dInP.dW, dInP.dB, dOutP.dW, dOutP.dB)
+
+  let (dXg, dB, dC) = cpuMamba2Backward(xgData, bData, cData, dY, B, H, T, D, m.aVals)
   for b in 0 ..< B:
     let baseIn = b * T * 4 * C
     let baseOut = b * T * C

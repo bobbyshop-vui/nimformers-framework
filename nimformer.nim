@@ -179,6 +179,11 @@ proc applyApiAfter*(api: string; ctx: Backend; inputs: openArray[Tensor];
           normalized in ForwardApiNames and inputs.len > 0:
         result = registration.after(ctx, inputs[0], result)
 
+template noTensorHooks(): bool =
+  ## True when no forward/API hook is registered: hot paths then skip the
+  ## operand seq copies that the hook plumbing needs.
+  gForwardHooks.len == 0
+
 proc applyForwardBefore(api: string; ctx: Backend; input: Tensor): Tensor =
   var inputs = @[input]
   applyApiBefore(api, ctx, inputs)
@@ -196,6 +201,12 @@ var gLoraSizeMismatchWarned = 0  ## counts LoRA size-mismatch warnings
                                   ## is not spammed when many Linears hit it.
 
 proc newTensor*(shape: seq[int], fill: float32 = 0'f32): Tensor {.apiHooked.} =
+  if noTensorHooks():
+    result.shape = shape
+    result.data = newSeq[float32](numel(shape))
+    if fill != 0'f32:
+      for i in 0 ..< result.data.len: result.data[i] = fill
+    return
   let ctx = Backend(kind: bkCpu)
   var inputs: seq[Tensor]
   applyApiBefore("newtensor", ctx, inputs)
@@ -232,6 +243,10 @@ proc addT*(ctx: Backend, a, b: Tensor): Tensor {.apiHooked.} =
   ## operation to ignore. This overload goes through the GPU, as required ("never
   ## silently run on the CPU"). The old addT(a,b) (no ctx) stays for the
   ## other callers that have no Backend in scope.
+  if noTensorHooks():
+    result.shape = a.shape
+    result.data = beAdd(ctx, a.data, b.data)
+    return
   var inputs = @[a, b]
   applyApiBefore("addt", ctx, inputs)
   if inputs.len != 2:
@@ -266,19 +281,29 @@ proc flatten2D*(shape: seq[int]): tuple[rows, cols: int] {.apiHooked.} =
   for i in 0 ..< shape.len - 1: rows *= shape[i]
   result = (rows, cols)
 
+proc transposeCore(input: Tensor): Tensor =
+  let (rows, cols) = flatten2D(input.shape)
+  result.shape = @[cols, rows]
+  result.data = newSeqUninit[float32](rows * cols)
+  if input.mappedData.owner == nil and input.data.len == rows * cols:
+    for i in 0 ..< rows:
+      let src = i * cols
+      for j in 0 ..< cols:
+        result.data[j * rows + i] = input.data[src + j]
+  else:
+    for i in 0 ..< rows:
+      for j in 0 ..< cols:
+        result.data[j * rows + i] = input.floatValues[i * cols + j]
+
 proc transpose*(x: Tensor): Tensor {.apiHooked.} =
   ## Transposes a tensor treated as a 2D matrix [rows, cols] (all dims except
   ## the last merged into "rows", like flatten2D) -> [cols, rows].
+  if noTensorHooks():
+    return transposeCore(x)
   let ctx = Backend(kind: bkCpu)
   var inputs = @[x]
   applyApiBefore("transpose", ctx, inputs)
-  let input = inputs[0]
-  let (rows, cols) = flatten2D(input.shape)
-  result.shape = @[cols, rows]
-  result.data = newSeq[float32](rows * cols)
-  for i in 0 ..< rows:
-    for j in 0 ..< cols:
-      result.data[j * rows + i] = input.floatValues[i * cols + j]
+  result = transposeCore(inputs[0])
   result = applyApiAfter("transpose", ctx, inputs, result)
 
 # ===================================================================
@@ -461,15 +486,11 @@ proc residentLinearNt(l: Linear; x: seq[float32]; rows: int; ctx: Backend): seq[
     byby.sessionFree(be, hx)
     byby.sessionFree(be, hy)
 
-proc forward*(l: Linear, x: Tensor, ctx: Backend): Tensor {.apiHooked.} =
-  var input = applyForwardBefore("linear", ctx, x)
-  if l.preForwardHook != nil:
-    input = l.preForwardHook(ctx, input)
+proc linearForwardCore(l: Linear, input: Tensor, ctx: Backend): Tensor =
   let (rows, cols) = flatten2D(input.shape)
   assert cols == l.inF
-  var outShape = input.shape
-  outShape[^1] = l.outF
-  result = newTensor(outShape)
+  result.shape = input.shape
+  result.shape[^1] = l.outF
 
   var y: seq[float32]
   pfTime("lin.gemm"):
@@ -519,12 +540,14 @@ proc forward*(l: Linear, x: Tensor, ctx: Backend): Tensor {.apiHooked.} =
       fixed[i] = y[i]
     y = fixed
 
-  # Add bias (l.bias.data has length l.outF; empty = no bias)
+  # Add bias in place (l.bias.data has length l.outF; empty = no bias), then
+  # hand the GEMM buffer over to the result without another copy.
   if l.bias.data.len == l.outF:
-    for i in 0 ..< y.len:
-      result.data[i] = y[i] + l.bias.data[i mod l.outF]
-  else:
-    for i in 0 ..< y.len: result.data[i] = y[i]
+    for r in 0 ..< rows:
+      let base = r * l.outF
+      for j in 0 ..< l.outF:
+        y[base + j] = y[base + j] + l.bias.data[j]
+  result.data = move(y)
 
   # LoRA is ADDED (additive), NOT physically merged into the weight. y/result
   # above always goes through the COMPRESSED resident/quant Q4 path like the base (weightQ/useQuant
@@ -563,6 +586,14 @@ proc forward*(l: Linear, x: Tensor, ctx: Backend): Tensor {.apiHooked.} =
         "(r=" & $l.loraR & ", loraA.len=" & $l.loraAValues.len & " (need " & $(l.loraR * l.inF) &
         "), loraB.len=" & $l.loraBValues.len & " (need " & $(l.outF * l.loraR) &
         ")) - skipping the LoRA delta for this parameter, using the base weight.")
+
+proc forward*(l: Linear, x: Tensor, ctx: Backend): Tensor {.apiHooked.} =
+  if noTensorHooks() and l.preForwardHook == nil:
+    return linearForwardCore(l, x, ctx)
+  var input = applyForwardBefore("linear", ctx, x)
+  if l.preForwardHook != nil:
+    input = l.preForwardHook(ctx, input)
+  result = linearForwardCore(l, input, ctx)
   result = applyForwardAfter("linear", ctx, input, result)
 proc backward*(l: Linear, x: Tensor, dOut: Tensor, ctx: Backend): tuple[dX, dW, dB: Tensor] {.apiHooked.} =
   ## Linear backward:
@@ -575,36 +606,36 @@ proc backward*(l: Linear, x: Tensor, dOut: Tensor, ctx: Backend): tuple[dX, dW, 
   doAssert dOut.shape[^1] == l.outF,
     &"Linear.backward: dOut.shape={dOut.shape} (last={dOut.shape[^1]}) but l.outF={l.outF} (l.inF={l.inF}, x.shape={x.shape})"
 
-  # dW = x^T @ dOut (transpose x -> [inF, rows], dOut -> [rows, outF])
-  let xT = transpose(x)  # [inF, rows]
+  # dW = dOut^T @ x is produced directly in l.weight's [outF, inF] layout, so
+  # no transposed copy of x and no transpose of the [inF, outF] product.
+  let dOutT = transpose(dOut)  # [outF, rows]
   let dOutFlat = dOut.data  # [rows * outF]
 
   # dW and dX are independent. The optional fine-tune route sends dW through
   # the backend's NT GEMM (Vulkan cooperative matrices / Metal SIMD). Tensor Core
   # training uses the same mixed-precision path for the input gradient.
-  var dWRawFlat, dXFlat: seq[float32]
+  var dWFlat, dXFlat: seq[float32]
   if ctx.usesTrainingTensorCores or (getEnv("BYBY_FINETUNE_ACCELERATED_GEMM", "0") != "0" and
      ctx.kind.toByby() in {byby.gbMetal, byby.gbVulkan}):
-    let dOutT = transpose(dOut)  # [outF, rows] for C = xT @ dOut
-    dWRawFlat = beMatmulNT(ctx, xT.data, l.inF, rows, dOutT.data, l.outF)
+    let xT = transpose(x)  # [inF, rows]: NT GEMM wants B as [n, k]
+    dWFlat = beMatmulNT(ctx, dOutT.data, l.outF, rows, xT.data, l.inF)
     if ctx.usesTrainingTensorCores:
       let weightT = transpose(l.weight)
       dXFlat = beMatmulNT(ctx, dOutFlat, rows, l.outF, weightT.data, l.inF)
     else:
       dXFlat = beMatmul(ctx, dOutFlat, rows, l.outF, l.weight.data, l.outF, l.inF)
   else:
-    (dWRawFlat, dXFlat) = beMatmul2(ctx,
-      xT.data, l.inF, rows, dOutFlat, rows, l.outF,
+    (dWFlat, dXFlat) = beMatmul2(ctx,
+      dOutT.data, l.outF, rows, x.floatValues, rows, l.inF,
       dOutFlat, rows, l.outF, l.weight.data, l.outF, l.inF)
 
-  var dWRaw: Tensor
-  dWRaw.shape = @[l.inF, l.outF]
-  dWRaw.data = dWRawFlat
-  let dW = transpose(dWRaw)  # -> [outF, inF], matches l.weight.shape
+  var dW: Tensor
+  dW.shape = @[l.outF, l.inF]  # matches l.weight.shape
+  dW.data = move(dWFlat)
 
   var dX: Tensor
   dX.shape = x.shape
-  dX.data = dXFlat
+  dX.data = move(dXFlat)
 
   # dB = sum of dOut over the batch
   var dB = newTensor(@[l.outF])
@@ -656,6 +687,12 @@ proc forward*(ln: LayerNorm, x: Tensor, ctx: Backend): Tensor {.apiHooked.} =
   ## backend (cuda/metal/opencl) was chosen. backend.nim already has `beLayernorm` matching
   ## this exact operation (rows x cols, same normalisation formula), so it just
   ## calls that so LayerNorm really runs on the chosen GPU.
+  if noTensorHooks():
+    let (rows, cols) = flatten2D(x.shape)
+    assert cols == ln.dim
+    result.shape = x.shape
+    result.data = beLayernorm(ctx, x.data, ln.gamma.data, ln.beta.data, rows, cols, ln.eps)
+    return
   let input = applyForwardBefore("layer_norm", ctx, x)
   let (rows, cols) = flatten2D(input.shape)
   assert cols == ln.dim
@@ -667,14 +704,13 @@ proc backward*(ln: LayerNorm, x: Tensor, dOut: Tensor, ctx: Backend): tuple[dX, 
   ## LayerNorm backward (matrix ops / GPU-bound)
   let (rows, cols) = flatten2D(x.shape)
   assert cols == ln.dim
-  var dX = newTensor(x.shape)
-  var dGamma = newTensor(ln.gamma.shape)
-  var dBeta = newTensor(ln.beta.shape)
-  let (dx_data, dgamma_data, dbeta_data) = beLayernormBackward(ctx, dOut.data, x.data, ln.gamma.data, ln.beta.data, rows, cols, ln.eps)
-  dX.data = dx_data
-  dGamma.data = dgamma_data
-  dBeta.data = dbeta_data
-  result = (dX, dGamma, dBeta)
+  var (dx_data, dgamma_data, dbeta_data) = beLayernormBackward(ctx, dOut.data, x.data, ln.gamma.data, ln.beta.data, rows, cols, ln.eps)
+  result.dX.shape = x.shape
+  result.dX.data = move(dx_data)
+  result.dGamma.shape = ln.gamma.shape
+  result.dGamma.data = move(dgamma_data)
+  result.dBeta.shape = ln.beta.shape
+  result.dBeta.data = move(dbeta_data)
 
 # ===================================================================
 # CausalSelfAttention (forward/backward use Metal matmul)
@@ -782,6 +818,10 @@ proc newFeedForward*(embedDim, mult: int): FeedForward {.apiHooked.} =
   result.fc2 = newLinear(embedDim * mult, embedDim)
 
 proc forward*(ff: FeedForward, x: Tensor, ctx: Backend): Tensor {.apiHooked.} =
+  if noTensorHooks():
+    var h = ff.fc1.forward(x, ctx)
+    h.data = beApflu(ctx, h.data, 0.1'f32, 1.0'f32)
+    return ff.fc2.forward(h, ctx)
   let input = applyForwardBefore("feed_forward", ctx, x)
   var h = ff.fc1.forward(input, ctx)
   h.data = beApflu(ctx, h.data, 0.1'f32, 1.0'f32)
