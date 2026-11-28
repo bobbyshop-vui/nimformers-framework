@@ -187,6 +187,26 @@ change compute. `--hrm-l-layers` must match the checkpoint. A checkpoint
 saved without HRM cannot gain it on resume; start a new `--checkpoint` with
 `--init-checkpoint` instead.
 
+### Train an end-of-sequence token
+
+`make download-spectron-hrm-eos` restores the step-1353 starter checkpoint to
+`test/spectron/models/hrm-eos/finetune.nimq`. It contains the weights, Adam
+state and EOS ID for resuming training. [Hugging Face checkpoint](https://huggingface.co/bobbydeveloper2014/bybyai-spectron/blob/main/hrm-eos/finetune.nimq)
+
+`make prepare-spectron-eos-data` packs complete Dolly answers and Python
+files from CodeParrot with their original record boundaries. With
+`--eos-data=test/spectron/data/scale5b/eos`, one quarter of each batch uses
+clean windows that cross those boundaries. The model adds one EOS ID
+after the 756 BPE IDs. The default loss weight for EOS targets is 8. Use
+`--eos-rows` and `--eos-weight` to adjust the mix and weight.
+
+`--resume-from=PATH` restores weights, Adam and step count when the output
+checkpoint is missing. Later runs resume from the output file. Enabling
+EOS adds a row to the embedding and output projection. The `[eos-val]`
+log reports correct stops, early stops and average EOS probability at
+document ends. Chat stops at EOS. The block decoder stops each row when
+it verifies EOS.
+
 ### Parallel block decoding
 
 `test/spectron/block_decode.nim` decodes a block of K positions at once. Each
@@ -248,7 +268,10 @@ The `[trace]` lines show each pass of the first prompt: verified tokens are
 plain, locked drafts are in `{braces}`, and other drafts start with `?`. The
 summary lines count forward calls, passes per prompt, accepted drafts (drafts
 that were already right when verification reached them), and right and wrong
-locks, and they check every output against greedy decoding.
+locks, and they check every output against greedy decoding. Each `[passes]`
+line lists the passes that every block of one prompt took. The `[prompt]`
+and `[sample]` lines print each prompt, cut as described above, and its
+greedy continuation.
 
 When several prompts share a batch, every pass waits for the slowest prompt,
 so `forwards` drops below K per block only when every prompt in the batch

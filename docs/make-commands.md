@@ -139,6 +139,9 @@ make build-spectron-trainer SPECTRON_TRAIN_BACKEND=vulkan
   SpectronNexus sequence program checkpoint to
   `test/math_spectronnexus/models/sequence_program.nimq`, plus the
   `test_nimformer` checkpoint and BPE tokenizer to `test/spectron/models/`.
+- `download-spectron-hrm-eos` is also part of `download-models`. It restores
+  the public HRM-EOS checkpoint to `test/spectron/models/hrm-eos/finetune.nimq`
+  when that file is missing. [HRM-EOS checkpoint](https://huggingface.co/bobbydeveloper2014/bybyai-spectron/blob/main/hrm-eos/finetune.nimq)
 - `download-codestral-tokenizer`: downloads only Codestral config/tokenizer
   assets into `INFER_LORA_DEFAULT_HFDIR`, useful when weights already exist.
 

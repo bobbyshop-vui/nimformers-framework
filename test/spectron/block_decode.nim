@@ -43,6 +43,7 @@ type
     locks*: int        ## Drafts locked by confidence.
     rightLocks*: int   ## Locked drafts that verification accepted.
     wrongLocks*: int   ## Locked drafts that verification replaced.
+    blockPasses*: seq[seq[int]]  ## Passes taken by every block, per row.
     seconds*: float64
 
   Prediction* = tuple[token: int, confidence, margin: float32]
@@ -53,6 +54,7 @@ type
     locked*: seq[bool]   ## Drafts kept by the confidence policy.
     previous*: seq[int]  ## Prediction of the previous pass, -1 before the first pass.
     verified*: int       ## Positions before this index equal greedy decoding.
+    passes*: int         ## Passes run on this block so far.
 
   TokenText* = proc (id: int): string
 
@@ -101,22 +103,31 @@ proc checkTau*(tau: float32) =
     raise newException(ValueError, "--tau must be in (0.5, 1]")
 
 proc applyPass*(b: var DraftBlock, predictions: openArray[Prediction], policy: BlockPolicy,
-                tau: float32, stats: var BlockDecodeStats) =
+                tau: float32, stats: var BlockDecodeStats, eos = -1) =
   ## Updates the block after one pass. `predictions[j]` must come from the inputs
   ## before position j, which include the current drafts before j.
   doAssert predictions.len == b.drafts.len and b.verified < b.drafts.len
   inc stats.rowPasses
+  inc b.passes
   # Verification: everything before e is verified, so prediction e is exact.
   var e = b.verified
   while e < b.drafts.len and b.drafts[e] == predictions[e].token:
     inc stats.accepted
     if b.locked[e]: inc stats.rightLocks
     inc e
+    if b.drafts[e - 1] == eos:
+      b.verified = e
+      b.drafts.setLen(e)
+      return
   if e < b.drafts.len:
     if b.locked[e]: inc stats.wrongLocks
     b.drafts[e] = predictions[e].token
     inc stats.written
     inc e
+    if b.drafts[e - 1] == eos:
+      b.verified = e
+      b.drafts.setLen(e)
+      return
   b.verified = e
   for i in e ..< b.drafts.len:
     let p = predictions[i]
@@ -142,25 +153,37 @@ proc greedyBlocks*(model: NimformerModelSpectron, prompts: seq[seq[int]],
   let started = getMonoTime()
   result = prompts
   margins = newSeq[seq[float32]](prompts.len)
-  for _ in 0 ..< newTokens div blockSize:
-    let prefixLen = result[0].len
+  let eos = model.eosTokenId
+  var stopped = newSeq[bool](prompts.len)
+  for blockIndex in 0 ..< newTokens div blockSize:
+    let prefixLen = prompts[0].len + blockIndex * blockSize
     let first = windowStart(prefixLen, context, blockSize)
     let base = prefixLen - first
     var generated = newSeq[seq[int]](prompts.len)
     for j in 0 ..< blockSize:
-      var windows = newSeq[seq[int]](prompts.len)
+      var windows: seq[seq[int]]
+      var activeRows: seq[int]
       for r in 0 ..< prompts.len:
-        windows[r] = result[r][first ..< prefixLen] & generated[r]
+        if stopped[r]: continue
+        activeRows.add(r)
+        var window = result[r][first ..< prefixLen] & generated[r]
         # Causal model: filler after position j does not change its logits.
-        while windows[r].len < base + blockSize: windows[r].add(windows[r][^1])
+        while window.len < base + blockSize: window.add(window[^1])
+        windows.add(move(window))
+      if activeRows.len == 0: break
       let logits = model.forwardBatch(windows, ctx)
       inc stats.forwards
-      for r in 0 ..< prompts.len:
-        let p = predict(logits, r, base - 1 + j)
+      for slot, r in activeRows:
+        let p = predict(logits, slot, base - 1 + j)
         generated[r].add(p.token)
         margins[r].add(p.margin)
+        stopped[r] = p.token == eos
         inc stats.rowPasses
         inc stats.written
+    var active = false
+    for row in generated:
+      if row.len > 0: active = true
+    if not active: break
     for r in 0 ..< prompts.len: result[r].add(generated[r])
     inc stats.blocks
   stats.seconds += float64((getMonoTime() - started).inNanoseconds) * 1e-9
@@ -184,36 +207,48 @@ proc blockDecode*(model: NimformerModelSpectron, prompts: seq[seq[int]],
   checkTau(tau)
   let started = getMonoTime()
   let rows = prompts.len
+  let eos = model.eosTokenId
+  let draftVocab = if eos >= 0: eos else: model.vocab
+  var stopped = newSeq[bool](rows)
   var rng = initRand(seed)
   result = prompts
+  stats.blockPasses.setLen(rows)
   var predictions = newSeq[Prediction](blockSize)
   for blockIndex in 0 ..< newTokens div blockSize:
-    let prefixLen = result[0].len
+    let prefixLen = prompts[0].len + blockIndex * blockSize
     let first = windowStart(prefixLen, context, blockSize)
     let base = prefixLen - first
     var blocks = newSeq[DraftBlock](rows)
+    var active = false
     for r in 0 ..< rows:
+      if stopped[r]: continue
+      active = true
       var drafts = newSeq[int](blockSize)
-      for token in drafts.mitems: token = rng.rand(model.vocab - 1)
+      for token in drafts.mitems: token = rng.rand(draftVocab - 1)
       blocks[r] = initDraftBlock(drafts)
+    if not active: break
     var pass = 0
     while true:
-      var active = false
-      for b in blocks:
-        if b.verified < blockSize: active = true
-      if not active: break
+      var windows: seq[seq[int]]
+      var activeRows: seq[int]
+      for r in 0 ..< rows:
+        if blocks[r].verified >= blocks[r].drafts.len: continue
+        activeRows.add(r)
+        windows.add(result[r][first ..< prefixLen] & blocks[r].drafts)
+      if activeRows.len == 0: break
       inc pass
-      var windows = newSeq[seq[int]](rows)
-      for r in 0 ..< rows: windows[r] = result[r][first ..< prefixLen] & blocks[r].drafts
       let logits = model.forwardBatch(windows, ctx)
       inc stats.forwards
-      for r in 0 ..< rows:
-        if blocks[r].verified == blockSize: continue
-        for j in 0 ..< blockSize: predictions[j] = predict(logits, r, base - 1 + j)
-        blocks[r].applyPass(predictions, policy, tau, stats)
+      for slot, r in activeRows:
+        for j in 0 ..< blockSize: predictions[j] = predict(logits, slot, base - 1 + j)
+        blocks[r].applyPass(predictions, policy, tau, stats, eos)
         if r == 0 and blockIndex < traceBlocks and tokenText != nil:
           echo traceLine(blockIndex, pass, blocks[r], tokenText)
-    for r in 0 ..< rows: result[r].add(blocks[r].drafts)
+    for r in 0 ..< rows:
+      if stopped[r]: continue
+      result[r].add(blocks[r].drafts)
+      stopped[r] = blocks[r].drafts[^1] == eos
+      stats.blockPasses[r].add(blocks[r].passes)
     inc stats.blocks
   stats.seconds += float64((getMonoTime() - started).inNanoseconds) * 1e-9
 
@@ -232,12 +267,14 @@ proc draftProbe*(model: NimformerModelSpectron, windows: seq[seq[int]], blockSiz
   ## that verification can accept without another pass.
   let width = windows[0].len
   let base = width - blockSize
+  let eos = model.eosTokenId
+  let draftVocab = if eos >= 0: eos else: model.vocab
   var rng = initRand(seed)
   var noisyWindows = windows
   for r in 0 ..< windows.len:
     for i in base ..< width - 1:
       if rng.rand(1.0) < float64(noise):
-        noisyWindows[r][i] = (windows[r][i] + 1 + rng.rand(model.vocab - 2)) mod model.vocab
+        noisyWindows[r][i] = (windows[r][i] + 1 + rng.rand(draftVocab - 2)) mod draftVocab
   let clean = model.forwardBatch(windows, ctx)
   let noisy = model.forwardBatch(noisyWindows, ctx)
   for r in 0 ..< windows.len:
@@ -292,10 +329,11 @@ Usage: block_decode --checkpoint=PATH [options]
 """
 
 proc printSummary(label: string, stats: BlockDecodeStats, greedy: BlockDecodeStats,
-                  rows, newTokens: int, identical: string) =
-  let perRow = float64(newTokens * rows) / float64(stats.rowPasses)
+                  rows: int, identical: string) =
+  let generated = stats.accepted + stats.written
+  let perRow = float64(generated) / float64(stats.rowPasses)
   echo &"[{label}] forwards={stats.forwards} tokens_per_forward=" &
-       &"{float64(newTokens) / float64(stats.forwards):.2f} " &
+       &"{float64(generated) / float64(rows * stats.forwards):.2f} " &
        &"row_passes={stats.rowPasses} tokens_per_row_pass={perRow:.2f} " &
        &"forward_reduction={float64(greedy.forwards) / float64(stats.forwards):.2f}x " &
        &"accepted_drafts={stats.accepted} written={stats.written} " &
@@ -343,7 +381,7 @@ when isMainModule:
   setForbidCpuFallback(true)
   let tok = loadBPE(tokenizerPath)
   let (model, step) = loadCheckpoint(checkpoint)
-  if model.vocab != tok.vocabSize:
+  if not model.matchesBpe(tok.vocabSize):
     quit("Checkpoint vocabulary differs from the tokenizer", 1)
   if probeFiles.len > 0:
     let ctx = if backendName.len > 0: newBackend(backendName) else: newBackend()
@@ -373,7 +411,7 @@ when isMainModule:
   for prompt in prompts.mitems: prompt = prompt[^keep .. ^1]
   let ctx = if backendName.len > 0: newBackend(backendName) else: newBackend()
   echo &"[block-decode] checkpoint={checkpoint} step={step} vocab={model.vocab} " &
-       &"hrm={model.hrmEnabled} experts={model.expertCount} rows={prompts.len} " &
+       &"hrm={model.hrmEnabled} experts={model.expertCount} eos={model.eosTokenId} rows={prompts.len} " &
        &"prompt_tokens={keep} new_tokens={newTokens} block={blockSize} context={context} tau={tau}"
   # Compile every window shape once so the timings measure warm kernels.
   block warmup:
@@ -387,9 +425,12 @@ when isMainModule:
   var greedyStats: BlockDecodeStats
   var margins: seq[seq[float32]]
   let greedy = model.greedyBlocks(prompts, newTokens, context, blockSize, ctx, greedyStats, margins)
-  echo &"[greedy] forwards={greedyStats.forwards} tokens_per_forward=1.00 " &
+  echo &"[greedy] forwards={greedyStats.forwards} " &
+       &"tokens_per_forward={float64(greedyStats.written) / float64(prompts.len * greedyStats.forwards):.2f} " &
        &"seconds={greedyStats.seconds:.2f}"
-  let tokenText: TokenText = proc (id: int): string = tok.decodeBPEStr(@[id])
+  let eos = model.eosTokenId
+  let tokenText: TokenText = proc (id: int): string =
+    if id == eos: "<EOS>" else: tok.decodeBPEStr(@[id])
   for policy in policies:
     var stats: BlockDecodeStats
     let decoded = model.blockDecode(prompts, newTokens, context, blockSize, policy, tau,
@@ -401,8 +442,15 @@ when isMainModule:
         inc same
       else:
         let index = at - keep
-        echo &"[{policy}] row={r} differs from greedy at new token {index}; greedy logit " &
-             &"margin there={margins[r][index]:.6f}"
-    printSummary($policy, stats, greedyStats, prompts.len, newTokens, &"{same}/{prompts.len}")
-  echo "[sample] " & tok.decodeBPEStr(greedy[0][keep .. ^1]).multiReplace(("\n", "\\n"))
+        let margin = if index in 0 ..< margins[r].len: &"{margins[r][index]:.6f}" else: "n/a"
+        echo &"[{policy}] row={r} differs from greedy at new token {index} greedy_margin={margin}"
+    printSummary($policy, stats, greedyStats, prompts.len, &"{same}/{prompts.len}")
+    for r in 0 ..< prompts.len:
+      echo &"[passes] {policy} row={r} per_block={stats.blockPasses[r]}"
+  for r in 0 ..< prompts.len:
+    echo &"[prompt] row={r} " & tok.decodeBPEStr(prompts[r]).multiReplace(("\n", "\\n"))
+    let stopped = greedy[r][^1] == eos
+    let count = greedy[r].len - keep - ord(stopped)
+    echo &"[sample] row={r} tokens={count} eos={stopped} " &
+         tok.decodeBPEStr(greedy[r][keep .. ^1]).multiReplace(("\n", "\\n"))
   closeBackend(ctx)

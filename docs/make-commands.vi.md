@@ -135,6 +135,9 @@ make build-spectron-trainer SPECTRON_TRAIN_BACKEND=vulkan
   sidecar `jamba_parallel_lora.bin.hf_tokenizer_dir` và tải checkpoint sequence
   program Math SpectronNexus vào `test/math_spectronnexus/models/sequence_program.nimq`,
   cùng checkpoint `test_nimformer` và tokenizer BPE vào `test/spectron/models/`.
+- `download-spectron-hrm-eos` cũng chạy khi dùng `download-models`. Target
+  tải checkpoint HRM-EOS vào `test/spectron/models/hrm-eos/finetune.nimq` khi
+  file này chưa có. [Checkpoint HRM-EOS](https://huggingface.co/bobbydeveloper2014/bybyai-spectron/blob/main/hrm-eos/finetune.nimq)
 - `download-codestral-tokenizer`: chỉ tải config/tokenizer Codestral vào
   `INFER_LORA_DEFAULT_HFDIR`, tiện khi đã có trọng số.
 

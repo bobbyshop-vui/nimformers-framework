@@ -69,6 +69,22 @@ proc decodeWith[P](p: P, drafts: seq[int], policy: BlockPolicy,
     b.applyPass(predictions, policy, 0.9'f32, stats)
   result.output = b.drafts
 
+block eosVerification:
+  const eos = 3
+  for policy in [bpJacobi, bpConfidence]:
+    var stats: BlockDecodeStats
+    var drafts = initDraftBlock(@[0, eos, 0, 0])
+    drafts.applyPass([prediction(1, true), prediction(eos, true), prediction(0, true),
+                      prediction(0, true)], policy, 0.9'f32, stats, eos)
+    doAssert drafts.verified == 1 and drafts.drafts.len == 4
+    drafts.applyPass([prediction(1, true), prediction(2, true), prediction(eos, true),
+                      prediction(0, true)], policy, 0.9'f32, stats, eos)
+    doAssert drafts.verified == 2 and drafts.drafts.len == 4
+    drafts.applyPass([prediction(1, true), prediction(2, true), prediction(eos, true),
+                      prediction(0, true)], policy, 0.9'f32, stats, eos)
+    doAssert drafts.verified == 3 and drafts.drafts == @[1, 2, eos]
+  echo "PASS: only verified EOS terminates a block"
+
 block blockDecodeLogic:
   # Every table, with every initial draft, must give the greedy output in at most
   # K passes; a wrong locked draft must be replaced when verification reaches it.

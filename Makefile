@@ -59,11 +59,13 @@ TEST_BIN  := test_nimformer$(EXE_EXT)
 HOOK_PLUGIN_BIN := test_hook_plugin_bin$(EXE_EXT)
 SPECTRON_BUILD_NIMCACHE := nimcache/spectron-build
 SPECTRON_PACK_BIN := $(SPECTRON_BUILD_NIMCACHE)/pack_tokens$(EXE_EXT)
+SPECTRON_BLOCK_BIN := $(SPECTRON_BUILD_NIMCACHE)/block_decode$(EXE_EXT)
 SPECTRON_DATA_REPO ?= bobbydeveloper2014/bybyai-spectron
 SPECTRON_DATA_REPO_TYPE ?= model
 SPECTRON_DATA_REVISION ?= main
 SPECTRON_DATA_SUBDIR ?= data/scale5b
 SPECTRON_DATA_DIR ?= test/spectron/data/scale5b
+SPECTRON_HRM_EOS_DIR ?= test/spectron/models/hrm-eos
 
 # ── Mamba binaries: graft / finetune (LoRA) / inference ──
 GRAFT_SRC       := test/codestral/graft_attention.nim
@@ -92,10 +94,11 @@ CLEAN_BINS      := $(TEST_BIN) $(GRAFT_BIN) $(FINETUNE_BIN) $(INFER_LORA_BIN) $(
 
 .PHONY: shaders all build run run-cpu run-metal run-vulkan run-opencl run-cuda clean \
         download download-models download-fir-models download-datasets download-codestral-tokenizer \
-        download-spectron-scale-data \
-        prepare-spectron-data prepare-spectron-scale-data build-spectron-packer \
+        download-spectron-scale-data download-spectron-hrm-eos \
+        prepare-spectron-data prepare-spectron-scale-data prepare-spectron-eos-data build-spectron-packer \
         build-graft build-finetune build-infer-lora build-compact-lora \
         build-migrate-lora build-nim-inference build-spectron build-spectron-trainer build-shared build-for-python \
+        run-spectron-block-decode \
         init-submodules \
         python-test python-example c-example bybylang-test hook-plugin-test bench-gflops \
         graft finetune-mamba finetune-codestral-vulkan finetune-codestral-metal hf-train build-hf-train infer-lora infer-mamba infer-deepseek run-spectron mamba-pipeline \
@@ -155,7 +158,7 @@ run-cuda:
 	./test/spectron/$(TEST_BIN) $(ARGS)
 
 # Download public Hugging Face assets into the paths used by inference/training.
-download-models: download-fir-models
+download-models: download-fir-models download-spectron-hrm-eos
 	@set -eu; \
 	mkdir -p test/deepseek-inference/models test/codestral/models/hf \
 	  test/mamba3/models/mamba3-siso-187m test/mamba3/models/runs/mamba3-siso-187m-gated \
@@ -192,6 +195,11 @@ download-models: download-fir-models
 	done; \
 	echo 'test/mamba3/models/mamba3-siso-1.5b' > test/mamba3/models/runs/mamba3-siso-1.5b-gated/lora-g1.bin.hf_tokenizer_dir
 
+download-spectron-hrm-eos:
+	SPECTRON_HF_REPO=bobbydeveloper2014/bybyai-spectron SPECTRON_HF_REPO_TYPE=model SPECTRON_HF_CHECKPOINT=hrm-eos/finetune.nimq \
+	  $(PYTHON) -B test/spectron/hf_checkpoint_sync.py --restore "$(SPECTRON_HRM_EOS_DIR)/finetune.nimq"
+	@test -s "$(SPECTRON_HRM_EOS_DIR)/finetune.nimq"
+
 # FIR models used by formers-cli (weights, tokenizer and model.fir in each folder).
 # Needs the Hugging Face CLI: pip install -U huggingface_hub
 FIR_MODEL_REPOS := forge-500m-chat forge-500m-chat-fir gpt2-125m huihui-moe-fir
@@ -214,6 +222,9 @@ prepare-spectron-data: build-spectron-packer
 
 prepare-spectron-scale-data: build-spectron-packer
 	$(PYTHON) -B test/spectron/prepare_scale_data.py --packer "$(SPECTRON_PACK_BIN)" $(ARGS)
+
+prepare-spectron-eos-data: build-spectron-packer
+	$(PYTHON) -B test/spectron/prepare_eos_data.py --packer "$(SPECTRON_PACK_BIN)" $(ARGS)
 
 download-spectron-scale-data:
 	$(PYTHON) -B test/spectron/download_scale_data.py --repo "$(SPECTRON_DATA_REPO)" --repo-type "$(SPECTRON_DATA_REPO_TYPE)" --revision "$(SPECTRON_DATA_REVISION)" --subdir "$(SPECTRON_DATA_SUBDIR)" --output "$(SPECTRON_DATA_DIR)"
@@ -338,6 +349,10 @@ build-nim-inference:
 build-spectron:
 	$(NIM) check $(NIMFLAGS) $(SPECTRON_SRC)
 	$(NIM) c $(NIMFLAGS) -o:$(SPECTRON_BIN) $(SPECTRON_SRC)
+
+run-spectron-block-decode:
+	$(NIM) c $(NIMFLAGS) --nimcache:$(SPECTRON_BUILD_NIMCACHE)/block -o:$(SPECTRON_BLOCK_BIN) test/spectron/block_decode.nim
+	$(SPECTRON_BLOCK_BIN) $(ARGS)
 
 # Build test/spectron/test_nimformer for one GPU backend without running it (Colab uses vulkan).
 SPECTRON_TRAIN_BACKEND ?= vulkan

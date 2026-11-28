@@ -180,6 +180,26 @@ khi resume vì chúng chỉ đổi lượng tính toán. `--hrm-l-layers` phải
 checkpoint. Checkpoint lưu khi chưa bật HRM không thể thêm HRM lúc resume;
 hãy tạo `--checkpoint` mới kèm `--init-checkpoint`.
 
+### Học token dừng
+
+`make download-spectron-hrm-eos` lấy checkpoint khởi đầu ở bước 1353 vào
+`test/spectron/models/hrm-eos/finetune.nimq`. Checkpoint có trọng số, Adam
+và ID EOS để train tiếp. [Checkpoint trên Hugging Face](https://huggingface.co/bobbydeveloper2014/bybyai-spectron/blob/main/hrm-eos/finetune.nimq)
+
+`make prepare-spectron-eos-data` đóng gói câu trả lời từ Dolly và file Python
+hoàn chỉnh từ CodeParrot, giữ ranh giới của từng mẫu. Với
+`--eos-data=test/spectron/data/scale5b/eos`, trainer dành một phần tư batch
+cho các cửa sổ sạch đi qua những ranh giới đó. EOS có ID 756, nằm ngoài
+756 ID BPE. Trọng số loss mặc định của mỗi nhãn EOS là 8. Điều chỉnh bằng
+`--eos-rows` và `--eos-weight`.
+
+`--resume-from=PATH` dùng trọng số, Adam và số bước từ checkpoint packed
+khi file `--checkpoint` chưa tồn tại. Các lượt sau resume từ file đích.
+Lần đầu bật EOS mở rộng embedding và lớp chiếu đầu ra thêm một ID.
+Log `[eos-val]` đo số lần chọn EOS đúng ranh giới, số lần chọn sớm và xác
+suất trung bình tại ranh giới. Chat dừng ở EOS. Giải mã theo block dừng
+khi EOS đã được xác minh trong từng dòng.
+
 ### Giải mã song song theo block
 
 `test/spectron/block_decode.nim` giải mã một lúc một block gồm K vị trí. Mỗi
@@ -240,7 +260,10 @@ Các dòng `[trace]` in từng lượt của prompt đầu tiên: token đã ki�
 nguyên, token nháp đã khoá nằm trong `{ngoặc nhọn}`, các token nháp khác bắt
 đầu bằng `?`. Dòng tổng kết đếm số lượt forward, số lượt cho mỗi prompt, số
 token nháp được chấp nhận (token nháp đã đúng sẵn khi bước kiểm chứng đi tới),
-số lần khoá đúng và khoá sai, và so mọi đầu ra với greedy.
+số lần khoá đúng và khoá sai, và so mọi đầu ra với greedy. Mỗi dòng
+`[passes]` liệt kê số lượt mà từng block của một prompt cần. Các dòng
+`[prompt]` và `[sample]` in từng prompt, đã cắt như trên, cùng phần greedy
+sinh tiếp.
 
 Khi nhiều prompt chung một batch, mỗi lượt phải chờ prompt chậm nhất, nên
 `forwards` chỉ giảm dưới K mỗi block khi mọi prompt trong batch đều xong block

@@ -1,6 +1,7 @@
 ## Encode UTF-8 documents arriving on stdin with the Spectron tokenizer.
 ## Each input record has a little-endian uint32 byte count followed by the text.
-## Stdout is a little-endian bit stream. The legacy default is 16 bits per ID.
+## Stdout is a little-endian bit stream. With --records each document has a
+## uint32 token count and its own byte-aligned payload.
 import std/[os, strutils, tables]
 import test_nimformer
 
@@ -29,14 +30,16 @@ proc encodeInto(tok: BPETokenizer, cache: var seq[CachedPiece],
     ids.add(cache[slot].ids)
 
 proc main() =
-  if paramCount() notin 2 .. 3:
-    quit("usage: pack_tokens TOKENIZER.json TOKEN_COUNT|all [BITS_PER_TOKEN]", 1)
+  if paramCount() notin 2 .. 4 or (paramCount() == 4 and paramStr(4) != "--records"):
+    quit("usage: pack_tokens TOKENIZER.json TOKEN_COUNT|all [BITS_PER_TOKEN [--records]]", 1)
   let tok = loadBPE(paramStr(1))
   let unlimited = paramStr(2) == "all"
   let quota = if unlimited: int64.high else: parseBiggestInt(paramStr(2))
-  let bits = if paramCount() == 3: parseInt(paramStr(3)) else: 16
+  let bits = if paramCount() >= 3: parseInt(paramStr(3)) else: 16
+  let records = paramCount() == 4
   if bits notin 8 .. 16 or tok.vocabSize notin 256 .. (1 shl bits) or quota <= 0:
     quit("Invalid token count or bits per token for this vocabulary", 1)
+  if records and not unlimited: quit("Record packing requires all documents", 1)
   for byte in 0 .. 255:
     if tok.byteEncoder[byte] notin tok.vocab:
       quit("Tokenizer is missing a base byte", 1)
@@ -64,6 +67,11 @@ proc main() =
       quit("Truncated document", 1)
     tok.encodeInto(cache, text, ids)
     let count = int(min(quota - written, int64(ids.len)))
+    if records:
+      var prefix: array[4, uint8]
+      for i in 0 ..< prefix.len: prefix[i] = uint8((count shr (8 * i)) and 255)
+      if stdout.writeBuffer(addr prefix[0], prefix.len) != prefix.len:
+        quit("Failed to write document token count", 1)
     if bits == 16:
       when cpuEndian == bigEndian:
         for i in 0 ..< count:
@@ -83,13 +91,19 @@ proc main() =
           bitBuffer = bitBuffer shr 8
       if position > 0 and stdout.writeBuffer(addr bytes[0], position) != position:
         quit("Failed to write token stream", 1)
+      if records and heldBits > 0:
+        var lastByte = uint8(bitBuffer)
+        if stdout.writeBuffer(addr lastByte, 1) != 1:
+          quit("Failed to end packed document", 1)
+        bitBuffer = 0
+        heldBits = 0
     written += count
   if heldBits > 0:
     var lastByte = uint8(bitBuffer)
     if stdout.writeBuffer(addr lastByte, 1) != 1:
       quit("Failed to write the final token byte", 1)
   stdout.flushFile()
-  if unlimited or paramCount() == 3:
+  if unlimited or paramCount() >= 3:
     stderr.writeLine(written)
 
 main()

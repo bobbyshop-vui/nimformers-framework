@@ -17,6 +17,7 @@ const
 Usage: test_nimformer --dataset=DIR [options]
   --checkpoint=PATH        Resume or save packed training (default finetune_packed.nimq,
                            or moe/finetune.nimq with --moe-experts/--merge-experts)
+  --resume-from=PATH      Use a packed checkpoint if the output does not exist yet
   --init-checkpoint=PATH   Start a new run with existing Spectron weights
   --init-tokenizer=PATH    Tokenizer for the initial weights (default Spectron BPE)
   --backend=metal         Use the specified backend (default from build)
@@ -39,19 +40,22 @@ Usage: test_nimformer --dataset=DIR [options]
   --draft-block=16        Train for parallel block decoding: in each block of this many
   --draft-noise=0.5       inputs, the first stays clean and each later input is replaced
                           by another token with a per-block rate drawn from U(0, noise)
+  --eos-data=DIR          Mix complete-document endings into batches and learn EOS
+  --eos-rows=N            Clean ending examples per batch (default one quarter)
+  --eos-weight=8         Weight assigned to true EOS targets
   --seed=1234
 """
 
 type
   PackedTrainingOptions = object
     dataset, checkpoint, initialWeights, initialTokenizer, backendName: string
-    donor, checkpointHook, tensorCoreMode: string
+    donor, checkpointHook, tensorCoreMode, resumeFrom, eosData: string
     steps, batch, context, warmup, decaySteps, curriculumSteps, seed: int
     evalEvery, evalBatches, logEvery, saveEvery, requantizeEvery: int
     experts, moeHidden, moeHeads, moeLayers, expertWidth, expertDepth: int
     hrmCycles, hrmLSteps, hrmLLayers, hrmSegments: int
-    draftBlock: int
-    lr, gradClip, beta2, draftNoise: float32
+    draftBlock, eosRows: int
+    lr, gradClip, beta2, draftNoise, eosWeight: float32
     lrSet, beta2Set: bool
 
   PackedOptimizer = object
@@ -76,6 +80,8 @@ type
     bits, vocab: int
     legacy: bool
 
+include eos_training
+
 proc packedOptions(): PackedTrainingOptions =
   result = PackedTrainingOptions(
     initialTokenizer: BPE_TOKENIZER_PATH, backendName: backend.backend,
@@ -83,7 +89,7 @@ proc packedOptions(): PackedTrainingOptions =
     warmup: 150, decaySteps: 500_000, curriculumSteps: 4000, seed: 1234,
     beta2: 0.98, gradClip: 1, evalEvery: 500, evalBatches: 8,
     logEvery: CFG_LOG_EVERY, saveEvery: 500, moeHidden: 512, moeHeads: 8, moeLayers: 4,
-    expertWidth: 7312, expertDepth: 4, draftNoise: 0.5)
+    expertWidth: 7312, expertDepth: 4, draftNoise: 0.5, eosWeight: 8)
   for kind, key, val in getopt():
     if key == "help" and kind == cmdLongOption:
       echo PackedUsage
@@ -93,6 +99,7 @@ proc packedOptions(): PackedTrainingOptions =
     case key
     of "dataset": result.dataset = val
     of "checkpoint": result.checkpoint = val
+    of "resume-from": result.resumeFrom = val
     of "checkpoint-hook": result.checkpointHook = val
     of "init-checkpoint": result.initialWeights = val
     of "init-tokenizer": result.initialTokenizer = val
@@ -109,6 +116,9 @@ proc packedOptions(): PackedTrainingOptions =
     of "hrm-segments": result.hrmSegments = parseInt(val)
     of "draft-block": result.draftBlock = parseInt(val)
     of "draft-noise": result.draftNoise = float32(parseFloat(val))
+    of "eos-data": result.eosData = val
+    of "eos-rows": result.eosRows = parseInt(val)
+    of "eos-weight": result.eosWeight = float32(parseFloat(val))
     of "backend": result.backendName = val
     of "tensor-cores":
       if val notin ["require", "off"]:
@@ -136,6 +146,8 @@ proc packedOptions(): PackedTrainingOptions =
     else: raise newException(ValueError, "Unknown option --" & key)
   if result.dataset.len == 0:
     raise newException(ValueError, "--dataset=DIR is required for packed training")
+  if result.resumeFrom.len > 0 and result.initialWeights.len > 0:
+    raise newException(ValueError, "Choose either --resume-from or --init-checkpoint")
   if result.checkpointHook.len > 0:
     result.checkpointHook = absolutePath(result.checkpointHook)
     if not fileExists(result.checkpointHook):
@@ -157,6 +169,9 @@ proc packedOptions(): PackedTrainingOptions =
     raise newException(ValueError, "--draft-block must be 0 (off) or between 2 and --seq")
   if not finite32(result.draftNoise) or result.draftNoise < 0 or result.draftNoise > 1:
     raise newException(ValueError, "--draft-noise must be in [0, 1]")
+  if result.eosRows < 0 or result.eosRows > result.batch or not finite32(result.eosWeight) or
+      result.eosWeight < 1:
+    raise newException(ValueError, "Invalid EOS row count or loss weight")
   if result.warmup < 0 or result.curriculumSteps < 0 or result.requantizeEvery < 0 or
       result.warmup >= result.decaySteps or
       result.lr.classify notin {fcNormal, fcSubnormal} or result.lr <= 0 or
@@ -447,9 +462,11 @@ proc loadDonorExperts(path, tokenizerHash: string, model: NimformerModelSpectron
     if name.startsWith(marker):
       matchesTokenizer = true
       break
-  if not matchesTokenizer or arch[0] != model.vocab or arch[1] != model.embed.dim:
+  if not matchesTokenizer or arch[1] != model.embed.dim:
     raise newException(ValueError, "Expert donor checkpoint uses a different tokenizer or hidden size")
   let donor = stateDictToModel(sd, arch[0], arch[1], arch[2], arch[3], arch[4])
+  if not donor.matchesBpe(model.vocab - ord(model.hasEos)):
+    raise newException(ValueError, "Expert donor uses a different tokenizer vocabulary")
   if donor.mixture.experts.len == 0 or donor.mixture.width != model.mixture.width or
       donor.mixture.depth != model.mixture.depth:
     raise newException(ValueError, "Expert donor checkpoint uses a different expert layout")
@@ -474,10 +491,11 @@ proc trainPacked() =
       let status = process.waitForExit()
       if status != 0:
         raise newException(IOError, &"Checkpoint hook exited with status {status} at step {step}")
-  if fileExists(options.checkpoint):
+  let resume = if fileExists(options.checkpoint): options.checkpoint else: options.resumeFrom
+  if resume.len > 0:
     if options.initialWeights.len != 0:
       raise newException(ValueError, "--init-checkpoint requires a new --checkpoint path")
-    (model, adam, optimizer, progress, start) = resumePacked(options.checkpoint, corpus.tokenizerHash)
+    (model, adam, optimizer, progress, start) = resumePacked(resume, corpus.tokenizerHash)
     if options.beta2Set and options.beta2 != optimizer.beta2:
       raise newException(ValueError,
         "Resuming Adam requires its saved beta2. Use --init-checkpoint to start a new optimizer.")
@@ -499,8 +517,18 @@ proc trainPacked() =
     if options.experts > 0 and model.mixture.experts.len == 0:
       model.mixture = newMixture(model.embed.dim, options.experts, options.expertWidth, options.expertDepth)
     adam = newModelAdamState(model)
-  if model.vocab != corpus.vocab or not model.useFinalNorm:
+  if not model.matchesBpe(corpus.vocab) or not model.useFinalNorm:
     raise newException(ValueError, "Incompatible Spectron training checkpoint")
+  let eosPath = if options.eosData.len > 0: options.eosData
+                elif model.hasEos: options.dataset / "eos" else: ""
+  var eosCorpus: EosCorpus
+  var eosRows = 0
+  if eosPath.len > 0:
+    eosCorpus = loadEosCorpus(eosPath, corpus)
+    if not model.hasEos: extendWithEos(model, adam)
+    eosRows = if options.eosRows > 0: options.eosRows else: max(1, options.batch div 4)
+    echo &"[eos] token_id={model.eosTokenId} clean_rows={eosRows}/{options.batch} " &
+         &"target_weight={options.eosWeight} data={eosPath}"
   let hrmRequested = options.hrmCycles > 0 or options.hrmLSteps > 0 or
                      options.hrmLLayers > 0 or options.hrmSegments > 0
   if hrmRequested:
@@ -592,6 +620,7 @@ proc trainPacked() =
     echo &"[val] step={step} epoch={progress.tokens div tokensPerEpoch} " &
          &"code_loss={codeLoss:.4f} english_loss={englishLoss:.4f} " &
          &"ppl={exp((codeLoss + englishLoss) / 2.0):.2f}" & estimate
+    if eosRows > 0: evalEos(model, eosCorpus, options, step, ctx)
 
   evaluate(start)
   discard ctx.takeTrainingGemmStats()
@@ -601,6 +630,7 @@ proc trainPacked() =
   var routes = newSeq[int64](model.mixture.experts.len)
   var updates, clipped = 0
   var draftReplaced, draftInputs = 0
+  var eosTargets = 0
   if options.draftBlock > 0:
     echo &"[draft] block={options.draftBlock} noise={options.draftNoise}: per-block replacement " &
          &"rate ~ U(0, {options.draftNoise}), first input of each block kept clean"
@@ -609,10 +639,16 @@ proc trainPacked() =
     var stats: SpectronTrainingStep
     var lr: float32
     var stepReplaced = 0
+    var stepEos = 0
     for attempt in 0 .. PackedRetryLimit:
       var rng = initRand(options.seed.int64 xor (step.int64 shl 1) xor (attempt.int64 shl 48))
       stepReplaced = 0
+      stepEos = 0
       for row in 0 ..< options.batch:
+        if row < eosRows:
+          let domain = PackedDomain((row + step) mod 2)
+          stepEos += eosCorpus.train[domain].eosWindow(options.context, rng, ids[row], targets[row])
+          continue
         let stream =
           if not corpus.legacy: corpus.sampleShard(corpus.training, tokensPerEpoch, rng)
           elif (row + step) mod 2 == 0: options.codeLevel(step, rng)
@@ -626,7 +662,7 @@ proc trainPacked() =
         raise newException(ValueError, "Packed learning rate rounded to zero")
       try:
         stats = checkedTrainStep(model, adam, ids, targets, ctx, lr, optimizer.beta2,
-                                 options.gradClip, options.requantizeEvery)
+                                 options.gradClip, options.requantizeEvery, options.eosWeight)
         break
       except SpectronNumericalError as error:
         if attempt == PackedRetryLimit or lr * 0.5'f32 == 0:
@@ -643,7 +679,8 @@ proc trainPacked() =
     seconds += float64((getMonoTime() - before).inNanoseconds) * 1e-9
     if options.draftBlock > 0:
       draftReplaced += stepReplaced
-      draftInputs += options.batch * options.context
+      draftInputs += (options.batch - eosRows) * options.context
+    eosTargets += stepEos
     lossSum += float64(stats.loss)
     balanceSum += stats.balanceLoss
     for i, count in stats.routes:
@@ -675,6 +712,9 @@ proc trainPacked() =
              &"({100.0 * float64(draftReplaced) / float64(draftInputs):.2f}%)"
         draftReplaced = 0
         draftInputs = 0
+      if eosRows > 0:
+        echo &"[eos] step={step} targets={eosTargets} in {updates} updates"
+        eosTargets = 0
       lossSum = 0.0
       seconds = 0.0
       peakGradNorm = 0.0

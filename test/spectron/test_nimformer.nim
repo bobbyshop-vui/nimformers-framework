@@ -1241,6 +1241,7 @@ type
     useFinalNorm*: bool
     outProj*: Linear
     vocab*: int
+    hasEos: bool
     mixture: SpectronMixture
     hrm*: HrmConfig
     hrmNormL*, hrmNormH*, hrmNormX*: LayerNorm
@@ -1252,6 +1253,12 @@ type
 proc hrmEnabled*(m: NimformerModelSpectron): bool {.inline.} = m.hrm.cycles > 0
 
 proc expertCount*(m: NimformerModelSpectron): int {.inline.} = m.mixture.experts.len
+
+proc eosTokenId*(m: NimformerModelSpectron): int {.inline.} =
+  if m.hasEos: m.vocab - 1 else: -1
+
+proc matchesBpe*(m: NimformerModelSpectron, vocab: int): bool {.inline.} =
+  m.vocab == vocab + ord(m.hasEos)
 
 proc validateHrm*(m: NimformerModelSpectron) =
   if not m.hrmEnabled: return
@@ -1587,6 +1594,7 @@ proc newModelAdamState*(m: NimformerModelSpectron): ModelAdamState =
 const
   MoeLayoutKey = "__moe_layout"
   HrmLayoutKey = "__hrm_layout"   # [lLayers, cycles, lSteps, segments]
+  EosTokenKey = "__eos_token"
 
 proc modelToStateDict(m: NimformerModelSpectron): seq[(string, QuantTensor)] =
   result = @[]
@@ -1595,6 +1603,8 @@ proc modelToStateDict(m: NimformerModelSpectron): seq[(string, QuantTensor)] =
   add("embed.weight", m.embed.weight)
   add("outProj.weight", m.outProj.weight)
   add("outProj.bias", m.outProj.bias)
+  if m.hasEos:
+    result.add((EosTokenKey, quantizeTensor(@[float32(m.eosTokenId)], @[1], qkFp32Raw)))
   if m.useFinalNorm:
     add("finalNorm.gamma", m.finalNorm.gamma)
     add("finalNorm.beta", m.finalNorm.beta)
@@ -1654,6 +1664,11 @@ proc stateDictToModel(sd: seq[(string, QuantTensor)],
   restore("embed.weight", result.embed.weight)
   restore("outProj.weight", result.outProj.weight)
   restore("outProj.bias", result.outProj.bias)
+  if EosTokenKey in lookup:
+    let marker = dequantizeTensor(lookup[EosTokenKey])
+    if marker.len != 1 or vocab < 2 or marker[0] != float32(vocab - 1):
+      raise newException(ValueError, "Invalid Spectron EOS token in checkpoint")
+    result.hasEos = true
   # Old checkpoints have no final norm. Preserve their inference exactly;
   # the training entry point explicitly enables it when resuming those files.
   let hasNormG = "finalNorm.gamma" in lookup
@@ -1941,18 +1956,41 @@ proc accumulate(total: var SpectronGrads, grads: SpectronGrads) =
 
 proc checkedTrainStep(m: var NimformerModelSpectron, adam: var ModelAdamState,
                       idsBatch, targetsBatch: seq[seq[int]], ctx: Backend,
-                      lr, beta2, maxGradNorm: float32, requantizeEvery: int): SpectronTrainingStep =
+                      lr, beta2, maxGradNorm: float32, requantizeEvery: int,
+                      eosWeight = 1'f32): SpectronTrainingStep =
   # HRM deep supervision: every segment is supervised from the previous
   # segment's detached state. Segment gradients are averaged into one update
   # so the optimizer step count stays equal to the training step.
   let segments = if m.hrmEnabled: m.hrm.segments else: 1
+  let eos = m.eosTokenId
+  var eosOffsets: seq[int]
+  if eos >= 0 and eosWeight > 1:
+    let context = idsBatch[0].len
+    for row, targets in targetsBatch:
+      for position, target in targets:
+        if target == eos: eosOffsets.add((row * context + position) * m.vocab)
   var carry: HrmCarry
   var grads: SpectronGrads
   var lossSum = 0.0
   for _ in 0 ..< segments:
     let cache = m.forwardForBackward(idsBatch, ctx, carry)
-    var ce = checkedCrossEntropy(m.outProj.forward(cache.headInput, ctx), targetsBatch, ctx)
+    let logits = m.outProj.forward(cache.headInput, ctx)
+    var ce = checkedCrossEntropy(logits, targetsBatch, ctx)
     if ce.nValid == 0: return
+    if eosOffsets.len > 0:
+      var eosLoss = 0.0
+      for offset in eosOffsets:
+        var peak = float64(logits.data[offset])
+        for id in 1 ..< m.vocab: peak = max(peak, float64(logits.data[offset + id]))
+        var total = 0.0
+        for id in 0 ..< m.vocab: total += exp(float64(logits.data[offset + id]) - peak)
+        eosLoss += peak - float64(logits.data[offset + eos]) + ln(total)
+      let weightedCount = float64(ce.nValid) + (float64(eosWeight) - 1) * float64(eosOffsets.len)
+      let scale = float32(float64(ce.nValid) / weightedCount)
+      ce.loss = float32((float64(ce.loss) * float64(ce.nValid) + (float64(eosWeight) - 1) * eosLoss) / weightedCount)
+      for value in ce.dLogits.data.mitems: value *= scale
+      for offset in eosOffsets:
+        for id in 0 ..< m.vocab: ce.dLogits.data[offset + id] *= eosWeight
     if segments > 1:
       let scale = 1'f32 / float32(segments)
       for value in ce.dLogits.data.mitems: value *= scale
@@ -2024,6 +2062,7 @@ proc generate*(m: NimformerModelSpectron, promptIds: seq[int], maxNewTokens: int
         int(beArgmaxIndexGpu(ctx, lastLogits, 1, V, 1).idx[0])   # greedy on the GPU
       else: sampleFromLogits(lastLogits, temperature, rng)
     result.add(nextId)
+    if nextId == m.eosTokenId: break
 
 # ═══════════════════════════════════════════════════════════════
 # DEMO: train on Dolly + Python code JSONL (byte-level tokenizer)

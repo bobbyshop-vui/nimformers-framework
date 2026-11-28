@@ -58,7 +58,8 @@ proc generateWithHistory(
     let lastLogits = logits.data[(T - 1) * V ..< T * V]
     let nextId = sampleFromLogits(lastLogits, temperature, rng)
     result.add(nextId)
-    if nextId == 0:  # EOS token
+    let eos = model.eosTokenId
+    if nextId == (if eos >= 0: eos else: 0):
       break
 
 # =============================================================================
@@ -94,7 +95,7 @@ when isMainModule:
 
   echo "Loading model from checkpoint: ", checkpointPath
   let (model, step) = test_nimformer.loadCheckpoint(checkpointPath)
-  if model.vocab != tok.vocabSize:
+  if not model.matchesBpe(tok.vocabSize):
     quit("Checkpoint vocabulary size differs from the tokenizer", 1)
   echo "Model loaded (trained for ", step, " steps)"
   echo ""
