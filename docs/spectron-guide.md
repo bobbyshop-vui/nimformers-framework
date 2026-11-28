@@ -224,7 +224,7 @@ and the log prints `[hrm] off`. To add HRM, start a new `--checkpoint` with
 `make download-spectron-hrm-eos` restores
 `test/spectron/models/hrm-eos/finetune.nimq` when the file is missing. It is
 the MoE upcycled from the dense step-2900 checkpoint, with the weights, Adam
-state, HRM layout and EOS ID for resuming training. [Hugging Face checkpoint](https://huggingface.co/bobbydeveloper2014/bybyai-spectron/blob/main/hrm-eos/finetune.nimq)
+state, HRM layout and EOS ID for resuming training. [Hugging Face checkpoint](https://huggingface.co/bobbydeveloper2014/bybyai-spectron/blob/main/finetune.nimq)
 
 `make prepare-spectron-eos-data` packs complete Dolly answers and Python
 files from CodeParrot with their original record boundaries. With

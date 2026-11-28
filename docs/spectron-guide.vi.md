@@ -215,7 +215,7 @@ Nó train tiếp không có HRM và log in `[hrm] off`. Muốn thêm HRM, hãy t
 
 `make download-spectron-hrm-eos` lấy `test/spectron/models/hrm-eos/finetune.nimq`
 khi file chưa có. Đây là bản MoE upcycle từ checkpoint dense ở bước 2900, gồm
-trọng số, Adam, bố cục HRM và ID EOS để train tiếp. [Checkpoint trên Hugging Face](https://huggingface.co/bobbydeveloper2014/bybyai-spectron/blob/main/hrm-eos/finetune.nimq)
+trọng số, Adam, bố cục HRM và ID EOS để train tiếp. [Checkpoint trên Hugging Face](https://huggingface.co/bobbydeveloper2014/bybyai-spectron/blob/main/finetune.nimq)
 
 `make prepare-spectron-eos-data` đóng gói câu trả lời từ Dolly và file Python
 hoàn chỉnh từ CodeParrot, giữ ranh giới của từng mẫu. Với

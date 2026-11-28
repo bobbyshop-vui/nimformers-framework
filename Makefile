@@ -201,7 +201,7 @@ download-spectron-hrm-eos:
 	@if [ -s "$(SPECTRON_MODELS_DIR)/hrm-eos/finetune.nimq" ]; then \
 	  echo "Using local $(SPECTRON_MODELS_DIR)/hrm-eos/finetune.nimq"; \
 	else \
-	  hf download $(SPECTRON_DATA_REPO) hrm-eos/finetune.nimq --local-dir "$(SPECTRON_MODELS_DIR)"; \
+	  hf download $(SPECTRON_DATA_REPO) finetune.nimq --local-dir "$(SPECTRON_MODELS_DIR)/hrm-eos"; \
 	fi
 	@test -s "$(SPECTRON_MODELS_DIR)/hrm-eos/finetune.nimq"
 
