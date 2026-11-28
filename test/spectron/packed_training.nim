@@ -1,5 +1,5 @@
 ## CLI for the mmap-backed training path in test_nimformer.
-import std/[md5, monotimes, osproc, parseopt, tempfiles, times]
+import std/[md5, monotimes, osproc, parseopt, strtabs, tempfiles, terminal, times]
 import mapped_weights
 
 const
@@ -32,6 +32,13 @@ Usage: test_nimformer --dataset=DIR [options]
   --grad-clip=1.0 --requantize-every=0
   --eval-every=500 --eval-batches=8 --log-every=100 --checkpoint-every=500
   --checkpoint-hook=PATH  Run this executable with the saved path and step
+  --hf-repo=REPO --hf-path=PATH
+                          Hugging Face mode: upload every saved checkpoint to this model
+                          repo path with `hf upload` while training continues; a save made
+                          during an upload goes next and older pending saves are skipped
+  --hf-token-file=PATH    Write token for Hugging Face mode (default
+                          ~/.env_spectron_token_huggingface); asked for and saved there
+                          with mode 600 when missing
   --tensor-cores=require  Verify Vulkan cooperative FP16/FP32 GEMM before training
   --moe-experts=2         Create or grow to this total number of experts
   --moe-hidden=512 --moe-heads=8 --moe-layers=4
@@ -56,6 +63,7 @@ type
   PackedTrainingOptions = object
     dataset, checkpoint, initialWeights, initialTokenizer, backendName: string
     donor, checkpointHook, tensorCoreMode, resumeFrom, eosData: string
+    hfRepo, hfPath, hfTokenFile: string
     steps, batch, context, warmup, decaySteps, curriculumSteps, seed: int
     evalEvery, evalBatches, logEvery, saveEvery, requantizeEvery: int
     experts, moeHidden, moeHeads, moeLayers, expertWidth, expertDepth: int
@@ -107,6 +115,9 @@ proc packedOptions(): PackedTrainingOptions =
     of "checkpoint": result.checkpoint = val
     of "resume-from": result.resumeFrom = val
     of "checkpoint-hook": result.checkpointHook = val
+    of "hf-repo": result.hfRepo = val
+    of "hf-path": result.hfPath = val
+    of "hf-token-file": result.hfTokenFile = val
     of "init-checkpoint": result.initialWeights = val
     of "init-tokenizer": result.initialTokenizer = val
     of "moe-experts": result.experts = parseInt(val)
@@ -162,6 +173,12 @@ proc packedOptions(): PackedTrainingOptions =
     result.checkpointHook = absolutePath(result.checkpointHook)
     if not fileExists(result.checkpointHook):
       raise newException(ValueError, "Checkpoint hook does not exist: " & result.checkpointHook)
+  if (result.hfRepo.len > 0) != (result.hfPath.len > 0):
+    raise newException(ValueError, "--hf-repo and --hf-path must be given together")
+  if result.hfTokenFile.len == 0:
+    result.hfTokenFile = getHomeDir() / ".env_spectron_token_huggingface"
+  if result.hfRepo.len > 0 and findExe("hf").len == 0:
+    raise newException(ValueError, "Hugging Face mode needs the hf CLI: pip install -U huggingface_hub")
   if result.checkpoint.len == 0:
     result.checkpoint = if result.experts > 0 or result.donor.len > 0:
                           "test/spectron/models/moe/finetune.nimq"
@@ -486,8 +503,54 @@ proc loadDonorExperts(path, tokenizerHash: string, model: NimformerModelSpectron
     raise newException(ValueError, "Expert donor checkpoint uses a different expert layout")
   result = donor.mixture.experts
 
+proc huggingFaceToken(path: string): string =
+  ## Reads the write token from `path`, or asks for it and saves it there.
+  if fileExists(path): result = readFile(path).strip()
+  if result.len > 0: return
+  if not stdin.isatty:
+    raise newException(ValueError, "No Hugging Face token in " & path)
+  result = readPasswordFromStdin("Hugging Face write token (hidden): ").strip()
+  if result.len == 0:
+    raise newException(ValueError, "No Hugging Face token entered")
+  if path.parentDir.len > 0: createDir(path.parentDir)
+  writeFile(path, result & "\n")
+  setFilePermissions(path, {fpUserRead, fpUserWrite})
+  echo "[hf] Saved the token to ", path
+
 proc trainPacked() =
   let options = packedOptions()
+  # Hugging Face mode: the token only reaches the `hf upload` child process.
+  var hfEnv: StringTableRef
+  var uploader: Process
+  var pendingUpload = -1
+  let snapshot = options.checkpoint & ".uploading"
+  if options.hfRepo.len > 0:
+    hfEnv = newStringTable(modeCaseSensitive)
+    for key, value in envPairs(): hfEnv[key] = value
+    hfEnv["HF_TOKEN"] = huggingFaceToken(options.hfTokenFile)
+    echo &"[hf] Uploading saves to {options.hfRepo}/{options.hfPath}"
+  proc startUpload(step: int) =
+    removeFile(snapshot)
+    # The trainer replaces the checkpoint by rename, so the link stays a stable snapshot.
+    try: createHardlink(options.checkpoint, snapshot)
+    except OSError: copyFile(options.checkpoint, snapshot)
+    uploader = startProcess("hf", args = ["upload", options.hfRepo, snapshot, options.hfPath,
+      "--quiet", "--commit-message", &"Spectron checkpoint at step {step}"],
+      env = hfEnv, options = {poUsePath, poParentStreams})
+    echo &"[hf] Upload of step {step} started"
+  proc pollUpload(wait = false) =
+    if uploader != nil:
+      let code = if wait: uploader.waitForExit() else: uploader.peekExitCode()
+      if code != -1:
+        echo &"[hf] Upload finished with exit code {code}"
+        uploader.close()
+        uploader = nil
+        removeFile(snapshot)
+    if uploader == nil and pendingUpload >= 0:
+      startUpload(pendingUpload)
+      pendingUpload = -1
+  defer:
+    while uploader != nil or pendingUpload >= 0: pollUpload(wait = true)
   let corpus = openCorpus(options.dataset, options.context)
   randomize(options.seed)
   var model: NimformerModelSpectron
@@ -498,6 +561,9 @@ proc trainPacked() =
   proc saveProgress(step: int) =
     savePacked(options.checkpoint, model, adam, optimizer, progress, step, corpus.tokenizerHash)
     echo &"[packed] Saved {options.checkpoint} at step {step}"
+    if hfEnv != nil:
+      pendingUpload = step  # An older pending save is skipped.
+      pollUpload()
     if options.checkpointHook.len > 0:
       let process = startProcess(options.checkpointHook,
         args = [absolutePath(options.checkpoint), $step], options = {poParentStreams})
@@ -657,6 +723,7 @@ proc trainPacked() =
     echo &"[draft] block={options.draftBlock} noise={options.draftNoise}: per-block replacement " &
          &"rate ~ U(0, {options.draftNoise}), first input of each block kept clean"
   for step in start + 1 .. finalStep:
+    if hfEnv != nil: pollUpload()
     let before = getMonoTime()
     var stats: SpectronTrainingStep
     var lr: float32

@@ -99,25 +99,25 @@ make build-spectron-trainer SPECTRON_TRAIN_BACKEND=vulkan
   --batch=64 --seq=128 --steps=6000 --tensor-cores=require
 ```
 
-`--checkpoint-hook=PATH` chạy một file thực thi sau mỗi lần lưu, với đường
-dẫn checkpoint và số bước. `test/spectron/hf_checkpoint_sync.py` upload lên
-Hugging Face Hub ở chế độ nền nên train vẫn chạy trong lúc upload. Nếu có bản
-lưu mới trong lúc đang upload, hook chỉ giữ bản mới nhất cho lần upload kế
-tiếp. Script đọc `HF_TOKEN` và upload lên `SPECTRON_HF_REPO` (mặc định
-`bobbydeveloper2014/bybyai-spectron`) tại `SPECTRON_HF_CHECKPOINT` (mặc định
-`moe/finetune.nimq`).
+Chế độ Hugging Face upload mỗi checkpoint đã lưu bằng CLI `hf` trong khi vẫn
+train. `--hf-repo=REPO --hf-path=PATH` chọn model repo và đường dẫn trong repo.
+Nếu có bản lưu mới trong lúc đang upload, bản đó được upload kế tiếp và các
+bản chờ cũ hơn bị bỏ. Trước khi thoát, trainer chờ lượt upload cuối xong.
+Token có quyền ghi được đọc từ `--hf-token-file` (mặc định
+`~/.env_spectron_token_huggingface`). Nếu chưa có file, trainer hỏi token với
+ô nhập bị che rồi lưu vào đó với quyền 600. Token chỉ được truyền cho tiến
+trình `hf upload`.
 
 ```sh
-export HF_TOKEN=...   # token có quyền ghi
-python3 test/spectron/hf_checkpoint_sync.py --restore test/spectron/models/moe/finetune.nimq
+pip install -U huggingface_hub
+hf download bobbydeveloper2014/bybyai-spectron moe/finetune.nimq --local-dir test/spectron/models
 ./test/spectron/test_nimformer --dataset=test/spectron/data/scale5b --moe-experts=2 \
   --batch=64 --steps=6000 --tensor-cores=require --checkpoint-every=20 \
-  --checkpoint-hook=test/spectron/hf_checkpoint_sync.py
-python3 test/spectron/hf_checkpoint_sync.py --wait test/spectron/models/moe/finetune.nimq
+  --hf-repo=bobbydeveloper2014/bybyai-spectron --hf-path=moe/finetune.nimq
 ```
 
-`--restore` chỉ tải checkpoint từ Hub khi chưa có file cục bộ. `--wait` trả
-về khi lượt upload cuối trong hàng đợi đã xong.
+`--checkpoint-hook=PATH` vẫn chạy một file thực thi sau mỗi lần lưu, với
+đường dẫn checkpoint và số bước.
 
 ### Train trên Colab T4
 
@@ -130,8 +130,10 @@ Lượt train dùng `--tensor-cores=require` và lõi HRM (`HRM_CYCLES = 2`,
 `HRM_L_STEPS = 2`, `HRM_SEGMENTS = 2` trong cell cấu hình), lưu và upload
 mỗi 20 bước. Bước đo batch cũng chạy với cùng cấu hình HRM. Khi
 Colab ngắt kết nối, chạy lại notebook để train tiếp từ checkpoint và trạng
-thái Adam đã upload gần nhất. Trước khi chạy, thêm token Hugging Face có
-quyền ghi vào Colab Secrets với tên `HF_TOKEN`.
+thái Adam đã upload gần nhất. Cell cấu hình mount Google Drive và giữ token
+có quyền ghi trong `MyDrive/.env_spectron_token_huggingface`; nếu chưa có
+file, cell hỏi token một lần. Cell train chạy trainer ở chế độ Hugging Face
+với file đó làm `--hf-token-file`.
 
 ### Lõi HRM
 

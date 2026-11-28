@@ -104,25 +104,25 @@ make build-spectron-trainer SPECTRON_TRAIN_BACKEND=vulkan
   --batch=64 --seq=128 --steps=6000 --tensor-cores=require
 ```
 
-`--checkpoint-hook=PATH` runs an executable after every save with the
-checkpoint path and step. `test/spectron/hf_checkpoint_sync.py` uploads to
-the Hugging Face Hub in the background, so training continues during the
-upload. When a newer save arrives during an upload, the hook keeps only the
-newest snapshot for the next upload. It reads `HF_TOKEN` and uploads to
-`SPECTRON_HF_REPO` (default `bobbydeveloper2014/bybyai-spectron`) at
-`SPECTRON_HF_CHECKPOINT` (default `moe/finetune.nimq`).
+Hugging Face mode uploads every saved checkpoint with the `hf` CLI while
+training continues. `--hf-repo=REPO --hf-path=PATH` names the model repo and
+the path inside it. When a newer save arrives during an upload, it goes next
+and older pending saves are skipped. Before exiting, the trainer waits for the
+last upload. The write token is read from `--hf-token-file` (default
+`~/.env_spectron_token_huggingface`). When the file is missing, the trainer
+asks for the token with hidden input and saves it there with mode 600. The
+token is passed only to the `hf upload` process.
 
 ```sh
-export HF_TOKEN=...   # a write token
-python3 test/spectron/hf_checkpoint_sync.py --restore test/spectron/models/moe/finetune.nimq
+pip install -U huggingface_hub
+hf download bobbydeveloper2014/bybyai-spectron moe/finetune.nimq --local-dir test/spectron/models
 ./test/spectron/test_nimformer --dataset=test/spectron/data/scale5b --moe-experts=2 \
   --batch=64 --steps=6000 --tensor-cores=require --checkpoint-every=20 \
-  --checkpoint-hook=test/spectron/hf_checkpoint_sync.py
-python3 test/spectron/hf_checkpoint_sync.py --wait test/spectron/models/moe/finetune.nimq
+  --hf-repo=bobbydeveloper2014/bybyai-spectron --hf-path=moe/finetune.nimq
 ```
 
-`--restore` downloads the Hub checkpoint only when the local file is missing.
-`--wait` returns after the last queued upload has finished.
+`--checkpoint-hook=PATH` also runs an executable after every save with the
+checkpoint path and step.
 
 ### Train on Colab T4
 
@@ -135,8 +135,10 @@ memory. Training uses `--tensor-cores=require` and the HRM core
 (`HRM_CYCLES = 2`, `HRM_L_STEPS = 2`, `HRM_SEGMENTS = 2` in the settings
 cell), and saves and uploads every 20 steps. The batch probe runs with the
 same HRM settings. After a disconnect, run the notebook again to continue from the
-last uploaded checkpoint and Adam state. Add a Hugging Face write token named
-`HF_TOKEN` to Colab Secrets before running it.
+last uploaded checkpoint and Adam state. The settings cell mounts Google
+Drive and keeps the write token in `MyDrive/.env_spectron_token_huggingface`;
+it asks for the token once when the file is missing. The training cell runs
+the trainer in Hugging Face mode with that file as `--hf-token-file`.
 
 ### HRM core
 
