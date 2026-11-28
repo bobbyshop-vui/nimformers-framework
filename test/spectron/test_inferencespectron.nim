@@ -137,11 +137,12 @@ when isMainModule:
     quit(1)
 
   echo "Loading model from checkpoint: ", checkpointPath
-  let (model, step) = test_nimformer.loadCheckpoint(checkpointPath)
+  var (model, step) = test_nimformer.loadCheckpoint(checkpointPath)
   if not model.matchesBpe(tok.vocabSize):
     quit("Checkpoint vocabulary size differs from the tokenizer", 1)
   echo "Model loaded (trained for ", step, " steps, hrm=", model.hrmEnabled,
-       ", eos=", model.eosTokenId, ")"
+       ", experts=", model.expertCount, ", eos=", model.eosTokenId, ")"
+  if model.blockExpertCount > 0: model.startRouteTally()
   if temperature > 0'f32:
     echo "Generation: sampling at temperature ", temperature
   else:
@@ -192,6 +193,15 @@ when isMainModule:
       echo "[block] tokens=", responseOnlyIds.len, " passes=", stats.rowPasses,
            " tokens_per_pass=",
            formatFloat(float64(responseOnlyIds.len) / float64(stats.rowPasses), ffDecimal, 2)
+    if model.routeTally != nil:
+      # Rows each block's router sent to each expert for this reply, over every
+      # forward pass and every HRM pass of the block.
+      for i in 0 ..< model.routeTally[].len:
+        template tally: untyped = model.routeTally[][i]
+        let total = sum(tally.tokens)
+        echo "[moe] block=", i, " expert_tokens=", tally.tokens, " chosen_p=",
+             formatFloat(tally.chosenProbability / float64(max(total, 1'i64)), ffDecimal, 4)
+        tally = BlockRouteTally()
     echo ""
 
     conversationHistory = responseIds

@@ -40,7 +40,9 @@ Usage: test_nimformer --dataset=DIR [options]
                           ~/.env_spectron_token_huggingface); asked for and saved there
                           with mode 600 when missing
   --tensor-cores=require  Verify Vulkan cooperative FP16/FP32 GEMM before training
-  --moe-experts=2         Create or grow to this total number of experts
+  --moe-experts=2         Create or grow to this total number of experts. With
+                          --init-checkpoint on dense weights, every block's trained
+                          feed-forward becomes this many experts (sparse upcycling)
   --moe-hidden=512 --moe-heads=8 --moe-layers=4
   --expert-width=7312 --expert-depth=4
   --merge-experts=PATH    Append experts from a compatible packed MoE checkpoint
@@ -371,6 +373,12 @@ template visitAdam(adam, globalStep, expertSteps, paramName, state, stateStep, b
       for j in 0 ..< adam.mixture.experts[i].layers.len:
         for fieldName, field in fieldPairs(adam.mixture.experts[i].layers[j]):
           visit(expertLayerKey(i, j) & fieldName, field, expertSteps[i])
+  for i in 0 ..< adam.blockMoe.len:
+    visit("block" & $i & ".moe.routerW", adam.blockMoe[i].routerW, globalStep)
+    visit("block" & $i & ".moe.routerB", adam.blockMoe[i].routerB, globalStep)
+    for e in 0 ..< adam.blockMoe[i].experts.len:
+      for fieldName, field in fieldPairs(adam.blockMoe[i].experts[e]):
+        visit("block" & $i & ".moe.ff" & $(e + 1) & "." & fieldName, field, globalStep)
 
 proc savePacked(path: string, model: NimformerModelSpectron, adam: ModelAdamState,
                 optimizer: PackedOptimizer, progress: PackedProgress, step: int, tokenizerHash: string) =
@@ -594,8 +602,15 @@ proc trainPacked() =
     else:
       model = newNimformerModelSpectron(corpus.vocab, CFG_EMBED_DIM, CFG_N_HEADS,
                                        CFG_N_LAYERS, CFG_FF_MULT)
-    if options.experts > 0 and model.mixture.experts.len == 0:
-      model.mixture = newMixture(model.embed.dim, options.experts, options.expertWidth, options.expertDepth)
+    if options.experts > 0 and model.expertCount == 0:
+      if options.initialWeights.len > 0:
+        # Sparse upcycling: every block's trained feed-forward becomes the experts, so
+        # the MoE model starts with exactly the outputs of the dense weights.
+        model.upcycleExperts(options.experts)
+        echo &"[moe] Upcycled the feed-forward of every block into {options.experts} experts " &
+             &"copied from {options.initialWeights}"
+      else:
+        model.mixture = newMixture(model.embed.dim, options.experts, options.expertWidth, options.expertDepth)
     adam = newModelAdamState(model)
   if not model.matchesBpe(corpus.vocab) or not model.useFinalNorm:
     raise newException(ValueError, "Incompatible Spectron training checkpoint")
@@ -644,10 +659,13 @@ proc trainPacked() =
          &"l_steps={h.lSteps} segments={h.segments} " &
          &"block_passes_per_segment={h.cycles * (h.lSteps * h.lLayers + model.blocks.len - h.lLayers)} " &
          "gradient=one-step"
-  let existingExperts = model.mixture.experts.len
+  let existingExperts = model.expertCount
   if options.experts > 0 and options.experts != existingExperts:
     if existingExperts == 0:
-      raise newException(ValueError, "Use --init-checkpoint with a new output path to attach experts to dense weights")
+      raise newException(ValueError, "Use --init-checkpoint with a new output path to turn dense weights into experts")
+    if model.blockExpertCount > 0:
+      raise newException(ValueError,
+        &"--moe-experts={options.experts} differs from the {existingExperts} experts in every block of this checkpoint")
     if options.experts < existingExperts:
       raise newException(ValueError, "--moe-experts is smaller than the checkpoint's expert count")
     var extra: seq[SpectronExpert]
@@ -663,6 +681,12 @@ proc trainPacked() =
   if model.mixture.experts.len > 0:
     let params = expertParameterCount(model.embed.dim, model.mixture.width, model.mixture.depth)
     echo &"[moe] experts={model.mixture.experts.len} parameters_per_expert={params} routing=top1"
+  elif model.blockExpertCount > 0:
+    let ff = model.blocks[0].ff
+    let params = ff.fc1.weight.data.len + ff.fc1.bias.data.len + ff.fc2.weight.data.len +
+                 ff.fc2.bias.data.len
+    echo &"[moe] experts={model.blockExpertCount} in each of {model.blocks.len} blocks " &
+         &"parameters_per_expert={params} routing=top1"
   if int64(options.batch) > int64.high div int64(options.context):
     raise newException(ValueError, "Packed batch token count is too large")
   let tokensPerStep = int64(options.batch) * int64(options.context)
@@ -715,7 +739,7 @@ proc trainPacked() =
   var ids = newSeq[seq[int]](options.batch)
   var targets = newSeq[seq[int]](options.batch)
   var lossSum, seconds, peakGradNorm, balanceSum = 0.0
-  var routes = newSeq[int64](model.mixture.experts.len)
+  var routes = newSeq[int64](model.expertCount)
   var updates, clipped = 0
   var draftReplaced, draftInputs = 0
   var eosTargets = 0

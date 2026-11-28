@@ -1080,6 +1080,13 @@ proc backwardMamba2*(m: Mamba2SSD, x: Tensor, dOut: Tensor, ctx: Backend): tuple
 # SPECTRON BLOCK: LinearPlusAttention + Mamba2SSD, GATED FUSION
 # ═══════════════════════════════════════════════════════════════
 
+type SpectronNumericalError* = object of CatchableError
+
+func finite32(value: float32): bool {.inline.} =
+  (cast[uint32](value) and 0x7f800000'u32) != 0x7f800000'u32
+
+include spectron_moe
+
 type
   TransformerBlockSpectron* = object
     attn*: LinearPlusAttention
@@ -1087,6 +1094,10 @@ type
     fuseGate*: Linear
     ff*: FeedForward
     ln1*, ln2*: LayerNorm
+    # Upcycled feed-forward: the router picks `ff` (expert 0) or one of
+    # `extraExperts` (experts 1..N-1) for each row. Both are empty in a dense block.
+    router*: Linear
+    extraExperts*: seq[FeedForward]
 
 proc newTransformerBlockSpectron*(embedDim, nHeads, ffMult: int, useSession: bool): TransformerBlockSpectron =
   result.attn = newLinearPlusAttention(embedDim, nHeads, useSession)
@@ -1130,6 +1141,11 @@ proc gateMix(ctx: Backend; gate: seq[float32]; a, b: Tensor): Tensor =
 type
   SpectronBlockForward = object
     x, x1, attnOut, mambaOut, fuseIn, gate, x2, x3: Tensor
+    # Upcycled blocks: rows sent to each expert, router softmax per row, and the
+    # selected expert's output per row.
+    routes: seq[seq[int]]
+    probabilities: seq[float32]
+    ffOut: Tensor
   SpectronBlockGrads = tuple[
     dX: Tensor,
     dAttnQkvW, dAttnQkvB, dAttnOutW, dAttnOutB: Tensor,
@@ -1150,20 +1166,142 @@ proc blockForward(blk: TransformerBlockSpectron, x: Tensor, ctx: Backend): Spect
   result.x2 = addT(ctx, x, combined)
   result.x3 = blk.ln2.forward(result.x2, ctx)
 
-proc blockOutput(blk: TransformerBlockSpectron, activations: SpectronBlockForward,
+proc expertCount*(blk: TransformerBlockSpectron): int {.inline.} =
+  ## Experts in the block's feed-forward, or 0 for a dense block.
+  if blk.extraExperts.len > 0: blk.extraExperts.len + 1 else: 0
+
+proc upcycleFeedForward*(blk: var TransformerBlockSpectron, count: int) =
+  ## Sparse upcycling: the trained feed-forward becomes `count` experts that all
+  ## start as exact copies of it, plus a new router. Each row passes through one
+  ## expert with weight 1, so the block still computes what the dense block did.
+  if count < 2 or blk.extraExperts.len > 0:
+    raise newException(ValueError, "Upcycling needs at least 2 experts and a dense block")
+  blk.router = newRouter(blk.ff.fc1.inF, count)
+  blk.extraExperts = newSeq[FeedForward](count - 1)
+  for expert in blk.extraExperts.mitems: expert = blk.ff
+
+proc routeRows(blk: TransformerBlockSpectron, a: var SpectronBlockForward, ctx: Backend) =
+  ## Top-1 routing of every feed-forward input row; the softmax is kept for backward.
+  let (rows, _) = flatten2D(a.x3.shape)
+  let n = blk.expertCount
+  let scores = blk.router.forward(a.x3, ctx)
+  a.probabilities = newSeq[float32](rows * n)
+  a.routes = newSeq[seq[int]](n)
+  for row in 0 ..< rows:
+    let offset = row * n
+    var winner = 0
+    for i in 0 ..< n:
+      let score = scores.data[offset + i]
+      if not finite32(score):
+        raise newException(SpectronNumericalError, "Non-finite Spectron block router logit")
+      if score > scores.data[offset + winner]: winner = i
+    let peak = float64(scores.data[offset + winner])
+    var total = 0.0
+    for i in 0 ..< n:
+      let value = exp(float64(scores.data[offset + i]) - peak)
+      a.probabilities[offset + i] = float32(value)
+      total += value
+    for i in 0 ..< n:
+      a.probabilities[offset + i] *= float32(1.0 / total)
+    a.routes[winner].add(row)
+
+proc routedFeedForward(blk: TransformerBlockSpectron, a: var SpectronBlockForward,
+                       ctx: Backend): Tensor =
+  ## Adds the selected expert's output with weight 1. The router still learns from
+  ## the softmax probability of its choice, as in Switch Transformer (straight-through).
+  blk.routeRows(a, ctx)
+  let dim = a.x3.shape[^1]
+  result = newTensor(a.x3.shape)
+  for e, rows in a.routes:
+    if rows.len == 0: continue
+    let input = gatherExpertRows(a.x3, rows, dim, ctx)
+    let output = if e == 0: blk.ff.forward(input, ctx)
+                 else: blk.extraExperts[e - 1].forward(input, ctx)
+    for j, row in rows:
+      copyMem(addr result.data[row * dim], unsafeAddr output.data[j * dim], dim * sizeof(float32))
+  a.ffOut = result
+
+proc blockOutput(blk: TransformerBlockSpectron, activations: var SpectronBlockForward,
                  ctx: Backend): Tensor =
-  addT(ctx, activations.x2, blk.ff.forward(activations.x3, ctx))
+  let ffOut = if blk.extraExperts.len > 0: blk.routedFeedForward(activations, ctx)
+              else: blk.ff.forward(activations.x3, ctx)
+  addT(ctx, activations.x2, ffOut)
 
 proc forward*(blk: TransformerBlockSpectron, x: Tensor, ctx: Backend): Tensor =
-  blk.blockOutput(blk.blockForward(x, ctx), ctx)
+  var activations = blk.blockForward(x, ctx)
+  blk.blockOutput(activations, ctx)
+
+type
+  ExpertFeedForwardGrad = tuple[dFf1W, dFf1B, dFf2W, dFf2B: Tensor]
+  BlockMoeGrad = object
+    ## Router and experts 1..N-1 of one upcycled block; expert 0 uses the dense slots.
+    routerW, routerB: Tensor
+    experts: seq[ExpertFeedForwardGrad]
+    routes: seq[int]
+    balanceLoss: float64
+
+proc routedFeedForwardBackward(blk: TransformerBlockSpectron, cache: SpectronBlockForward,
+                               dOut: Tensor, ctx: Backend, grads: var BlockMoeGrad):
+    tuple[dX, dFc1W, dFc1B, dFc2W, dFc2B: Tensor] =
+  ## Returns the input gradient and expert 0's gradients. The router and the other
+  ## experts go into `grads`; the router gradient follows backwardMixture.
+  let (rows, dim) = flatten2D(cache.x3.shape)
+  let n = blk.expertCount
+  let balanceScale = MoeBalanceWeight * float64(n) / float64(rows)
+  var fractions = newSeq[float64](n)
+  grads.routes = newSeq[int](n)
+  for i, group in cache.routes:
+    grads.routes[i] = group.len
+    fractions[i] = float64(group.len) / float64(rows)
+  grads.experts = newSeq[ExpertFeedForwardGrad](n - 1)
+  var dX = newTensor(cache.x3.shape)
+  var dScores = newTensor(@[rows, n])
+  for e in 0 ..< n:
+    let group = cache.routes[e]
+    var expertGrads: ExpertFeedForwardGrad
+    if group.len == 0:
+      expertGrads = (newTensor(blk.ff.fc1.weight.shape), newTensor(blk.ff.fc1.bias.shape),
+                     newTensor(blk.ff.fc2.weight.shape), newTensor(blk.ff.fc2.bias.shape))
+    else:
+      let input = gatherExpertRows(cache.x3, group, dim, ctx)
+      let dy = gatherExpertRows(dOut, group, dim, ctx)
+      let d = if e == 0: blk.ff.backward(input, dy, ctx)
+              else: blk.extraExperts[e - 1].backward(input, dy, ctx)
+      expertGrads = (d.dFc1W, d.dFc1B, d.dFc2W, d.dFc2B)
+      for j, row in group:
+        copyMem(addr dX.data[row * dim], unsafeAddr d.dX.data[j * dim], dim * sizeof(float32))
+        let offset = row * n
+        let weight = float64(cache.probabilities[offset + e])
+        var gateDerivative, expectedFraction = 0.0
+        for c in 0 ..< dim:
+          gateDerivative += float64(dOut.data[row * dim + c]) * float64(cache.ffOut.data[row * dim + c])
+        for k in 0 ..< n:
+          expectedFraction += fractions[k] * float64(cache.probabilities[offset + k])
+        grads.balanceLoss += balanceScale * expectedFraction
+        for k in 0 ..< n:
+          let selected = if k == e: 1.0 else: 0.0
+          dScores.data[offset + k] = float32(float64(cache.probabilities[offset + k]) * (
+            gateDerivative * (selected - weight) + balanceScale * (fractions[k] - expectedFraction)))
+    if e == 0:
+      result.dFc1W = expertGrads.dFf1W
+      result.dFc1B = expertGrads.dFf1B
+      result.dFc2W = expertGrads.dFf2W
+      result.dFc2B = expertGrads.dFf2B
+    else:
+      grads.experts[e - 1] = expertGrads
+  let router = blk.router.backward(cache.x3, dScores, ctx)
+  grads.routerW = router.dW
+  grads.routerB = router.dB
+  result.dX = addT(ctx, dX, router.dX)
 
 proc blockBackward(blk: TransformerBlockSpectron, cache: SpectronBlockForward,
-                   dOut: Tensor, ctx: Backend): SpectronBlockGrads =
+                   dOut: Tensor, ctx: Backend, moe: var BlockMoeGrad): SpectronBlockGrads =
   let C = cache.x.shape[2]
   let gate = cache.gate.data
 
   # ---- backward FF + LN2 ----
-  let dFF = blk.ff.backward(cache.x3, dOut, ctx)
+  let dFF = if blk.extraExperts.len > 0: blk.routedFeedForwardBackward(cache, dOut, ctx, moe)
+            else: blk.ff.backward(cache.x3, dOut, ctx)
   let dLN2 = blk.ln2.backward(cache.x2, dFF.dX, ctx)
   let dX2 = addT(ctx, dLN2.dX, dOut)   # residual x2 = x + combined
 
@@ -1203,18 +1341,14 @@ proc blockBackward(blk: TransformerBlockSpectron, cache: SpectronBlockForward,
 
 proc backward*(blk: TransformerBlockSpectron, x: Tensor, dOut: Tensor,
                ctx: Backend): SpectronBlockGrads =
-  blk.blockBackward(blk.blockForward(x, ctx), dOut, ctx)
+  var activations = blk.blockForward(x, ctx)
+  if blk.extraExperts.len > 0: discard blk.blockOutput(activations, ctx)  # routes the rows
+  var moe: BlockMoeGrad
+  blk.blockBackward(activations, dOut, ctx, moe)
 
 # ═══════════════════════════════════════════════════════════════
 # NIMFORMER MODEL VỚI SPECTRON BLOCKS (embed -> N blocks -> lm head)
 # ═══════════════════════════════════════════════════════════════
-
-type SpectronNumericalError* = object of CatchableError
-
-func finite32(value: float32): bool {.inline.} =
-  (cast[uint32](value) and 0x7f800000'u32) != 0x7f800000'u32
-
-include spectron_moe
 
 type
   HrmConfig* = object
@@ -1234,6 +1368,11 @@ type
     ## detached state (deep supervision). cycles == 0 disables HRM.
     lLayers*, cycles*, lSteps*, segments*: int
 
+  BlockRouteTally* = object
+    ## Expert choices of one upcycled block, counted over forward passes.
+    tokens*: seq[int64]           # rows the router sent to each expert
+    chosenProbability*: float64   # sum of the router probability of every choice
+
   NimformerModelSpectron* = object
     embed*: Embedding
     blocks*: seq[TransformerBlockSpectron]
@@ -1245,6 +1384,7 @@ type
     mixture: SpectronMixture
     hrm*: HrmConfig
     hrmNormL*, hrmNormH*, hrmNormX*: LayerNorm
+    routeTally*: ref seq[BlockRouteTally]  # per-block expert counts; nil does not count
 
   HrmCarry = object
     ## Recurrent HRM state between segments; empty tensors mean zero state.
@@ -1252,7 +1392,31 @@ type
 
 proc hrmEnabled*(m: NimformerModelSpectron): bool {.inline.} = m.hrm.cycles > 0
 
-proc expertCount*(m: NimformerModelSpectron): int {.inline.} = m.mixture.experts.len
+proc blockExpertCount*(m: NimformerModelSpectron): int {.inline.} =
+  ## Experts per block of an upcycled model, or 0.
+  if m.blocks.len > 0: m.blocks[0].expertCount else: 0
+
+proc expertCount*(m: NimformerModelSpectron): int {.inline.} =
+  if m.mixture.experts.len > 0: m.mixture.experts.len else: m.blockExpertCount
+
+proc upcycleExperts*(m: var NimformerModelSpectron, count: int) =
+  ## Turns every block's trained feed-forward into `count` experts copied from it.
+  for blk in m.blocks.mitems: blk.upcycleFeedForward(count)
+
+proc startRouteTally*(m: var NimformerModelSpectron) =
+  ## Counts, in every later forward pass, the rows each upcycled block's router
+  ## sends to each expert and the router probability of each choice.
+  m.routeTally = new(seq[BlockRouteTally])
+  m.routeTally[].setLen(m.blocks.len)
+
+proc tallyRoutes(m: NimformerModelSpectron, index: int, a: SpectronBlockForward) =
+  if m.routeTally == nil or a.routes.len == 0: return
+  template tally: untyped = m.routeTally[][index]
+  let n = a.routes.len
+  if tally.tokens.len != n: tally.tokens = newSeq[int64](n)
+  for e, rows in a.routes:
+    tally.tokens[e] += rows.len
+    for row in rows: tally.chosenProbability += float64(a.probabilities[row * n + e])
 
 proc eosTokenId*(m: NimformerModelSpectron): int {.inline.} =
   if m.hasEos: m.vocab - 1 else: -1
@@ -1286,10 +1450,13 @@ proc runHrmLevel(m: NimformerModelSpectron, first, last: int, input: Tensor, ctx
   result = input
   for i in first ..< last:
     if cache == nil:
-      result = m.blocks[i].forward(result, ctx)
+      var activations = m.blocks[i].blockForward(result, ctx)
+      result = m.blocks[i].blockOutput(activations, ctx)
+      m.tallyRoutes(i, activations)
     else:
       cache[][i] = m.blocks[i].blockForward(result, ctx)
       result = m.blocks[i].blockOutput(cache[][i], ctx)
+      m.tallyRoutes(i, cache[][i])
 
 proc hrmSegment(m: NimformerModelSpectron, embedded: Tensor, carry: var HrmCarry,
                 ctx: Backend, cache: ptr seq[SpectronBlockForward] = nil,
@@ -1337,8 +1504,10 @@ proc forwardBatch*(m: NimformerModelSpectron, idsBatch: seq[seq[int]], ctx: Back
       m.hrmSegment(injected, carry, ctx)
     x = carry.zH
   else:
-    for blk in m.blocks:
-      x = blk.forward(x, ctx)
+    for i, blk in m.blocks:
+      var activations = blk.blockForward(x, ctx)
+      x = blk.blockOutput(activations, ctx)
+      m.tallyRoutes(i, activations)
   if m.mixture.experts.len > 0:
     x = m.mixture.forwardMixture(x, ctx, false).output
   if m.useFinalNorm:
@@ -1366,6 +1535,7 @@ type
     dEmbed*: Tensor
     dHrmNormLG*, dHrmNormLB*, dHrmNormHG*, dHrmNormHB*, dHrmNormXG*, dHrmNormXB*: Tensor
     mixture: MixtureGrad
+    dBlockMoe: seq[BlockMoeGrad]
 
 type SpectronForward = object
   blocks: seq[SpectronBlockForward]
@@ -1391,6 +1561,7 @@ proc forwardForBackward(m: NimformerModelSpectron, idsBatch: seq[seq[int]],
     for i, blk in m.blocks:
       result.blocks[i] = blk.blockForward(x, ctx)
       x = blk.blockOutput(result.blocks[i], ctx)
+      m.tallyRoutes(i, result.blocks[i])
   if m.mixture.experts.len > 0:
     result.mixture = m.mixture.forwardMixture(x, ctx, true)
     x = result.mixture.output
@@ -1420,10 +1591,14 @@ proc backwardCached(m: NimformerModelSpectron, idsBatch: seq[seq[int]], dLoss: T
     dOut = result.mixture.dx
 
   result.dBlocks = newSeq[typeof(result.dBlocks[0])](m.blocks.len)
+  if m.blockExpertCount > 0: result.dBlockMoe = newSeq[BlockMoeGrad](m.blocks.len)
   proc blocksBackward(m: NimformerModelSpectron, first, last: int, dOut: var Tensor,
                       grads: var SpectronGrads) =
     for i in countdown(last - 1, first):
-      let dBlk = m.blocks[i].blockBackward(cache.blocks[i], dOut, ctx)
+      var dense: BlockMoeGrad
+      let dBlk = if grads.dBlockMoe.len > 0:
+                   m.blocks[i].blockBackward(cache.blocks[i], dOut, ctx, grads.dBlockMoe[i])
+                 else: m.blocks[i].blockBackward(cache.blocks[i], dOut, ctx, dense)
       dOut = dBlk.dX
       grads.dBlocks[i] = (
         dBlk.dAttnQkvW, dBlk.dAttnQkvB, dBlk.dAttnOutW, dBlk.dAttnOutB,
@@ -1533,6 +1708,11 @@ proc softmaxCrossEntropy*(logits: Tensor, targets: seq[seq[int]], ctx: Backend):
 # ADAM STATE FOR THE WHOLE MODEL + 1 train() STEP
 # ═══════════════════════════════════════════════════════════════
 type
+  BlockMoeAdam = object
+    ## Adam state of one upcycled block's router and experts 1..N-1.
+    routerW, routerB: ApfAdamState
+    experts: seq[tuple[ff1W, ff1B, ff2W, ff2B: ApfAdamState]]
+
   ModelAdamState* = object
     outProjW*, outProjB*: ApfAdamState
     finalNormG*, finalNormB*: ApfAdamState
@@ -1545,6 +1725,7 @@ type
     embed*: ApfAdamState
     hrmNormLG*, hrmNormLB*, hrmNormHG*, hrmNormHB*, hrmNormXG*, hrmNormXB*: ApfAdamState
     mixture: MixtureAdam
+    blockMoe: seq[BlockMoeAdam]
 
 proc newModelAdamState*(m: NimformerModelSpectron): ModelAdamState =
   result.outProjW = newApfAdamState(m.outProj.weight.data.len)
@@ -1560,6 +1741,15 @@ proc newModelAdamState*(m: NimformerModelSpectron): ModelAdamState =
   result.hrmNormXB = newApfAdamState(m.hrmNormX.beta.data.len)
   if m.mixture.experts.len > 0:
     result.mixture = newMixtureAdam(m.mixture)
+  if m.blockExpertCount > 0:
+    result.blockMoe = newSeq[BlockMoeAdam](m.blocks.len)
+    for i, blk in m.blocks:
+      result.blockMoe[i].routerW = newApfAdamState(blk.router.weight.data.len)
+      result.blockMoe[i].routerB = newApfAdamState(blk.router.bias.data.len)
+      for expert in blk.extraExperts:
+        result.blockMoe[i].experts.add((newApfAdamState(expert.fc1.weight.data.len),
+          newApfAdamState(expert.fc1.bias.data.len), newApfAdamState(expert.fc2.weight.data.len),
+          newApfAdamState(expert.fc2.bias.data.len)))
   result.blocks = newSeq[typeof(result.blocks[0])](m.blocks.len)
   for i, blk in m.blocks:
     result.blocks[i] = (
@@ -1593,6 +1783,7 @@ proc newModelAdamState*(m: NimformerModelSpectron): ModelAdamState =
 
 const
   MoeLayoutKey = "__moe_layout"
+  BlockMoeLayoutKey = "__block_moe_layout"   # [experts per block] of an upcycled model
   HrmLayoutKey = "__hrm_layout"   # [lLayers, cycles, lSteps, segments]
   EosTokenKey = "__eos_token"
 
@@ -1628,6 +1819,18 @@ proc modelToStateDict(m: NimformerModelSpectron): seq[(string, QuantTensor)] =
     add(p & "ln1.beta", blk.ln1.beta)
     add(p & "ln2.gamma", blk.ln2.gamma)
     add(p & "ln2.beta", blk.ln2.beta)
+  if m.blockExpertCount > 0:
+    result.add((BlockMoeLayoutKey, quantizeTensor(@[float32(m.blockExpertCount)], @[1], qkFp32Raw)))
+    for i, blk in m.blocks:
+      let p = &"block{i}."
+      add(p & "router.weight", blk.router.weight)
+      add(p & "router.bias", blk.router.bias)
+      for e, expert in blk.extraExperts:
+        let q = p & &"ff{e + 1}."
+        add(q & "fc1.weight", expert.fc1.weight)
+        add(q & "fc1.bias", expert.fc1.bias)
+        add(q & "fc2.weight", expert.fc2.weight)
+        add(q & "fc2.bias", expert.fc2.bias)
   if m.hrmEnabled:
     let h = m.hrm
     let layout = [float32(h.lLayers), float32(h.cycles), float32(h.lSteps), float32(h.segments)]
@@ -1699,6 +1902,36 @@ proc stateDictToModel(sd: seq[(string, QuantTensor)],
     restore(p & "ln1.beta", result.blocks[i].ln1.beta)
     restore(p & "ln2.gamma", result.blocks[i].ln2.gamma)
     restore(p & "ln2.beta", result.blocks[i].ln2.beta)
+  if BlockMoeLayoutKey in lookup:
+    let layout = dequantizeTensor(lookup[BlockMoeLayoutKey])
+    if layout.len != 1 or not finite32(layout[0]) or layout[0] < 2 or layout[0] > 65_536'f32 or
+        floor(layout[0]) != layout[0]:
+      raise newException(ValueError, "Invalid Spectron block expert count")
+    let count = int(layout[0])
+    proc restoreExpert(name: string, value: var Tensor) =
+      if name notin lookup or lookup[name].shape != value.shape:
+        raise newException(ValueError, "Missing or incorrectly shaped Spectron tensor " & name)
+      let data = dequantizeTensor(lookup[name])
+      let size = if value.shape.len == 1: value.shape[0] else: value.shape[0] * value.shape[1]
+      if data.len != size:
+        raise newException(ValueError, "Invalid Spectron tensor length for " & name)
+      value.data = data
+    for i in 0 ..< result.blocks.len:
+      let p = &"block{i}."
+      let hidden = result.blocks[i].ff.fc1.outF
+      result.blocks[i].router = newLinear(embedDim, count, false)
+      restoreExpert(p & "router.weight", result.blocks[i].router.weight)
+      restoreExpert(p & "router.bias", result.blocks[i].router.bias)
+      result.blocks[i].extraExperts = newSeq[FeedForward](count - 1)
+      for e in 0 ..< count - 1:
+        let q = p & &"ff{e + 1}."
+        template expert: untyped = result.blocks[i].extraExperts[e]
+        expert = FeedForward(fc1: newLinear(embedDim, hidden, false),
+                             fc2: newLinear(hidden, embedDim, false))
+        restoreExpert(q & "fc1.weight", expert.fc1.weight)
+        restoreExpert(q & "fc1.bias", expert.fc1.bias)
+        restoreExpert(q & "fc2.weight", expert.fc2.weight)
+        restoreExpert(q & "fc2.bias", expert.fc2.bias)
   if HrmLayoutKey in lookup:
     let layout = dequantizeTensor(lookup[HrmLayoutKey])
     if layout.len != 4:
@@ -1792,6 +2025,13 @@ proc checkAndClipGradients(grads: var SpectronGrads, limit: float32): float64 =
     for layers in grads.mixture.expertLayers.mitems:
       for layer in layers.mitems:
         for value in fields(layer):
+          let gradient {.inject.} = addr value
+          body
+    for moe in grads.dBlockMoe.mitems:
+      for gradient {.inject.} in [addr moe.routerW, addr moe.routerB]:
+        body
+      for expert in moe.experts.mitems:
+        for value in fields(expert):
           let gradient {.inject.} = addr value
           body
 
@@ -1898,6 +2138,17 @@ proc applyGradients(m: var NimformerModelSpectron, adam: var ModelAdamState,
     apfAdamStep(m.blocks[i].ln1.beta, g.dLn1B, a.ln1B)
     apfAdamStep(m.blocks[i].ln2.gamma, g.dLn2G, a.ln2G)
     apfAdamStep(m.blocks[i].ln2.beta, g.dLn2B, a.ln2B)
+  for i in 0 ..< grads.dBlockMoe.len:
+    template g: untyped = grads.dBlockMoe[i]
+    template a: untyped = adam.blockMoe[i]
+    apfAdamStep(m.blocks[i].router.weight, g.routerW, a.routerW)
+    apfAdamStep(m.blocks[i].router.bias, g.routerB, a.routerB)
+    for e in 0 ..< m.blocks[i].extraExperts.len:
+      template expert: untyped = m.blocks[i].extraExperts[e]
+      apfAdamStep(expert.fc1.weight, g.experts[e].dFf1W, a.experts[e].ff1W)
+      apfAdamStep(expert.fc1.bias, g.experts[e].dFf1B, a.experts[e].ff1B)
+      apfAdamStep(expert.fc2.weight, g.experts[e].dFf2W, a.experts[e].ff2W)
+      apfAdamStep(expert.fc2.bias, g.experts[e].dFf2B, a.experts[e].ff2B)
 
 type SpectronTrainingStep = object
   loss: float32
@@ -1935,6 +2186,17 @@ proc accumulate(total: var SpectronGrads, grads: SpectronGrads) =
     total.dBlocks = grads.dBlocks
   else:
     for i in 0 ..< total.dBlocks.len: addTupleInto(total.dBlocks[i], grads.dBlocks[i])
+  if total.dBlockMoe.len == 0:
+    total.dBlockMoe = grads.dBlockMoe
+  else:
+    for i in 0 ..< total.dBlockMoe.len:
+      template sum: untyped = total.dBlockMoe[i]
+      template part: untyped = grads.dBlockMoe[i]
+      addInto(sum.routerW, part.routerW)
+      addInto(sum.routerB, part.routerB)
+      for e in 0 ..< sum.experts.len: addTupleInto(sum.experts[e], part.experts[e])
+      for e, count in part.routes: sum.routes[e] += count
+      sum.balanceLoss += part.balanceLoss
   addInto(total.mixture.routerW, grads.mixture.routerW)
   addInto(total.mixture.routerB, grads.mixture.routerB)
   addInto(total.mixture.normG, grads.mixture.normG)
@@ -2001,6 +2263,12 @@ proc checkedTrainStep(m: var NimformerModelSpectron, adam: var ModelAdamState,
   result.gradNorm = grads.checkAndClipGradients(maxGradNorm)
   result.balanceLoss = grads.mixture.balanceLoss
   result.routes = move(grads.mixture.routes)
+  if result.routes.len == 0 and grads.dBlockMoe.len > 0:
+    # Upcycled blocks: tokens per expert summed over blocks, balance loss averaged.
+    result.routes = newSeq[int](m.blockExpertCount)
+    for moe in grads.dBlockMoe:
+      for e, count in moe.routes: result.routes[e] += count
+      result.balanceLoss += moe.balanceLoss / float64(segments * grads.dBlockMoe.len)
 
   # Keep the current state live until the proposed update passes the numeric checks.
   var nextModel = m

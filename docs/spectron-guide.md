@@ -86,6 +86,32 @@ with the same BPE, hidden size, expert width, and expert depth. It imports
 the expert weights and initializes the new router rows. Use a donor trained
 from the same backbone and continue training to adapt routing.
 
+To turn a trained dense checkpoint into MoE without training, start a new
+checkpoint from its weights with `--steps=0`. The MoE
+`test/spectron/models/hrm-eos/finetune.nimq` was made this way from the dense
+step-2900 weights, which are kept as `hrm-eos/finetunedense.nimq`:
+
+```sh
+./test/spectron/test_nimformer --dataset=test/spectron/data/scale5b \
+  --init-checkpoint=test/spectron/models/hrm-eos/finetunedense.nimq \
+  --init-tokenizer=test/spectron/data/scale5b/tokenizer.json \
+  --moe-experts=2 --lr=3.2e-4 --steps=0 \
+  --checkpoint=test/spectron/models/hrm-eos/finetune.nimq
+```
+
+Every block's trained feed-forward becomes `--moe-experts` experts that
+start as copies of it (sparse upcycling), and each block gets a router that
+sends each token to one expert. The selected expert's output is added with
+weight 1, so the MoE model gives the outputs of the dense weights until
+training makes the experts differ. Training updates each router through the
+selected expert's gate and the same balance loss as the default MoE. The
+checkpoint keeps the HRM layout and the EOS ID; the step count and Adam
+state start again from zero. On resume, `--moe-experts` must match the
+experts per block. For the step-2900 `hrm-eos` checkpoint, with 2 experts of
+33,088 parameters in each of its 2 blocks, `block_decode` and chat produce
+the same tokens from both files, and resuming the MoE file with `--steps=0`
+writes the same bytes.
+
 ### Tensor Cores and checkpoint uploads
 
 On NVIDIA GPUs, build with Vulkan and pass `--tensor-cores=require`. Linear
@@ -195,9 +221,10 @@ and the log prints `[hrm] off`. To add HRM, start a new `--checkpoint` with
 
 ### Train an end-of-sequence token
 
-`make download-spectron-hrm-eos` restores the step-1353 starter checkpoint to
-`test/spectron/models/hrm-eos/finetune.nimq`. It contains the weights, Adam
-state and EOS ID for resuming training. [Hugging Face checkpoint](https://huggingface.co/bobbydeveloper2014/bybyai-spectron/blob/main/hrm-eos/finetune.nimq)
+`make download-spectron-hrm-eos` restores
+`test/spectron/models/hrm-eos/finetune.nimq` when the file is missing. It is
+the MoE upcycled from the dense step-2900 checkpoint, with the weights, Adam
+state, HRM layout and EOS ID for resuming training. [Hugging Face checkpoint](https://huggingface.co/bobbydeveloper2014/bybyai-spectron/blob/main/hrm-eos/finetune.nimq)
 
 `make prepare-spectron-eos-data` packs complete Dolly answers and Python
 files from CodeParrot with their original record boundaries. With
@@ -458,7 +485,11 @@ produces up to 128 tokens per turn. By default it loads
 confidence-guided parallel block generation (`--block=16 --context=128
 --tau=0.9`), so each reply equals greedy decoding and ends at EOS when the
 checkpoint has one. A `[block]` line after each reply prints its tokens and
-passes. `--temperature=0.7` samples one token per forward pass instead.
+passes. For a checkpoint whose blocks have experts, a `[moe]` line per block
+follows: `expert_tokens` counts the rows that the block's router sent to each
+expert for the reply, over every forward pass and every HRM pass of the
+block, and `chosen_p` is the mean router probability of the chosen experts.
+`--temperature=0.7` samples one token per forward pass instead.
 Pass these options in `ARGS`. The demo checkpoint needs
 `ARGS='--checkpoint=test/spectron/models/finetune.nimq --tokenizer=test/spectron/models/spectron_bpe_tokenizer.json'`.
 

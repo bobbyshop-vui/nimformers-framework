@@ -82,6 +82,31 @@ trọng số các expert được nhập và khởi tạo các hàng router tư�
 checkpoint từ cùng backbone rồi train tiếp để router học sử dụng các expert
 vừa ghép.
 
+Để chuyển một checkpoint dense đã train sang MoE mà không train, tạo checkpoint
+mới từ trọng số của nó với `--steps=0`. Checkpoint MoE
+`test/spectron/models/hrm-eos/finetune.nimq` được tạo theo cách này từ trọng số
+dense ở bước 2900, nay giữ ở `hrm-eos/finetunedense.nimq`:
+
+```sh
+./test/spectron/test_nimformer --dataset=test/spectron/data/scale5b \
+  --init-checkpoint=test/spectron/models/hrm-eos/finetunedense.nimq \
+  --init-tokenizer=test/spectron/data/scale5b/tokenizer.json \
+  --moe-experts=2 --lr=3.2e-4 --steps=0 \
+  --checkpoint=test/spectron/models/hrm-eos/finetune.nimq
+```
+
+Feed-forward đã train của mỗi block trở thành `--moe-experts` expert, ban đầu
+là các bản sao của nó (sparse upcycling), và mỗi block có một router gửi mỗi
+token tới một expert. Đầu ra của expert được chọn được cộng với trọng số 1, nên
+model MoE cho ra đúng kết quả của trọng số dense cho tới khi train làm các
+expert khác nhau. Khi train, router của mỗi block học qua cổng của expert được
+chọn và cùng balance loss với MoE mặc định. Checkpoint giữ cấu trúc HRM và ID
+EOS; số bước và trạng thái Adam bắt đầu lại từ 0. Khi resume, `--moe-experts`
+phải bằng số expert mỗi block. Với checkpoint `hrm-eos` ở step 2900, có 2
+expert 33.088 tham số trong mỗi block của 2 block, `block_decode` và chat sinh
+ra cùng các token từ cả hai file, và resume file MoE với `--steps=0` ghi ra
+đúng các byte cũ.
+
 ### Tensor Core và upload checkpoint
 
 Trên GPU NVIDIA, build với Vulkan rồi truyền `--tensor-cores=require`. Khi đó
@@ -188,9 +213,9 @@ Nó train tiếp không có HRM và log in `[hrm] off`. Muốn thêm HRM, hãy t
 
 ### Học token dừng
 
-`make download-spectron-hrm-eos` lấy checkpoint khởi đầu ở bước 1353 vào
-`test/spectron/models/hrm-eos/finetune.nimq`. Checkpoint có trọng số, Adam
-và ID EOS để train tiếp. [Checkpoint trên Hugging Face](https://huggingface.co/bobbydeveloper2014/bybyai-spectron/blob/main/hrm-eos/finetune.nimq)
+`make download-spectron-hrm-eos` lấy `test/spectron/models/hrm-eos/finetune.nimq`
+khi file chưa có. Đây là bản MoE upcycle từ checkpoint dense ở bước 2900, gồm
+trọng số, Adam, bố cục HRM và ID EOS để train tiếp. [Checkpoint trên Hugging Face](https://huggingface.co/bobbydeveloper2014/bybyai-spectron/blob/main/hrm-eos/finetune.nimq)
 
 `make prepare-spectron-eos-data` đóng gói câu trả lời từ Dolly và file Python
 hoàn chỉnh từ CodeParrot, giữ ranh giới của từng mẫu. Với
@@ -442,7 +467,11 @@ với `test/spectron/data/scale5b/tokenizer.json`. Câu trả lời dùng
 confidence-guided parallel block generation (`--block=16 --context=128
 --tau=0.9`), nên mỗi câu trả lời trùng với giải mã greedy và dừng ở EOS khi
 checkpoint có EOS. Sau mỗi câu trả lời, dòng `[block]` in số token và số
-lượt. `--temperature=0.7` chuyển sang lấy mẫu mỗi lượt forward một token.
+lượt. Với checkpoint có expert trong block, mỗi block in thêm một dòng `[moe]`:
+`expert_tokens` đếm số hàng router của block đã gửi tới từng expert khi sinh
+câu trả lời, tính qua mọi lượt forward và mọi lượt HRM của block, còn
+`chosen_p` là xác suất router trung bình của các expert được chọn.
+`--temperature=0.7` chuyển sang lấy mẫu mỗi lượt forward một token.
 Truyền các tùy chọn này qua `ARGS`. Checkpoint demo cần
 `ARGS='--checkpoint=test/spectron/models/finetune.nimq --tokenizer=test/spectron/models/spectron_bpe_tokenizer.json'`.
 
