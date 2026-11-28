@@ -11,7 +11,11 @@ const
   PackedRetryLimit = 2
   LegacyPackedLr = 1e-3'f32
   PackedPeakLr = 1.2e-3'f32
-  PackedFiles = ["code-basic.bin", "code-intermediate.bin", "code-advanced.bin",
+  DefaultHrmCycles = 2
+  DefaultHrmLSteps = 2
+  DefaultHrmSegments = 2
+  DefaultDraftBlock = 16
+  PackedFiles =["code-basic.bin", "code-intermediate.bin", "code-advanced.bin",
                  "english.bin", "val-code.bin", "val-english.bin"]
   PackedUsage = """
 Usage: test_nimformer --dataset=DIR [options]
@@ -33,13 +37,15 @@ Usage: test_nimformer --dataset=DIR [options]
   --moe-hidden=512 --moe-heads=8 --moe-layers=4
   --expert-width=7312 --expert-depth=4
   --merge-experts=PATH    Append experts from a compatible packed MoE checkpoint
-  --hrm-cycles=2          Enable the HRM core with this many high-level cycles
-  --hrm-l-steps=2 --hrm-l-layers=HALF --hrm-segments=1
+  --hrm-cycles=2          HRM high-level cycles; HRM is on by default for a new model
+                          (0 starts a new model without HRM)
+  --hrm-l-steps=2 --hrm-l-layers=HALF --hrm-segments=2
                           Low-level steps per cycle, blocks in the low-level
                           module, and deep-supervision segments per step
-  --draft-block=16        Train for parallel block decoding: in each block of this many
-  --draft-noise=0.5       inputs, the first stays clean and each later input is replaced
-                          by another token with a per-block rate drawn from U(0, noise)
+  --draft-block=16        Train for parallel block decoding, on by default when --seq is
+  --draft-noise=0.5       at least 16 (0 turns it off): in each block of this many inputs,
+                          the first stays clean and each later input is replaced by another
+                          token with a per-block rate drawn from U(0, noise)
   --eos-data=DIR          Mix complete-document endings into batches and learn EOS
   --eos-rows=N            Clean ending examples per batch (default one quarter)
   --eos-weight=8         Weight assigned to true EOS targets
@@ -56,7 +62,7 @@ type
     hrmCycles, hrmLSteps, hrmLLayers, hrmSegments: int
     draftBlock, eosRows: int
     lr, gradClip, beta2, draftNoise, eosWeight: float32
-    lrSet, beta2Set: bool
+    lrSet, beta2Set, hrmOff, draftBlockSet: bool
 
   PackedOptimizer = object
     beta2, peakLr, lrScale: float32
@@ -110,11 +116,15 @@ proc packedOptions(): PackedTrainingOptions =
     of "expert-width": result.expertWidth = parseInt(val)
     of "expert-depth": result.expertDepth = parseInt(val)
     of "merge-experts": result.donor = val
-    of "hrm-cycles": result.hrmCycles = parseInt(val)
+    of "hrm-cycles":
+      result.hrmCycles = parseInt(val)
+      result.hrmOff = result.hrmCycles == 0
     of "hrm-l-steps": result.hrmLSteps = parseInt(val)
     of "hrm-l-layers": result.hrmLLayers = parseInt(val)
     of "hrm-segments": result.hrmSegments = parseInt(val)
-    of "draft-block": result.draftBlock = parseInt(val)
+    of "draft-block":
+      result.draftBlock = parseInt(val)
+      result.draftBlockSet = true
     of "draft-noise": result.draftNoise = float32(parseFloat(val))
     of "eos-data": result.eosData = val
     of "eos-rows": result.eosRows = parseInt(val)
@@ -165,6 +175,10 @@ proc packedOptions(): PackedTrainingOptions =
     raise newException(ValueError, "Invalid step count or MoE dimensions")
   if min([result.hrmCycles, result.hrmLSteps, result.hrmLLayers, result.hrmSegments]) < 0:
     raise newException(ValueError, "HRM settings must be positive")
+  if result.hrmOff and max([result.hrmLSteps, result.hrmLLayers, result.hrmSegments]) > 0:
+    raise newException(ValueError, "--hrm-cycles=0 turns HRM off; remove the other --hrm options")
+  if not result.draftBlockSet:
+    result.draftBlock = if result.context >= DefaultDraftBlock: DefaultDraftBlock else: 0
   if result.draftBlock < 0 or result.draftBlock == 1 or result.draftBlock > result.context:
     raise newException(ValueError, "--draft-block must be 0 (off) or between 2 and --seq")
   if not finite32(result.draftNoise) or result.draftNoise < 0 or result.draftNoise > 1:
@@ -529,16 +543,21 @@ proc trainPacked() =
     eosRows = if options.eosRows > 0: options.eosRows else: max(1, options.batch div 4)
     echo &"[eos] token_id={model.eosTokenId} clean_rows={eosRows}/{options.batch} " &
          &"target_weight={options.eosWeight} data={eosPath}"
+  # HRM is on by default for a new model. A resumed checkpoint keeps its own core.
+  let newModel = resume.len == 0
   let hrmRequested = options.hrmCycles > 0 or options.hrmLSteps > 0 or
                      options.hrmLLayers > 0 or options.hrmSegments > 0
-  if hrmRequested:
-    if start > 0 and not model.hrmEnabled:
+  if options.hrmOff and model.hrmEnabled:
+    raise newException(ValueError, "--hrm-cycles=0 cannot remove the HRM core from these weights")
+  if hrmRequested or (newModel and not options.hrmOff):
+    if not newModel and not model.hrmEnabled:
       raise newException(ValueError,
         "This checkpoint has no HRM core. Use --init-checkpoint with a new --checkpoint path to add one.")
-    if start > 0 and options.hrmLLayers > 0 and options.hrmLLayers != model.hrm.lLayers:
+    if not newModel and options.hrmLLayers > 0 and options.hrmLLayers != model.hrm.lLayers:
       raise newException(ValueError, "--hrm-l-layers differs from the checkpoint's HRM split")
     if not model.hrmEnabled:
-      model.hrm = HrmConfig(cycles: 2, lSteps: 2, segments: 1, lLayers: max(1, model.blocks.len div 2))
+      model.hrm = HrmConfig(cycles: DefaultHrmCycles, lSteps: DefaultHrmLSteps,
+                            segments: DefaultHrmSegments, lLayers: max(1, model.blocks.len div 2))
       # Random blocks start near identity so the recurrence contracts; trained
       # --init-checkpoint weights are kept as they are.
       if options.initialWeights.len == 0:
@@ -549,6 +568,9 @@ proc trainPacked() =
     if options.hrmLSteps > 0: model.hrm.lSteps = options.hrmLSteps
     if options.hrmLLayers > 0: model.hrm.lLayers = options.hrmLLayers
     if options.hrmSegments > 0: model.hrm.segments = options.hrmSegments
+  elif not model.hrmEnabled and not options.hrmOff:
+    echo "[hrm] off: this checkpoint has no HRM core; --init-checkpoint with a new " &
+         "--checkpoint path adds one"
   model.validateHrm()
   if model.hrmEnabled:
     let h = model.hrm

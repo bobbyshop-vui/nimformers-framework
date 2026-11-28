@@ -93,8 +93,12 @@ inference. The two binaries have different output locations.
 
 The trainer uses its `CFG_*` settings for the demo corpus. Pass
 `ARGS='--dataset=test/spectron/data/packed --steps=6000'` to a trainer
-target to train on the packed corpus. The chat target accepts
-`--checkpoint=PATH` and `--tokenizer=PATH` in `ARGS`.
+target to train on the packed corpus. The packed trainer turns on HRM and
+block-decoding training by default for a new model. The chat target loads the
+HRM-EOS checkpoint by default and answers with confidence-guided parallel
+block generation. It accepts `--checkpoint=PATH`, `--tokenizer=PATH`,
+`--block`, `--context`, `--tau` and `--temperature` in `ARGS`;
+`--temperature=0.7` samples instead.
 [Spectron training guide](spectron-guide.md#train-on-the-packed-dataset)
 
 

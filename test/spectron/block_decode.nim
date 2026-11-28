@@ -317,7 +317,7 @@ Usage: block_decode --checkpoint=PATH [options]
   --tokens=64           New tokens per prompt (a multiple of --block)
   --context=128         Window: the last context-block tokens plus the block
   --tau=0.9             Confidence needed to lock a draft (0.5 < tau <= 1)
-  --policy=both         jacobi, confidence or both
+  --policy=confidence   confidence (default), jacobi or both
   --prompt=TEXT         A prompt (repeatable; default: built-in English and code prompts)
   --trace-blocks=1      Print every pass of the first prompt for this many blocks
   --seed=7              Seed for the initial drafts
@@ -347,7 +347,7 @@ when isMainModule:
   var newTokens = 64
   var context = 128
   var tau = 0.9'f32
-  var policies = @[bpJacobi, bpConfidence]
+  var policies = @[bpConfidence]
   var texts: seq[string]
   var traceBlocks = 1
   var seed = 7

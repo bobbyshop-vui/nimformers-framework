@@ -148,19 +148,22 @@ its state `--hrm-l-steps` times from `zL + zH + x`, where `x` is the
 normalized token embedding. H then updates once from `zH + zL`. A LayerNorm
 follows each module, and the H state feeds the MoE and the LM head.
 
+HRM is on by default for a new model, including one started with
+`--init-checkpoint`. The HRM flags in this command only restate the defaults:
+
 ```sh
 ./test/spectron/test_nimformer --dataset=test/spectron/data/scale5b --moe-experts=2 \
   --batch=64 --seq=128 --steps=6000 --tensor-cores=require \
-  --hrm-cycles=2 --hrm-l-steps=2 --hrm-segments=1
+  --hrm-cycles=2 --hrm-l-steps=2 --hrm-segments=2
 ```
 
-- `--hrm-cycles` turns HRM on and sets the high-level cycles per segment
-  (default 2 when another HRM flag is given).
+- `--hrm-cycles` sets the high-level cycles per segment (default 2).
+  `--hrm-cycles=0` starts a new model without HRM.
 - `--hrm-l-steps` sets the low-level steps per cycle (default 2).
 - `--hrm-l-layers` sets how many blocks belong to L (default half of the
   blocks). The rest belong to H.
 - `--hrm-segments` sets the deep-supervision segments per optimizer step
-  (default 1). Each segment starts from the previous segment's state and
+  (default 2). Each segment starts from the previous segment's state and
   computes its own loss. The trainer averages the segment gradients into one
   Adam update.
 
@@ -184,8 +187,9 @@ with their Adam state. On resume, the trainer reads the layout from the
 checkpoint, so the HRM flags can be left out. `--hrm-cycles`,
 `--hrm-l-steps` and `--hrm-segments` may change on resume, because they only
 change compute. `--hrm-l-layers` must match the checkpoint. A checkpoint
-saved without HRM cannot gain it on resume; start a new `--checkpoint` with
-`--init-checkpoint` instead.
+saved without HRM cannot gain it on resume. It keeps training without HRM
+and the log prints `[hrm] off`. To add HRM, start a new `--checkpoint` with
+`--init-checkpoint`.
 
 ### Train an end-of-sequence token
 
@@ -226,6 +230,8 @@ parallel. Then:
 3. The block is done when every position is verified.
 
 `--tau` must be above 0.5 and at most 1, so at most one token can reach it.
+`--policy` defaults to `confidence`. Pass `--policy=jacobi` or
+`--policy=both` to compare the policies.
 
 Each pass verifies at least one position, so a block takes at most K passes,
 the same number of forward calls as greedy decoding. The output is the greedy
@@ -284,7 +290,8 @@ its own.
 A model trained only on clean text predicts badly when the drafts before a
 position are wrong, so most blocks need close to K passes.
 `--draft-block=K --draft-noise=ρ` trains the model for the decoding passes.
-The window is cut into blocks of K inputs at a random offset. The first input
+It is on by default with K = 16 and ρ = 0.5 when `--seq` is at least 16.
+`--draft-block=0` turns it off. The window is cut into blocks of K inputs at a random offset. The first input
 of each block plays the last verified token and stays clean. Each later input
 plays a draft and is replaced by a different token with probability r, where
 r ~ U(0, ρ) is drawn per block. The targets keep the true next tokens. On
@@ -305,7 +312,7 @@ Measured on an Intel Iris Plus 640 (Metal): the dense step-6030 checkpoint
 `test/spectron/models/finetune.nimq` was fine-tuned for 200 steps on the
 5-billion-token corpus (`--steps=200 --batch=16 --seq=64 --lr=1e-3
 --warmup=10`), once with `--draft-block=16 --draft-noise=0.5` and once
-without. Validation reads clean text. Its perplexity after 200 steps is 68.05
+with `--draft-block=0`. Validation reads clean text. Its perplexity after 200 steps is 68.05
 with draft noise and 60.50 without. The probe used 64 windows per file with
 `--context=64 --block=16`, so 960 block positions per file:
 
@@ -443,8 +450,15 @@ make run-spectron
 This compiles `test/spectron/test_inferencespectron.nim` into
 `./test_inferencespectron`, loads checkpoint/tokenizer, and accepts prompts
 at `>>>`. Enter `exit` or `quit` to stop. Chat keeps session history and
-produces up to 128 tokens per turn at temperature 0.7, as configured in the
-inference source. Use `ARGS` to pass `--checkpoint=PATH` and `--tokenizer=PATH`.
+produces up to 128 tokens per turn. By default it loads
+`test/spectron/models/hrm-eos/finetune.nimq` with
+`test/spectron/data/scale5b/tokenizer.json`. It answers with
+confidence-guided parallel block generation (`--block=16 --context=128
+--tau=0.9`), so each reply equals greedy decoding and ends at EOS when the
+checkpoint has one. A `[block]` line after each reply prints its tokens and
+passes. `--temperature=0.7` samples one token per forward pass instead.
+Pass these options in `ARGS`. The demo checkpoint needs
+`ARGS='--checkpoint=test/spectron/models/finetune.nimq --tokenizer=test/spectron/models/spectron_bpe_tokenizer.json'`.
 
 
 ## Trainer startup

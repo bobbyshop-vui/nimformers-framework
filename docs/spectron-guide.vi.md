@@ -143,19 +143,22 @@ nhật trạng thái `--hrm-l-steps` lần từ `zL + zH + x`, với `x` là emb
 token đã chuẩn hoá. Sau đó H cập nhật một lần từ `zH + zL`. Sau mỗi module có
 một LayerNorm, và trạng thái H đi tiếp vào MoE và LM head.
 
+HRM bật mặc định cho model mới, kể cả model bắt đầu bằng `--init-checkpoint`.
+Các cờ HRM trong lệnh này chỉ nhắc lại giá trị mặc định:
+
 ```sh
 ./test/spectron/test_nimformer --dataset=test/spectron/data/scale5b --moe-experts=2 \
   --batch=64 --seq=128 --steps=6000 --tensor-cores=require \
-  --hrm-cycles=2 --hrm-l-steps=2 --hrm-segments=1
+  --hrm-cycles=2 --hrm-l-steps=2 --hrm-segments=2
 ```
 
-- `--hrm-cycles` bật HRM và đặt số chu kỳ mức cao trong mỗi segment (mặc
-  định 2 khi có truyền một cờ HRM khác).
+- `--hrm-cycles` đặt số chu kỳ mức cao trong mỗi segment (mặc định 2).
+  `--hrm-cycles=0` tạo model mới không có HRM.
 - `--hrm-l-steps` đặt số bước mức thấp trong mỗi chu kỳ (mặc định 2).
 - `--hrm-l-layers` đặt số block thuộc L (mặc định một nửa số block). Các
   block còn lại thuộc H.
 - `--hrm-segments` đặt số segment deep supervision trong mỗi bước optimizer
-  (mặc định 1). Mỗi segment bắt đầu từ trạng thái của segment trước và tính
+  (mặc định 2). Mỗi segment bắt đầu từ trạng thái của segment trước và tính
   loss riêng. Trainer lấy trung bình gradient của các segment rồi cập nhật
   Adam một lần.
 
@@ -177,8 +180,9 @@ Checkpoint lưu bố cục HRM (`__hrm_layout`) cùng ba LayerNorm của HRM và
 thái Adam của chúng. Khi resume, trainer đọc bố cục từ checkpoint nên có thể
 bỏ các cờ HRM. `--hrm-cycles`, `--hrm-l-steps` và `--hrm-segments` được đổi
 khi resume vì chúng chỉ đổi lượng tính toán. `--hrm-l-layers` phải khớp với
-checkpoint. Checkpoint lưu khi chưa bật HRM không thể thêm HRM lúc resume;
-hãy tạo `--checkpoint` mới kèm `--init-checkpoint`.
+checkpoint. Checkpoint lưu khi chưa bật HRM không thể thêm HRM lúc resume.
+Nó train tiếp không có HRM và log in `[hrm] off`. Muốn thêm HRM, hãy tạo
+`--checkpoint` mới kèm `--init-checkpoint`.
 
 ### Học token dừng
 
@@ -219,7 +223,8 @@ block. Sau đó:
 3. Block xong khi mọi vị trí đã được kiểm chứng.
 
 `--tau` phải lớn hơn 0,5 và không quá 1, nên nhiều nhất một token đạt được
-ngưỡng này.
+ngưỡng này. `--policy` mặc định là `confidence`. Truyền `--policy=jacobi`
+hoặc `--policy=both` để so sánh các policy.
 
 Mỗi lượt kiểm chứng được ít nhất một vị trí, nên một block cần tối đa K lượt,
 bằng số lượt forward của greedy. Đầu ra chính là đầu ra greedy: một token nháp
@@ -274,7 +279,9 @@ cho biết mức lợi khi giải mã riêng từng prompt.
 
 Model chỉ train trên văn bản sạch dự đoán rất kém khi các token nháp phía
 trước còn sai, nên đa số block cần gần K lượt. `--draft-block=K
---draft-noise=ρ` train model cho đúng tình huống của các lượt giải mã. Cửa sổ
+--draft-noise=ρ` train model cho đúng tình huống của các lượt giải mã. Chế độ
+này bật mặc định với K = 16 và ρ = 0,5 khi `--seq` từ 16 trở lên.
+`--draft-block=0` tắt nó. Cửa sổ
 được cắt thành các block K input bắt đầu từ một vị trí ngẫu nhiên. Input đầu
 mỗi block đóng vai token cuối đã kiểm chứng nên giữ sạch. Mỗi input sau đó
 đóng vai token nháp và bị thay bằng một token khác với xác suất r, trong đó
@@ -295,7 +302,7 @@ phép so sánh công bằng giữa các model.
 `test/spectron/models/finetune.nimq` ở bước 6030 được fine-tune 200 bước trên
 corpus 5 tỷ token (`--steps=200 --batch=16 --seq=64 --lr=1e-3
 --warmup=10`), một lần có `--draft-block=16 --draft-noise=0.5` và một lần
-không. Validation đọc văn bản sạch. Sau 200 bước, perplexity validation là
+với `--draft-block=0`. Validation đọc văn bản sạch. Sau 200 bước, perplexity validation là
 68,05 khi có nhiễu nháp và 60,50 khi không. Phép đo dùng 64 cửa sổ mỗi file
 với `--context=64 --block=16`, tức 960 vị trí block mỗi file:
 
@@ -428,8 +435,14 @@ make run-spectron
 Lệnh này compile `test/spectron/test_inferencespectron.nim` thành
 `./test_inferencespectron`, load checkpoint/tokenizer, rồi nhận prompt ở
 `>>>`. Gõ `exit` hoặc `quit` để thoát. Chat giữ lịch sử trong phiên, sinh tối
-đa 128 token/lượt với temperature 0.7 theo constants của file inference.
-Dùng `ARGS` để truyền `--checkpoint=PATH` và `--tokenizer=PATH`.
+đa 128 token/lượt. Mặc định nó nạp `test/spectron/models/hrm-eos/finetune.nimq`
+với `test/spectron/data/scale5b/tokenizer.json`. Câu trả lời dùng
+confidence-guided parallel block generation (`--block=16 --context=128
+--tau=0.9`), nên mỗi câu trả lời trùng với giải mã greedy và dừng ở EOS khi
+checkpoint có EOS. Sau mỗi câu trả lời, dòng `[block]` in số token và số
+lượt. `--temperature=0.7` chuyển sang lấy mẫu mỗi lượt forward một token.
+Truyền các tùy chọn này qua `ARGS`. Checkpoint demo cần
+`ARGS='--checkpoint=test/spectron/models/finetune.nimq --tokenizer=test/spectron/models/spectron_bpe_tokenizer.json'`.
 
 
 ## Khi trainer khởi động

@@ -91,8 +91,11 @@ là chương trình inference. Hai binary có vị trí output khác nhau.
 
 Trainer dùng các thiết lập `CFG_*` cho corpus demo. Truyền
 `ARGS='--dataset=test/spectron/data/packed --steps=6000'` vào target train để
-dùng corpus đã đóng gói. Target chat nhận `--checkpoint=PATH` và
-`--tokenizer=PATH` qua `ARGS`.
+dùng corpus đã đóng gói. Trainer packed bật HRM và train cho giải mã theo
+block mặc định với model mới. Target chat mặc định nạp checkpoint HRM-EOS và
+trả lời bằng confidence-guided parallel block generation. Nó nhận
+`--checkpoint=PATH`, `--tokenizer=PATH`, `--block`, `--context`, `--tau` và
+`--temperature` qua `ARGS`; `--temperature=0.7` chuyển sang lấy mẫu.
 [Hướng dẫn train Spectron](spectron-guide.vi.md#train-với-bộ-dữ-liệu-đã-đóng-gói)
 
 
